@@ -51,7 +51,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--sequence-length",     type=int,   default=32)
     parser.add_argument("--hidden-size",         type=int,   default=256)
     parser.add_argument("--total-timesteps",     type=int,   default=1_000_000_000)
-    parser.add_argument("--minibatch-size",      type=int,   default=16_384)
+    parser.add_argument("--minibatch-size",      type=int,   default=65_536)
     parser.add_argument("--learning-rate",       type=float, default=2.5e-4)
     parser.add_argument("--epochs",              type=int,   default=8)
     parser.add_argument("--entropy-coef",        type=float, default=1e-3)
@@ -63,6 +63,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--reward-scale",        type=float, default=1.0)
     parser.add_argument("--gamma",               type=float, default=0.999)
     parser.add_argument("--gae-lambda",          type=float, default=0.99)
+    parser.add_argument("--precision",           type=str,   default="bfloat16")
     parser.add_argument("--log-dir",             type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",      type=Path,  default=Path("checkpoints"))
     parser.add_argument("--run-name",            type=str,   default=None)
@@ -106,6 +107,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("entropy-coef cannot be negative")
     if arguments.gamma > 1.0 or arguments.gae_lambda > 1.0:
         raise ValueError("gamma and gae-lambda cannot exceed one")
+    if arguments.precision not in {"float32", "bfloat16"}:
+        raise ValueError("precision must be float32 or bfloat16")
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
 
@@ -158,6 +161,7 @@ def build_ppo(
         horizon=arguments.rollout_steps,
         num_envs=environment.n_envs,
         device=environment.device,
+        copy_on_finish=False,
     )
     opponent_pool = SnapshotPool(
         policy=policy.actor,
@@ -215,6 +219,14 @@ def build_ppo(
                 arguments.minibatch_size // arguments.sequence_length
             ),
             epochs=arguments.epochs,
+            fields=(
+                "observation",
+                "action",
+                "advantage",
+                "old_log_prob",
+                "baseline_value",
+                "returns",
+            ),
         ),
         loss=PPOLoss(
             policy,
@@ -227,6 +239,9 @@ def build_ppo(
             max_grad_norm=0.5,
         ),
         section="PPO",
+        autocast_dtype=(
+            torch.bfloat16 if arguments.precision == "bfloat16" else None
+        ),
     )
     return runner, rollout, Algorithm(update)
 
@@ -234,6 +249,8 @@ def build_ppo(
 def main() -> None:
     arguments = parse_arguments()
     validate_arguments(arguments)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(arguments.seed)
     run_id = arguments.run_name or datetime.now().strftime(
         "goddard-%Y%m%d-%H%M%S"
