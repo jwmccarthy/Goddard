@@ -56,6 +56,14 @@ The snapshot interval is measured in PPO updates. Other aligned defaults are a
 constant `2.5e-4` learning rate, entropy coefficient `1e-3`, discount `0.999`,
 and GAE lambda `0.99`.
 
+TrueSkill evaluation runs every 5,000,000 learner timesteps by default. Each
+evaluation plays the current actor against up to three historical snapshots
+from both team assignments using 64 parallel simulations. Configure this with
+`--trueskill-interval`, `--trueskill-simulations`, and
+`--trueskill-opponents`. Metrics are written under `TrueSkill/` in TensorBoard,
+and ratings are persisted as `checkpoints/<run-id>/trueskill_ratings.json`.
+Draws are reported but do not update ratings.
+
 The historical-game proportion is `1 - self-play-current`.
 The learner's team is randomized in historical games. Both teams contribute
 training samples in current-policy mirrors, while historical opponent samples
