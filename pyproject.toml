@@ -7,9 +7,16 @@ dependencies = [
     "carl==0.1.0",
     "jarl==0.1.0",
     "tensorboard>=2.0",
+    "torch>=2.7",
     "trueskill>=0.4.5",
 ]
 
 [tool.uv.sources]
 carl = { path = "../CARL" }
 jarl = { path = "../JARL" }
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
