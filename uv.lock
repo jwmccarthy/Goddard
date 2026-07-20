@@ -242,6 +242,7 @@ dependencies = [
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "rich" },
     { name = "torch" },
+    { name = "trueskill" },
 ]
 
 [package.metadata]
@@ -252,6 +253,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14.0" },
     { name = "tensorboard", marker = "extra == 'logging'", specifier = ">=2.0" },
     { name = "torch", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "trueskill", specifier = ">=0.4.5" },
 ]
 provides-extras = ["examples", "logging"]
 

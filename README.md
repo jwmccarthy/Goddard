@@ -19,7 +19,8 @@ python train.py --total-timesteps 100000000
 Training metrics are written to timestamped directories such as
 `runs/goddard-20260720-143000`, with matching snapshots and the final model in
 `checkpoints/goddard-20260720-143000`. Use `--run-name NAME` to provide a
-stable shared label.
+stable shared label and `--tensorboard-dir PATH` to change the TensorBoard base
+directory.
 Episode reward and length include only actors controlled by the actively
 trained policy; frozen historical opponents are excluded. In current-policy
 mirror games, both sides are active learners and contribute metrics. The

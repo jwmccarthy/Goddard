@@ -14,6 +14,7 @@ from jarl.collect import (
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
+    TrueSkillEvaluator,
     ValueCapture,
 )
 from jarl.learn import (
@@ -36,7 +37,6 @@ from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
 from rewards import SeerReward
-from evaluation import TrueSkillEvaluator
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -60,7 +60,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--snapshot-interval",            type=int,   default=16)
     parser.add_argument("--opponent-pool-size",           type=int,   default=8)
     parser.add_argument("--historical-policies",          type=int,   default=4)
-    parser.add_argument("--trueskill-interval",           type=int,   default=5_000_000)
+    parser.add_argument("--trueskill-interval",           type=int,   default=16_000_000)
     parser.add_argument("--trueskill-simulations",        type=int,   default=64)
     parser.add_argument("--trueskill-opponents",          type=int,   default=3)
     parser.add_argument("--trueskill-draw-probability",   type=float, default=0.0)
@@ -68,7 +68,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--reward-scale",                 type=float, default=1.0)
     parser.add_argument("--gamma",                        type=float, default=0.999)
     parser.add_argument("--gae-lambda",                   type=float, default=0.99)
-    parser.add_argument("--log-dir",                      type=Path,  default=Path("runs"))
+    parser.add_argument("--tensorboard-dir",              type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",               type=Path,  default=Path("checkpoints"))
     parser.add_argument("--run-name",                     type=str,   default=None)
     parser.add_argument("--seed",                         type=int,   default=0)
@@ -257,7 +257,7 @@ def main() -> None:
     run_id = arguments.run_name or datetime.now().strftime(
         "goddard-%Y%m%d-%H%M%S"
     )
-    run_dir = arguments.log_dir / run_id
+    run_dir = arguments.tensorboard_dir / run_id
     checkpoint_dir = arguments.checkpoint_dir / run_id
 
     environment = CARLTorchVectorEnv(
@@ -292,17 +292,30 @@ def main() -> None:
             checkpoint_dir,
         )
         logger = Logger(log_dir=str(run_dir))
+
+        def make_evaluation_environment():
+            return CARLTorchVectorEnv(
+                n_sim=arguments.trueskill_simulations,
+                n_blue=arguments.n_blue,
+                n_orange=arguments.n_orange,
+                seed=arguments.seed + 1,
+                frameskip=arguments.frameskip,
+                max_ticks=arguments.max_ticks,
+                synchronize=False,
+            )
+
         evaluator = TrueSkillEvaluator(
             policy=policy.actor,
             opponent_pool=runner.opponent_pool,
+            env_factory=make_evaluation_environment,
             logger=logger,
             checkpoint_dir=checkpoint_dir,
             interval=arguments.trueskill_interval,
-            n_simulations=arguments.trueskill_simulations,
-            n_blue=arguments.n_blue,
-            n_orange=arguments.n_orange,
-            frameskip=arguments.frameskip,
-            max_ticks=arguments.max_ticks,
+            num_matches=arguments.trueskill_simulations,
+            team_sizes=(arguments.n_blue, arguments.n_orange),
+            max_steps=(
+                arguments.max_ticks + arguments.frameskip - 1
+            ) // arguments.frameskip,
             opponents=arguments.trueskill_opponents,
             draw_probability=arguments.trueskill_draw_probability,
             seed=arguments.seed,
