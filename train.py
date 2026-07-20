@@ -63,7 +63,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--reward-scale",        type=float, default=1.0)
     parser.add_argument("--gamma",               type=float, default=0.999)
     parser.add_argument("--gae-lambda",          type=float, default=0.99)
-    parser.add_argument("--precision",           type=str,   default="bfloat16")
+    parser.add_argument("--precision",           type=str,   default="float32")
     parser.add_argument("--log-dir",             type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",      type=Path,  default=Path("checkpoints"))
     parser.add_argument("--run-name",            type=str,   default=None)
