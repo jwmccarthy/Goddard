@@ -42,7 +42,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a naive PPO Rocket League agent"
     )
-    parser.add_argument("--num-simulations",     type=int,   default=2048)
+    parser.add_argument("--num-simulations",     type=int,   default=1024)
     parser.add_argument("--n-blue",              type=int,   default=1)
     parser.add_argument("--n-orange",            type=int,   default=1)
     parser.add_argument("--frameskip",           type=int,   default=8)

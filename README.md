@@ -22,7 +22,9 @@ Training metrics are written to timestamped directories such as
 stable shared label.
 Episode reward and length include only actors controlled by the actively
 trained policy; frozen historical opponents are excluded. In current-policy
-mirror games, both sides are active learners and contribute metrics.
+mirror games, both sides are active learners and contribute metrics. The
+`historical_reward` and `historical_length` series isolate active learner
+episodes played against frozen historical opponents.
 
 The defaults run 1,024 parallel 1v1 simulations, collect 512 steps per update,
 unroll 32-step GRU sequences with a 256-unit hidden state, and use eight PPO
