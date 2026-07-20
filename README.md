@@ -28,10 +28,9 @@ episodes played against frozen historical opponents.
 
 The defaults run 1,024 parallel 1v1 simulations, collect 512 steps per update,
 unroll 32-step GRU sequences with a 256-unit hidden state, and use eight PPO
-epochs with 65,536-sample minibatches. Updates use TF32 matrix multiplication,
-zero-copy rollout acquisition, reset-aware fused GRU batches, and field-pruned
-recurrent sampling. BF16 remains available through `--precision bfloat16` but
-is experimental because recurrent PPO can become numerically unstable.
+epochs with 65,536-sample minibatches. Updates use zero-copy rollout
+acquisition, reset-aware fused GRU batches, and field-pruned recurrent
+sampling.
 Episodes truncate after 4,096 physics
 ticks. `--total-timesteps 256 --num-simulations 16
 --rollout-steps 8 --sequence-length 4 --hidden-size 32 --minibatch-size 256` is
