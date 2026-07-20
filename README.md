@@ -13,18 +13,21 @@ CARL and JARL must be installed in the active Python environment. With the
 local `rlenv` environment used by this workspace:
 
 ```bash
-python train.py --total-timesteps 100000000 --checkpoint checkpoints/ppo.pt
+python train.py --total-timesteps 100000000
 ```
 
 Training metrics are written to timestamped directories such as
-`runs/goddard-20260720-143000`. Use `--run-name NAME` to provide a stable label.
+`runs/goddard-20260720-143000`, with matching snapshots and the final model in
+`checkpoints/goddard-20260720-143000`. Use `--run-name NAME` to provide a
+stable shared label.
 Episode reward and length include only actors controlled by the actively
 trained policy; frozen historical opponents are excluded. In current-policy
 mirror games, both sides are active learners and contribute metrics.
 
-The defaults run 1,024 parallel 1v1 simulations, collect 256 steps per update,
-unroll 32-step GRU sequences with a 256-unit hidden state, and use
-16,384-sample PPO minibatches. `--total-timesteps 256 --num-simulations 16
+The defaults run 2,048 parallel 1v1 simulations, collect 128 steps per update,
+unroll 32-step GRU sequences with a 256-unit hidden state, and use eight PPO
+epochs with 16,384-sample minibatches. Episodes truncate after 4,096 physics
+ticks. `--total-timesteps 256 --num-simulations 16
 --rollout-steps 8 --sequence-length 4 --hidden-size 32 --minibatch-size 256` is
 a useful smoke test.
 
@@ -71,16 +74,3 @@ team's mean reward, then normalized with running mean and variance. Touch decay
 and last-touch possession are maintained on CUDA across steps. CARL does not
 store the demolishing player, so demo credit is exact in 1v1 and distributed
 across the opposing team in larger matches.
-
-## Direct Recurrent Comparison
-
-`carl_ppo.py` preserves the earlier direct-CARL recurrent PPO experiment in a
-standalone file for throughput comparisons:
-
-```bash
-python carl_ppo.py --checkpoint-dir checkpoints/carl_gru_ppo
-```
-
-Its comparable environment and PPO defaults match `train.py`. GRU, sequence,
-reward-shaping, snapshot-opponent, and TrueSkill options remain independently
-configurable. Its metrics use timestamped `runs/carl_ppo-*` directories.
