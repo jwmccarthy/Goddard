@@ -1,13 +1,11 @@
 import argparse
 from datetime import datetime
 from functools import partial
-import math
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import LinearLR
 
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
@@ -28,7 +26,7 @@ from jarl.learn import (
 )
 from jarl.log.logger import Logger
 from jarl.modules import ActorCritic, GRU, MLP
-from jarl.modules.encoder.core import FlattenEncoder
+from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import ValueFunction
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.modules.utils import init_layer
@@ -49,19 +47,22 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--n-orange",            type=int,   default=1)
     parser.add_argument("--frameskip",           type=int,   default=8)
     parser.add_argument("--max-ticks",           type=int,   default=4096)
-    parser.add_argument("--rollout-steps",       type=int,   default=128)
+    parser.add_argument("--rollout-steps",       type=int,   default=512)
     parser.add_argument("--sequence-length",     type=int,   default=32)
     parser.add_argument("--hidden-size",         type=int,   default=256)
-    parser.add_argument("--total-timesteps",     type=int,   default=100_000_000)
+    parser.add_argument("--total-timesteps",     type=int,   default=1_000_000_000)
     parser.add_argument("--minibatch-size",      type=int,   default=16_384)
-    parser.add_argument("--learning-rate",       type=float, default=3e-4)
+    parser.add_argument("--learning-rate",       type=float, default=2.5e-4)
     parser.add_argument("--epochs",              type=int,   default=8)
     parser.add_argument("--entropy-coef",        type=float, default=1e-3)
     parser.add_argument("--self-play-current",   type=float, default=0.8)
-    parser.add_argument("--snapshot-interval",   type=int,   default=5_000_000)
+    parser.add_argument("--snapshot-interval",   type=int,   default=16)
     parser.add_argument("--opponent-pool-size",  type=int,   default=8)
     parser.add_argument("--historical-policies", type=int,   default=4)
-    parser.add_argument("--team-spirit",         type=float, default=0.5)
+    parser.add_argument("--team-spirit",         type=float, default=1.0)
+    parser.add_argument("--reward-scale",        type=float, default=1.0)
+    parser.add_argument("--gamma",               type=float, default=0.999)
+    parser.add_argument("--gae-lambda",          type=float, default=0.99)
     parser.add_argument("--log-dir",             type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",      type=Path,  default=Path("checkpoints"))
     parser.add_argument("--run-name",            type=str,   default=None)
@@ -83,6 +84,9 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "minibatch-size":      arguments.minibatch_size,
         "learning-rate":       arguments.learning_rate,
         "epochs":              arguments.epochs,
+        "reward-scale":        arguments.reward_scale,
+        "gamma":               arguments.gamma,
+        "gae-lambda":          arguments.gae_lambda,
         "snapshot-interval":   arguments.snapshot_interval,
         "opponent-pool-size":  arguments.opponent_pool_size,
         "historical-policies": arguments.historical_policies,
@@ -100,6 +104,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("team-spirit must be between zero and one")
     if arguments.entropy_coef < 0:
         raise ValueError("entropy-coef cannot be negative")
+    if arguments.gamma > 1.0 or arguments.gae_lambda > 1.0:
+        raise ValueError("gamma and gae-lambda cannot exceed one")
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
 
@@ -108,7 +114,7 @@ def build_policy_and_value(
     environment: CARLTorchVectorEnv,
     arguments: argparse.Namespace,
 ):
-    head = FlattenEncoder()
+    head = LinearEncoder(arguments.hidden_size, func=nn.ReLU)
     body = GRU(hidden_size=arguments.hidden_size)
     actor = MultiCategoricalPolicy(
         head=head,
@@ -156,7 +162,13 @@ def build_ppo(
     opponent_pool = SnapshotPool(
         policy=policy.actor,
         max_size=arguments.opponent_pool_size,
-        snapshot_interval=arguments.snapshot_interval,
+        snapshot_interval=int(
+            environment.n_envs
+            * (1.0 + arguments.self_play_current)
+            / 2.0
+            * arguments.rollout_steps
+            * arguments.snapshot_interval
+        ),
         active_cache_size=max(4, arguments.historical_policies * 2),
         seed=arguments.seed,
         checkpoint_dir=checkpoint_dir,
@@ -188,13 +200,6 @@ def build_ppo(
         unique_parameters((policy, value_function)),
         lr=arguments.learning_rate,
     )
-    expected_learners = environment.n_envs * (
-        1.0 + arguments.self_play_current
-    ) / 2.0
-    update_count = math.ceil(
-        arguments.total_timesteps
-        / (expected_learners * arguments.rollout_steps)
-    )
     update = Update(
         transforms=(
             TeamSpirit(
@@ -202,7 +207,7 @@ def build_ppo(
                 team_sizes=(arguments.n_blue, arguments.n_orange),
                 spirit=arguments.team_spirit,
             ),
-            GAE(gamma=0.99, lambda_=0.95),
+            GAE(gamma=arguments.gamma, lambda_=arguments.gae_lambda),
         ),
         sampler=RecurrentRolloutMinibatches(
             sequence_length=arguments.sequence_length,
@@ -220,12 +225,6 @@ def build_ppo(
             (policy, value_function),
             optimizer,
             max_grad_norm=0.5,
-            scheduler=LinearLR(
-                optimizer,
-                start_factor=1.0,
-                end_factor=0.0,
-                total_iters=update_count,
-            ),
         ),
         section="PPO",
     )
@@ -250,6 +249,7 @@ def main() -> None:
         frameskip=arguments.frameskip,
         max_ticks=arguments.max_ticks,
         synchronize=False,
+        reward_scale=arguments.reward_scale,
     )
     environment.register_reward(
         SeerReward(

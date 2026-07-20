@@ -24,16 +24,16 @@ Episode reward and length include only actors controlled by the actively
 trained policy; frozen historical opponents are excluded. In current-policy
 mirror games, both sides are active learners and contribute metrics.
 
-The defaults run 2,048 parallel 1v1 simulations, collect 128 steps per update,
+The defaults run 1,024 parallel 1v1 simulations, collect 512 steps per update,
 unroll 32-step GRU sequences with a 256-unit hidden state, and use eight PPO
 epochs with 16,384-sample minibatches. Episodes truncate after 4,096 physics
 ticks. `--total-timesteps 256 --num-simulations 16
 --rollout-steps 8 --sequence-length 4 --hidden-size 32 --minibatch-size 256` is
 a useful smoke test.
 
-The actor and critic are standard JARL modules with a shared `FlattenEncoder`
-head and GRU body, plus independent output feet. `ActorCritic` executes the
-shared path once for policy and value estimation.
+The actor and critic are standard JARL modules with a shared linear-ReLU head
+and GRU body, plus independent output feet. `ActorCritic` executes the shared
+path once for policy and value estimation.
 
 Self-play defaults to 80% current-policy mirrors and 20% games against
 historical snapshots:
@@ -41,11 +41,15 @@ historical snapshots:
 ```bash
 python train.py \
     --self-play-current 0.8 \
-    --snapshot-interval 5000000 \
+    --snapshot-interval 16 \
     --opponent-pool-size 8 \
     --historical-policies 4 \
-    --team-spirit 0.5
+    --team-spirit 1.0
 ```
+
+The snapshot interval is measured in PPO updates. Other aligned defaults are a
+constant `2.5e-4` learning rate, entropy coefficient `1e-3`, discount `0.999`,
+and GAE lambda `0.99`.
 
 The historical-game proportion is `1 - self-play-current`.
 The learner's team is randomized in historical games. Both teams contribute
