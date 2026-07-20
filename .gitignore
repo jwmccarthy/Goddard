@@ -1,0 +1,6 @@
+.venv/
+.opencode/
+.ruff*
+__pycache__/
+checkpoints/
+runs/

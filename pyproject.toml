@@ -1,0 +1,15 @@
+[project]
+name = "goddard"
+version = "0.1.0"
+description = "A PPO Rocket League agent trained with CARL and JARL"
+requires-python = ">=3.11"
+dependencies = [
+    "carl==0.1.0",
+    "jarl==0.1.0",
+    "tensorboard>=2.0",
+    "trueskill>=0.4.5",
+]
+
+[tool.uv.sources]
+carl = { path = "../CARL" }
+jarl = { path = "../JARL" }
