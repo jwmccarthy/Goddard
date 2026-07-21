@@ -282,7 +282,9 @@ def build_ppo(
     return runner, rollout, Algorithm(
         discriminator_update,
         TransformRollout(
-            DiscriminatorReward(discriminator, mask_terminal=True)
+            DiscriminatorReward(discriminator, mask_terminal=True),
+            report_fields=("imitation_reward",),
+            section="GAIfO",
         ),
         update,
     )
