@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Goddard Checkpoint Match</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #070a10; color: #f4f7fb; font-family: Inter, system-ui, sans-serif; }
+  #view { position: fixed; inset: 0; }
+  #score { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); display: grid; grid-template-columns: 220px 96px 220px; align-items: center; padding: 12px 18px; border: 1px solid rgba(255,255,255,.13); border-radius: 8px; background: rgba(7,10,16,.82); backdrop-filter: blur(8px); pointer-events: none; }
+  .team { overflow: hidden; font: 600 12px ui-monospace, monospace; letter-spacing: .04em; text-overflow: ellipsis; white-space: nowrap; }
+  .blue { color: #49a8ff; text-align: right; }
+  .orange { color: #ff8b45; }
+  #goals { font: 700 28px ui-monospace, monospace; text-align: center; }
+  #round { position: fixed; left: 18px; bottom: 16px; color: rgba(255,255,255,.55); font: 12px ui-monospace, monospace; pointer-events: none; }
+  #status { position: fixed; inset: 0; display: grid; place-items: center; color: rgba(255,255,255,.6); font: 13px ui-monospace, monospace; pointer-events: none; }
+  #picker { position: fixed; top: 18px; right: 18px; width: 290px; display: grid; gap: 8px; padding: 12px; border: 1px solid rgba(255,255,255,.13); border-radius: 8px; background: rgba(7,10,16,.82); backdrop-filter: blur(8px); }
+  #picker label { display: grid; gap: 4px; color: rgba(255,255,255,.58); font: 10px ui-monospace, monospace; text-transform: uppercase; }
+  #picker select, #picker button { width: 100%; border: 1px solid rgba(255,255,255,.15); border-radius: 5px; background: #111824; color: #eef4fc; padding: 7px; font: 11px ui-monospace, monospace; }
+  #picker button { cursor: pointer; color: #fff; background: #1d5d91; }
+  #picker .mode { display: flex; grid-template-columns: none; align-items: center; gap: 7px; color: rgba(255,255,255,.75); }
+  @media (max-width: 760px) {
+    #score { top: 10px; width: calc(100% - 20px); grid-template-columns: minmax(0,1fr) 72px minmax(0,1fr); padding: 9px 10px; }
+    #goals { font-size: 22px; }
+    #picker { top: 76px; right: 10px; width: min(290px, calc(100% - 20px)); }
+  }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="score">
+  <div id="blue" class="team blue">BLUE</div>
+  <div id="goals">0 - 0</div>
+  <div id="orange" class="team orange">ORANGE</div>
+</div>
+<div id="round">connecting</div>
+<div id="picker">
+  <label>Checkpoint directory<select id="checkpointDirectory"></select></label>
+  <label>Blue checkpoint<select id="blueCheckpoint"></select></label>
+  <label>Orange checkpoint<select id="orangeCheckpoint"></select></label>
+  <label class="mode"><input id="sampleActions" type="checkbox"> Sample actions</label>
+  <label class="mode"><input id="replayResets" type="checkbox"> Replay starting positions</label>
+  <button id="applyMatch">Apply and reset</button>
+</div>
+<div id="status">waiting for CARL</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -3,4 +3,5 @@
 .ruff*
 __pycache__/
 checkpoints/
+data/
 runs/

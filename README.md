@@ -1,94 +1,78 @@
 # Goddard
 
-Goddard is a Rocket League agent trained in CARL with JARL. The first baseline
-is shared-policy self-play using PPO and the reward design from the Seer thesis.
+Goddard trains a recurrent PPO Rocket League policy in CARL with JARL. Training uses 1v1 self play and expert replay states.
 
-Each car is one PPO rollout actor. CARL inverts orange observations and computes
-the registered reward from canonical state transitions. All simulation,
-reward, rollout, and learning tensors remain on `cuda:0`.
+## Requirements
+
+Goddard requires Python 3.11 or newer, CUDA, and the CARL and JARL repositories at `../CARL` and `../JARL`.
+
+Install the environment with:
+
+```bash
+uv sync
+```
+
+## Replay Dataset
+
+Training requires a parsed replay dataset. Download SSL game average ranked duel replays with:
+
+```bash
+uv run python replay_dataset.py acquire --count 1024
+```
+
+Parse the files and build the dataset with:
+
+```bash
+uv run python replay_dataset.py parse --fps 10
+```
+
+Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `dataset/CURRENT` names the active dataset generation.
+
+The collector uses the `babytowniv-rl-dataset/1.0` user agent and limits requests to five per second. The download manifest stores file hashes and supports resumed runs.
 
 ## Training
 
-CARL and JARL must be installed in the active Python environment. With the
-local `rlenv` environment used by this workspace:
+Start training with:
 
 ```bash
-python train.py --total-timesteps 100000000
+uv run python train.py --total-timesteps 100000000
 ```
 
-Training metrics are written to timestamped directories such as
-`runs/goddard-20260720-143000`, with matching snapshots and the final model in
-`checkpoints/goddard-20260720-143000`. Use `--run-name NAME` to provide a
-stable shared label and `--tensorboard-dir PATH` to change the TensorBoard base
-directory.
-Episode reward and length include only actors controlled by the actively
-trained policy; frozen historical opponents are excluded. In current-policy
-mirror games, both sides are active learners and contribute metrics. The
-`historical_reward` and `historical_length` series isolate active learner
-episodes played against frozen historical opponents.
+Training loads the replay dataset onto `cuda:0` and samples a state at each episode reset. TrueSkill evaluation uses normal kickoff states.
 
-The defaults run 1,024 parallel 1v1 simulations, collect 512 steps per update,
-unroll 32-step GRU sequences with a 256-unit hidden state, and use eight PPO
-epochs with 65,536-sample minibatches. Updates use zero-copy rollout
-acquisition, reset-aware fused GRU batches, and field-pruned recurrent
-sampling.
-Episodes truncate after 4,096 physics
-ticks. `--total-timesteps 256 --num-simulations 16
---rollout-steps 8 --sequence-length 4 --hidden-size 32 --minibatch-size 256` is
-a useful smoke test.
+The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 16,000,000 learner transitions.
 
-The actor and critic are standard JARL modules with a shared linear-ReLU head
-and GRU body, plus independent output feet. `ActorCritic` executes the shared
-path once for policy and value estimation.
+TensorBoard data is written to `runs/<run_id>`. Policy snapshots, ratings, and the final model are written to `checkpoints/<run_id>`.
 
-Self-play defaults to 80% current-policy mirrors and 20% games against
-historical snapshots:
+Run a small training check with:
 
 ```bash
-python train.py \
-    --self-play-current 0.8 \
-    --snapshot-interval 16 \
-    --opponent-pool-size 8 \
-    --historical-policies 4 \
-    --team-spirit 1.0
+uv run python train.py \
+    --total-timesteps 256 \
+    --num-simulations 16 \
+    --rollout-steps 8 \
+    --sequence-length 4 \
+    --hidden-size 32 \
+    --minibatch-size 256 \
+    --self-play-current 1.0
 ```
 
-The snapshot interval is measured in PPO updates. Other aligned defaults are a
-constant `2.5e-4` learning rate, entropy coefficient `1e-3`, discount `0.999`,
-and GAE lambda `0.99`.
+Use `uv run python train.py --help` for all options.
 
-TrueSkill evaluation runs every 5,000,000 learner timesteps by default. Each
-evaluation plays the current actor against up to three historical snapshots
-from both team assignments using 64 parallel simulations. Configure this with
-`--trueskill-interval`, `--trueskill-simulations`, and
-`--trueskill-opponents`. Metrics are written under `TrueSkill/` in TensorBoard,
-and ratings are persisted as `checkpoints/<run-id>/trueskill_ratings.json`.
-Draws are reported but do not update ratings.
+## Checkpoint Viewer
 
-The historical-game proportion is `1 - self-play-current`.
-The learner's team is randomized in historical games. Both teams contribute
-training samples in current-policy mirrors, while historical opponent samples
-are excluded from PPO. Team spirit only changes behavior for multi-car teams
-and has no effect in 1v1.
+Start the browser viewer with:
 
-The progress counter reports learner-controlled per-car transitions, not CARL
-simulation steps or historical-opponent actions.
+```bash
+uv run python watch_checkpoints.py --open
+```
 
-CARL performs same-step autoreset but does not expose terminal observations.
-JARL therefore disables value bootstrapping for CARL time-limit truncations
-rather than using the next episode's kickoff state.
+The viewer runs at `http://127.0.0.1:8788`. It scans `checkpoints/` every five seconds. The menu selects a run directory and a checkpoint for each team. It also supports sampled actions and random replay starting states.
+
+Drag to orbit. Right drag to pan. Scroll to zoom. Use WASD, Space, and Ctrl to move the camera. Press `R` to reset the match.
+
+The page loads Three.js from `unpkg.com`, so the browser needs internet access.
 
 ## Reward
 
-`SeerReward` is registered directly with `CARLTorchVectorEnv`. It combines the
-16 terms documented in *Seer: Reinforcement Learning in Rocket League*: goal
-scored, boost difference, ball touch, demo, player-ball distance, ball-goal
-distance, facing ball, ball-goal alignment, closest to ball, last touch,
-behind ball, velocity toward ball, kickoff, velocity, boost amount, and forward
-velocity.
-
-The weighted reward is converted to zero-sum form by subtracting the opposing
-team's mean reward, then normalized with running mean and variance. Touch decay
-and last-touch possession are maintained on CUDA across steps. CARL does not
-store the demolishing player, so demo credit is exact in 1v1 and distributed
-across the opposing team in larger matches.
+`SeerReward` combines 16 Rocket League reward terms. It converts the result to zero sum team rewards and normalizes it with running statistics.

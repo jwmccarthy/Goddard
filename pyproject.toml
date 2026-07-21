@@ -4,8 +4,11 @@ version = "0.1.0"
 description = "A PPO Rocket League agent trained with CARL and JARL"
 requires-python = ">=3.11"
 dependencies = [
+    "numpy>=2.0",
+    "requests>=2.32",
     "carl==0.1.0",
     "jarl==0.1.0",
+    "subtr-actor-py==1.2.0",
     "tensorboard>=2.0",
     "torch>=2.7",
     "trueskill>=0.4.5",
