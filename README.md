@@ -26,6 +26,8 @@ Parse the files and build the dataset with:
 uv run python replay_dataset.py parse --fps 10
 ```
 
+Parsing removes states that occur less than five seconds before a goal.
+
 Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `dataset/CURRENT` names the active dataset generation.
 
 The collector uses the `babytowniv-rl-dataset/1.0` user agent and limits requests to five per second. The download manifest stores file hashes and supports resumed runs.

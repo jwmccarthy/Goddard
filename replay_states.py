@@ -7,7 +7,7 @@ import torch
 
 from jarl.data import TensorBatch, TensorDataset
 
-from replay_dataset import replay_columns
+from replay_dataset import SHARD_SCHEMA_VERSION, replay_columns
 
 
 CHUNK_SIZE = 131_072
@@ -49,7 +49,7 @@ def _load_active_generation(
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     expected_columns = replay_columns()
-    if metadata.get("schema_version") != 1:
+    if metadata.get("schema_version") != SHARD_SCHEMA_VERSION:
         raise ValueError("Unsupported replay dataset schema")
     if metadata.get("columns") != expected_columns:
         raise ValueError("Replay dataset columns do not match the parser schema")

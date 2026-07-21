@@ -31,13 +31,14 @@ SEARCH_URL = (
 )
 USER_AGENT = "babytowniv-rl-dataset/1.0"
 MAX_REQUEST_RATE = 5.0
-SHARD_SCHEMA_VERSION = 1
+SHARD_SCHEMA_VERSION = 2
+GOAL_EXCLUSION_SECONDS = 5.0
 REPLAY_PATH = re.compile(
     r"^/dl/replay/"
     r"(?P<id>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$",
     re.IGNORECASE,
 )
-GLOBAL_FEATURES = ["BallRigidBodyQuaternionVelocities"]
+GLOBAL_FEATURES = ["BallRigidBodyQuaternionVelocities", "FrameTime"]
 PLAYER_FEATURES = [
     "PlayerRigidBodyQuaternionVelocities",
     "PlayerBoost",
@@ -623,6 +624,9 @@ def parse_replay_file(
 
     columns = replay_columns()
     _validate_frame_matrix(frames, columns)
+    replay_data = subtr_actor.get_replay_frames_data(str(replay_path))
+    goal_times = [event["time"] for event in replay_data["goal_events"]]
+    frames = _exclude_pre_goal_frames(frames, columns, goal_times)
     _write_parsed_shard(
         frame_directory / f"{replay_id}.npz",
         frames=frames,
@@ -632,6 +636,23 @@ def parse_replay_file(
         source_sha256=source_sha256,
     )
     return ParseResult(replay_id, len(frames))
+
+
+def _exclude_pre_goal_frames(
+    frames:     np.ndarray,
+    columns:    list[str],
+    goal_times: list[float],
+) -> np.ndarray:
+    if not goal_times:
+        return frames
+
+    frame_times = frames[:, columns.index("frame time")]
+    keep = np.ones(len(frames), dtype=np.bool_)
+    for goal_time in goal_times:
+        near_goal = frame_times > goal_time - GOAL_EXCLUSION_SECONDS
+        near_goal &= frame_times <= goal_time
+        keep &= ~near_goal
+    return frames[keep]
 
 
 def _validate_frame_matrix(
@@ -820,7 +841,7 @@ def _write_dataset_generation(
         del replay_index
 
         metadata = {
-            "schema_version": 1,
+            "schema_version": SHARD_SCHEMA_VERSION,
             "created_at":     utc_now(),
             "source":         "ballchasing.com SSL game-average ranked duels",
             "fps":            fps,
