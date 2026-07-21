@@ -79,6 +79,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--discriminator-batch-size",   type=int,   default=65_536)
     parser.add_argument("--discriminator-epochs",       type=int,   default=2)
     parser.add_argument("--discriminator-learning-rate", type=float, default=3e-4)
+    parser.add_argument("--discriminator-noise-std",     type=float, default=0.01)
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)
     return parser.parse_args()
@@ -121,6 +122,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("self-play-current must be between zero and one")
     if arguments.entropy_coef < 0:
         raise ValueError("entropy-coef cannot be negative")
+    if arguments.discriminator_noise_std < 0:
+        raise ValueError("discriminator-noise-std cannot be negative")
     if not 0.0 <= arguments.trueskill_draw_probability < 1.0:
         raise ValueError("trueskill-draw-probability must be between zero and one")
     if arguments.gamma > 1.0 or arguments.gae_lambda > 1.0:
@@ -282,7 +285,11 @@ def build_ppo(
     return runner, rollout, Algorithm(
         discriminator_update,
         TransformRollout(
-            DiscriminatorReward(discriminator, mask_terminal=True),
+            DiscriminatorReward(
+                discriminator,
+                mask_terminal=True,
+                reward_type="negative_logit",
+            ),
             report_fields=("imitation_reward",),
             section="GAIfO",
         ),
@@ -328,7 +335,9 @@ def main() -> None:
                 f"({environment.n_envs:,} actor timesteps)"
             )
         policy, value_function = build_policy_and_value(environment, arguments)
-        discriminator = TransitionDiscriminator().to(environment.device)
+        discriminator = TransitionDiscriminator(
+            noise_std=arguments.discriminator_noise_std
+        ).to(environment.device)
         runner, rollout, ppo = build_ppo(
             environment,
             policy,

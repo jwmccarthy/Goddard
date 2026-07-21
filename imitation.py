@@ -3,8 +3,15 @@ import torch.nn as nn
 
 
 class TransitionDiscriminator(nn.Module):
-    def __init__(self, hidden_size: int = 256) -> None:
+    def __init__(
+        self,
+        hidden_size: int = 256,
+        noise_std:   float = 0.01,
+    ) -> None:
         super().__init__()
+        if noise_std < 0:
+            raise ValueError("noise standard deviation cannot be negative")
+        self.noise_std = noise_std
         self.register_buffer(
             "ball_scale",
             torch.tensor([6000.0] * 6 + [6.0] * 3),
@@ -35,8 +42,16 @@ class TransitionDiscriminator(nn.Module):
 
     def forward(self, transition) -> torch.Tensor:
         observation, next_observation = transition
+        observation = self.project(observation)
+        next_observation = self.project(next_observation)
+        if self.training and self.noise_std:
+            observation = observation + torch.randn_like(observation) * self.noise_std
+            next_observation = (
+                next_observation
+                + torch.randn_like(next_observation) * self.noise_std
+            )
         inputs = torch.cat(
-            (self.project(observation), self.project(next_observation)),
+            (observation, next_observation),
             dim=-1,
         )
         return self.model(inputs).squeeze(-1)
