@@ -643,16 +643,21 @@ def _exclude_pre_goal_frames(
     columns:    list[str],
     goal_times: list[float],
 ) -> np.ndarray:
-    if not goal_times:
-        return frames
+    return frames[_pre_goal_mask(frames, columns, goal_times)]
 
+
+def _pre_goal_mask(
+    frames:     np.ndarray,
+    columns:    list[str],
+    goal_times: list[float],
+) -> np.ndarray:
     frame_times = frames[:, columns.index("frame time")]
     keep = np.ones(len(frames), dtype=np.bool_)
     for goal_time in goal_times:
         near_goal = frame_times > goal_time - GOAL_EXCLUSION_SECONDS
         near_goal &= frame_times <= goal_time
         keep &= ~near_goal
-    return frames[keep]
+    return keep
 
 
 def _validate_frame_matrix(
@@ -733,14 +738,15 @@ def valid_parsed_shard(
 
 
 def build_dataset(
-    output:     Path,
-    replay_ids: list[str],
+    output:       Path,
+    replay_ids:   list[str],
+    dataset_name: str = "dataset",
 ) -> None:
     if not replay_ids:
         raise ValueError("No parsed replays are available to build")
 
     frame_directory = output / "frames"
-    dataset_root = output / "dataset"
+    dataset_root = output / dataset_name
     dataset_root.mkdir(exist_ok=True)
 
     shards, columns, fps = _inspect_shards(frame_directory, replay_ids)

@@ -621,7 +621,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--replay-dataset",
         type=Path,
-        default=root / "data" / "ballchasing-ssl-1v1" / "dataset",
+        default=root / "data" / "ballchasing-ssl-1v1" / "reset_dataset",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--host", default="127.0.0.1")

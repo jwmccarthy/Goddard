@@ -1,6 +1,6 @@
 # Goddard
 
-Goddard trains a recurrent PPO Rocket League policy in CARL with JARL. Training uses 1v1 self play and expert replay states.
+Goddard trains a recurrent GAIfO and PPO Rocket League policy in CARL with JARL. Training uses 1v1 self play and expert replay data.
 
 ## Requirements
 
@@ -28,7 +28,13 @@ uv run python replay_dataset.py parse --fps 10
 
 Parsing removes states that occur less than five seconds before a goal.
 
-Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `dataset/CURRENT` names the active dataset generation.
+Split the replays into reset states and frameskip matched GAIfO observation pairs with:
+
+```bash
+uv run python imitation_dataset.py --expert-count 512 --frameskip 8
+```
+
+Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `reset_dataset/CURRENT` names the active reset generation. `expert_dataset/CURRENT` names the active observation pair generation.
 
 The collector uses the `babytowniv-rl-dataset/1.0` user agent and limits requests to five per second. The download manifest stores file hashes and supports resumed runs.
 
@@ -40,7 +46,7 @@ Start training with:
 uv run python train.py --total-timesteps 100000000
 ```
 
-Training loads the replay dataset onto `cuda:0` and samples a state at each episode reset. TrueSkill evaluation uses normal kickoff states.
+Training loads the reset dataset onto `cuda:0` and samples a state at each episode reset. A transition discriminator trains from the frameskip matched expert observation pairs and supplies the PPO reward. TrueSkill evaluation uses normal kickoff states.
 
 The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 16,000,000 learner transitions.
 
@@ -74,7 +80,3 @@ The viewer runs at `http://127.0.0.1:8788`. It scans `checkpoints/` every five s
 Drag to orbit. Right drag to pan. Scroll to zoom. Use WASD, Space, and Ctrl to move the camera. Press `R` to reset the match.
 
 The page loads Three.js from `unpkg.com`, so the browser needs internet access.
-
-## Reward
-
-`SeerReward` combines 16 Rocket League reward terms. It converts the result to zero sum team rewards and normalizes it with running statistics.
