@@ -26,9 +26,6 @@ import requests
 
 
 BASE_URL = "https://ballchasing.com"
-SEARCH_URL = (
-    f"{BASE_URL}/?playlist=10&min-rank=22&max-rank=22&sort-by=replay-date&sort-dir=desc"
-)
 USER_AGENT = "babytowniv-rl-dataset/1.0"
 MAX_REQUEST_RATE = 5.0
 SHARD_SCHEMA_VERSION = 2
@@ -56,6 +53,13 @@ def validate_url(url: str) -> str:
     if parsed.scheme != "https" or parsed.hostname != "ballchasing.com":
         raise ValueError(f"Unexpected ballchasing URL: {url}")
     return url
+
+
+def search_url(min_rank: int, max_rank: int) -> str:
+    return (
+        f"{BASE_URL}/?playlist=10&min-rank={min_rank}&max-rank={max_rank}"
+        "&sort-by=replay-date&sort-dir=desc"
+    )
 
 
 @dataclass(frozen=True)
@@ -369,14 +373,15 @@ class DownloadResult:
 
 
 def discover_replays(
-    client:   BallchasingClient,
-    manifest: ReplayManifest,
-    count:    int,
+    client:      BallchasingClient,
+    manifest:    ReplayManifest,
+    count:       int,
+    initial_url: str,
 ) -> list[ReplayLink]:
     if count <= 0:
         raise ValueError("count must be positive")
 
-    current_url: str | None = SEARCH_URL
+    current_url: str | None = initial_url
     visited_pages: set[str] = set()
     discovered: dict[str, ReplayLink] = {}
     while current_url is not None and len(discovered) < count:
@@ -493,6 +498,8 @@ def download_replay(
 
 
 def acquire_replays(arguments: argparse.Namespace) -> None:
+    if arguments.min_rank > arguments.max_rank:
+        raise ValueError("min-rank cannot exceed max-rank")
     output = arguments.output
     replay_directory = output / "replays"
     output.mkdir(parents=True, exist_ok=True)
@@ -506,7 +513,20 @@ def acquire_replays(arguments: argparse.Namespace) -> None:
     )
     manifest = ReplayManifest(output / "manifest.sqlite3")
     try:
-        replays = discover_replays(client, manifest, arguments.count)
+        replays = discover_replays(
+            client,
+            manifest,
+            arguments.count,
+            search_url(arguments.min_rank, arguments.max_rank),
+        )
+        collection = {
+            "playlist": 10,
+            "min_rank": arguments.min_rank,
+            "max_rank": arguments.max_rank,
+        }
+        (output / "collection.json").write_text(
+            json.dumps(collection, indent=2) + "\n"
+        )
         pending = [
             replay
             for replay in replays
@@ -750,12 +770,14 @@ def build_dataset(
     dataset_root.mkdir(exist_ok=True)
 
     shards, columns, fps = _inspect_shards(frame_directory, replay_ids)
+    source = _dataset_source(output)
     generation_directory = _write_dataset_generation(
         dataset_root,
         frame_directory,
         shards,
         columns,
         fps,
+        source,
     )
     _publish_generation(dataset_root, generation_directory.name)
     print(
@@ -803,6 +825,7 @@ def _write_dataset_generation(
     shards:          list[tuple[str, int]],
     columns:         list[str],
     fps:             float,
+    source:          str,
 ) -> Path:
     total_frames = sum(frame_count for _, frame_count in shards)
     generation = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
@@ -849,7 +872,7 @@ def _write_dataset_generation(
         metadata = {
             "schema_version": SHARD_SCHEMA_VERSION,
             "created_at":     utc_now(),
-            "source":         "ballchasing.com SSL game-average ranked duels",
+            "source":         source,
             "fps":            fps,
             "frame_count":    total_frames,
             "columns":        columns,
@@ -864,6 +887,17 @@ def _write_dataset_generation(
         shutil.rmtree(generation_directory)
         raise
     return generation_directory
+
+
+def _dataset_source(output: Path) -> str:
+    collection_path = output / "collection.json"
+    if not collection_path.is_file():
+        return "ballchasing.com SSL game average ranked duels"
+    collection = json.loads(collection_path.read_text())
+    return (
+        "ballchasing.com ranked duels with game average rank "
+        f"{collection['min_rank']} through {collection['max_rank']}"
+    )
 
 
 def _publish_generation(
@@ -1047,6 +1081,8 @@ def parse_arguments() -> argparse.Namespace:
         "--output", type=Path, default=Path("data/ballchasing-ssl-1v1")
     )
     acquire.add_argument("--count", type=positive_int, default=1_000)
+    acquire.add_argument("--min-rank", type=nonnegative_int, default=22)
+    acquire.add_argument("--max-rank", type=nonnegative_int, default=22)
     acquire.add_argument("--workers", type=positive_int, default=4)
     acquire.add_argument(
         "--requests-per-second",
