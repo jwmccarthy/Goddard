@@ -24,6 +24,9 @@ class ReplayStateColumns:
     car_angular_velocity:  tuple[int, ...]
     car_boost:             tuple[int, ...]
     car_demolished_by:     tuple[int, ...]
+    car_dodge_active: tuple[int, ...]
+    car_jump_active: tuple[int, ...]
+    car_double_jump_active: tuple[int, ...]
 
 
 def load_replay_dataset(
@@ -86,9 +89,7 @@ def _resolve_columns(columns: list[str]) -> ReplayStateColumns:
     return ReplayStateColumns(
         ball_position=_field_indices(index, "Ball", "position", 3),
         ball_velocity=_field_indices(index, "Ball", "linear velocity", 3),
-        ball_angular_velocity=_field_indices(
-            index, "Ball", "angular velocity", 3
-        ),
+        ball_angular_velocity=_field_indices(index, "Ball", "angular velocity", 3),
         car_position=_player_field_indices(index, "position", 3),
         car_rotation=_player_field_indices(index, "quaternion", 4),
         car_velocity=_player_field_indices(index, "linear velocity", 3),
@@ -98,8 +99,16 @@ def _resolve_columns(columns: list[str]) -> ReplayStateColumns:
             for player in range(2)
         ),
         car_demolished_by=tuple(
-            index[f"player {player} - player demolished by"]
-            for player in range(2)
+            index[f"player {player} - player demolished by"] for player in range(2)
+        ),
+        car_dodge_active=tuple(
+            index[f"player {player} - dodge active"] for player in range(2)
+        ),
+        car_jump_active=tuple(
+            index[f"player {player} - jump active"] for player in range(2)
+        ),
+        car_double_jump_active=tuple(
+            index[f"player {player} - double jump active"] for player in range(2)
         ),
     )
 
@@ -122,20 +131,32 @@ def _validate_and_select_frames(
         if not demolition_valid.all():
             raise ValueError("Replay demolition values are invalid")
 
+        car_positions = chunk[:, columns.car_position].reshape(-1, 2, 3)
+        rotations = chunk[:, columns.car_rotation].reshape(-1, 2, 4)
+        up_z = 1.0 - 2.0 * (rotations[..., 0] ** 2 + rotations[..., 1] ** 2)
+        inactive = (
+            np.concatenate(
+                (
+                    chunk[:, columns.car_dodge_active],
+                    chunk[:, columns.car_jump_active],
+                    chunk[:, columns.car_double_jump_active],
+                ),
+                axis=1,
+        )
+            == 0
+        )
+
         valid = chunk[:, columns.ball_position[2]] > 0
-        valid &= (demolished_by[:, 0] >= 0) | (
-            chunk[:, columns.car_position[2]] > 0
-        )
-        valid &= (demolished_by[:, 1] >= 0) | (
-            chunk[:, columns.car_position[5]] > 0
-        )
+        valid &= (demolished_by < 0).all(axis=1)
+        valid &= (car_positions[..., 2] >= 10.0).all(axis=1)
+        valid &= (car_positions[..., 2] <= 40.0).all(axis=1)
+        valid &= (up_z >= 0.95).all(axis=1)
+        valid &= inactive.all(axis=1)
         local_indices = np.flatnonzero(valid)
         if not len(local_indices):
             continue
 
-        rotations = chunk[np.ix_(local_indices, columns.car_rotation)].reshape(
-            -1, 2, 4
-        )
+        rotations = chunk[np.ix_(local_indices, columns.car_rotation)].reshape(-1, 2, 4)
         rotation_norm = np.linalg.vector_norm(rotations, axis=-1)
         if not np.allclose(rotation_norm, 1.0, atol=1e-3):
             raise ValueError("Replay car quaternions must have unit length")

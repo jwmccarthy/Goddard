@@ -29,7 +29,7 @@ from replay_states import (
 
 PHYSICS_HZ = 120
 SPLIT_SALT = b"goddard-replay-split-v1\0"
-EXPERT_SCHEMA_VERSION = 3
+EXPERT_SCHEMA_VERSION = 4
 EXPERT_GLOBAL_FEATURES = [
     *GLOBAL_FEATURES,
     "CurrentTime",
@@ -47,6 +47,7 @@ class ObservationEncoder:
             n_blue=1,
             n_orange=1,
             synchronize=True,
+            normalize=True,
         )
         self.indices = torch.arange(batch_size, device=self.environment.device)
 

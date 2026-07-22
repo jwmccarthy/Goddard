@@ -1,4 +1,5 @@
 import argparse
+import math
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -6,28 +7,29 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+from torch.optim.lr_scheduler import LinearLR
 
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
     LogProbCapture,
     RecurrentStateCapture,
+    RecurrentValueCapture,
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
     TrueSkillEvaluator,
-    ValueCapture,
 )
 from jarl.envs import DatasetResetSampler
 from jarl.learn import (
     Algorithm,
+    IndependentOptimizerSteps,
     OptimizerStep,
     PPOConfig,
     PPOLoss,
     Update,
-    unique_parameters,
 )
 from jarl.log.logger import Logger
-from jarl.modules import ActorCritic, GRU, MLP
+from jarl.modules import GRU, MLP
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import ValueFunction
 from jarl.modules.policy import MultiCategoricalPolicy
@@ -50,19 +52,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--n-orange",                   type=int,   default=1)
     parser.add_argument("--frameskip",                  type=int,   default=8)
     parser.add_argument("--max-ticks",                  type=int,   default=4096)
-    parser.add_argument("--rollout-steps",              type=int,   default=512)
+    parser.add_argument("--rollout-steps",              type=int,   default=256)
     parser.add_argument("--sequence-length",            type=int,   default=32)
     parser.add_argument("--hidden-size",                type=int,   default=256)
     parser.add_argument("--total-timesteps",            type=int,   default=1_000_000_000)
     parser.add_argument("--minibatch-size",             type=int,   default=65_536)
-    parser.add_argument("--learning-rate",              type=float, default=2.5e-4)
-    parser.add_argument("--epochs",                     type=int,   default=8)
+    parser.add_argument("--learning-rate",              type=float, default=1e-5)
+    parser.add_argument("--learning-rate-end-factor",   type=float, default=0.1)
+    parser.add_argument("--epochs",                     type=int,   default=2)
     parser.add_argument("--entropy-coef",               type=float, default=1e-3)
     parser.add_argument("--self-play-current",          type=float, default=0.8)
     parser.add_argument("--snapshot-interval",          type=int,   default=16)
     parser.add_argument("--opponent-pool-size",         type=int,   default=8)
     parser.add_argument("--historical-policies",        type=int,   default=4)
-    parser.add_argument("--trueskill-interval",         type=int,   default=16_000_000)
+    parser.add_argument("--trueskill-interval",         type=int,   default=32_000_000)
     parser.add_argument("--trueskill-simulations",      type=int,   default=64)
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
     parser.add_argument("--trueskill-draw-probability", type=float, default=0.0)
@@ -72,8 +75,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gae-lambda",                 type=float, default=0.99)
     parser.add_argument("--tensorboard-dir",            type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",             type=Path,  default=Path("checkpoints"))
-    parser.add_argument("--replay-dataset",             type=Path,  default=Path("data/ballchasing-ssl-1v1/reset_dataset"))
+    parser.add_argument(
+        "--replay-dataset",
+        type=Path,
+        default=Path("data/ballchasing-ssl-1v1/reset_dataset"),
+    )
     parser.add_argument("--replay-reset-probability",   type=float, default=0.7)
+    parser.add_argument(
+        "--normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)
     return parser.parse_args()
@@ -110,12 +122,18 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("rollout-steps must be divisible by sequence-length")
     if arguments.minibatch_size % arguments.sequence_length:
         raise ValueError("minibatch-size must be divisible by sequence-length")
+    if arguments.opponent_pool_size < 3:
+        raise ValueError("opponent-pool-size must be at least three")
+    if arguments.historical_policies >= arguments.opponent_pool_size:
+        raise ValueError("historical-policies must be smaller than opponent-pool-size")
     if not 0.0 <= arguments.self_play_current <= 1.0:
         raise ValueError("self-play-current must be between zero and one")
     if not 0.0 <= arguments.team_spirit <= 1.0:
         raise ValueError("team-spirit must be between zero and one")
     if arguments.entropy_coef < 0:
         raise ValueError("entropy-coef cannot be negative")
+    if not 0.0 < arguments.learning_rate_end_factor <= 1.0:
+        raise ValueError("learning-rate-end-factor must be in (0, 1]")
     if not 0.0 <= arguments.replay_reset_probability <= 1.0:
         raise ValueError("replay-reset-probability must be between zero and one")
     if not 0.0 <= arguments.trueskill_draw_probability < 1.0:
@@ -134,11 +152,11 @@ def build_policy_and_value(
     environment: CARLTorchVectorEnv,
     arguments: argparse.Namespace,
 ):
-    head = LinearEncoder(arguments.hidden_size, func=nn.ReLU)
-    body = GRU(hidden_size=arguments.hidden_size)
+    actor_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
+    actor_body = GRU(hidden_size=arguments.hidden_size).build(actor_head.feats)
     actor = MultiCategoricalPolicy(
-        head=head,
-        body=body,
+        head=actor_head,
+        body=actor_body,
         foot=MLP(
             dims=[arguments.hidden_size, arguments.hidden_size // 2],
             func=nn.LeakyReLU,
@@ -146,25 +164,21 @@ def build_policy_and_value(
         ),
         action_codec=environment.action_codec,
     )
+    actor.build_composed(environment, actor_body.feats).to(environment.device)
+
+    critic_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
+    critic_body = GRU(hidden_size=arguments.hidden_size).build(critic_head.feats)
     critic = ValueFunction(
-        head=head,
-        body=body,
+        head=critic_head,
+        body=critic_body,
         foot=MLP(
             dims=[arguments.hidden_size // 2, arguments.hidden_size // 4],
             func=nn.LeakyReLU,
             out_init_func=partial(init_layer, std=1.0),
         ),
     )
-    actor_critic = (
-        ActorCritic(
-            actor=actor,
-            critic=critic,
-            shared_state=True,
-        )
-        .build(environment)
-        .to(environment.device)
-    )
-    return actor_critic, actor_critic
+    critic.build_composed(environment, critic_body.feats).to(environment.device)
+    return actor, critic
 
 
 def build_ppo(
@@ -181,7 +195,7 @@ def build_ppo(
         copy_on_finish=False,
     )
     opponent_pool = SnapshotPool(
-        policy=policy.actor,
+        policy=policy,
         max_size=arguments.opponent_pool_size,
         snapshot_interval=int(
             environment.n_envs
@@ -198,7 +212,7 @@ def build_ppo(
         num_matches=environment.n_sim,
         team_sizes=(arguments.n_blue, arguments.n_orange),
         current_fraction=arguments.self_play_current,
-        historical_ids=opponent_pool.sample_ids(arguments.historical_policies),
+        historical_ids=opponent_pool.select_ids(arguments.historical_policies),
         device=environment.device,
         seed=arguments.seed,
     )
@@ -208,18 +222,37 @@ def build_ppo(
         buffer=rollout,
         opponent_pool=opponent_pool,
         matchmaker=matchmaker,
-        snapshot_policy=policy.actor,
+        snapshot_policy=policy,
         historical_policies=arguments.historical_policies,
         captures=(
             LogProbCapture(),
             RecurrentStateCapture(),
-            ValueCapture(value_function),
+            RecurrentValueCapture(value_function),
         ),
     )
 
-    optimizer = Adam(
-        unique_parameters((policy, value_function)),
-        lr=arguments.learning_rate,
+    policy_optimizer = Adam(policy.parameters(), lr=arguments.learning_rate)
+    value_optimizer = Adam(value_function.parameters(), lr=arguments.learning_rate)
+    expected_rollout_timesteps = (
+        environment.n_envs
+        * (1.0 + arguments.self_play_current)
+        / 2.0
+        * arguments.rollout_steps
+    )
+    update_count = max(
+        1, math.ceil(arguments.total_timesteps / expected_rollout_timesteps)
+    )
+    policy_scheduler = LinearLR(
+        policy_optimizer,
+        start_factor=1.0,
+        end_factor=arguments.learning_rate_end_factor,
+        total_iters=update_count,
+    )
+    value_scheduler = LinearLR(
+        value_optimizer,
+        start_factor=1.0,
+        end_factor=arguments.learning_rate_end_factor,
+        total_iters=update_count,
     )
     update = Update(
         transforms=(
@@ -253,10 +286,19 @@ def build_ppo(
             value_function,
             PPOConfig(clip=0.2, entropy_coef=arguments.entropy_coef),
         ),
-        optimizer_step=OptimizerStep(
-            (policy, value_function),
-            optimizer,
-            max_grad_norm=0.5,
+        optimizer_step=IndependentOptimizerSteps(
+            OptimizerStep(
+                policy,
+                policy_optimizer,
+                max_grad_norm=0.5,
+                scheduler=policy_scheduler,
+            ),
+            OptimizerStep(
+                value_function,
+                value_optimizer,
+                max_grad_norm=0.5,
+                scheduler=value_scheduler,
+            ),
         ),
         section="PPO",
     )
@@ -292,11 +334,13 @@ def main() -> None:
         synchronize=False,
         reward_scale=arguments.reward_scale,
         reset_state_provider=reset_sampler,
+        normalize=arguments.normalize,
     )
     environment.register_reward(
         SeerReward(
             n_blue=arguments.n_blue,
             n_orange=arguments.n_orange,
+            log_diagnostics=True,
         )
     )
     evaluator = None
@@ -325,10 +369,11 @@ def main() -> None:
                 frameskip=arguments.frameskip,
                 max_ticks=arguments.max_ticks,
                 synchronize=False,
+                normalize=arguments.normalize,
             )
 
         evaluator = TrueSkillEvaluator(
-            policy=policy.actor,
+            policy=policy,
             opponent_pool=runner.opponent_pool,
             env_factory=make_evaluation_environment,
             logger=logger,

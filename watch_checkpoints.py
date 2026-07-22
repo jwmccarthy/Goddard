@@ -96,11 +96,7 @@ class CheckpointRegistry:
     def resolve(self, value: str) -> Path:
         path = (self.directory / value).resolve()
         valid_name = any(path.match(pattern) for pattern in CHECKPOINT_PATTERNS)
-        if (
-            self.directory not in path.parents
-            or not path.is_file()
-            or not valid_name
-        ):
+        if self.directory not in path.parents or not path.is_file() or not valid_name:
             raise ValueError("Invalid checkpoint path")
         inspect_checkpoint(self.directory, path)
         return path
@@ -369,6 +365,7 @@ def simulate(
     max_ticks:       int,
     sample_actions:  bool,
     replay_resets:   bool,
+    normalize: bool,
     replay_dataset:  Path,
     seed:            int,
 ) -> None:
@@ -380,6 +377,7 @@ def simulate(
         frameskip=tick_skip,
         max_ticks=max_ticks,
         synchronize=True,
+        normalize=normalize,
     )
     reset_controller = ReplayResetController(replay_dataset, seed)
 
@@ -619,6 +617,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--sample-actions", action="store_true")
     parser.add_argument("--replay-resets", action="store_true")
     parser.add_argument(
+        "--normalize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
         "--replay-dataset",
         type=Path,
         default=root / "data" / "ballchasing-ssl-1v1" / "reset_dataset",
@@ -668,6 +671,7 @@ def main() -> None:
             arguments.max_ticks,
             arguments.sample_actions,
             arguments.replay_resets,
+            arguments.normalize,
             arguments.replay_dataset,
             arguments.seed,
         ),

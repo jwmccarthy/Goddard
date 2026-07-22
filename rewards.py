@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from carl.gymnasium import RewardContext
+from carl.gymnasium import RewardContext, RewardResult
 
 
 BALL_RADIUS = 91.25
@@ -39,20 +39,25 @@ class SeerReward:
         n_blue:    int,
         n_orange:  int,
         normalize: bool = True,
+        log_diagnostics: bool = False,
         weights:   SeerRewardWeights = SeerRewardWeights(),
     ) -> None:
         self.n_blue = n_blue
         self.n_orange = n_orange
         self.n_cars = n_blue + n_orange
         self.normalize = normalize
+        self.log_diagnostics = log_diagnostics
         self.weights = weights
         self._touch_decay = None
         self._last_touch = None
         self._count = 0
         self._mean = None
         self._variance = None
+        self._diagnostic_sums = None
+        self._diagnostic_squares = None
+        self._diagnostic_steps = None
 
-    def __call__(self, context: RewardContext) -> torch.Tensor:
+    def __call__(self, context: RewardContext) -> torch.Tensor | RewardResult:
         current = context.current
         previous = context.previous
         self._ensure_state(current.raw.shape[0], current.raw.device)
@@ -70,9 +75,7 @@ class SeerReward:
 
         score_for_actor = context.events.score_delta[:, None] * team_sign
         ball_speed = current.ball_velocity.norm(dim=-1, keepdim=True)
-        goal_scored = score_for_actor.gt(0) * (
-            1.0 + 0.5 * ball_speed / BALL_MAX_SPEED
-        )
+        goal_scored = score_for_actor.gt(0) * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
 
         boost_current = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
         boost_previous = (previous.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
@@ -85,8 +88,10 @@ class SeerReward:
             (self._touch_decay + 0.013).clamp_max(1.0),
         )
         touch_height = (
-            (ball_position[..., 2] + BALL_RADIUS) / (2.0 * BALL_RADIUS)
-        ).clamp_min(0.0).pow(0.2836)
+            ((ball_position[..., 2] + BALL_RADIUS) / (2.0 * BALL_RADIUS))
+            .clamp_min(0.0)
+            .pow(0.2836)
+        )
         ball_touch = touches * self._touch_decay * touch_height
 
         newly_demoed = current.car_demoed & ~previous.car_demoed
@@ -114,44 +119,58 @@ class SeerReward:
         self._last_touch[touched_simulation] = touches[touched_simulation]
         touched_last = self._last_touch.float()
         behind_ball = (
-            team_sign * (ball_position[..., 1] - current.car_position[..., 1])
-        ).gt(0).float()
+            (team_sign * (ball_position[..., 1] - current.car_position[..., 1]))
+            .gt(0)
+            .float()
+        )
         velocity_player_ball = (
             self._unit(current.car_velocity) * direction_to_ball
         ).sum(dim=-1)
         kickoff = velocity_player_ball * ball_position[..., :2].norm(dim=-1).lt(1.0)
         velocity = (current.car_velocity.norm(dim=-1) / CAR_MAX_SPEED).clamp_max(1.0)
         boost_amount = boost_current
-        forward_velocity = (
-            current.car_forward * current.car_velocity
-        ).sum(dim=-1) / CAR_MAX_SPEED
+        forward_velocity = (current.car_forward * current.car_velocity).sum(
+            dim=-1
+        ) / CAR_MAX_SPEED
 
         weights = self.weights
-        reward = (
-            weights.goal_scored          * goal_scored
-            + weights.boost_difference   * boost_difference
-            + weights.ball_touch         * ball_touch
-            + weights.demo               * demo
-            + weights.distance_player_ball * distance_player_ball
-            + weights.distance_ball_goal * distance_ball_goal
-            + weights.facing_ball        * facing_ball
-            + weights.align_ball_goal    * align_ball_goal
-            + weights.closest_to_ball    * closest_to_ball
-            + weights.touched_last       * touched_last
-            + weights.behind_ball        * behind_ball
-            + weights.velocity_player_ball * velocity_player_ball
-            + weights.kickoff            * kickoff
-            + weights.velocity           * velocity
-            + weights.boost_amount       * boost_amount
-            + weights.forward_velocity   * forward_velocity
-        )
-        reward = self._zero_sum(reward)
+        components = {
+            "goal_scored": weights.goal_scored * goal_scored,
+            "boost_difference": weights.boost_difference * boost_difference,
+            "ball_touch": weights.ball_touch * ball_touch,
+            "demo": weights.demo * demo,
+            "distance_player_ball": weights.distance_player_ball * distance_player_ball,
+            "distance_ball_goal": weights.distance_ball_goal * distance_ball_goal,
+            "facing_ball": weights.facing_ball * facing_ball,
+            "align_ball_goal": weights.align_ball_goal * align_ball_goal,
+            "closest_to_ball": weights.closest_to_ball * closest_to_ball,
+            "touched_last": weights.touched_last * touched_last,
+            "behind_ball": weights.behind_ball * behind_ball,
+            "velocity_player_ball": weights.velocity_player_ball * velocity_player_ball,
+            "kickoff": weights.kickoff * kickoff,
+            "velocity": weights.velocity * velocity,
+            "boost_amount": weights.boost_amount * boost_amount,
+            "forward_velocity": weights.forward_velocity * forward_velocity,
+        }
+        raw_reward = sum(components.values())
+        zero_sum_reward = self._zero_sum(raw_reward)
+        reward = zero_sum_reward
         if self.normalize:
             reward = self._normalize(reward)
+
+        info = (
+            self._diagnostics(
+                components, raw_reward, zero_sum_reward, reward, context.events.done
+            )
+            if self.log_diagnostics
+            else {}
+        )
 
         done = context.events.done
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
+        if self.log_diagnostics:
+            return RewardResult(reward, info)
         return reward
 
     def _ensure_state(self, n_sim: int, device: torch.device) -> None:
@@ -163,6 +182,60 @@ class SeerReward:
         self._count = 0
         self._mean = torch.zeros((), device=device)
         self._variance = torch.ones((), device=device)
+        self._diagnostic_sums = None
+        self._diagnostic_squares = None
+        self._diagnostic_steps = None
+
+    def _diagnostics(
+        self,
+        components: dict[str, torch.Tensor],
+        raw: torch.Tensor,
+        zero_sum: torch.Tensor,
+        normalized: torch.Tensor,
+        done: torch.Tensor,
+    ) -> dict[str, list[float]]:
+        names = tuple(components)
+        values = torch.stack(tuple(components.values()), dim=-1)
+        aggregates = torch.stack((raw, zero_sum, normalized), dim=-1)
+        if self._diagnostic_sums is None:
+            shape = (*raw.shape, len(names) + 3)
+            self._diagnostic_sums = torch.zeros(
+                shape, dtype=raw.dtype, device=raw.device
+            )
+            self._diagnostic_squares = torch.zeros(
+                (*raw.shape, 3), dtype=raw.dtype, device=raw.device
+            )
+            self._diagnostic_steps = torch.zeros(
+                raw.shape, dtype=torch.int64, device=raw.device
+            )
+
+        self._diagnostic_sums[..., : len(names)] += values
+        self._diagnostic_sums[..., len(names) :] += aggregates
+        self._diagnostic_squares += aggregates.square()
+        self._diagnostic_steps += 1
+
+        finished = done[:, None].expand_as(raw).reshape(-1)
+        if not finished.any():
+            return {}
+        steps = self._diagnostic_steps.reshape(-1)[finished].clamp_min(1)
+        means = (
+            self._diagnostic_sums.reshape(-1, len(names) + 3)[finished] / steps[:, None]
+        )
+        rms = (
+            self._diagnostic_squares.reshape(-1, 3)[finished] / steps[:, None]
+        ).sqrt()
+        info = {
+            f"seer/component/{name}": means[:, index].cpu().tolist()
+            for index, name in enumerate(names)
+        }
+        for index, name in enumerate(("raw", "zero_sum", "normalized")):
+            info[f"seer/aggregate/{name}"] = means[:, len(names) + index].cpu().tolist()
+            info[f"seer/scale/{name}"] = rms[:, index].cpu().tolist()
+
+        self._diagnostic_sums[done] = 0
+        self._diagnostic_squares[done] = 0
+        self._diagnostic_steps[done] = 0
+        return info
 
     def _opponent_team_mean(self, value: torch.Tensor) -> torch.Tensor:
         blue = value[:, : self.n_blue]

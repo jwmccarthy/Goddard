@@ -46,7 +46,9 @@ Start training with:
 uv run python train.py --total-timesteps 100000000
 ```
 
-Training loads the reset dataset onto `cuda:0`. By default, 70 percent of completed simulations receive a replay state and the rest keep their normal kickoff state. Configure this with `--replay-reset-probability`. PPO uses the normalized zero sum Seer reward. TrueSkill evaluation uses normal kickoff states.
+Training loads the reset dataset onto `cuda:0`. By default, 70 percent of completed simulations receive a conservative grounded replay state and the rest keep their normal kickoff state. Configure this with `--replay-reset-probability`. PPO uses the normalized zero sum Seer reward. TrueSkill evaluation uses normal kickoff states.
+
+CARL observations are normalized by physical limits by default; use `--no-normalize` to retain raw observations. Actor and critic recurrent networks are independent, and their learning rates decay linearly to 10 percent of the initial rate over the configured run. Configure the final factor with `--learning-rate-end-factor`.
 
 The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 16,000,000 learner transitions.
 
@@ -75,7 +77,7 @@ Start the browser viewer with:
 uv run python watch_checkpoints.py --open
 ```
 
-The viewer runs at `http://127.0.0.1:8788`. It scans `checkpoints/` every five seconds. The menu selects a run directory and a checkpoint for each team. It also supports sampled actions and random replay starting states.
+The viewer runs at `http://127.0.0.1:8788`. It scans `checkpoints/` every five seconds. The menu selects a run directory and a checkpoint for each team. It also supports sampled actions and random replay starting states. Pass `--normalize` when viewing checkpoints trained with normalized observations; the default remains raw for older checkpoints.
 
 Drag to orbit. Right drag to pan. Scroll to zoom. Use WASD, Space, and Ctrl to move the camera. Press `R` to reset the match.
 
@@ -83,4 +85,4 @@ The page loads Three.js from `unpkg.com`, so the browser needs internet access.
 
 ## Reward
 
-`SeerReward` combines 16 Rocket League reward terms. It converts the result to zero sum team rewards and normalizes it with running statistics.
+`SeerReward` combines 16 Rocket League reward terms. It converts the result to zero sum team rewards and normalizes it with running statistics. TensorBoard records per-component episode means and raw, zero-sum, and normalized aggregate means and RMS scales.

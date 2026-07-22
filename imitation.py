@@ -12,20 +12,6 @@ class TransitionDiscriminator(nn.Module):
         if noise_std < 0:
             raise ValueError("noise standard deviation cannot be negative")
         self.noise_std = noise_std
-        self.register_buffer(
-            "ball_scale",
-            torch.tensor([6000.0] * 6 + [6.0] * 3),
-        )
-        self.register_buffer(
-            "car_scale",
-            torch.tensor(
-                [6000.0] * 3
-                + [2300.0] * 3
-                + [6.0] * 3
-                + [1.0] * 6
-                + [100.0]
-            ),
-        )
         self.model = nn.Sequential(
             nn.Linear(82, hidden_size),
             nn.ReLU(),
@@ -35,9 +21,9 @@ class TransitionDiscriminator(nn.Module):
         )
 
     def project(self, observation: torch.Tensor) -> torch.Tensor:
-        ball = observation[..., :9] / self.ball_scale
-        own_car = observation[..., 9:25] / self.car_scale
-        opponent = observation[..., 30:46] / self.car_scale
+        ball = observation[..., :9]
+        own_car = observation[..., 9:25]
+        opponent = observation[..., 30:46]
         return torch.cat((ball, own_car, opponent), dim=-1)
 
     def forward(self, transition) -> torch.Tensor:
@@ -47,8 +33,7 @@ class TransitionDiscriminator(nn.Module):
         if self.training and self.noise_std:
             observation = observation + torch.randn_like(observation) * self.noise_std
             next_observation = (
-                next_observation
-                + torch.randn_like(next_observation) * self.noise_std
+                next_observation + torch.randn_like(next_observation) * self.noise_std
             )
         inputs = torch.cat(
             (observation, next_observation),
