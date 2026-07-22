@@ -20,12 +20,9 @@ from jarl.collect import (
 from jarl.envs import DatasetResetSampler
 from jarl.learn import (
     Algorithm,
-    GAIFOLoss,
-    GAIFOMinibatches,
     OptimizerStep,
     PPOConfig,
     PPOLoss,
-    TransformRollout,
     Update,
     unique_parameters,
 )
@@ -38,10 +35,9 @@ from jarl.modules.utils import init_layer
 from jarl.runtime import OnPolicySchedule, Trainer
 from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
-from jarl.transform import DiscriminatorReward, GAE
+from jarl.transform import GAE, TeamSpirit
 
-from imitation import TransitionDiscriminator
-from imitation_dataset import load_expert_dataset
+from rewards import SeerReward
 from replay_states import load_replay_dataset
 
 
@@ -49,67 +45,62 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a naive PPO Rocket League agent"
     )
-    parser.add_argument("--num-simulations",            type=int,   default=1024)
-    parser.add_argument("--n-blue",                     type=int,   default=1)
-    parser.add_argument("--n-orange",                   type=int,   default=1)
-    parser.add_argument("--frameskip",                  type=int,   default=8)
-    parser.add_argument("--max-ticks",                  type=int,   default=4096)
-    parser.add_argument("--rollout-steps",              type=int,   default=512)
-    parser.add_argument("--sequence-length",            type=int,   default=32)
-    parser.add_argument("--hidden-size",                type=int,   default=256)
-    parser.add_argument("--total-timesteps",            type=int,   default=1_000_000_000)
-    parser.add_argument("--minibatch-size",             type=int,   default=65_536)
-    parser.add_argument("--learning-rate",              type=float, default=2.5e-4)
-    parser.add_argument("--epochs",                     type=int,   default=8)
-    parser.add_argument("--entropy-coef",               type=float, default=1e-3)
-    parser.add_argument("--self-play-current",          type=float, default=0.8)
-    parser.add_argument("--snapshot-interval",          type=int,   default=16)
-    parser.add_argument("--opponent-pool-size",         type=int,   default=8)
-    parser.add_argument("--historical-policies",        type=int,   default=4)
-    parser.add_argument("--trueskill-interval",         type=int,   default=16_000_000)
-    parser.add_argument("--trueskill-simulations",      type=int,   default=64)
-    parser.add_argument("--trueskill-opponents",        type=int,   default=3)
-    parser.add_argument("--trueskill-draw-probability", type=float, default=0.0)
-    parser.add_argument("--gamma",                      type=float, default=0.999)
-    parser.add_argument("--gae-lambda",                 type=float, default=0.99)
-    parser.add_argument("--tensorboard-dir",            type=Path,  default=Path("runs"))
-    parser.add_argument("--checkpoint-dir",             type=Path,  default=Path("checkpoints"))
-    parser.add_argument("--replay-dataset",             type=Path,  default=Path("data/ballchasing-ssl-1v1/reset_dataset"))
-    parser.add_argument("--expert-dataset",             type=Path,  default=Path("data/ballchasing-ssl-1v1/expert_dataset"))
-    parser.add_argument("--discriminator-batch-size",   type=int,   default=65_536)
-    parser.add_argument("--discriminator-epochs",       type=int,   default=2)
-    parser.add_argument("--discriminator-learning-rate", type=float, default=3e-4)
-    parser.add_argument("--discriminator-noise-std",     type=float, default=0.01)
-    parser.add_argument("--run-name",                   type=str,   default=None)
-    parser.add_argument("--seed",                       type=int,   default=0)
+    parser.add_argument("--num-simulations",             type=int,   default=1024)
+    parser.add_argument("--n-blue",                      type=int,   default=1)
+    parser.add_argument("--n-orange",                    type=int,   default=1)
+    parser.add_argument("--frameskip",                   type=int,   default=8)
+    parser.add_argument("--max-ticks",                   type=int,   default=4096)
+    parser.add_argument("--rollout-steps",               type=int,   default=512)
+    parser.add_argument("--sequence-length",             type=int,   default=32)
+    parser.add_argument("--hidden-size",                 type=int,   default=256)
+    parser.add_argument("--total-timesteps",             type=int,   default=1_000_000_000)
+    parser.add_argument("--minibatch-size",              type=int,   default=65_536)
+    parser.add_argument("--learning-rate",               type=float, default=2.5e-4)
+    parser.add_argument("--epochs",                      type=int,   default=8)
+    parser.add_argument("--entropy-coef",                type=float, default=1e-3)
+    parser.add_argument("--self-play-current",           type=float, default=0.8)
+    parser.add_argument("--snapshot-interval",           type=int,   default=16)
+    parser.add_argument("--opponent-pool-size",          type=int,   default=8)
+    parser.add_argument("--historical-policies",         type=int,   default=4)
+    parser.add_argument("--trueskill-interval",          type=int,   default=16_000_000)
+    parser.add_argument("--trueskill-simulations",       type=int,   default=64)
+    parser.add_argument("--trueskill-opponents",         type=int,   default=3)
+    parser.add_argument("--trueskill-draw-probability",  type=float, default=0.0)
+    parser.add_argument("--team-spirit",                 type=float, default=1.0)
+    parser.add_argument("--reward-scale",                type=float, default=1.0)
+    parser.add_argument("--gamma",                       type=float, default=0.999)
+    parser.add_argument("--gae-lambda",                  type=float, default=0.99)
+    parser.add_argument("--tensorboard-dir",             type=Path,  default=Path("runs"))
+    parser.add_argument("--checkpoint-dir",              type=Path,  default=Path("checkpoints"))
+    parser.add_argument("--replay-dataset",              type=Path,  default=Path("data/ballchasing-ssl-1v1/reset_dataset"))
+    parser.add_argument("--run-name",                    type=str,   default=None)
+    parser.add_argument("--seed",                        type=int,   default=0)
     return parser.parse_args()
 
 
 def validate_arguments(arguments: argparse.Namespace) -> None:
     positive = {
-        "num-simulations":       arguments.num_simulations,
-        "n-blue":                arguments.n_blue,
-        "n-orange":              arguments.n_orange,
-        "frameskip":             arguments.frameskip,
-        "max-ticks":             arguments.max_ticks,
-        "rollout-steps":         arguments.rollout_steps,
-        "sequence-length":       arguments.sequence_length,
-        "hidden-size":           arguments.hidden_size,
-        "total-timesteps":       arguments.total_timesteps,
-        "minibatch-size":        arguments.minibatch_size,
-        "learning-rate":         arguments.learning_rate,
-        "epochs":                arguments.epochs,
-        "gamma":                 arguments.gamma,
-        "gae-lambda":            arguments.gae_lambda,
-        "snapshot-interval":     arguments.snapshot_interval,
-        "opponent-pool-size":    arguments.opponent_pool_size,
-        "historical-policies":   arguments.historical_policies,
-        "trueskill-interval":    arguments.trueskill_interval,
-        "trueskill-simulations": arguments.trueskill_simulations,
-        "trueskill-opponents":   arguments.trueskill_opponents,
-        "discriminator-batch-size": arguments.discriminator_batch_size,
-        "discriminator-epochs": arguments.discriminator_epochs,
-        "discriminator-learning-rate": arguments.discriminator_learning_rate,
+        "num-simulations":             arguments.num_simulations,
+        "n-blue":                      arguments.n_blue,
+        "n-orange":                    arguments.n_orange,
+        "frameskip":                   arguments.frameskip,
+        "max-ticks":                   arguments.max_ticks,
+        "rollout-steps":               arguments.rollout_steps,
+        "sequence-length":             arguments.sequence_length,
+        "hidden-size":                 arguments.hidden_size,
+        "total-timesteps":             arguments.total_timesteps,
+        "minibatch-size":              arguments.minibatch_size,
+        "learning-rate":               arguments.learning_rate,
+        "epochs":                      arguments.epochs,
+        "reward-scale":                arguments.reward_scale,
+        "gamma":                       arguments.gamma,
+        "gae-lambda":                  arguments.gae_lambda,
+        "snapshot-interval":           arguments.snapshot_interval,
+        "opponent-pool-size":          arguments.opponent_pool_size,
+        "historical-policies":         arguments.historical_policies,
+        "trueskill-interval":          arguments.trueskill_interval,
+        "trueskill-simulations":       arguments.trueskill_simulations,
+        "trueskill-opponents":         arguments.trueskill_opponents,
     }
     invalid = [name for name, value in positive.items() if value <= 0]
     if invalid:
@@ -120,10 +111,10 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("minibatch-size must be divisible by sequence-length")
     if not 0.0 <= arguments.self_play_current <= 1.0:
         raise ValueError("self-play-current must be between zero and one")
+    if not 0.0 <= arguments.team_spirit <= 1.0:
+        raise ValueError("team-spirit must be between zero and one")
     if arguments.entropy_coef < 0:
         raise ValueError("entropy-coef cannot be negative")
-    if arguments.discriminator_noise_std < 0:
-        raise ValueError("discriminator-noise-std cannot be negative")
     if not 0.0 <= arguments.trueskill_draw_probability < 1.0:
         raise ValueError("trueskill-draw-probability must be between zero and one")
     if arguments.gamma > 1.0 or arguments.gae_lambda > 1.0:
@@ -132,8 +123,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("The replay dataset currently supports only 1v1 training")
     if not arguments.replay_dataset.is_dir():
         raise ValueError(f"Replay dataset does not exist: {arguments.replay_dataset}")
-    if not arguments.expert_dataset.is_dir():
-        raise ValueError(f"Expert dataset does not exist: {arguments.expert_dataset}")
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
 
@@ -181,8 +170,6 @@ def build_ppo(
     value_function,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
-    discriminator: TransitionDiscriminator,
-    expert_dataset,
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm]:
     rollout = RolloutBuffer(
         horizon=arguments.rollout_steps,
@@ -227,32 +214,20 @@ def build_ppo(
         ),
     )
 
-    discriminator_optimizer = Adam(
-        discriminator.parameters(),
-        lr=arguments.discriminator_learning_rate,
-    )
-    discriminator_update = Update(
-        transforms=(),
-        sampler=GAIFOMinibatches(
-            expert_dataset,
-            batch_size=arguments.discriminator_batch_size,
-            epochs=arguments.discriminator_epochs,
-        ),
-        loss=GAIFOLoss(discriminator),
-        optimizer_step=OptimizerStep(discriminator, discriminator_optimizer),
-        section="Discriminator",
-    )
-
     optimizer = Adam(
         unique_parameters((policy, value_function)),
         lr=arguments.learning_rate,
     )
     update = Update(
         transforms=(
+            TeamSpirit(
+                num_matches=environment.n_sim,
+                team_sizes=(arguments.n_blue, arguments.n_orange),
+                spirit=arguments.team_spirit,
+            ),
             GAE(
                 gamma=arguments.gamma,
                 lambda_=arguments.gae_lambda,
-                reward_field="imitation_reward",
             ),
         ),
         sampler=RecurrentRolloutMinibatches(
@@ -282,19 +257,7 @@ def build_ppo(
         ),
         section="PPO",
     )
-    return runner, rollout, Algorithm(
-        discriminator_update,
-        TransformRollout(
-            DiscriminatorReward(
-                discriminator,
-                mask_terminal=True,
-                reward_type="negative_logit",
-            ),
-            report_fields=("imitation_reward",),
-            section="GAIfO",
-        ),
-        update,
-    )
+    return runner, rollout, Algorithm(update)
 
 
 def main() -> None:
@@ -312,11 +275,6 @@ def main() -> None:
         device="cuda:0",
     )
     reset_sampler = DatasetResetSampler(replay_dataset, seed=arguments.seed)
-    expert_dataset = load_expert_dataset(
-        arguments.expert_dataset,
-        arguments.frameskip,
-    )
-
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=arguments.n_blue,
@@ -325,7 +283,14 @@ def main() -> None:
         frameskip=arguments.frameskip,
         max_ticks=arguments.max_ticks,
         synchronize=False,
+        reward_scale=arguments.reward_scale,
         reset_state_provider=reset_sampler,
+    )
+    environment.register_reward(
+        SeerReward(
+            n_blue=arguments.n_blue,
+            n_orange=arguments.n_orange,
+        )
     )
     evaluator = None
     try:
@@ -335,17 +300,12 @@ def main() -> None:
                 f"({environment.n_envs:,} actor timesteps)"
             )
         policy, value_function = build_policy_and_value(environment, arguments)
-        discriminator = TransitionDiscriminator(
-            noise_std=arguments.discriminator_noise_std
-        ).to(environment.device)
         runner, rollout, ppo = build_ppo(
             environment,
             policy,
             value_function,
             arguments,
             checkpoint_dir,
-            discriminator,
-            expert_dataset,
         )
         logger = Logger(log_dir=str(run_dir))
 
@@ -386,7 +346,6 @@ def main() -> None:
         )
         trainer.run(arguments.total_timesteps)
         torch.save(policy.state_dict(), checkpoint_dir / "actor_critic_final.pt")
-        torch.save(discriminator.state_dict(), checkpoint_dir / "discriminator_final.pt")
     finally:
         if evaluator is not None:
             evaluator.close()
