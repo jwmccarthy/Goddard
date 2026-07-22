@@ -68,7 +68,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--trueskill-interval",         type=int,   default=32_000_000)
     parser.add_argument("--trueskill-simulations",      type=int,   default=64)
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
-    parser.add_argument("--trueskill-draw-probability", type=float, default=0.0)
+    parser.add_argument("--trueskill-draw-probability", type=float, default=0.9)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
     parser.add_argument("--reward-scale",               type=float, default=1.0)
     parser.add_argument("--gamma",                      type=float, default=0.999)

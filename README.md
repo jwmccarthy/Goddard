@@ -50,7 +50,9 @@ Training loads the reset dataset onto `cuda:0`. By default, 70 percent of comple
 
 CARL observations are normalized by physical limits by default; use `--no-normalize` to retain raw observations. Actor and critic recurrent networks are independent, and their learning rates decay linearly to 10 percent of the initial rate over the configured run. Configure the final factor with `--learning-rate-end-factor`.
 
-The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 16,000,000 learner transitions.
+The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 32,000,000 learner transitions.
+
+TrueSkill treats every checkpoint as an immutable player. Each evaluation matches the newest checkpoint against the initial anchor, its immediate predecessor, and stale older checkpoints as capacity permits. Draws and all match outcomes are persisted, then ratings are recomputed from a common prior.
 
 TensorBoard data is written to `runs/<run_id>`. Policy snapshots, ratings, and the final model are written to `checkpoints/<run_id>`.
 
