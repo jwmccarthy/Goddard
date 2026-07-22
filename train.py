@@ -244,16 +244,19 @@ def build_ppo(
         device=environment.device,
         copy_on_finish=False,
     )
+    snapshot_rollout_timesteps = int(
+        environment.n_envs
+        * (1.0 + arguments.self_play_current)
+        / 2.0
+        * arguments.rollout_steps
+    )
     opponent_pool = SnapshotPool(
         policy=policy,
         max_size=arguments.opponent_pool_size,
-        snapshot_interval=int(
-            environment.n_envs
-            * (1.0 + arguments.self_play_current)
-            / 2.0
-            * arguments.rollout_steps
-            * arguments.snapshot_interval
+        snapshot_interval=(
+            snapshot_rollout_timesteps * arguments.snapshot_interval
         ),
+        initial_snapshot_interval=snapshot_rollout_timesteps,
         active_cache_size=max(4, arguments.historical_policies * 2),
         seed=arguments.seed,
         checkpoint_dir=checkpoint_dir,
