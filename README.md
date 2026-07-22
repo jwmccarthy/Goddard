@@ -87,4 +87,4 @@ The page loads Three.js from `unpkg.com`, so the browser needs internet access.
 
 ## Reward
 
-`SeerReward` combines 16 Rocket League reward terms. It converts the result to zero sum team rewards and normalizes it with running statistics. TensorBoard records per-component episode means and raw, zero-sum, and normalized aggregate means and RMS scales.
+`SeerReward` combines 16 Rocket League reward terms. It converts the result to zero sum team rewards and normalizes it with running statistics unless `--no-normalize-rewards` is passed. TensorBoard records per-component episode means and raw, zero-sum, and normalized aggregate means and RMS scales.

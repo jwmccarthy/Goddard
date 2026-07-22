@@ -71,6 +71,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--trueskill-draw-probability", type=float, default=0.9)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
     parser.add_argument("--reward-scale",               type=float, default=1.0)
+    parser.add_argument(
+        "--normalize-rewards",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--gamma",                      type=float, default=0.999)
     parser.add_argument("--gae-lambda",                 type=float, default=0.99)
     parser.add_argument("--tensorboard-dir",            type=Path,  default=Path("runs"))
@@ -340,6 +345,7 @@ def main() -> None:
         SeerReward(
             n_blue=arguments.n_blue,
             n_orange=arguments.n_orange,
+            normalize=arguments.normalize_rewards,
             log_diagnostics=True,
         )
     )
