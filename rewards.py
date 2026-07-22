@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -56,6 +56,11 @@ class SeerReward:
         self._diagnostic_sums = None
         self._diagnostic_squares = None
         self._diagnostic_steps = None
+
+    def set_goal_scored_weight(self, value: float) -> None:
+        if value <= 0:
+            raise ValueError("goal scored weight must be positive")
+        self.weights = replace(self.weights, goal_scored=value)
 
     def __call__(self, context: RewardContext) -> torch.Tensor | RewardResult:
         current = context.current

@@ -48,7 +48,9 @@ uv run python train.py --total-timesteps 100000000
 
 Training loads the reset dataset onto `cuda:0`. By default, 70 percent of completed simulations receive a conservative grounded replay state and the rest keep their normal kickoff state. Configure this with `--replay-reset-probability`. PPO uses the normalized zero sum Seer reward. TrueSkill evaluation uses normal kickoff states.
 
-CARL observations are normalized by physical limits by default; use `--no-normalize` to retain raw observations. Actor and critic recurrent networks are independent, and their learning rates decay linearly to 10 percent of the initial rate over the configured run. Configure the final factor with `--learning-rate-end-factor`.
+CARL observations are normalized by physical limits by default; use `--no-normalize` to retain raw observations. Actor and critic recurrent networks are independent. Learning rate, entropy coefficient, reward goal weight, and credit half-life follow linear schedules over actual learner transitions. The Seer-compatible defaults use `1e-5 → 5e-6`, `0.01 → 0.005`, `1.25 → 1.45`, and `10s → 20s`, respectively.
+
+The default recurrent setup uses 512-step rollouts, 16-step sequences, 32 PPO epochs, and episodes up to 120 seconds. Every schedule is recorded under `Schedule/*` in TensorBoard. Passing `--gamma` replaces the credit half-life schedule with a constant discount.
 
 The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 32,000,000 learner transitions.
 
