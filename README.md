@@ -26,7 +26,7 @@ Parse the files and build the dataset with:
 uv run python replay_dataset.py parse --fps 10
 ```
 
-Parsing removes states that occur less than five seconds before a goal.
+Parsing keeps live gameplay states and removes states that occur less than five seconds before a goal.
 
 Split the replays into reset states and frameskip matched GAIfO observation pairs with:
 

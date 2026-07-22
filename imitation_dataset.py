@@ -29,11 +29,10 @@ from replay_states import (
 
 PHYSICS_HZ = 120
 SPLIT_SALT = b"goddard-replay-split-v1\0"
-EXPERT_SCHEMA_VERSION = 2
+EXPERT_SCHEMA_VERSION = 3
 EXPERT_GLOBAL_FEATURES = [
     *GLOBAL_FEATURES,
     "CurrentTime",
-    "ReplicatedStateName",
 ]
 
 

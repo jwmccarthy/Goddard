@@ -28,14 +28,18 @@ import requests
 BASE_URL = "https://ballchasing.com"
 USER_AGENT = "babytowniv-rl-dataset/1.0"
 MAX_REQUEST_RATE = 5.0
-SHARD_SCHEMA_VERSION = 2
+SHARD_SCHEMA_VERSION = 3
 GOAL_EXCLUSION_SECONDS = 5.0
 REPLAY_PATH = re.compile(
     r"^/dl/replay/"
     r"(?P<id>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$",
     re.IGNORECASE,
 )
-GLOBAL_FEATURES = ["BallRigidBodyQuaternionVelocities", "FrameTime"]
+GLOBAL_FEATURES = [
+    "BallRigidBodyQuaternionVelocities",
+    "FrameTime",
+    "ReplicatedStateName",
+]
 PLAYER_FEATURES = [
     "PlayerRigidBodyQuaternionVelocities",
     "PlayerBoost",
@@ -646,6 +650,7 @@ def parse_replay_file(
     _validate_frame_matrix(frames, columns)
     replay_data = subtr_actor.get_replay_frames_data(str(replay_path))
     goal_times = [event["time"] for event in replay_data["goal_events"]]
+    frames = _select_live_gameplay(frames, columns, goal_times)
     frames = _exclude_pre_goal_frames(frames, columns, goal_times)
     _write_parsed_shard(
         frame_directory / f"{replay_id}.npz",
@@ -678,6 +683,28 @@ def _pre_goal_mask(
         near_goal &= frame_times <= goal_time
         keep &= ~near_goal
     return keep
+
+
+def _select_live_gameplay(
+    frames:     np.ndarray,
+    columns:    list[str],
+    goal_times: list[float],
+) -> np.ndarray:
+    frame_times = frames[:, columns.index("frame time")]
+    game_state = frames[:, columns.index("game state")]
+    candidates = []
+
+    for goal_time in goal_times:
+        index = np.searchsorted(frame_times, goal_time, side="left") - 1
+        if index >= 0:
+            candidates.append(game_state[index])
+
+    if candidates:
+        states, counts = np.unique(candidates, return_counts=True)
+    else:
+        states, counts = np.unique(game_state, return_counts=True)
+    live_state = states[counts.argmax()]
+    return frames[game_state == live_state]
 
 
 def _validate_frame_matrix(
