@@ -46,7 +46,7 @@ Start training with:
 uv run python train.py --total-timesteps 100000000
 ```
 
-Training loads the reset dataset onto `cuda:0` and samples a state at each episode reset. PPO uses the normalized zero sum Seer reward. TrueSkill evaluation uses normal kickoff states.
+Training loads the reset dataset onto `cuda:0`. By default, 70 percent of completed simulations receive a replay state and the rest keep their normal kickoff state. Configure this with `--replay-reset-probability`. PPO uses the normalized zero sum Seer reward. TrueSkill evaluation uses normal kickoff states.
 
 The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 16,000,000 learner transitions.
 

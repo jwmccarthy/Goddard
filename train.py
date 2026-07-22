@@ -73,6 +73,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--tensorboard-dir",            type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",             type=Path,  default=Path("checkpoints"))
     parser.add_argument("--replay-dataset",             type=Path,  default=Path("data/ballchasing-ssl-1v1/reset_dataset"))
+    parser.add_argument("--replay-reset-probability",   type=float, default=0.7)
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)
     return parser.parse_args()
@@ -115,6 +116,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("team-spirit must be between zero and one")
     if arguments.entropy_coef < 0:
         raise ValueError("entropy-coef cannot be negative")
+    if not 0.0 <= arguments.replay_reset_probability <= 1.0:
+        raise ValueError("replay-reset-probability must be between zero and one")
     if not 0.0 <= arguments.trueskill_draw_probability < 1.0:
         raise ValueError("trueskill-draw-probability must be between zero and one")
     if arguments.gamma > 1.0 or arguments.gae_lambda > 1.0:
@@ -274,7 +277,11 @@ def main() -> None:
         arguments.replay_dataset,
         device="cuda:0",
     )
-    reset_sampler = DatasetResetSampler(replay_dataset, seed=arguments.seed)
+    reset_sampler = DatasetResetSampler(
+        replay_dataset,
+        probability=arguments.replay_reset_probability,
+        seed=arguments.seed,
+    )
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=arguments.n_blue,
