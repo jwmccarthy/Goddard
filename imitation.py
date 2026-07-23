@@ -217,3 +217,13 @@ class SequenceDiscriminatorReward:
         )
         reward.reshape(-1, self.sequence_length, num_envs)[:, -1] = sequence_reward
         return batch.with_fields(**{self.output_field: reward})
+
+
+class AddImitationReward:
+    def __init__(self, imitation_field: str = "imitation_reward") -> None:
+        self.imitation_field = imitation_field
+
+    def __call__(self, batch: TensorBatch, context) -> TensorBatch:
+        return batch.replace_fields(
+            reward=batch["reward"] + batch[self.imitation_field]
+        )

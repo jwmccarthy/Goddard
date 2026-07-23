@@ -49,12 +49,14 @@ from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
 from imitation import (
+    AddImitationReward,
     SequenceDiscriminator,
     SequenceDiscriminatorReward,
     SequenceGAIFOLoss,
     SequenceGAIFOMinibatches,
 )
 from imitation_dataset import load_expert_dataset
+from rewards import SeerReward
 from replay_states import load_replay_dataset
 
 
@@ -85,6 +87,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--trueskill-simulations",           type=int,   default=64)
     parser.add_argument("--trueskill-opponents",             type=int,   default=3)
     parser.add_argument("--trueskill-draw-probability",      type=float, default=0.9)
+    parser.add_argument("--reward-scale",                    type=float, default=1.0)
+    parser.add_argument("--goal-score-weight",               type=float, default=1.25)
+    parser.add_argument("--shaping-coef",                    type=float, default=1.0)
+    parser.add_argument(
+        "--normalize-rewards",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--discount-half-life",              type=float, default=10.0)
     parser.add_argument("--discount-half-life-end",          type=float, default=20.0)
     parser.add_argument(
@@ -136,6 +146,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "minibatch-size":         arguments.minibatch_size,
         "learning-rate":          arguments.learning_rate,
         "epochs":                 arguments.epochs,
+        "reward-scale":           arguments.reward_scale,
+        "goal-score-weight":      arguments.goal_score_weight,
         "discount-half-life":     arguments.discount_half_life,
         "discount-half-life-end": arguments.discount_half_life_end,
         "gae-lambda":             arguments.gae_lambda,
@@ -186,6 +198,10 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         0.0 <= arguments.replay_reset_probability <= 1.0
     ):
         raise ValueError("replay-reset-probability must be between zero and one")
+    if not math.isfinite(arguments.shaping_coef) or not (
+        0.0 <= arguments.shaping_coef <= 1.0
+    ):
+        raise ValueError("shaping-coef must be between zero and one")
     if (
         not math.isfinite(arguments.discriminator_noise_std)
         or arguments.discriminator_noise_std < 0
@@ -250,6 +266,7 @@ def build_ppo(
     value_function,
     discriminator: SequenceDiscriminator,
     expert_dataset,
+    reward_function: SeerReward,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler]:
@@ -321,11 +338,7 @@ def build_ppo(
     initial_gamma = arguments.gamma or 0.5 ** (
         1.0 / (actions_per_second * arguments.discount_half_life)
     )
-    gae = GAE(
-        gamma=initial_gamma,
-        lambda_=arguments.gae_lambda,
-        reward_field="imitation_reward",
-    )
+    gae = GAE(gamma=initial_gamma, lambda_=arguments.gae_lambda)
     ppo_loss = PPOLoss(
         policy,
         value_function,
@@ -333,6 +346,7 @@ def build_ppo(
     )
     update = Update(
         transforms=(
+            AddImitationReward(),
             gae,
         ),
         sampler=RecurrentRolloutMinibatches(
@@ -373,6 +387,7 @@ def build_ppo(
         arguments.entropy_coef,
         arguments.entropy_coef_end,
     )
+    shaping_coef = LinearSchedule(arguments.shaping_coef, 0.0)
     if arguments.gamma is None:
         half_life = LinearSchedule(
             arguments.discount_half_life,
@@ -397,6 +412,11 @@ def build_ppo(
     scheduled_values = [
         ScheduledValue("learning_rate", learning_rate, set_learning_rate),
         ScheduledValue("entropy_coef", entropy_coef, set_entropy_coef),
+        ScheduledValue(
+            "shaping_coef",
+            shaping_coef,
+            reward_function.set_shaping_scale,
+        ),
     ]
 
     if half_life is not None:
@@ -460,9 +480,19 @@ def main() -> None:
         frameskip=arguments.frameskip,
         max_ticks=arguments.max_ticks,
         synchronize=False,
+        reward_scale=arguments.reward_scale,
         reset_state_provider=reset_sampler,
         normalize=arguments.normalize,
     )
+    reward_function = environment.register_reward(
+        SeerReward(
+            n_blue=arguments.n_blue,
+            n_orange=arguments.n_orange,
+            normalize=arguments.normalize_rewards,
+            log_diagnostics=True,
+        )
+    )
+    reward_function.set_goal_scored_weight(arguments.goal_score_weight)
     evaluator = None
     try:
         if arguments.total_timesteps < environment.n_envs:
@@ -481,6 +511,7 @@ def main() -> None:
             value_function,
             discriminator,
             expert_dataset,
+            reward_function,
             arguments,
             checkpoint_dir,
         )

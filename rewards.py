@@ -48,6 +48,7 @@ class SeerReward:
         self.normalize = normalize
         self.log_diagnostics = log_diagnostics
         self.weights = weights
+        self.shaping_scale = 1.0
         self._touch_decay = None
         self._last_touch = None
         self._count = 0
@@ -61,6 +62,11 @@ class SeerReward:
         if value <= 0:
             raise ValueError("goal scored weight must be positive")
         self.weights = replace(self.weights, goal_scored=value)
+
+    def set_shaping_scale(self, value: float) -> None:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("shaping scale must be between zero and one")
+        self.shaping_scale = value
 
     def __call__(self, context: RewardContext) -> torch.Tensor | RewardResult:
         current = context.current
@@ -157,6 +163,7 @@ class SeerReward:
             "boost_amount": weights.boost_amount * boost_amount,
             "forward_velocity": weights.forward_velocity * forward_velocity,
         }
+        components = self._scale_components(components)
         raw_reward = sum(components.values())
         zero_sum_reward = self._zero_sum(raw_reward)
         reward = zero_sum_reward
@@ -177,6 +184,14 @@ class SeerReward:
         if self.log_diagnostics:
             return RewardResult(reward, info)
         return reward
+
+    def _scale_components(
+        self, components: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            name: value if name == "goal_scored" else self.shaping_scale * value
+            for name, value in components.items()
+        }
 
     def _ensure_state(self, n_sim: int, device: torch.device) -> None:
         expected = (n_sim, self.n_cars)
