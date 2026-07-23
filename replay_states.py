@@ -187,7 +187,7 @@ def _load_state_tensors(
         columns.ball_angular_velocity,
         (count, 3),
         device,
-    )
+    ).mul_(torch.pi / 180.0)
     car_position = _extract_tensor(
         frames, valid_indices, columns.car_position, (count, 2, 3), device
     )
@@ -203,7 +203,7 @@ def _load_state_tensors(
         columns.car_angular_velocity,
         (count, 2, 3),
         device,
-    )
+    ).mul_(torch.pi / 180.0)
     car_demoed = _extract_tensor(
         frames, valid_indices, columns.car_demolished_by, (count, 2), device
     ).ge(0)
