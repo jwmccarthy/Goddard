@@ -50,6 +50,7 @@ from jarl.transform import GAE
 
 from imitation import (
     AddImitationReward,
+    EveryNUpdates,
     SequenceDiscriminator,
     SequenceDiscriminatorReward,
     SequenceGAIFOLoss,
@@ -119,6 +120,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--replay-reset-probability",        type=float, default=0.7)
     parser.add_argument("--discriminator-batch-size",        type=int,   default=2048)
     parser.add_argument("--discriminator-reward-batch-size", type=int, default=4096)
+    parser.add_argument("--discriminator-update-interval",   type=int,   default=1)
     parser.add_argument("--discriminator-epochs",            type=int,   default=2)
     parser.add_argument("--discriminator-learning-rate",     type=float, default=3e-4)
     parser.add_argument("--discriminator-noise-std",         type=float, default=0.01)
@@ -161,6 +163,7 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "discriminator-reward-batch-size": (
             arguments.discriminator_reward_batch_size
         ),
+        "discriminator-update-interval": arguments.discriminator_update_interval,
         "discriminator-epochs": arguments.discriminator_epochs,
         "discriminator-learning-rate": arguments.discriminator_learning_rate,
     }
@@ -434,7 +437,10 @@ def build_ppo(
     )
     value_scheduler = ValueScheduler(*scheduled_values)
     return runner, rollout, Algorithm(
-        discriminator_update,
+        EveryNUpdates(
+            discriminator_update,
+            arguments.discriminator_update_interval,
+        ),
         TransformRollout(
             SequenceDiscriminatorReward(
                 discriminator,

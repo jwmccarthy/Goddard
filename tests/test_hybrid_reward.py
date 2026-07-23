@@ -1,14 +1,28 @@
 import unittest
+from unittest.mock import Mock
 
 import torch
 
 from jarl.data import TensorBatch
 
-from imitation import AddImitationReward
+from imitation import AddImitationReward, EveryNUpdates
 from rewards import SeerReward
 
 
 class HybridRewardTests(unittest.TestCase):
+    def test_periodic_stage_runs_first_and_every_n_updates(self):
+        stage = Mock()
+        stage.run.side_effect = lambda experience: (experience, {"ran": {}})
+        periodic = EveryNUpdates(stage, interval=3)
+
+        metrics = [periodic.run("rollout")[1] for _ in range(7)]
+
+        self.assertEqual(stage.run.call_count, 3)
+        self.assertEqual(
+            metrics,
+            [{"ran": {}}, {}, {}, {"ran": {}}, {}, {}, {"ran": {}}],
+        )
+
     def test_shaping_scale_does_not_change_goal_reward(self):
         reward = SeerReward(1, 1, normalize=False)
         reward.set_shaping_scale(0.25)

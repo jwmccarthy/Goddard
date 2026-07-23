@@ -85,6 +85,8 @@ uv run python gaifo.py --total-timesteps 100000000
 
 GAIfO uses the full imitation reward throughout training. It begins with the default Seer reward components and linearly anneals all non-goal shaping to zero over total training timesteps; goal scoring remains active. Configure the initial shaping strength with `--shaping-coef`.
 
+PPO updates every rollout. Configure discriminator training cadence with `--discriminator-update-interval`; `1` trains it every PPO update, while `N` trains it on the first update and every `N` updates thereafter. Reward inference still runs every rollout using the latest discriminator.
+
 Run a small GAIfO training check with:
 
 ```bash

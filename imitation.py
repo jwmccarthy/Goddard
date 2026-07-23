@@ -227,3 +227,19 @@ class AddImitationReward:
         return batch.replace_fields(
             reward=batch["reward"] + batch[self.imitation_field]
         )
+
+
+class EveryNUpdates:
+    def __init__(self, stage, interval: int) -> None:
+        if interval < 1:
+            raise ValueError("update interval must be positive")
+        self.stage = stage
+        self.interval = interval
+        self.update_count = 0
+
+    def run(self, experience):
+        should_run = self.update_count % self.interval == 0
+        self.update_count += 1
+        if should_run:
+            return self.stage.run(experience)
+        return experience, {}
