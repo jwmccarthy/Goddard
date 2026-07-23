@@ -14,6 +14,25 @@ from replay_states import load_replay_dataset
 from watch_checkpoints import load_actor
 
 
+PROJECTED_FEATURES = (
+    *(f"ball_position_{axis}" for axis in "xyz"),
+    *(f"ball_velocity_{axis}" for axis in "xyz"),
+    *(f"ball_angular_velocity_{axis}" for axis in "xyz"),
+    *(f"own_position_{axis}" for axis in "xyz"),
+    *(f"own_velocity_{axis}" for axis in "xyz"),
+    *(f"own_angular_velocity_{axis}" for axis in "xyz"),
+    *(f"own_forward_{axis}" for axis in "xyz"),
+    *(f"own_up_{axis}" for axis in "xyz"),
+    "own_boost",
+    *(f"opponent_position_{axis}" for axis in "xyz"),
+    *(f"opponent_velocity_{axis}" for axis in "xyz"),
+    *(f"opponent_angular_velocity_{axis}" for axis in "xyz"),
+    *(f"opponent_forward_{axis}" for axis in "xyz"),
+    *(f"opponent_up_{axis}" for axis in "xyz"),
+    "opponent_boost",
+)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure expert and CARL observation separability"
@@ -195,6 +214,18 @@ def effect_summary(expert: torch.Tensor, agent: torch.Tensor) -> str:
     return "median={:.3f} p95={:.3f} max={:.3f}".format(*quantiles.tolist())
 
 
+def print_feature_ranking(expert: torch.Tensor, agent: torch.Tensor) -> None:
+    pooled_std = ((expert.var(0) + agent.var(0)) / 2).sqrt().clamp_min(1e-6)
+    effect = (expert.mean(0) - agent.mean(0)).abs() / pooled_std
+    for index in effect.argsort(descending=True)[:8]:
+        index = int(index)
+        print(
+            f"feature={PROJECTED_FEATURES[index]} effect={effect[index]:.3f} "
+            f"expert_mean={expert[:, index].mean():.3f} "
+            f"agent_mean={agent[:, index].mean():.3f}"
+        )
+
+
 def main() -> None:
     arguments = parse_arguments()
     if min(
@@ -256,6 +287,12 @@ def main() -> None:
         generator=generator,
     )
     expert = expert_dataset.data["observation"][expert_indices].float()
+    expert_has_kickoff = kickoff_wait_mask(expert.flatten(0, 1)).reshape(
+        len(expert), arguments.sequence_length
+    ).any(dim=1)
+    agent_has_kickoff = kickoff_wait_mask(agent.flatten(0, 1)).reshape(
+        len(agent), arguments.sequence_length
+    ).any(dim=1)
     expert_frames = expert_dataset.data["observation"].reshape(-1, 119)
     expert_kickoff = expert_frames[kickoff_wait_mask(expert_frames)].float()
     carl_kickoff = carl_kickoff[kickoff_wait_mask(carl_kickoff)]
@@ -276,6 +313,7 @@ def main() -> None:
     print(f"noise_std={arguments.noise_std:.4f}")
     print(f"frame_effect {effect_summary(expert_frame, agent_frame)}")
     print(f"delta_effect {effect_summary(expert_delta, agent_delta)}")
+    print_feature_ranking(expert_frame, agent_frame)
     probes = (
         ("single_frame", expert_frame, agent_frame),
         ("one_step_delta", expert_delta, agent_delta),
@@ -287,6 +325,40 @@ def main() -> None:
         ),
     )
     for name, expert_features, agent_features in probes:
+        accuracy = probe_accuracy(
+            expert_features,
+            agent_features,
+            arguments.probe_steps,
+            arguments.max_probe_examples,
+            generator,
+            device,
+        )
+        print(f"{name}_accuracy={accuracy:.4f}")
+
+    expert_non_kickoff = expert[~expert_has_kickoff]
+    agent_non_kickoff = agent[~agent_has_kickoff]
+    print(
+        f"kickoff_sequences expert={int(expert_has_kickoff.sum()):,} "
+        f"agent={int(agent_has_kickoff.sum()):,}"
+    )
+    non_kickoff_probes = (
+        (
+            "non_kickoff_single_frame",
+            expert_non_kickoff.flatten(0, 1),
+            agent_non_kickoff.flatten(0, 1),
+        ),
+        (
+            "non_kickoff_one_step_delta",
+            (expert_non_kickoff[:, 1:] - expert_non_kickoff[:, :-1]).flatten(0, 1),
+            (agent_non_kickoff[:, 1:] - agent_non_kickoff[:, :-1]).flatten(0, 1),
+        ),
+        (
+            "non_kickoff_ordered_sequence",
+            sequence_summary(expert_non_kickoff),
+            sequence_summary(agent_non_kickoff),
+        ),
+    )
+    for name, expert_features, agent_features in non_kickoff_probes:
         accuracy = probe_accuracy(
             expert_features,
             agent_features,
