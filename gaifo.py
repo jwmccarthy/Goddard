@@ -62,40 +62,40 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a sequence-level GAIfO Rocket League agent"
     )
-    parser.add_argument("--num-simulations",            type=int,   default=1024)
-    parser.add_argument("--n-blue",                     type=int,   default=1)
-    parser.add_argument("--n-orange",                   type=int,   default=1)
-    parser.add_argument("--frameskip",                  type=int,   default=8)
-    parser.add_argument("--max-ticks",                  type=int,   default=14_400)
-    parser.add_argument("--rollout-steps",              type=int,   default=512)
-    parser.add_argument("--sequence-length",            type=int,   default=16)
-    parser.add_argument("--hidden-size",                type=int,   default=256)
-    parser.add_argument("--total-timesteps",            type=int,   default=10_000_000_000)
-    parser.add_argument("--minibatch-size",             type=int,   default=65_536)
-    parser.add_argument("--learning-rate",              type=float, default=1e-5)
-    parser.add_argument("--learning-rate-end-factor",   type=float, default=0.5)
-    parser.add_argument("--epochs",                     type=int,   default=32)
-    parser.add_argument("--entropy-coef",               type=float, default=0.01)
-    parser.add_argument("--entropy-coef-end",           type=float, default=0.005)
-    parser.add_argument("--self-play-current",          type=float, default=0.8)
-    parser.add_argument("--snapshot-interval",          type=int,   default=16)
-    parser.add_argument("--opponent-pool-size",         type=int,   default=8)
-    parser.add_argument("--historical-policies",        type=int,   default=4)
-    parser.add_argument("--trueskill-interval",         type=int,   default=32_000_000)
-    parser.add_argument("--trueskill-simulations",      type=int,   default=64)
-    parser.add_argument("--trueskill-opponents",        type=int,   default=3)
-    parser.add_argument("--trueskill-draw-probability", type=float, default=0.9)
-    parser.add_argument("--discount-half-life",         type=float, default=10.0)
-    parser.add_argument("--discount-half-life-end",     type=float, default=20.0)
+    parser.add_argument("--num-simulations",                 type=int,   default=1024)
+    parser.add_argument("--n-blue",                          type=int,   default=1)
+    parser.add_argument("--n-orange",                        type=int,   default=1)
+    parser.add_argument("--frameskip",                       type=int,   default=8)
+    parser.add_argument("--max-ticks",                       type=int,   default=14_400)
+    parser.add_argument("--rollout-steps",                   type=int,   default=512)
+    parser.add_argument("--sequence-length",                 type=int,   default=16)
+    parser.add_argument("--hidden-size",                     type=int,   default=256)
+    parser.add_argument("--total-timesteps",                 type=int,   default=10_000_000_000)
+    parser.add_argument("--minibatch-size",                  type=int,   default=65_536)
+    parser.add_argument("--learning-rate",                   type=float, default=1e-5)
+    parser.add_argument("--learning-rate-end-factor",        type=float, default=0.5)
+    parser.add_argument("--epochs",                          type=int,   default=32)
+    parser.add_argument("--entropy-coef",                    type=float, default=0.01)
+    parser.add_argument("--entropy-coef-end",                type=float, default=0.005)
+    parser.add_argument("--self-play-current",               type=float, default=0.8)
+    parser.add_argument("--snapshot-interval",               type=int,   default=16)
+    parser.add_argument("--opponent-pool-size",              type=int,   default=8)
+    parser.add_argument("--historical-policies",             type=int,   default=4)
+    parser.add_argument("--trueskill-interval",              type=int,   default=32_000_000)
+    parser.add_argument("--trueskill-simulations",           type=int,   default=64)
+    parser.add_argument("--trueskill-opponents",             type=int,   default=3)
+    parser.add_argument("--trueskill-draw-probability",      type=float, default=0.9)
+    parser.add_argument("--discount-half-life",              type=float, default=10.0)
+    parser.add_argument("--discount-half-life-end",          type=float, default=20.0)
     parser.add_argument(
         "--gamma",
         type=float,
         default=None,
         help="constant discount override; disables the half-life schedule",
     )
-    parser.add_argument("--gae-lambda",                 type=float, default=0.99)
-    parser.add_argument("--tensorboard-dir",            type=Path,  default=Path("runs"))
-    parser.add_argument("--checkpoint-dir",             type=Path,  default=Path("checkpoints"))
+    parser.add_argument("--gae-lambda",                      type=float, default=0.99)
+    parser.add_argument("--tensorboard-dir",                 type=Path,  default=Path("runs"))
+    parser.add_argument("--checkpoint-dir",                  type=Path,  default=Path("checkpoints"))
     parser.add_argument(
         "--replay-dataset",
         type=Path,
@@ -106,18 +106,19 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         default=Path("data/ballchasing-ssl-1v1/expert_dataset"),
     )
-    parser.add_argument("--replay-reset-probability",    type=float, default=0.7)
-    parser.add_argument("--discriminator-batch-size",    type=int,   default=2048)
-    parser.add_argument("--discriminator-epochs",        type=int,   default=2)
-    parser.add_argument("--discriminator-learning-rate", type=float, default=3e-4)
-    parser.add_argument("--discriminator-noise-std",     type=float, default=0.01)
+    parser.add_argument("--replay-reset-probability",        type=float, default=0.7)
+    parser.add_argument("--discriminator-batch-size",        type=int,   default=2048)
+    parser.add_argument("--discriminator-reward-batch-size", type=int, default=4096)
+    parser.add_argument("--discriminator-epochs",            type=int,   default=2)
+    parser.add_argument("--discriminator-learning-rate",     type=float, default=3e-4)
+    parser.add_argument("--discriminator-noise-std",         type=float, default=0.01)
     parser.add_argument(
         "--normalize",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--run-name",                   type=str,   default=None)
-    parser.add_argument("--seed",                       type=int,   default=0)
+    parser.add_argument("--run-name",                        type=str,   default=None)
+    parser.add_argument("--seed",                            type=int,   default=0)
     return parser.parse_args()
 
 
@@ -145,6 +146,9 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "trueskill-simulations":  arguments.trueskill_simulations,
         "trueskill-opponents":    arguments.trueskill_opponents,
         "discriminator-batch-size": arguments.discriminator_batch_size,
+        "discriminator-reward-batch-size": (
+            arguments.discriminator_reward_batch_size
+        ),
         "discriminator-epochs": arguments.discriminator_epochs,
         "discriminator-learning-rate": arguments.discriminator_learning_rate,
     }
@@ -415,6 +419,7 @@ def build_ppo(
             SequenceDiscriminatorReward(
                 discriminator,
                 sequence_length=arguments.sequence_length,
+                batch_size=arguments.discriminator_reward_batch_size,
             ),
             report_fields=("imitation_reward",),
             section="GAIfO",

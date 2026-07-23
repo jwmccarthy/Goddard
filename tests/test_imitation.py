@@ -10,12 +10,18 @@ from imitation import (
     SequenceDiscriminatorReward,
     SequenceGAIFOMinibatches,
     _sequence_chunks,
+    _sequence_grid,
 )
 
 
 class SumDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.batch_sizes = []
+
     def forward(self, sequence):
         observation, _ = sequence
+        self.batch_sizes.append(len(observation))
         return observation[..., 0].sum(dim=1)
 
 
@@ -29,6 +35,14 @@ class SequenceGAIFOTests(unittest.TestCase):
             chunks,
             torch.tensor([[0, 2], [1, 3], [4, 6], [5, 7]]),
         )
+
+    def test_sequence_grid_is_a_view_of_rollout_storage(self):
+        values = torch.arange(8).reshape(4, 2)
+
+        grid = _sequence_grid(values, 2)
+
+        self.assertEqual(grid.shape, (2, 2, 2))
+        self.assertEqual(grid.data_ptr(), values.data_ptr())
 
     def test_discriminator_returns_one_logit_per_sequence(self):
         discriminator = SequenceDiscriminator(hidden_size=8, noise_std=0.0)
@@ -93,6 +107,26 @@ class SequenceGAIFOTests(unittest.TestCase):
             reward,
             torch.tensor([[0.0, 0.0], [-10.0, -12.0], [0.0, 0.0], [-50.0, 0.0]]),
         )
+
+    def test_reward_inference_respects_batch_size(self):
+        discriminator = SumDiscriminator()
+        observation = torch.ones(4, 3, 119)
+        batch = TensorBatch(
+            {
+                "observation": observation,
+                "next_obs": observation.clone(),
+                "learner_mask": torch.ones(4, 3, dtype=torch.bool),
+                "terminated": torch.zeros(4, 3, dtype=torch.bool),
+                "truncated": torch.zeros(4, 3, dtype=torch.bool),
+            }
+        )
+        transform = SequenceDiscriminatorReward(
+            discriminator, sequence_length=2, batch_size=2
+        )
+
+        transform(batch, None)
+
+        self.assertEqual(discriminator.batch_sizes, [2, 2, 2])
 
 
 if __name__ == "__main__":

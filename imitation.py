@@ -6,17 +6,22 @@ from jarl.data import TensorBatch
 from jarl.learn import LossOutput
 
 
-def _sequence_chunks(value: torch.Tensor, sequence_length: int) -> torch.Tensor:
+def _sequence_grid(value: torch.Tensor, sequence_length: int) -> torch.Tensor:
     horizon, num_envs = value.shape[:2]
     if horizon % sequence_length:
         raise ValueError("rollout horizon must be divisible by sequence length")
+    return value.reshape(
+        horizon // sequence_length,
+        sequence_length,
+        num_envs,
+        *value.shape[2:],
+    )
+
+
+def _sequence_chunks(value: torch.Tensor, sequence_length: int) -> torch.Tensor:
+    grid = _sequence_grid(value, sequence_length)
     return (
-        value.reshape(
-            horizon // sequence_length,
-            sequence_length,
-            num_envs,
-            *value.shape[2:],
-        )
+        grid
         .transpose(1, 2)
         .reshape(-1, sequence_length, *value.shape[2:])
     )
@@ -71,35 +76,44 @@ class SequenceGAIFOMinibatches:
         self.epochs = epochs
 
     def __call__(self, rollout: TensorBatch):
-        observation = _sequence_chunks(
-            rollout["observation"], self.sequence_length
+        observation = _sequence_grid(rollout["observation"], self.sequence_length)
+        next_obs = _sequence_grid(rollout["next_obs"], self.sequence_length)
+        valid = torch.ones(
+            observation.shape[0],
+            observation.shape[2],
+            dtype=torch.bool,
+            device=rollout.device,
         )
-        next_obs = _sequence_chunks(rollout["next_obs"], self.sequence_length)
-        valid = torch.ones(len(observation), dtype=torch.bool, device=rollout.device)
         if "learner_mask" in rollout:
-            valid &= _sequence_chunks(
+            valid &= _sequence_grid(
                 rollout["learner_mask"], self.sequence_length
             ).bool().all(dim=1)
         for field in ("terminated", "truncated"):
             if field in rollout:
-                valid &= ~_sequence_chunks(
+                valid &= ~_sequence_grid(
                     rollout[field], self.sequence_length
                 ).bool().any(dim=1)
 
-        agent_sequences = TensorBatch(
-            {"observation": observation[valid], "next_obs": next_obs[valid]}
-        )
-        if len(agent_sequences) < self.batch_size:
+        coordinates = valid.nonzero()
+        if len(coordinates) < self.batch_size:
             raise RuntimeError(
                 "not enough valid rollout sequences for a discriminator minibatch"
             )
 
         for _ in range(self.epochs):
-            indices = torch.randperm(len(agent_sequences), device=rollout.device)
-            for start in range(0, len(agent_sequences), self.batch_size):
+            indices = torch.randperm(len(coordinates), device=rollout.device)
+            for start in range(0, len(coordinates), self.batch_size):
                 batch_indices = indices[start : start + self.batch_size]
                 if len(batch_indices) == self.batch_size:
-                    yield self._build_batch(agent_sequences[batch_indices])
+                    selected = coordinates[batch_indices]
+                    chunk, environment = selected.unbind(dim=1)
+                    agent_sequences = TensorBatch(
+                        {
+                            "observation": observation[chunk, :, environment],
+                            "next_obs": next_obs[chunk, :, environment],
+                        }
+                    )
+                    yield self._build_batch(agent_sequences)
 
     def _build_batch(self, agent_sequences: TensorBatch) -> TensorBatch:
         expert = self.expert_dataset.sample(self.batch_size).to(agent_sequences.device)
@@ -145,45 +159,63 @@ class SequenceDiscriminatorReward:
         self,
         discriminator: SequenceDiscriminator,
         sequence_length: int,
+        batch_size: int = 4096,
         output_field: str = "imitation_reward",
     ) -> None:
-        if sequence_length < 1:
-            raise ValueError("sequence length must be positive")
+        if sequence_length < 1 or batch_size < 1:
+            raise ValueError("sequence length and batch size must be positive")
         self.discriminator = discriminator
         self.sequence_length = sequence_length
+        self.batch_size = batch_size
         self.output_field = output_field
 
     @torch.no_grad()
     def __call__(self, batch: TensorBatch, context) -> TensorBatch:
-        observation = _sequence_chunks(batch["observation"], self.sequence_length)
-        next_obs = _sequence_chunks(batch["next_obs"], self.sequence_length)
-        was_training = self.discriminator.training
-        self.discriminator.eval()
-        try:
-            sequence_reward = -self.discriminator((observation, next_obs))
-        finally:
-            self.discriminator.train(was_training)
-
-        valid = torch.ones_like(sequence_reward, dtype=torch.bool)
+        observation = _sequence_grid(batch["observation"], self.sequence_length)
+        next_obs = _sequence_grid(batch["next_obs"], self.sequence_length)
+        valid = torch.ones(
+            observation.shape[0],
+            observation.shape[2],
+            dtype=torch.bool,
+            device=batch.device,
+        )
         if "learner_mask" in batch:
-            valid &= _sequence_chunks(
+            valid &= _sequence_grid(
                 batch["learner_mask"], self.sequence_length
             ).bool().all(dim=1)
         for field in ("terminated", "truncated"):
             if field in batch:
-                valid &= ~_sequence_chunks(
+                valid &= ~_sequence_grid(
                     batch[field], self.sequence_length
                 ).bool().any(dim=1)
-        sequence_reward = sequence_reward.masked_fill(~valid, 0.0)
+
+        sequence_reward = torch.zeros(
+            valid.shape,
+            dtype=batch["observation"].dtype,
+            device=batch.device,
+        )
+        coordinates = valid.nonzero()
+        was_training = self.discriminator.training
+        self.discriminator.eval()
+        try:
+            for start in range(0, len(coordinates), self.batch_size):
+                selected = coordinates[start : start + self.batch_size]
+                chunk, environment = selected.unbind(dim=1)
+                score = self.discriminator(
+                    (
+                        observation[chunk, :, environment],
+                        next_obs[chunk, :, environment],
+                    )
+                )
+                sequence_reward[chunk, environment] = -score
+        finally:
+            self.discriminator.train(was_training)
 
         horizon, num_envs = batch["observation"].shape[:2]
         reward = torch.zeros(
-            (horizon // self.sequence_length, num_envs, self.sequence_length),
+            (horizon, num_envs),
             dtype=sequence_reward.dtype,
             device=sequence_reward.device,
         )
-        reward[..., -1] = sequence_reward.reshape(
-            horizon // self.sequence_length, num_envs
-        )
-        reward = reward.transpose(1, 2).reshape(horizon, num_envs)
+        reward.reshape(-1, self.sequence_length, num_envs)[:, -1] = sequence_reward
         return batch.with_fields(**{self.output_field: reward})
