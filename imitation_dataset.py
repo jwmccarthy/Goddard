@@ -29,7 +29,7 @@ from replay_states import (
 
 PHYSICS_HZ = 120
 SPLIT_SALT = b"goddard-replay-split-v1\0"
-EXPERT_SCHEMA_VERSION = 4
+EXPERT_SCHEMA_VERSION = 5
 EXPERT_GLOBAL_FEATURES = [
     *GLOBAL_FEATURES,
     "CurrentTime",
@@ -120,9 +120,10 @@ def expert_columns() -> list[str]:
 
 
 def parse_expert_replay(
-    replay_path: Path,
-    frameskip:   int,
-    encoder:     ObservationEncoder,
+    replay_path:    Path,
+    frameskip:      int,
+    sequence_length: int,
+    encoder:        ObservationEncoder,
 ) -> tuple[np.ndarray, np.ndarray]:
     fps = PHYSICS_HZ / frameskip
     metadata, frames = subtr_actor.get_ndarray_with_info_from_replay_filepath(
@@ -158,8 +159,8 @@ def parse_expert_replay(
 
     demolished = frames[np.ix_(valid_indices, state_columns.car_demolished_by)]
     valid_indices = valid_indices[(demolished < 0).all(axis=1)]
-    if len(valid_indices) < 2:
-        return _empty_pairs()
+    if len(valid_indices) <= sequence_length:
+        return _empty_sequences(sequence_length)
 
     states = TensorDataset(
         TensorBatch(
@@ -181,13 +182,27 @@ def parse_expert_replay(
         atol=2e-4,
         rtol=0,
     )
-    observation = observations[:-1][pair].reshape(-1, observations.shape[-1])
-    next_observation = observations[1:][pair].reshape(-1, observations.shape[-1])
+    starts = []
+    run_start = 0
+    for index in np.flatnonzero(~pair):
+        starts.extend(range(run_start, index - sequence_length + 1, sequence_length))
+        run_start = index + 1
+    starts.extend(range(run_start, len(pair) - sequence_length + 1, sequence_length))
+    if not starts:
+        return _empty_sequences(sequence_length)
+
+    sequence_indices = np.asarray(starts)[:, None] + np.arange(sequence_length)
+    observation = observations[sequence_indices].transpose(0, 2, 1, 3)
+    next_observation = observations[sequence_indices + 1].transpose(0, 2, 1, 3)
+    observation = observation.reshape(-1, sequence_length, observations.shape[-1])
+    next_observation = next_observation.reshape(
+        -1, sequence_length, observations.shape[-1]
+    )
     return observation, next_observation
 
 
-def _empty_pairs() -> tuple[np.ndarray, np.ndarray]:
-    empty = np.empty((0, 119), dtype=np.float32)
+def _empty_sequences(sequence_length: int) -> tuple[np.ndarray, np.ndarray]:
+    empty = np.empty((0, sequence_length, 119), dtype=np.float32)
     return empty, empty.copy()
 
 
@@ -197,6 +212,7 @@ def write_expert_shard(
     next_observation: np.ndarray,
     replay_id:        str,
     frameskip:        int,
+    sequence_length:  int,
 ) -> None:
     temporary_path: Path | None = None
 
@@ -214,6 +230,7 @@ def write_expert_shard(
                 next_obs=next_observation,
                 replay_id=np.asarray(replay_id),
                 frameskip=np.asarray(frameskip, dtype=np.int64),
+                sequence_length=np.asarray(sequence_length, dtype=np.int64),
                 schema_version=np.asarray(EXPERT_SCHEMA_VERSION, dtype=np.int64),
             )
         os.replace(temporary_path, path)
@@ -224,10 +241,11 @@ def write_expert_shard(
 
 
 def build_expert_dataset(
-    source:      Path,
-    replay_ids:  list[str],
-    frameskip:   int,
-    batch_size:  int,
+    source:          Path,
+    replay_ids:      list[str],
+    frameskip:       int,
+    sequence_length: int,
+    batch_size:      int,
 ) -> Path:
     root = source / "expert_dataset"
     shards = root / "shards"
@@ -237,10 +255,11 @@ def build_expert_dataset(
     try:
         for index, replay_id in enumerate(replay_ids, start=1):
             shard = shards / f"{replay_id}.npz"
-            if not _valid_expert_shard(shard, frameskip):
+            if not _valid_expert_shard(shard, frameskip, sequence_length):
                 observation, next_observation = parse_expert_replay(
                     source / "replays" / f"{replay_id}.replay",
                     frameskip,
+                    sequence_length,
                     encoder,
                 )
                 write_expert_shard(
@@ -249,6 +268,7 @@ def build_expert_dataset(
                     next_observation,
                     replay_id,
                     frameskip,
+                    sequence_length,
                 )
             print(f"Expert replay {index}/{len(replay_ids)}: {replay_id}")
     finally:
@@ -267,13 +287,13 @@ def build_expert_dataset(
         directory / "observation.npy",
         mode="w+",
         dtype=np.float32,
-        shape=(total, 119),
+        shape=(total, sequence_length, 119),
     )
     next_obs = np.lib.format.open_memmap(
         directory / "next_obs.npy",
         mode="w+",
         dtype=np.float32,
-        shape=(total, 119),
+        shape=(total, sequence_length, 119),
     )
 
     offset = 0
@@ -292,8 +312,9 @@ def build_expert_dataset(
         "frameskip":              frameskip,
         "physics_hz":             PHYSICS_HZ,
         "sample_hz":              PHYSICS_HZ / frameskip,
+        "sequence_length":        sequence_length,
         "observation_dim":        119,
-        "pair_count":             total,
+        "sequence_count":         total,
         "goal_buffer_seconds":    5.0,
         "live_gameplay_only":     True,
         "demoed_states_removed": True,
@@ -304,7 +325,11 @@ def build_expert_dataset(
     return directory
 
 
-def _valid_expert_shard(path: Path, frameskip: int) -> bool:
+def _valid_expert_shard(
+    path: Path,
+    frameskip: int,
+    sequence_length: int,
+) -> bool:
     if not path.is_file():
         return False
     try:
@@ -312,23 +337,29 @@ def _valid_expert_shard(path: Path, frameskip: int) -> bool:
             return (
                 int(shard["schema_version"]) == EXPERT_SCHEMA_VERSION
                 and int(shard["frameskip"]) == frameskip
+                and int(shard["sequence_length"]) == sequence_length
                 and shard["observation"].dtype == np.float32
                 and shard["observation"].shape == shard["next_obs"].shape
-                and shard["observation"].shape[1:] == (119,)
+                and shard["observation"].shape[1:] == (sequence_length, 119)
             )
     except (KeyError, OSError, ValueError):
         return False
 
 
 def load_expert_dataset(
-    root:      Path,
-    frameskip: int,
+    root:            Path,
+    frameskip:       int,
+    sequence_length: int,
 ) -> TensorDataset:
     generation = (root / "CURRENT").read_text().strip()
     directory = root / generation
     metadata = json.loads((directory / "metadata.json").read_text())
     if metadata.get("frameskip") != frameskip:
         raise ValueError("Expert dataset frameskip does not match the environment")
+    if metadata.get("schema_version") != EXPERT_SCHEMA_VERSION:
+        raise ValueError("Expert dataset schema is out of date; rebuild it")
+    if metadata.get("sequence_length") != sequence_length:
+        raise ValueError("Expert dataset sequence length does not match training")
     observation = torch.from_numpy(
         np.load(directory / "observation.npy", mmap_mode="c", allow_pickle=False)
     )
@@ -346,10 +377,11 @@ def load_expert_dataset(
 
 
 def build_split(
-    source:       Path,
-    expert_count: int,
-    frameskip:    int,
-    batch_size:   int,
+    source:          Path,
+    expert_count:    int,
+    frameskip:       int,
+    sequence_length: int,
+    batch_size:      int,
 ) -> None:
     manifest = ReplayManifest(source / "manifest.sqlite3")
     try:
@@ -360,13 +392,16 @@ def build_split(
     split = {
         "salt":        SPLIT_SALT.decode(errors="ignore").rstrip("\0"),
         "frameskip":   frameskip,
+        "sequence_length": sequence_length,
         "expert_ids":  expert_ids,
         "reset_ids":   reset_ids,
     }
     (source / "split.json").write_text(json.dumps(split, indent=2) + "\n")
 
     build_dataset(source, reset_ids, dataset_name="reset_dataset")
-    directory = build_expert_dataset(source, expert_ids, frameskip, batch_size)
+    directory = build_expert_dataset(
+        source, expert_ids, frameskip, sequence_length, batch_size
+    )
     print(f"Reset replays: {len(reset_ids)}")
     print(f"Expert replays: {len(expert_ids)}")
     print(f"Expert dataset: {directory}")
@@ -383,18 +418,25 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--expert-count", type=int, default=512)
     parser.add_argument("--frameskip", type=int, default=8)
+    parser.add_argument("--sequence-length", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=4096)
     return parser.parse_args()
 
 
 def main() -> None:
     arguments = parse_arguments()
-    if min(arguments.expert_count, arguments.frameskip, arguments.batch_size) < 1:
-        raise ValueError("counts and frameskip must be positive")
+    if min(
+        arguments.expert_count,
+        arguments.frameskip,
+        arguments.sequence_length,
+        arguments.batch_size,
+    ) < 1:
+        raise ValueError("counts, frameskip, and sequence length must be positive")
     build_split(
         arguments.source,
         arguments.expert_count,
         arguments.frameskip,
+        arguments.sequence_length,
         arguments.batch_size,
     )
 

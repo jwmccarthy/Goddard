@@ -26,6 +26,7 @@ from jarl.learn import (
     OptimizerStep,
     PPOConfig,
     PPOLoss,
+    TransformRollout,
     Update,
 )
 from jarl.log.logger import Logger
@@ -45,9 +46,15 @@ from jarl.runtime import (
 )
 from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
-from jarl.transform import GAE, TeamSpirit
+from jarl.transform import GAE
 
-from rewards import SeerReward
+from imitation import (
+    SequenceDiscriminator,
+    SequenceDiscriminatorReward,
+    SequenceGAIFOLoss,
+    SequenceGAIFOMinibatches,
+)
+from imitation_dataset import load_expert_dataset
 from replay_states import load_replay_dataset
 
 
@@ -78,15 +85,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--trueskill-simulations",      type=int,   default=64)
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
     parser.add_argument("--trueskill-draw-probability", type=float, default=0.9)
-    parser.add_argument("--team-spirit",                type=float, default=1.0)
-    parser.add_argument("--reward-scale",               type=float, default=1.0)
-    parser.add_argument("--goal-score-weight",          type=float, default=1.25)
-    parser.add_argument("--goal-score-weight-end",      type=float, default=1.45)
-    parser.add_argument(
-        "--normalize-rewards",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument("--discount-half-life",         type=float, default=10.0)
     parser.add_argument("--discount-half-life-end",     type=float, default=20.0)
     parser.add_argument(
@@ -103,7 +101,16 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         default=Path("data/ballchasing-ssl-1v1/reset_dataset"),
     )
+    parser.add_argument(
+        "--expert-dataset",
+        type=Path,
+        default=Path("data/ballchasing-ssl-1v1/expert_dataset"),
+    )
     parser.add_argument("--replay-reset-probability",   type=float, default=0.7)
+    parser.add_argument("--discriminator-batch-size",   type=int,   default=2048)
+    parser.add_argument("--discriminator-epochs",       type=int,   default=2)
+    parser.add_argument("--discriminator-learning-rate", type=float, default=3e-4)
+    parser.add_argument("--discriminator-noise-std",    type=float, default=0.01)
     parser.add_argument(
         "--normalize",
         action=argparse.BooleanOptionalAction,
@@ -128,11 +135,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "minibatch-size":         arguments.minibatch_size,
         "learning-rate":          arguments.learning_rate,
         "epochs":                 arguments.epochs,
-        "reward-scale":           arguments.reward_scale,
         "discount-half-life":     arguments.discount_half_life,
         "discount-half-life-end": arguments.discount_half_life_end,
-        "goal-score-weight":      arguments.goal_score_weight,
-        "goal-score-weight-end":  arguments.goal_score_weight_end,
         "gae-lambda":             arguments.gae_lambda,
         "snapshot-interval":      arguments.snapshot_interval,
         "opponent-pool-size":     arguments.opponent_pool_size,
@@ -140,6 +144,9 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "trueskill-interval":     arguments.trueskill_interval,
         "trueskill-simulations":  arguments.trueskill_simulations,
         "trueskill-opponents":    arguments.trueskill_opponents,
+        "discriminator-batch-size": arguments.discriminator_batch_size,
+        "discriminator-epochs": arguments.discriminator_epochs,
+        "discriminator-learning-rate": arguments.discriminator_learning_rate,
     }
     invalid = [
         name
@@ -160,10 +167,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         0.0 <= arguments.self_play_current <= 1.0
     ):
         raise ValueError("self-play-current must be between zero and one")
-    if not math.isfinite(arguments.team_spirit) or not (
-        0.0 <= arguments.team_spirit <= 1.0
-    ):
-        raise ValueError("team-spirit must be between zero and one")
     if (
         not math.isfinite(arguments.entropy_coef)
         or not math.isfinite(arguments.entropy_coef_end)
@@ -179,6 +182,11 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         0.0 <= arguments.replay_reset_probability <= 1.0
     ):
         raise ValueError("replay-reset-probability must be between zero and one")
+    if (
+        not math.isfinite(arguments.discriminator_noise_std)
+        or arguments.discriminator_noise_std < 0
+    ):
+        raise ValueError("discriminator-noise-std cannot be negative")
     if not math.isfinite(arguments.trueskill_draw_probability) or not (
         0.0 <= arguments.trueskill_draw_probability < 1.0
     ):
@@ -193,6 +201,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("The replay dataset currently supports only 1v1 training")
     if not arguments.replay_dataset.is_dir():
         raise ValueError(f"Replay dataset does not exist: {arguments.replay_dataset}")
+    if not arguments.expert_dataset.is_dir():
+        raise ValueError(f"Expert dataset does not exist: {arguments.expert_dataset}")
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
 
@@ -234,7 +244,8 @@ def build_ppo(
     environment: CARLTorchVectorEnv,
     policy,
     value_function,
-    reward_function: SeerReward,
+    discriminator: SequenceDiscriminator,
+    expert_dataset,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler]:
@@ -284,13 +295,33 @@ def build_ppo(
         ),
     )
 
+    discriminator_optimizer = Adam(
+        discriminator.parameters(), lr=arguments.discriminator_learning_rate
+    )
+    discriminator_update = Update(
+        transforms=(),
+        sampler=SequenceGAIFOMinibatches(
+            expert_dataset,
+            sequence_length=arguments.sequence_length,
+            batch_size=arguments.discriminator_batch_size,
+            epochs=arguments.discriminator_epochs,
+        ),
+        loss=SequenceGAIFOLoss(discriminator),
+        optimizer_step=OptimizerStep(discriminator, discriminator_optimizer),
+        section="Discriminator",
+    )
+
     policy_optimizer = Adam(policy.parameters(), lr=arguments.learning_rate)
     value_optimizer = Adam(value_function.parameters(), lr=arguments.learning_rate)
     actions_per_second = 120.0 / arguments.frameskip
     initial_gamma = arguments.gamma or 0.5 ** (
         1.0 / (actions_per_second * arguments.discount_half_life)
     )
-    gae = GAE(gamma=initial_gamma, lambda_=arguments.gae_lambda)
+    gae = GAE(
+        gamma=initial_gamma,
+        lambda_=arguments.gae_lambda,
+        reward_field="imitation_reward",
+    )
     ppo_loss = PPOLoss(
         policy,
         value_function,
@@ -298,11 +329,6 @@ def build_ppo(
     )
     update = Update(
         transforms=(
-            TeamSpirit(
-                num_matches=environment.n_sim,
-                team_sizes=(arguments.n_blue, arguments.n_orange),
-                spirit=arguments.team_spirit,
-            ),
             gae,
         ),
         sampler=RecurrentRolloutMinibatches(
@@ -355,11 +381,6 @@ def build_ppo(
     else:
         half_life = None
         gamma = ConstantSchedule(arguments.gamma)
-    goal_score_weight = LinearSchedule(
-        arguments.goal_score_weight,
-        arguments.goal_score_weight_end,
-    )
-
     def set_learning_rate(value: float) -> None:
         for optimizer in (policy_optimizer, value_optimizer):
             for parameter_group in optimizer.param_groups:
@@ -378,23 +399,25 @@ def build_ppo(
             ScheduledValue.metric("discount_half_life", half_life)
         )
 
-    scheduled_values.extend(
-        (
-            ScheduledValue.attribute(
-                "gamma",
-                gae,
-                "gamma",
-                gamma,
-            ),
-            ScheduledValue(
-                "goal_score_weight",
-                goal_score_weight,
-                reward_function.set_goal_scored_weight,
-            ),
+    scheduled_values.append(
+        ScheduledValue.attribute(
+            "gamma",
+            gae,
+            "gamma",
+            gamma,
         )
     )
     value_scheduler = ValueScheduler(*scheduled_values)
-    return runner, rollout, Algorithm(update), value_scheduler
+    return runner, rollout, Algorithm(
+        discriminator_update,
+        TransformRollout(
+            SequenceDiscriminatorReward(
+                discriminator,
+                sequence_length=arguments.sequence_length,
+            )
+        ),
+        update,
+    ), value_scheduler
 
 
 def main() -> None:
@@ -416,6 +439,11 @@ def main() -> None:
         probability=arguments.replay_reset_probability,
         seed=arguments.seed,
     )
+    expert_dataset = load_expert_dataset(
+        arguments.expert_dataset,
+        arguments.frameskip,
+        arguments.sequence_length,
+    )
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=arguments.n_blue,
@@ -424,17 +452,8 @@ def main() -> None:
         frameskip=arguments.frameskip,
         max_ticks=arguments.max_ticks,
         synchronize=False,
-        reward_scale=arguments.reward_scale,
         reset_state_provider=reset_sampler,
         normalize=arguments.normalize,
-    )
-    reward_function = environment.register_reward(
-        SeerReward(
-            n_blue=arguments.n_blue,
-            n_orange=arguments.n_orange,
-            normalize=arguments.normalize_rewards,
-            log_diagnostics=True,
-        )
     )
     evaluator = None
     try:
@@ -444,11 +463,16 @@ def main() -> None:
                 f"({environment.n_envs:,} actor timesteps)"
             )
         policy, value_function = build_policy_and_value(environment, arguments)
+        discriminator = SequenceDiscriminator(
+            hidden_size=arguments.hidden_size,
+            noise_std=arguments.discriminator_noise_std,
+        ).to(environment.device)
         runner, rollout, ppo, value_scheduler = build_ppo(
             environment,
             policy,
             value_function,
-            reward_function,
+            discriminator,
+            expert_dataset,
             arguments,
             checkpoint_dir,
         )
@@ -493,6 +517,9 @@ def main() -> None:
         )
         trainer.run(arguments.total_timesteps)
         torch.save(policy.state_dict(), checkpoint_dir / "actor_critic_final.pt")
+        torch.save(
+            discriminator.state_dict(), checkpoint_dir / "discriminator_final.pt"
+        )
     finally:
         if evaluator is not None:
             evaluator.close()
