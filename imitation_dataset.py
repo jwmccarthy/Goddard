@@ -23,13 +23,12 @@ from replay_dataset import (
 from replay_states import (
     _load_state_tensors,
     _resolve_columns,
-    _validate_and_select_frames,
 )
 
 
 PHYSICS_HZ = 120
 SPLIT_SALT = b"goddard-replay-split-v1\0"
-EXPERT_SCHEMA_VERSION = 5
+EXPERT_SCHEMA_VERSION = 6
 EXPERT_GLOBAL_FEATURES = [
     *GLOBAL_FEATURES,
     "CurrentTime",
@@ -154,13 +153,29 @@ def parse_expert_replay(
     live_game_state = states[counts.argmax()]
     allowed &= game_state == live_game_state
     state_columns = _resolve_columns(columns)
-    valid_indices = _validate_and_select_frames(frames, state_columns)
-    valid_indices = valid_indices[allowed[valid_indices]]
+    valid_indices = np.flatnonzero(allowed)
+
+    selected = frames[valid_indices]
+    if not np.isfinite(selected).all():
+        raise ValueError("Expert replay contains non-finite states")
+    raw_boost = selected[:, state_columns.car_boost]
+    if (raw_boost < 0).any() or (raw_boost > 255).any():
+        raise ValueError("Expert replay boost values must be between 0 and 255")
 
     demolished = frames[np.ix_(valid_indices, state_columns.car_demolished_by)]
+    demolition_valid = np.isin(demolished[:, 0], (-1, 1))
+    demolition_valid &= np.isin(demolished[:, 1], (-1, 0))
+    if not demolition_valid.all():
+        raise ValueError("Expert replay demolition values are invalid")
     valid_indices = valid_indices[(demolished < 0).all(axis=1)]
     if len(valid_indices) <= sequence_length:
         return _empty_sequences(sequence_length)
+
+    rotations = frames[np.ix_(valid_indices, state_columns.car_rotation)].reshape(
+        -1, 2, 4
+    )
+    if not np.allclose(np.linalg.vector_norm(rotations, axis=-1), 1.0, atol=1e-3):
+        raise ValueError("Expert replay car quaternions must have unit length")
 
     states = TensorDataset(
         TensorBatch(
