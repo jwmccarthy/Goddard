@@ -1,6 +1,6 @@
 # Goddard
 
-Goddard trains a recurrent PPO Rocket League policy in CARL with JARL. Training uses 1v1 self play, sequence-level GAIfO, and expert replay starting states.
+Goddard trains recurrent PPO Rocket League policies in CARL with JARL. It supports 1v1 self play with either the Seer reward or sequence-level GAIfO.
 
 ## Requirements
 
@@ -28,13 +28,13 @@ uv run python replay_dataset.py parse --fps 10
 
 Parsing keeps live gameplay states and removes states that occur less than five seconds before a goal.
 
-Split the replays into reset states and frameskip-matched GAIfO observation sequences with:
+Split the replay IDs and reparse the expert half directly from the raw replay files into frameskip-matched GAIfO observation sequences with:
 
 ```bash
 uv run python imitation_dataset.py --expert-count 512 --frameskip 8 --sequence-length 16
 ```
 
-Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `reset_dataset/CURRENT` names the active reset generation. `expert_dataset/CURRENT` names the active observation sequence generation.
+Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `reset_dataset/CURRENT` names the active sampled starting-position generation. `expert_dataset/CURRENT` names the active contiguous observation-sequence generation. GAIfO only reads `expert_dataset`; it never forms sequences from `reset_dataset`.
 
 The collector uses the `babytowniv-rl-dataset/1.0` user agent and limits requests to five per second. The download manifest stores file hashes and supports resumed runs.
 
@@ -46,9 +46,9 @@ Start training with:
 uv run python train.py --total-timesteps 100000000
 ```
 
-Training loads the reset dataset onto `cuda:0`. By default, 70 percent of completed simulations receive a conservative grounded replay state and the rest keep their normal kickoff state. Configure this with `--replay-reset-probability`. PPO uses rewards from a recurrent GAIfO discriminator trained to classify complete 16-transition policy and expert sequences. TrueSkill evaluation uses normal kickoff states.
+Training loads the reset dataset onto `cuda:0`. By default, 70 percent of completed simulations receive a conservative grounded replay state and the rest keep their normal kickoff state. Configure this with `--replay-reset-probability`. PPO uses the normalized zero sum Seer reward. TrueSkill evaluation uses normal kickoff states.
 
-CARL observations are normalized by physical limits by default; use `--no-normalize` to retain raw observations. Actor and critic recurrent networks are independent. Learning rate, entropy coefficient, and credit half-life follow linear schedules over actual learner transitions.
+CARL observations are normalized by physical limits by default; use `--no-normalize` to retain raw observations. Actor and critic recurrent networks are independent. Learning rate, entropy coefficient, reward goal weight, and credit half-life follow linear schedules over actual learner transitions. The Seer-compatible defaults use `1e-5 -> 5e-6`, `0.01 -> 0.005`, `1.25 -> 1.45`, and `10s -> 20s`, respectively.
 
 The default recurrent setup uses 512-step rollouts, 16-step sequences, 32 PPO epochs, and episodes up to 120 seconds. Every schedule is recorded under `Schedule/*` in TensorBoard. Passing `--gamma` replaces the credit half-life schedule with a constant discount.
 
@@ -62,6 +62,31 @@ Run a small training check with:
 
 ```bash
 uv run python train.py \
+    --total-timesteps 256 \
+    --num-simulations 16 \
+    --rollout-steps 8 \
+    --sequence-length 4 \
+    --hidden-size 32 \
+    --minibatch-size 256 \
+    --self-play-current 1.0
+```
+
+Use `uv run python train.py --help` for all options.
+
+## GAIfO Training
+
+Train with the sequence-level imitation reward using:
+
+```bash
+uv run python gaifo.py --total-timesteps 100000000
+```
+
+`gaifo.py` requires an expert dataset built with the same frameskip and sequence length. Each expert sequence comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz), using replay IDs disjoint from the sampled starting-position dataset. Its recurrent discriminator classifies complete policy and expert sequences rather than individual transitions. The negative discriminator logit is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
+
+Run a small GAIfO training check with:
+
+```bash
+uv run python gaifo.py \
     --total-timesteps 512 \
     --num-simulations 16 \
     --rollout-steps 16 \
@@ -72,7 +97,7 @@ uv run python train.py \
     --self-play-current 1.0
 ```
 
-Use `uv run python train.py --help` for all options.
+Use `uv run python gaifo.py --help` for all GAIfO options.
 
 ## Checkpoint Viewer
 
@@ -90,4 +115,4 @@ The page loads Three.js from `unpkg.com`, so the browser needs internet access.
 
 ## Reward
 
-The discriminator projects each observation to ball, controlled-car, and opponent features, encodes every transition in a sequence with a GRU, and classifies the final sequence representation. Its negative logit is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
+`SeerReward` combines 16 Rocket League reward terms. It converts the result to zero sum team rewards and normalizes it with running statistics unless `--no-normalize-rewards` is passed. TensorBoard records per-component episode means and raw, zero-sum, and normalized aggregate means and RMS scales.
