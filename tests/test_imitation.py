@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from jarl.data import TensorBatch, TensorDataset
 
@@ -103,10 +104,10 @@ class SequenceGAIFOTests(unittest.TestCase):
 
         reward = transform(batch, None)["imitation_reward"]
 
-        torch.testing.assert_close(
-            reward,
-            torch.tensor([[0.0, 0.0], [-10.0, -12.0], [0.0, 0.0], [-50.0, 0.0]]),
-        )
+        expected = torch.zeros(4, 2)
+        expected[1] = F.softplus(torch.tensor([-10.0, -12.0]))
+        expected[3, 0] = F.softplus(torch.tensor(-50.0))
+        torch.testing.assert_close(reward, expected)
 
     def test_reward_inference_respects_batch_size(self):
         discriminator = SumDiscriminator()

@@ -207,7 +207,7 @@ class SequenceDiscriminatorReward:
                         next_obs[chunk, :, environment],
                     )
                 )
-                sequence_reward[chunk, environment] = -score
+                sequence_reward[chunk, environment] = F.softplus(-score)
         finally:
             self.discriminator.train(was_training)
 
