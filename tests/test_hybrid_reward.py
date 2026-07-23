@@ -1,15 +1,22 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
 from jarl.data import TensorBatch
 
+from gaifo import parse_arguments
 from imitation import AddImitationReward, EveryNUpdates
 from rewards import SeerReward
 
 
 class HybridRewardTests(unittest.TestCase):
+    def test_seer_reward_is_disabled_by_default(self):
+        with patch("sys.argv", ["gaifo.py"]):
+            arguments = parse_arguments()
+
+        self.assertFalse(arguments.seer_reward)
+
     def test_periodic_stage_runs_first_and_every_n_updates(self):
         stage = Mock()
         stage.run.side_effect = lambda experience: (experience, {"ran": {}})

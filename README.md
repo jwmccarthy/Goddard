@@ -83,7 +83,7 @@ uv run python gaifo.py --total-timesteps 100000000
 
 `gaifo.py` requires an expert dataset whose history length is at least the configured training sequence length. Each expert history comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz), using replay IDs disjoint from the sampled starting-position dataset. Training randomly crops each longer expert history to match `--sequence-length`, so one 64-observation artifact supports 16-, 32-, and 64-observation discriminators. The recurrent discriminator classifies complete observation sequences rather than explicit transition pairs. The discriminator reward `softplus(-logit)` is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
 
-GAIfO uses the full imitation reward throughout training. It begins with the default Seer reward components and linearly anneals all non-goal shaping to zero over total training timesteps; goal scoring remains active. Configure the initial shaping strength with `--shaping-coef`.
+GAIfO uses full-strength imitation plus CARL's goal reward by default. Pass `--seer-reward` to add the default Seer components; all non-goal shaping then linearly anneals to zero over total training timesteps while goal scoring remains active. Configure its initial strength with `--shaping-coef`.
 
 PPO updates every rollout. Configure discriminator training cadence with `--discriminator-update-interval`; `1` trains it every PPO update, while `N` trains it on the first update and every `N` updates thereafter. Reward inference still runs every rollout using the latest discriminator.
 

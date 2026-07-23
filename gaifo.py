@@ -91,6 +91,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--reward-scale",                    type=float, default=1.0)
     parser.add_argument("--goal-score-weight",               type=float, default=1.25)
     parser.add_argument("--shaping-coef",                    type=float, default=1.0)
+    parser.add_argument("--seer-reward", action="store_true")
     parser.add_argument(
         "--normalize-rewards",
         action=argparse.BooleanOptionalAction,
@@ -269,7 +270,7 @@ def build_ppo(
     value_function,
     discriminator: SequenceDiscriminator,
     expert_dataset,
-    reward_function: SeerReward,
+    reward_function: SeerReward | None,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler]:
@@ -390,7 +391,6 @@ def build_ppo(
         arguments.entropy_coef,
         arguments.entropy_coef_end,
     )
-    shaping_coef = LinearSchedule(arguments.shaping_coef, 0.0)
     if arguments.gamma is None:
         half_life = LinearSchedule(
             arguments.discount_half_life,
@@ -415,12 +415,15 @@ def build_ppo(
     scheduled_values = [
         ScheduledValue("learning_rate", learning_rate, set_learning_rate),
         ScheduledValue("entropy_coef", entropy_coef, set_entropy_coef),
-        ScheduledValue(
-            "shaping_coef",
-            shaping_coef,
-            reward_function.set_shaping_scale,
-        ),
     ]
+    if reward_function is not None:
+        scheduled_values.append(
+            ScheduledValue(
+                "shaping_coef",
+                LinearSchedule(arguments.shaping_coef, 0.0),
+                reward_function.set_shaping_scale,
+            )
+        )
 
     if half_life is not None:
         scheduled_values.append(
@@ -490,15 +493,17 @@ def main() -> None:
         reset_state_provider=reset_sampler,
         normalize=arguments.normalize,
     )
-    reward_function = environment.register_reward(
-        SeerReward(
-            n_blue=arguments.n_blue,
-            n_orange=arguments.n_orange,
-            normalize=arguments.normalize_rewards,
-            log_diagnostics=True,
+    reward_function = None
+    if arguments.seer_reward:
+        reward_function = environment.register_reward(
+            SeerReward(
+                n_blue=arguments.n_blue,
+                n_orange=arguments.n_orange,
+                normalize=arguments.normalize_rewards,
+                log_diagnostics=True,
+            )
         )
-    )
-    reward_function.set_goal_scored_weight(arguments.goal_score_weight)
+        reward_function.set_goal_scored_weight(arguments.goal_score_weight)
     evaluator = None
     try:
         if arguments.total_timesteps < environment.n_envs:
