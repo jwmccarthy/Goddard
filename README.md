@@ -81,7 +81,7 @@ Train with the sequence-level imitation reward using:
 uv run python gaifo.py --total-timesteps 100000000
 ```
 
-`gaifo.py` requires an expert dataset built with the same frameskip and sequence length. Each expert sequence comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz), using replay IDs disjoint from the sampled starting-position dataset. Its recurrent discriminator classifies complete policy and expert sequences rather than individual transitions. The discriminator reward `softplus(-logit)` is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
+`gaifo.py` requires an expert dataset built with the same frameskip and sequence length. Each expert sequence comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz), using replay IDs disjoint from the sampled starting-position dataset. Its recurrent discriminator classifies complete observation sequences rather than explicit transition pairs. The discriminator reward `softplus(-logit)` is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
 
 Run a small GAIfO training check with:
 

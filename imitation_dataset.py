@@ -378,14 +378,10 @@ def load_expert_dataset(
     observation = torch.from_numpy(
         np.load(directory / "observation.npy", mmap_mode="c", allow_pickle=False)
     )
-    next_obs = torch.from_numpy(
-        np.load(directory / "next_obs.npy", mmap_mode="c", allow_pickle=False)
-    )
     return TensorDataset(
         TensorBatch(
             {
                 "observation": observation,
-                "next_obs":    next_obs,
             }
         )
     )

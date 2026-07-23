@@ -37,7 +37,7 @@ class SequenceDiscriminator(nn.Module):
         if noise_std < 0:
             raise ValueError("noise standard deviation cannot be negative")
         self.noise_std = noise_std
-        self.recurrent = nn.GRU(82, hidden_size, batch_first=True)
+        self.recurrent = nn.GRU(41, hidden_size, batch_first=True)
         self.output = nn.Linear(hidden_size, 1)
 
     def project(self, observation: torch.Tensor) -> torch.Tensor:
@@ -46,17 +46,11 @@ class SequenceDiscriminator(nn.Module):
         opponent = observation[..., 30:46]
         return torch.cat((ball, own_car, opponent), dim=-1)
 
-    def forward(self, sequence) -> torch.Tensor:
-        observation, next_observation = sequence
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
         observation = self.project(observation)
-        next_observation = self.project(next_observation)
         if self.training and self.noise_std:
             observation = observation + torch.randn_like(observation) * self.noise_std
-            next_observation = (
-                next_observation + torch.randn_like(next_observation) * self.noise_std
-            )
-        transitions = torch.cat((observation, next_observation), dim=-1)
-        _, final_state = self.recurrent(transitions)
+        _, final_state = self.recurrent(observation)
         return self.output(final_state[-1]).squeeze(-1)
 
 
@@ -77,7 +71,6 @@ class SequenceGAIFOMinibatches:
 
     def __call__(self, rollout: TensorBatch):
         observation = _sequence_grid(rollout["observation"], self.sequence_length)
-        next_obs = _sequence_grid(rollout["next_obs"], self.sequence_length)
         valid = torch.ones(
             observation.shape[0],
             observation.shape[2],
@@ -110,7 +103,6 @@ class SequenceGAIFOMinibatches:
                     agent_sequences = TensorBatch(
                         {
                             "observation": observation[chunk, :, environment],
-                            "next_obs": next_obs[chunk, :, environment],
                         }
                     )
                     yield self._build_batch(agent_sequences)
@@ -121,9 +113,6 @@ class SequenceGAIFOMinibatches:
             {
                 "observation": torch.cat(
                     (agent_sequences["observation"], expert["observation"])
-                ),
-                "next_obs": torch.cat(
-                    (agent_sequences["next_obs"], expert["next_obs"])
                 ),
                 "is_agent": torch.cat(
                     (
@@ -140,7 +129,7 @@ class SequenceGAIFOLoss:
         self.discriminator = discriminator
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
-        score = self.discriminator((batch["observation"], batch["next_obs"]))
+        score = self.discriminator(batch["observation"])
         target = batch["is_agent"]
         loss = F.binary_cross_entropy_with_logits(score, target)
         is_agent = target.bool()
@@ -172,7 +161,6 @@ class SequenceDiscriminatorReward:
     @torch.no_grad()
     def __call__(self, batch: TensorBatch, context) -> TensorBatch:
         observation = _sequence_grid(batch["observation"], self.sequence_length)
-        next_obs = _sequence_grid(batch["next_obs"], self.sequence_length)
         valid = torch.ones(
             observation.shape[0],
             observation.shape[2],
@@ -201,12 +189,7 @@ class SequenceDiscriminatorReward:
             for start in range(0, len(coordinates), self.batch_size):
                 selected = coordinates[start : start + self.batch_size]
                 chunk, environment = selected.unbind(dim=1)
-                score = self.discriminator(
-                    (
-                        observation[chunk, :, environment],
-                        next_obs[chunk, :, environment],
-                    )
-                )
+                score = self.discriminator(observation[chunk, :, environment])
                 sequence_reward[chunk, environment] = F.softplus(-score)
         finally:
             self.discriminator.train(was_training)

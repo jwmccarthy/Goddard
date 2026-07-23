@@ -20,8 +20,7 @@ class SumDiscriminator(nn.Module):
         super().__init__()
         self.batch_sizes = []
 
-    def forward(self, sequence):
-        observation, _ = sequence
+    def forward(self, observation):
         self.batch_sizes.append(len(observation))
         return observation[..., 0].sum(dim=1)
 
@@ -49,7 +48,7 @@ class SequenceGAIFOTests(unittest.TestCase):
         discriminator = SequenceDiscriminator(hidden_size=8, noise_std=0.0)
         observation = torch.randn(3, 4, 119)
 
-        score = discriminator((observation, observation))
+        score = discriminator(observation)
 
         self.assertEqual(score.shape, (3,))
 
@@ -70,7 +69,6 @@ class SequenceGAIFOTests(unittest.TestCase):
             TensorBatch(
                 {
                     "observation": torch.randn(3, 2, 119),
-                    "next_obs": torch.randn(3, 2, 119),
                 }
             )
         )
@@ -81,6 +79,7 @@ class SequenceGAIFOTests(unittest.TestCase):
         batch = next(iter(sampler(rollout)))
 
         self.assertEqual(batch["observation"].shape, (4, 2, 119))
+        self.assertNotIn("next_obs", batch)
         torch.testing.assert_close(
             batch["is_agent"], torch.tensor([1.0, 1.0, 0.0, 0.0])
         )
