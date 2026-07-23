@@ -226,6 +226,62 @@ def print_feature_ranking(expert: torch.Tensor, agent: torch.Tensor) -> None:
         )
 
 
+def print_scale_comparison(expert: torch.Tensor, agent: torch.Tensor) -> None:
+    groups = {
+        "ball_position": (slice(0, 3),),
+        "ball_velocity": (slice(3, 6),),
+        "ball_angular_velocity": (slice(6, 9),),
+        "car_position": (slice(9, 12), slice(25, 28)),
+        "car_velocity": (slice(12, 15), slice(28, 31)),
+        "car_angular_velocity": (slice(15, 18), slice(31, 34)),
+        "car_forward": (slice(18, 21), slice(34, 37)),
+        "car_up": (slice(21, 24), slice(37, 40)),
+        "boost": (slice(24, 25), slice(40, 41)),
+    }
+    for name, slices in groups.items():
+        expert_group = torch.cat([expert[..., item] for item in slices], dim=-1)
+        agent_group = torch.cat([agent[..., item] for item in slices], dim=-1)
+        expert_rms = expert_group.square().mean().sqrt()
+        agent_rms = agent_group.square().mean().sqrt()
+        expert_p99 = torch.quantile(expert_group.abs(), 0.99)
+        agent_p99 = torch.quantile(agent_group.abs(), 0.99)
+        print(
+            f"scale={name} expert_rms={expert_rms:.4f} agent_rms={agent_rms:.4f} "
+            f"expert_p99={expert_p99:.4f} agent_p99={agent_p99:.4f}"
+        )
+
+
+def print_orientation_invariants(name: str, observation: torch.Tensor) -> None:
+    forward = torch.cat((observation[..., 18:21], observation[..., 34:37]))
+    up = torch.cat((observation[..., 21:24], observation[..., 37:40]))
+    forward_error = (forward.norm(dim=-1) - 1.0).abs()
+    up_error = (up.norm(dim=-1) - 1.0).abs()
+    orthogonality_error = (forward * up).sum(dim=-1).abs()
+    print(
+        f"orientation={name} forward_error={forward_error.mean():.6f} "
+        f"up_error={up_error.mean():.6f} "
+        f"dot_error={orthogonality_error.mean():.6f}"
+    )
+
+
+def print_integration_fit(
+    name: str,
+    observation: torch.Tensor,
+    position: slice,
+    velocity: slice,
+) -> None:
+    delta = observation[:, 1:, position] - observation[:, :-1, position]
+    midpoint_velocity = 0.5 * (
+        observation[:, 1:, velocity] + observation[:, :-1, velocity]
+    )
+    coefficient = (delta * midpoint_velocity).sum() / midpoint_velocity.square().sum()
+    residual = delta - coefficient * midpoint_velocity
+    print(
+        f"integration={name} coefficient={coefficient:.6f} "
+        f"residual_rms={residual.square().mean().sqrt():.6f}"
+    )
+
+
 def main() -> None:
     arguments = parse_arguments()
     if min(
@@ -296,8 +352,23 @@ def main() -> None:
     expert_frames = expert_dataset.data["observation"].reshape(-1, 119)
     expert_kickoff = expert_frames[kickoff_wait_mask(expert_frames)].float()
     carl_kickoff = carl_kickoff[kickoff_wait_mask(carl_kickoff)]
-    expert = add_noise(project(expert), arguments.noise_std, generator)
-    agent = add_noise(project(agent.float()), arguments.noise_std, generator)
+    expert = project(expert)
+    agent = project(agent.float())
+    print_scale_comparison(expert, agent)
+    print_orientation_invariants("expert", expert)
+    print_orientation_invariants("agent", agent)
+    for domain, observation in (("expert", expert), ("agent", agent)):
+        print_integration_fit(
+            f"{domain}_ball", observation, slice(0, 3), slice(3, 6)
+        )
+        print_integration_fit(
+            f"{domain}_own_car", observation, slice(9, 12), slice(12, 15)
+        )
+        print_integration_fit(
+            f"{domain}_opponent", observation, slice(25, 28), slice(28, 31)
+        )
+    expert = add_noise(expert, arguments.noise_std, generator)
+    agent = add_noise(agent, arguments.noise_std, generator)
     expert_kickoff = add_noise(
         project(expert_kickoff), arguments.noise_std, generator
     )
