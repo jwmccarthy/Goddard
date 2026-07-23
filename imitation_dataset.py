@@ -17,6 +17,7 @@ from replay_dataset import (
     GLOBAL_FEATURES,
     PLAYER_FEATURES,
     ReplayManifest,
+    _live_gameplay_mask,
     _pre_goal_mask,
     build_dataset,
 )
@@ -28,7 +29,7 @@ from replay_states import (
 
 PHYSICS_HZ = 120
 SPLIT_SALT = b"goddard-replay-split-v1\0"
-EXPERT_SCHEMA_VERSION = 7
+EXPERT_SCHEMA_VERSION = 8
 EXPERT_GLOBAL_FEATURES = [
     *GLOBAL_FEATURES,
     "CurrentTime",
@@ -142,16 +143,8 @@ def parse_expert_replay(
     columns = expert_columns()
     replay_data = subtr_actor.get_replay_frames_data(str(replay_path))
     goal_times = [event["time"] for event in replay_data["goal_events"]]
-    allowed = _pre_goal_mask(frames, columns, goal_times)
-    frame_times = frames[:, columns.index("frame time")]
-    precedes_goal = np.zeros(len(frames), dtype=np.bool_)
-    for goal_time in goal_times:
-        precedes_goal |= frame_times <= goal_time - 5.0
-    allowed &= precedes_goal
-    game_state = frames[:, columns.index("game state")]
-    states, counts = np.unique(game_state, return_counts=True)
-    live_game_state = states[counts.argmax()]
-    allowed &= game_state == live_game_state
+    allowed = _live_gameplay_mask(frames, columns, goal_times)
+    allowed &= _pre_goal_mask(frames, columns, goal_times)
     state_columns = _resolve_columns(columns)
     valid_indices = np.flatnonzero(allowed)
 

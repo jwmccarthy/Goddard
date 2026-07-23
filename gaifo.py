@@ -120,7 +120,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--replay-reset-probability",        type=float, default=0.7)
     parser.add_argument("--discriminator-batch-size",        type=int,   default=2048)
-    parser.add_argument("--discriminator-reward-batch-size", type=int, default=4096)
+    parser.add_argument("--discriminator-reward-batch-size", type=int,   default=4096)
     parser.add_argument("--discriminator-update-interval",   type=int,   default=1)
     parser.add_argument("--discriminator-epochs",            type=int,   default=2)
     parser.add_argument("--discriminator-learning-rate",     type=float, default=3e-4)

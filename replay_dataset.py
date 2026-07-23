@@ -690,6 +690,14 @@ def _select_live_gameplay(
     columns:    list[str],
     goal_times: list[float],
 ) -> np.ndarray:
+    return frames[_live_gameplay_mask(frames, columns, goal_times)]
+
+
+def _live_gameplay_mask(
+    frames:     np.ndarray,
+    columns:    list[str],
+    goal_times: list[float],
+) -> np.ndarray:
     frame_times = frames[:, columns.index("frame time")]
     game_state = frames[:, columns.index("game state")]
     candidates = []
@@ -704,7 +712,7 @@ def _select_live_gameplay(
     else:
         states, counts = np.unique(game_state, return_counts=True)
     live_state = states[counts.argmax()]
-    return frames[game_state == live_state]
+    return game_state == live_state
 
 
 def _validate_frame_matrix(
