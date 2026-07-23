@@ -48,6 +48,14 @@ def project(observation: torch.Tensor) -> torch.Tensor:
     )
 
 
+def kickoff_wait_mask(observation: torch.Tensor) -> torch.Tensor:
+    ball_centered = observation[:, :2].abs().amax(dim=1) < 1e-4
+    ball_stationary = observation[:, 3:6].abs().amax(dim=1) < 1e-4
+    own_stationary = observation[:, 12:15].abs().amax(dim=1) < 1e-4
+    opponent_stationary = observation[:, 33:36].abs().amax(dim=1) < 1e-4
+    return ball_centered & ball_stationary & own_stationary & opponent_stationary
+
+
 @torch.inference_mode()
 def collect_policy_sequences(
     environment: CARLTorchVectorEnv,
@@ -230,6 +238,10 @@ def main() -> None:
             arguments.sequence_count,
             arguments.sequence_length,
         )
+        environment.reset_state_provider = None
+        carl_kickoff = torch.cat(
+            [environment.reset().cpu() for _ in range(8)]
+        )
     finally:
         environment.close()
 
@@ -244,8 +256,15 @@ def main() -> None:
         generator=generator,
     )
     expert = expert_dataset.data["observation"][expert_indices].float()
+    expert_frames = expert_dataset.data["observation"].reshape(-1, 119)
+    expert_kickoff = expert_frames[kickoff_wait_mask(expert_frames)].float()
+    carl_kickoff = carl_kickoff[kickoff_wait_mask(carl_kickoff)]
     expert = add_noise(project(expert), arguments.noise_std, generator)
     agent = add_noise(project(agent.float()), arguments.noise_std, generator)
+    expert_kickoff = add_noise(
+        project(expert_kickoff), arguments.noise_std, generator
+    )
+    carl_kickoff = add_noise(project(carl_kickoff), arguments.noise_std, generator)
 
     expert_frame = expert.flatten(0, 1)
     agent_frame = agent.flatten(0, 1)
@@ -277,6 +296,27 @@ def main() -> None:
             device,
         )
         print(f"{name}_accuracy={accuracy:.4f}")
+
+    if min(len(expert_kickoff), len(carl_kickoff)) >= 10:
+        kickoff_accuracy = probe_accuracy(
+            expert_kickoff,
+            carl_kickoff,
+            arguments.probe_steps,
+            arguments.max_probe_examples,
+            generator,
+            device,
+        )
+        print(
+            f"kickoff_frames expert={len(expert_kickoff):,} "
+            f"carl={len(carl_kickoff):,}"
+        )
+        print(f"kickoff_effect {effect_summary(expert_kickoff, carl_kickoff)}")
+        print(f"kickoff_accuracy={kickoff_accuracy:.4f}")
+    else:
+        print(
+            f"kickoff_frames expert={len(expert_kickoff):,} "
+            f"carl={len(carl_kickoff):,} insufficient"
+        )
 
 
 if __name__ == "__main__":
