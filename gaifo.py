@@ -106,11 +106,11 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         default=Path("data/ballchasing-ssl-1v1/expert_dataset"),
     )
-    parser.add_argument("--replay-reset-probability",   type=float, default=0.7)
-    parser.add_argument("--discriminator-batch-size",   type=int,   default=2048)
-    parser.add_argument("--discriminator-epochs",       type=int,   default=2)
+    parser.add_argument("--replay-reset-probability",    type=float, default=0.7)
+    parser.add_argument("--discriminator-batch-size",    type=int,   default=2048)
+    parser.add_argument("--discriminator-epochs",        type=int,   default=2)
     parser.add_argument("--discriminator-learning-rate", type=float, default=3e-4)
-    parser.add_argument("--discriminator-noise-std",    type=float, default=0.01)
+    parser.add_argument("--discriminator-noise-std",     type=float, default=0.01)
     parser.add_argument(
         "--normalize",
         action=argparse.BooleanOptionalAction,
@@ -415,7 +415,9 @@ def build_ppo(
             SequenceDiscriminatorReward(
                 discriminator,
                 sequence_length=arguments.sequence_length,
-            )
+            ),
+            report_fields=("imitation_reward",),
+            section="GAIfO",
         ),
         update,
     ), value_scheduler
@@ -478,6 +480,11 @@ def main() -> None:
             checkpoint_dir,
         )
         logger = Logger(log_dir=str(run_dir))
+        logger.register_progress_metric(
+            "GAIfO",
+            "imitation_reward",
+            format_spec=",.4f",
+        )
 
         def make_evaluation_environment():
             return CARLTorchVectorEnv(
