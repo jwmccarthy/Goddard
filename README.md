@@ -31,7 +31,7 @@ Parsing keeps live gameplay states and removes states that occur less than five 
 Split the replay IDs and reparse the expert half directly from the raw replay files into frameskip-matched GAIfO observation sequences with:
 
 ```bash
-uv run python imitation_dataset.py --expert-count 512 --frameskip 8 --sequence-length 16
+uv run python imitation_dataset.py --expert-count 512 --frameskip 8 --history-length 64
 ```
 
 Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `reset_dataset/CURRENT` names the active sampled starting-position generation. `expert_dataset/CURRENT` names the active contiguous observation-sequence generation. GAIfO only reads `expert_dataset`; it never forms sequences from `reset_dataset`.
@@ -81,7 +81,7 @@ Train with the sequence-level imitation reward using:
 uv run python gaifo.py --total-timesteps 100000000
 ```
 
-`gaifo.py` requires an expert dataset built with the same frameskip and sequence length. Each expert sequence comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz), using replay IDs disjoint from the sampled starting-position dataset. Its recurrent discriminator classifies complete observation sequences rather than explicit transition pairs. The discriminator reward `softplus(-logit)` is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
+`gaifo.py` requires an expert dataset whose history length is at least the configured training sequence length. Each expert history comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz), using replay IDs disjoint from the sampled starting-position dataset. Training randomly crops each longer expert history to match `--sequence-length`, so one 64-observation artifact supports 16-, 32-, and 64-observation discriminators. The recurrent discriminator classifies complete observation sequences rather than explicit transition pairs. The discriminator reward `softplus(-logit)` is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
 
 Run a small GAIfO training check with:
 

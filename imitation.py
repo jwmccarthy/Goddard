@@ -108,11 +108,26 @@ class SequenceGAIFOMinibatches:
                     yield self._build_batch(agent_sequences)
 
     def _build_batch(self, agent_sequences: TensorBatch) -> TensorBatch:
-        expert = self.expert_dataset.sample(self.batch_size).to(agent_sequences.device)
+        expert = self.expert_dataset.sample(self.batch_size)["observation"]
+        history_length = expert.shape[1]
+        if history_length < self.sequence_length:
+            raise ValueError("expert history is shorter than rollout sequences")
+        if history_length > self.sequence_length:
+            starts = torch.randint(
+                history_length - self.sequence_length + 1,
+                (self.batch_size,),
+                device=expert.device,
+            )
+            offsets = torch.arange(self.sequence_length, device=expert.device)
+            expert = expert[
+                torch.arange(self.batch_size, device=expert.device)[:, None],
+                starts[:, None] + offsets,
+            ]
+        expert = expert.to(agent_sequences.device)
         return TensorBatch(
             {
                 "observation": torch.cat(
-                    (agent_sequences["observation"], expert["observation"])
+                    (agent_sequences["observation"], expert)
                 ),
                 "is_agent": torch.cat(
                     (

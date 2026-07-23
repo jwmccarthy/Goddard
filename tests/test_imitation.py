@@ -65,13 +65,9 @@ class SequenceGAIFOTests(unittest.TestCase):
                 "truncated": torch.zeros_like(terminal),
             }
         )
-        expert = TensorDataset(
-            TensorBatch(
-                {
-                    "observation": torch.randn(3, 2, 119),
-                }
-            )
-        )
+        expert_observation = torch.zeros(3, 4, 119)
+        expert_observation[..., 0] = torch.arange(4)
+        expert = TensorDataset(TensorBatch({"observation": expert_observation}))
         sampler = SequenceGAIFOMinibatches(
             expert, sequence_length=2, batch_size=2
         )
@@ -80,6 +76,10 @@ class SequenceGAIFOTests(unittest.TestCase):
 
         self.assertEqual(batch["observation"].shape, (4, 2, 119))
         self.assertNotIn("next_obs", batch)
+        torch.testing.assert_close(
+            batch["observation"][2:, 1, 0] - batch["observation"][2:, 0, 0],
+            torch.ones(2),
+        )
         torch.testing.assert_close(
             batch["is_agent"], torch.tensor([1.0, 1.0, 0.0, 0.0])
         )
