@@ -16,34 +16,34 @@ GOAL_DISTANCE_OFFSET = GOAL_Y - BACK_WALL_Y + BALL_RADIUS
 
 @dataclass(frozen=True)
 class SeerRewardWeights:
-    goal_scored:            float = 1.25
-    boost_difference:       float = 0.1
-    ball_touch:             float = 0.1
-    ball_height:            float = 0.00125
-    ball_velocity:          float = 0.00125
-    demo:                   float = 0.3
-    distance_player_ball:   float = 0.0025
-    distance_ball_goal:     float = 0.0025
-    facing_ball:            float = 0.000625
-    align_ball_goal:        float = 0.0025
-    closest_to_ball:        float = 0.00125
-    touched_last:           float = 0.00125
-    behind_ball:            float = 0.00125
-    velocity_player_ball:   float = 0.00125
-    kickoff:                float = 0.1
-    velocity:               float = 0.000625
-    boost_amount:           float = 0.00125
-    forward_velocity:       float = 0.0015
+    goal_scored:          float = 1.25
+    boost_difference:     float = 0.1
+    ball_touch:           float = 0.1
+    ball_height:          float = 0.00125
+    ball_velocity:        float = 0.00125
+    demo:                 float = 0.3
+    distance_player_ball: float = 0.0025
+    distance_ball_goal:   float = 0.0025
+    facing_ball:          float = 0.000625
+    align_ball_goal:      float = 0.0025
+    closest_to_ball:      float = 0.00125
+    touched_last:         float = 0.00125
+    behind_ball:          float = 0.00125
+    velocity_player_ball: float = 0.00125
+    kickoff:              float = 0.1
+    velocity:             float = 0.000625
+    boost_amount:         float = 0.00125
+    forward_velocity:     float = 0.0015
 
 
 class SeerReward:
     def __init__(
         self,
-        n_blue:    int,
-        n_orange:  int,
-        normalize: bool = True,
+        n_blue:          int,
+        n_orange:        int,
+        normalize:       bool = True,
         log_diagnostics: bool = False,
-        weights:   SeerRewardWeights = SeerRewardWeights(),
+        weights:         SeerRewardWeights = SeerRewardWeights(),
     ) -> None:
         self.n_blue = n_blue
         self.n_orange = n_orange
@@ -208,8 +208,8 @@ class SeerReward:
     @staticmethod
     def _ball_state_rewards(
         ball_position: torch.Tensor,
-        ball_speed: torch.Tensor,
-        touched_last: torch.Tensor,
+        ball_speed:    torch.Tensor,
+        touched_last:  torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         height = (
             (ball_position[..., 2] - BALL_RADIUS)
