@@ -1,0 +1,3 @@
+numpy>=2.0
+torch>=2.7
+rlbot>=2.0.0.beta

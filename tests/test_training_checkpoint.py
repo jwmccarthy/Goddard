@@ -60,6 +60,28 @@ class TrainingCheckpointTests(unittest.TestCase):
         torch.testing.assert_close(target.weight, source.weight)
         torch.testing.assert_close(target.bias, source.bias)
 
+    def test_legacy_value_function_key_is_migrated_to_critic(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                critic = torch.nn.Linear(2, 1)
+                optimizer = torch.optim.Adam(critic.parameters())
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "training_latest.pt"
+                    checkpointer = TrainingCheckpointer(
+                        path,
+                        modules={"critic": critic},
+                        optimizers={"critic": optimizer},
+                    )
+                    checkpointer(SimpleNamespace(clock=Clock()))
+                    state = torch.load(path, weights_only=False)
+                    state["format_version"] = version
+                    for section in ("modules", "optimizers"):
+                        state[section]["value_function"] = state[section].pop("critic")
+                    torch.save(state, path)
+
+                    checkpointer.load(path, "cpu")
+
 
 if __name__ == "__main__":
     unittest.main()

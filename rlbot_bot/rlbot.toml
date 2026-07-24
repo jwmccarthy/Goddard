@@ -1,0 +1,26 @@
+#:schema https://rlbot.org/schemas/match.json
+[rlbot]
+launcher = "Steam"
+auto_start_agents = true
+wait_for_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+skip_replays = true
+start_without_countdown = false
+existing_match_behavior = "Restart"
+enable_rendering = false
+enable_state_setting = false
+auto_save_replay = false
+freeplay = false
+
+[[cars]]
+config_file = "bot.toml"
+team = "Blue"
+auto_start = true
+
+[[cars]]
+type = "Psyonix"
+team = "Orange"
+skill = "Allstar"

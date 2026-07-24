@@ -13,7 +13,7 @@ from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
     LogProbCapture,
     RecurrentStateCapture,
-    RecurrentValueCapture,
+    RecurrentCriticCapture,
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
@@ -32,7 +32,7 @@ from jarl.learn import (
 from jarl.log.logger import Logger
 from jarl.modules import GRU, MLP
 from jarl.modules.encoder import LinearEncoder
-from jarl.modules.operator import ValueFunction
+from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.modules.utils import init_layer
 from jarl.runtime import (
@@ -240,7 +240,7 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise RuntimeError("CARL requires a CUDA-capable GPU")
 
 
-def build_policy_and_value(
+def build_policy_and_critic(
     environment: CARLTorchVectorEnv,
     arguments: argparse.Namespace,
 ):
@@ -260,7 +260,7 @@ def build_policy_and_value(
 
     critic_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
     critic_body = GRU(hidden_size=arguments.hidden_size).build(critic_head.feats)
-    critic = ValueFunction(
+    critic = Critic(
         head=critic_head,
         body=critic_body,
         foot=MLP(
@@ -276,7 +276,7 @@ def build_policy_and_value(
 def build_ppo(
     environment: CARLTorchVectorEnv,
     policy,
-    value_function,
+    critic,
     discriminator: SequenceDiscriminator,
     expert_dataset,
     reward_function: SeerReward | None,
@@ -325,7 +325,7 @@ def build_ppo(
         captures=(
             LogProbCapture(),
             RecurrentStateCapture(),
-            RecurrentValueCapture(value_function),
+            RecurrentCriticCapture(critic),
         ),
     )
 
@@ -346,7 +346,7 @@ def build_ppo(
     )
 
     policy_optimizer = Adam(policy.parameters(), lr=arguments.learning_rate)
-    value_optimizer = Adam(value_function.parameters(), lr=arguments.learning_rate)
+    critic_optimizer = Adam(critic.parameters(), lr=arguments.learning_rate)
     actions_per_second = 120.0 / arguments.frameskip
     initial_gamma = arguments.gamma or 0.5 ** (
         1.0 / (actions_per_second * arguments.discount_half_life)
@@ -354,7 +354,7 @@ def build_ppo(
     gae = GAE(gamma=initial_gamma, lambda_=arguments.gae_lambda)
     ppo_loss = PPOLoss(
         policy,
-        value_function,
+        critic,
         PPOConfig(clip=0.2, entropy_coef=arguments.entropy_coef),
     )
     update = Update(
@@ -385,8 +385,8 @@ def build_ppo(
                 max_grad_norm=0.5,
             ),
             OptimizerStep(
-                value_function,
-                value_optimizer,
+                critic,
+                critic_optimizer,
                 max_grad_norm=0.5,
             ),
         ),
@@ -467,12 +467,12 @@ def build_ppo(
     ), value_scheduler, {
         "modules": {
             "policy": policy,
-            "value_function": value_function,
+            "critic": critic,
             "discriminator": discriminator,
         },
         "optimizers": {
             "policy": policy_optimizer,
-            "value_function": value_optimizer,
+            "critic": critic_optimizer,
             "discriminator": discriminator_optimizer,
         },
         "stateful": {"discriminator_cadence": periodic_discriminator},
@@ -533,14 +533,14 @@ def main() -> None:
                 "total-timesteps must include at least one vector step "
                 f"({environment.n_envs:,} actor timesteps)"
             )
-        policy, value_function = build_policy_and_value(environment, arguments)
+        policy, critic = build_policy_and_critic(environment, arguments)
         discriminator = SequenceDiscriminator(
             hidden_size=arguments.hidden_size,
             noise_std=arguments.discriminator_noise_std,
         ).to(environment.device)
         modules = {
             "policy": policy,
-            "value_function": value_function,
+            "critic": critic,
             "discriminator": discriminator,
         }
         if arguments.resume_checkpoint is not None:
@@ -552,7 +552,7 @@ def main() -> None:
         runner, rollout, ppo, value_scheduler, training_objects = build_ppo(
             environment,
             policy,
-            value_function,
+            critic,
             discriminator,
             expert_dataset,
             reward_function,

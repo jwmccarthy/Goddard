@@ -13,7 +13,7 @@ from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
     LogProbCapture,
     RecurrentStateCapture,
-    RecurrentValueCapture,
+    RecurrentCriticCapture,
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
@@ -26,12 +26,14 @@ from jarl.learn import (
     OptimizerStep,
     PPOConfig,
     PPOLoss,
+    SPOConfig,
+    SPOLoss,
     Update,
 )
 from jarl.log.logger import Logger
 from jarl.modules import GRU, MLP
 from jarl.modules.encoder import LinearEncoder
-from jarl.modules.operator import ValueFunction
+from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.modules.utils import init_layer
 from jarl.runtime import (
@@ -52,9 +54,9 @@ from replay_states import load_replay_dataset
 from training_checkpoint import TrainingCheckpointer
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a naive PPO Rocket League agent"
+        description=f"Train a {algorithm.upper()} Rocket League agent"
     )
     parser.add_argument("--num-simulations",            type=int,   default=1024)
     parser.add_argument("--n-blue",                     type=int,   default=1)
@@ -206,7 +208,7 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise RuntimeError("CARL requires a CUDA-capable GPU")
 
 
-def build_policy_and_value(
+def build_policy_and_critic(
     environment: CARLTorchVectorEnv,
     arguments: argparse.Namespace,
 ):
@@ -226,7 +228,7 @@ def build_policy_and_value(
 
     critic_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
     critic_body = GRU(hidden_size=arguments.hidden_size).build(critic_head.feats)
-    critic = ValueFunction(
+    critic = Critic(
         head=critic_head,
         body=critic_body,
         foot=MLP(
@@ -239,13 +241,30 @@ def build_policy_and_value(
     return actor, critic
 
 
+def build_policy_loss(algorithm: str, policy, critic, entropy_coef: float):
+    if algorithm == "ppo":
+        return PPOLoss(
+            policy,
+            critic,
+            PPOConfig(clip=0.2, entropy_coef=entropy_coef),
+        )
+    if algorithm == "spo":
+        return SPOLoss(
+            policy,
+            critic,
+            SPOConfig(ratio_epsilon=0.2, entropy_coef=entropy_coef),
+        )
+    raise ValueError(f"unknown policy optimization algorithm: {algorithm}")
+
+
 def build_ppo(
     environment: CARLTorchVectorEnv,
     policy,
-    value_function,
+    critic,
     reward_function: SeerReward,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
+    algorithm: str = "ppo",
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler, dict]:
     rollout = RolloutBuffer(
         horizon=arguments.rollout_steps,
@@ -289,21 +308,22 @@ def build_ppo(
         captures=(
             LogProbCapture(),
             RecurrentStateCapture(),
-            RecurrentValueCapture(value_function),
+            RecurrentCriticCapture(critic),
         ),
     )
 
     policy_optimizer = Adam(policy.parameters(), lr=arguments.learning_rate)
-    value_optimizer = Adam(value_function.parameters(), lr=arguments.learning_rate)
+    critic_optimizer = Adam(critic.parameters(), lr=arguments.learning_rate)
     actions_per_second = 120.0 / arguments.frameskip
     initial_gamma = arguments.gamma or 0.5 ** (
         1.0 / (actions_per_second * arguments.discount_half_life)
     )
     gae = GAE(gamma=initial_gamma, lambda_=arguments.gae_lambda)
-    ppo_loss = PPOLoss(
+    policy_loss = build_policy_loss(
+        algorithm,
         policy,
-        value_function,
-        PPOConfig(clip=0.2, entropy_coef=arguments.entropy_coef),
+        critic,
+        arguments.entropy_coef,
     )
     update = Update(
         transforms=(
@@ -329,7 +349,7 @@ def build_ppo(
                 "returns",
             ),
         ),
-        loss=ppo_loss,
+        loss=policy_loss,
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(
                 policy,
@@ -337,12 +357,12 @@ def build_ppo(
                 max_grad_norm=0.5,
             ),
             OptimizerStep(
-                value_function,
-                value_optimizer,
+                critic,
+                critic_optimizer,
                 max_grad_norm=0.5,
             ),
         ),
-        section="PPO",
+        section=algorithm.upper(),
     )
     learning_rate = LinearSchedule(
         arguments.learning_rate,
@@ -375,7 +395,7 @@ def build_ppo(
                 parameter_group["lr"] = value
 
     def set_entropy_coef(value: float) -> None:
-        ppo_loss.config = replace(ppo_loss.config, entropy_coef=value)
+        policy_loss.config = replace(policy_loss.config, entropy_coef=value)
 
     scheduled_values = [
         ScheduledValue("learning_rate", learning_rate, set_learning_rate),
@@ -406,21 +426,22 @@ def build_ppo(
     return runner, rollout, Algorithm(update), value_scheduler, {
         "modules": {
             "policy": policy,
-            "value_function": value_function,
+            "critic": critic,
         },
         "optimizers": {
             "policy": policy_optimizer,
-            "value_function": value_optimizer,
+            "critic": critic_optimizer,
         },
     }
 
 
-def main() -> None:
-    arguments = parse_arguments()
+def main(algorithm: str = "ppo") -> None:
+    arguments = parse_arguments(algorithm)
     validate_arguments(arguments)
     torch.manual_seed(arguments.seed)
+    prefix = "goddard" if algorithm == "ppo" else f"goddard-{algorithm}"
     run_id = arguments.run_name or datetime.now().strftime(
-        "goddard-%Y%m%d-%H%M%S"
+        f"{prefix}-%Y%m%d-%H%M%S"
     )
     run_dir = arguments.tensorboard_dir / run_id
     checkpoint_dir = arguments.checkpoint_dir / run_id
@@ -461,10 +482,10 @@ def main() -> None:
                 "total-timesteps must include at least one vector step "
                 f"({environment.n_envs:,} actor timesteps)"
             )
-        policy, value_function = build_policy_and_value(environment, arguments)
+        policy, critic = build_policy_and_critic(environment, arguments)
         modules = {
             "policy": policy,
-            "value_function": value_function,
+            "critic": critic,
         }
         if arguments.resume_checkpoint is not None:
             TrainingCheckpointer.load_modules(
@@ -472,13 +493,14 @@ def main() -> None:
                 modules,
                 environment.device,
             )
-        runner, rollout, ppo, value_scheduler, training_objects = build_ppo(
+        runner, rollout, learner, value_scheduler, training_objects = build_ppo(
             environment,
             policy,
-            value_function,
+            critic,
             reward_function,
             arguments,
             checkpoint_dir,
+            algorithm,
         )
         logger = Logger(log_dir=str(run_dir))
 
@@ -517,7 +539,7 @@ def main() -> None:
         trainer = Trainer(
             runner,
             rollout,
-            ppo,
+            learner,
             OnPolicySchedule(),
             logger=logger,
             checkpoint=evaluator,

@@ -43,7 +43,7 @@ The collector uses the `babytowniv-rl-dataset/1.0` user agent and limits request
 Start training with:
 
 ```bash
-uv run python train.py --total-timesteps 100000000
+uv run python ppo.py --total-timesteps 100000000
 ```
 
 Training loads the reset dataset onto `cuda:0`. By default, 70 percent of completed simulations receive a conservative grounded replay state and the rest keep their normal kickoff state. Configure this with `--replay-reset-probability`. PPO uses the normalized zero sum Seer reward. TrueSkill evaluation uses normal kickoff states.
@@ -58,12 +58,12 @@ TrueSkill treats every checkpoint as an immutable player. Each evaluation matche
 
 TensorBoard data is written to `runs/<run_id>`. Policy snapshots, ratings, and the final model are written to `checkpoints/<run_id>`.
 
-Each PPO update atomically refreshes `checkpoints/<run_id>/training_latest.pt` with model weights, optimizer states, trainer counters, RNG state, and GAIfO discriminator cadence. Resume into a new run with `--resume-checkpoint checkpoints/<run_id>/training_latest.pt`; `--total-timesteps` is the absolute training target rather than additional timesteps. Environment state and historical self-play assignments restart.
+Each policy update atomically refreshes `checkpoints/<run_id>/training_latest.pt` with model weights, optimizer states, trainer counters, RNG state, and GAIfO discriminator cadence. Resume into a new run with `--resume-checkpoint checkpoints/<run_id>/training_latest.pt`; `--total-timesteps` is the absolute training target rather than additional timesteps. Environment state and historical self-play assignments restart.
 
 Run a small training check with:
 
 ```bash
-uv run python train.py \
+uv run python ppo.py \
     --total-timesteps 256 \
     --num-simulations 16 \
     --rollout-steps 8 \
@@ -73,7 +73,7 @@ uv run python train.py \
     --self-play-current 1.0
 ```
 
-Use `uv run python train.py --help` for all options.
+Use `uv run python ppo.py --help` for all PPO options. Run the same training pipeline with the quadratic SPO surrogate using `uv run python spo.py`; it accepts the same options and records metrics under `SPO/*`.
 
 ## GAIfO Training
 

@@ -7,7 +7,8 @@ from jarl.runtime.clock import Clock
 
 
 class TrainingCheckpointer:
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 3
+    LEGACY_CRITIC_KEY = "value_function"
 
     def __init__(
         self,
@@ -48,8 +49,7 @@ class TrainingCheckpointer:
             map_location=device,
             weights_only=False,
         )
-        if state.get("format_version") != self.FORMAT_VERSION:
-            raise ValueError("unsupported training checkpoint format")
+        state = self._upgrade(state)
         self._require_names("modules", state["modules"], self.modules)
         self._require_names("optimizers", state["optimizers"], self.optimizers)
         self._require_names("stateful", state["stateful"], self.stateful)
@@ -73,8 +73,7 @@ class TrainingCheckpointer:
         device: torch.device | str,
     ) -> None:
         state = torch.load(path, map_location=device, weights_only=False)
-        if state.get("format_version") != cls.FORMAT_VERSION:
-            raise ValueError("unsupported training checkpoint format")
+        state = cls._upgrade(state)
         cls._require_names("modules", state["modules"], modules)
         for name, module in modules.items():
             module.load_state_dict(state["modules"][name])
@@ -86,3 +85,16 @@ class TrainingCheckpointer:
                 f"training checkpoint {kind} do not match: "
                 f"saved={sorted(saved)}, current={sorted(current)}"
             )
+
+    @classmethod
+    def _upgrade(cls, state: dict) -> dict:
+        version = state.get("format_version")
+        if version in (1, 2):
+            for section in ("modules", "optimizers"):
+                values = state[section]
+                if cls.LEGACY_CRITIC_KEY in values:
+                    values["critic"] = values.pop(cls.LEGACY_CRITIC_KEY)
+            state["format_version"] = cls.FORMAT_VERSION
+        elif version != cls.FORMAT_VERSION:
+            raise ValueError("unsupported training checkpoint format")
+        return state
