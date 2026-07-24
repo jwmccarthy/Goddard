@@ -243,3 +243,12 @@ class EveryNUpdates:
         if should_run:
             return self.stage.run(experience)
         return experience, {}
+
+    def state_dict(self) -> dict[str, int]:
+        return {"update_count": self.update_count}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        update_count = state.get("update_count")
+        if not isinstance(update_count, int) or update_count < 0:
+            raise ValueError("invalid periodic update count")
+        self.update_count = update_count

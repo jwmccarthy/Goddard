@@ -58,6 +58,8 @@ TrueSkill treats every checkpoint as an immutable player. Each evaluation matche
 
 TensorBoard data is written to `runs/<run_id>`. Policy snapshots, ratings, and the final model are written to `checkpoints/<run_id>`.
 
+Each PPO update atomically refreshes `checkpoints/<run_id>/training_latest.pt` with model weights, optimizer states, trainer counters, RNG state, and GAIfO discriminator cadence. Resume into a new run with `--resume-checkpoint checkpoints/<run_id>/training_latest.pt`; `--total-timesteps` is the absolute training target rather than additional timesteps. Environment state and historical self-play assignments restart.
+
 Run a small training check with:
 
 ```bash

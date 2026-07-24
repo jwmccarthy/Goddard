@@ -59,6 +59,7 @@ from imitation import (
 from imitation_dataset import load_expert_dataset
 from rewards import SeerReward
 from replay_states import load_replay_dataset
+from training_checkpoint import TrainingCheckpointer
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -108,6 +109,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gae-lambda",                      type=float, default=0.99)
     parser.add_argument("--tensorboard-dir",                 type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",                  type=Path,  default=Path("checkpoints"))
+    parser.add_argument("--resume-checkpoint",               type=Path,  default=None)
     parser.add_argument(
         "--replay-dataset",
         type=Path,
@@ -227,6 +229,13 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError(f"Replay dataset does not exist: {arguments.replay_dataset}")
     if not arguments.expert_dataset.is_dir():
         raise ValueError(f"Expert dataset does not exist: {arguments.expert_dataset}")
+    if (
+        arguments.resume_checkpoint is not None
+        and not arguments.resume_checkpoint.is_file()
+    ):
+        raise ValueError(
+            f"Resume checkpoint does not exist: {arguments.resume_checkpoint}"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
 
@@ -273,7 +282,7 @@ def build_ppo(
     reward_function: SeerReward | None,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
-) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler]:
+) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler, dict]:
     rollout = RolloutBuffer(
         horizon=arguments.rollout_steps,
         num_envs=environment.n_envs,
@@ -439,11 +448,12 @@ def build_ppo(
         )
     )
     value_scheduler = ValueScheduler(*scheduled_values)
+    periodic_discriminator = EveryNUpdates(
+        discriminator_update,
+        arguments.discriminator_update_interval,
+    )
     return runner, rollout, Algorithm(
-        EveryNUpdates(
-            discriminator_update,
-            arguments.discriminator_update_interval,
-        ),
+        periodic_discriminator,
         TransformRollout(
             SequenceDiscriminatorReward(
                 discriminator,
@@ -454,7 +464,19 @@ def build_ppo(
             section="GAIfO",
         ),
         update,
-    ), value_scheduler
+    ), value_scheduler, {
+        "modules": {
+            "policy": policy,
+            "value_function": value_function,
+            "discriminator": discriminator,
+        },
+        "optimizers": {
+            "policy": policy_optimizer,
+            "value_function": value_optimizer,
+            "discriminator": discriminator_optimizer,
+        },
+        "stateful": {"discriminator_cadence": periodic_discriminator},
+    }
 
 
 def main() -> None:
@@ -516,7 +538,18 @@ def main() -> None:
             hidden_size=arguments.hidden_size,
             noise_std=arguments.discriminator_noise_std,
         ).to(environment.device)
-        runner, rollout, ppo, value_scheduler = build_ppo(
+        modules = {
+            "policy": policy,
+            "value_function": value_function,
+            "discriminator": discriminator,
+        }
+        if arguments.resume_checkpoint is not None:
+            TrainingCheckpointer.load_modules(
+                arguments.resume_checkpoint,
+                modules,
+                environment.device,
+            )
+        runner, rollout, ppo, value_scheduler, training_objects = build_ppo(
             environment,
             policy,
             value_function,
@@ -561,6 +594,10 @@ def main() -> None:
             draw_probability=arguments.trueskill_draw_probability,
             seed=arguments.seed,
         )
+        training_checkpointer = TrainingCheckpointer(
+            checkpoint_dir / "training_latest.pt",
+            **training_objects,
+        )
         trainer = Trainer(
             runner,
             rollout,
@@ -569,8 +606,15 @@ def main() -> None:
             logger=logger,
             checkpoint=evaluator,
             value_scheduler=value_scheduler,
+            update_callback=training_checkpointer,
         )
+        if arguments.resume_checkpoint is not None:
+            trainer.clock = training_checkpointer.load(
+                arguments.resume_checkpoint,
+                environment.device,
+            )
         trainer.run(arguments.total_timesteps)
+        training_checkpointer(trainer)
         torch.save(policy.state_dict(), checkpoint_dir / "actor_critic_final.pt")
         torch.save(
             discriminator.state_dict(), checkpoint_dir / "discriminator_final.pt"
