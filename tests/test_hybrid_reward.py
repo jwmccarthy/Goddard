@@ -7,10 +7,23 @@ from jarl.data import TensorBatch
 
 from gaifo import parse_arguments
 from imitation import AddImitationReward, EveryNUpdates
-from rewards import SeerReward
+from rewards import BALL_MAX_SPEED, CEILING_Z, SeerReward, SeerRewardWeights
 
 
 class HybridRewardTests(unittest.TestCase):
+    def test_ball_state_rewards_are_normalized_and_attributed(self):
+        weights = SeerRewardWeights()
+        self.assertEqual(weights.ball_height, 0.00125)
+        self.assertEqual(weights.ball_velocity, 0.00125)
+        height, velocity = SeerReward._ball_state_rewards(
+            torch.tensor([[[0.0, 0.0, CEILING_Z]]]),
+            torch.tensor([[BALL_MAX_SPEED]]),
+            torch.tensor([[1.0, 0.0]]),
+        )
+
+        torch.testing.assert_close(height, torch.tensor([[1.0, 0.0]]))
+        torch.testing.assert_close(velocity, torch.tensor([[1.0, 0.0]]))
+
     def test_seer_reward_is_disabled_by_default(self):
         with patch("sys.argv", ["gaifo.py"]):
             arguments = parse_arguments()
