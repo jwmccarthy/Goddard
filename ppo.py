@@ -390,7 +390,7 @@ def build_ppo(
     )
 
     def set_learning_rate(value: float) -> None:
-        for optimizer in (policy_optimizer, value_optimizer):
+        for optimizer in (policy_optimizer, critic_optimizer):
             for parameter_group in optimizer.param_groups:
                 parameter_group["lr"] = value
 
