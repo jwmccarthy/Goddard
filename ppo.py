@@ -97,7 +97,7 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
         help="matches per opponent; 600 * 3 opponents * 2 sides = 3,600 games",
     )
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
-    parser.add_argument("--trueskill-draw-probability", type=float, default=0.9)
+    parser.add_argument("--trueskill-draw-probability", type=float, default=0.3)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
     parser.add_argument("--reward-scale",               type=float, default=1.0)
     parser.add_argument("--goal-score-weight",          type=float, default=1.25)
@@ -561,6 +561,11 @@ def main(algorithm: str = "ppo") -> None:
             opponents=arguments.trueskill_opponents,
             draw_probability=arguments.trueskill_draw_probability,
             seed=arguments.seed,
+            fixed_opponents={
+                "initial": runner.opponent_pool.policy(
+                    0, environment.device
+                )
+            },
         )
         training_checkpointer = TrainingCheckpointer(
             checkpoint_dir / "training_latest.pt",
