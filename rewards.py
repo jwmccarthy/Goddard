@@ -16,24 +16,25 @@ GOAL_DISTANCE_OFFSET = GOAL_Y - BACK_WALL_Y + BALL_RADIUS
 
 @dataclass(frozen=True)
 class SeerRewardWeights:
-    goal_scored:          float = 1.25
+    goal_scored:          float = 5.0
     boost_difference:     float = 0.1
-    ball_touch:           float = 0.1
-    ball_height:          float = 0.00125
-    ball_velocity:        float = 0.00125
+    ball_touch:           float = 0.02
+    ball_height:          float = 0.00025
+    ball_velocity:        float = 0.00025
     demo:                 float = 0.3
     distance_player_ball: float = 0.0025
     distance_ball_goal:   float = 0.0025
     facing_ball:          float = 0.000625
     align_ball_goal:      float = 0.0025
     closest_to_ball:      float = 0.00125
-    touched_last:         float = 0.00125
+    touched_last:         float = 0.00025
     behind_ball:          float = 0.00125
     velocity_player_ball: float = 0.00125
     kickoff:              float = 0.1
     velocity:             float = 0.000625
     boost_amount:         float = 0.00125
     forward_velocity:     float = 0.0015
+    ball_goal_progress:   float = 5.0
 
 
 class SeerReward:
@@ -106,7 +107,20 @@ class SeerReward:
             .clamp_min(0.0)
             .pow(0.2836)
         )
-        ball_touch = touches * self._touch_decay * touch_height
+        previous_ball_position = previous.ball_position[:, None, :]
+        previous_ball_to_goal = opponent_goal - previous_ball_position
+        ball_goal_progress = (
+            torch.exp(-ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
+            - torch.exp(-previous_ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
+        )
+        # Contact is valuable only when it moves the ball toward the opponent
+        # goal; neutral or backward touches no longer pay a dense bonus.
+        ball_touch = (
+            touches
+            * self._touch_decay
+            * touch_height
+            * ball_goal_progress.clamp_min(0.0)
+        )
 
         newly_demoed = current.car_demoed & ~previous.car_demoed
         demo = self._opponent_team_mean(newly_demoed.float())
@@ -170,6 +184,7 @@ class SeerReward:
             "velocity":             weights.velocity * velocity,
             "boost_amount":         weights.boost_amount * boost_amount,
             "forward_velocity":     weights.forward_velocity * forward_velocity,
+            "ball_goal_progress":   weights.ball_goal_progress * ball_goal_progress,
         }
 
         components = self._scale_components(components)

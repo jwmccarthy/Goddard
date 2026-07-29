@@ -13,8 +13,8 @@ from rewards import BALL_MAX_SPEED, CEILING_Z, SeerReward, SeerRewardWeights
 class HybridRewardTests(unittest.TestCase):
     def test_ball_state_rewards_are_normalized_and_attributed(self):
         weights = SeerRewardWeights()
-        self.assertEqual(weights.ball_height, 0.00125)
-        self.assertEqual(weights.ball_velocity, 0.00125)
+        self.assertEqual(weights.ball_height, 0.00025)
+        self.assertEqual(weights.ball_velocity, 0.00025)
         height, velocity = SeerReward._ball_state_rewards(
             torch.tensor([[[0.0, 0.0, CEILING_Z]]]),
             torch.tensor([[BALL_MAX_SPEED]]),
