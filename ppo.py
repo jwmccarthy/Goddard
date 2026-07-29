@@ -70,6 +70,12 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--minibatch-size",             type=int,   default=65_536)
     parser.add_argument("--learning-rate",              type=float, default=1e-5)
     parser.add_argument("--learning-rate-end-factor",   type=float, default=0.5)
+    parser.add_argument(
+        "--bf16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use BF16 autocast for PPO updates",
+    )
     parser.add_argument("--epochs",                     type=int,   default=32)
     parser.add_argument("--entropy-coef",               type=float, default=0.01)
     parser.add_argument("--entropy-coef-end",           type=float, default=0.005)
@@ -206,6 +212,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
+    if arguments.bf16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("--bf16 requires a CUDA device with BF16 support")
 
 
 def build_policy_and_critic(
@@ -241,12 +249,18 @@ def build_policy_and_critic(
     return actor, critic
 
 
-def build_policy_loss(algorithm: str, policy, critic, entropy_coef: float):
+def build_policy_loss(
+    algorithm: str,
+    policy,
+    critic,
+    entropy_coef: float,
+    bf16: bool = False,
+):
     if algorithm == "ppo":
         return PPOLoss(
             policy,
             critic,
-            PPOConfig(clip=0.2, entropy_coef=entropy_coef),
+            PPOConfig(clip=0.2, entropy_coef=entropy_coef, bf16=bf16),
         )
     if algorithm == "spo":
         return SPOLoss(
@@ -324,6 +338,7 @@ def build_ppo(
         policy,
         critic,
         arguments.entropy_coef,
+        arguments.bf16,
     )
     update = Update(
         transforms=(
