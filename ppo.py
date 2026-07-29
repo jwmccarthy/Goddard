@@ -63,6 +63,12 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--n-orange",                   type=int,   default=1)
     parser.add_argument("--frameskip",                  type=int,   default=8)
     parser.add_argument("--max-ticks",                  type=int,   default=14_400)
+    parser.add_argument(
+        "--no-touch-timeout",
+        type=float,
+        default=16.0,
+        help="end an episode after this many seconds without a ball touch",
+    )
     parser.add_argument("--rollout-steps",              type=int,   default=512)
     parser.add_argument("--sequence-length",            type=int,   default=16)
     parser.add_argument("--hidden-size",                type=int,   default=256)
@@ -84,7 +90,12 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--opponent-pool-size",         type=int,   default=8)
     parser.add_argument("--historical-policies",        type=int,   default=4)
     parser.add_argument("--trueskill-interval",         type=int,   default=32_000_000)
-    parser.add_argument("--trueskill-simulations",      type=int,   default=64)
+    parser.add_argument(
+        "--trueskill-simulations",
+        type=int,
+        default=600,
+        help="matches per opponent; 600 * 3 opponents * 2 sides = 3,600 games",
+    )
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
     parser.add_argument("--trueskill-draw-probability", type=float, default=0.9)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
@@ -214,6 +225,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise RuntimeError("CARL requires a CUDA-capable GPU")
     if arguments.bf16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("--bf16 requires a CUDA device with BF16 support")
+    if not math.isfinite(arguments.no_touch_timeout) or arguments.no_touch_timeout <= 0:
+        raise ValueError("no-touch-timeout must be positive and finite")
 
 
 def build_policy_and_critic(
@@ -477,6 +490,7 @@ def main(algorithm: str = "ppo") -> None:
         seed=arguments.seed,
         frameskip=arguments.frameskip,
         max_ticks=arguments.max_ticks,
+        no_touch_timeout_seconds=arguments.no_touch_timeout,
         synchronize=False,
         reward_scale=arguments.reward_scale,
         reset_state_provider=reset_sampler,
@@ -527,6 +541,7 @@ def main(algorithm: str = "ppo") -> None:
                 seed=arguments.seed + 1,
                 frameskip=arguments.frameskip,
                 max_ticks=arguments.max_ticks,
+                no_touch_timeout_seconds=arguments.no_touch_timeout,
                 synchronize=False,
                 normalize=arguments.normalize,
             )
