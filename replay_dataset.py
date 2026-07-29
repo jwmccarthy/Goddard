@@ -32,6 +32,7 @@ SHARD_SCHEMA_VERSION = 3
 GOAL_EXCLUSION_SECONDS = 5.0
 RESET_EVENT_OFFSET_SECONDS = 3.0
 RESET_EVENT_WINDOW_SECONDS = 0.5
+RESET_SAMPLES_PER_REPLAY = 120
 REPLAY_PATH = re.compile(
     r"^/dl/replay/"
     r"(?P<id>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$",
@@ -703,20 +704,33 @@ def _reset_candidate_mask(
     if not len(frames):
         return np.zeros(0, dtype=np.bool_)
     live = _live_gameplay_mask(frames, columns, [])
-    frame_times = frames[:, columns.index("frame time")]
-    starts = np.flatnonzero(live & ~np.r_[False, live[:-1]])
-    ends = np.flatnonzero(live[:-1] & ~live[1:])
-    candidates = np.zeros(len(frames), dtype=np.bool_)
+    candidates = np.flatnonzero(live)
+    if len(candidates) <= RESET_SAMPLES_PER_REPLAY:
+        return live
 
-    for start in starts:
-        target = frame_times[start] + RESET_EVENT_OFFSET_SECONDS
-        candidates |= np.abs(frame_times - target) <= RESET_EVENT_WINDOW_SECONDS
-
-    for end in ends:
-        target = frame_times[end] - RESET_EVENT_OFFSET_SECONDS
-        candidates |= np.abs(frame_times - target) <= RESET_EVENT_WINDOW_SECONDS
-
-    return candidates & live
+    # Stratify by ball height, car height, and field half so ordinary grounded
+    # kickoff frames cannot crowd out aerial, wall, and recovery states.
+    ball_z = frames[:, columns.index("Ball - position z")]
+    car_z = frames[:, columns.index("player 0 - position z")]
+    ball_y = frames[:, columns.index("Ball - position y")]
+    buckets = (
+        (ball_z[candidates] > 180.0).astype(np.int32)
+        + 2 * (car_z[candidates] > 100.0).astype(np.int32)
+        + 4 * (np.abs(ball_y[candidates]) > 2560.0).astype(np.int32)
+    )
+    selected = []
+    quota = max(1, RESET_SAMPLES_PER_REPLAY // 8)
+    for bucket in range(8):
+        members = candidates[buckets == bucket]
+        if len(members):
+            selected.append(members[np.linspace(0, len(members) - 1, min(quota, len(members)), dtype=int)])
+    selected = np.concatenate(selected) if selected else candidates
+    if len(selected) < RESET_SAMPLES_PER_REPLAY:
+        remaining = np.setdiff1d(candidates, selected, assume_unique=False)
+        selected = np.concatenate((selected, remaining[: RESET_SAMPLES_PER_REPLAY - len(selected)]))
+    mask = np.zeros(len(frames), dtype=np.bool_)
+    mask[selected[:RESET_SAMPLES_PER_REPLAY]] = True
+    return mask
 
 
 def _live_gameplay_mask(

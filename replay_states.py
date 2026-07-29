@@ -131,30 +131,7 @@ def _validate_and_select_frames(
         if not demolition_valid.all():
             raise ValueError("Replay demolition values are invalid")
 
-        car_positions = chunk[:, columns.car_position].reshape(-1, 2, 3)
-        rotations = chunk[:, columns.car_rotation].reshape(-1, 2, 4)
-        up_z = 1.0 - 2.0 * (rotations[..., 0] ** 2 + rotations[..., 1] ** 2)
-        inactive = (
-            np.concatenate(
-                (
-                    chunk[:, columns.car_dodge_active],
-                    chunk[:, columns.car_jump_active],
-                    chunk[:, columns.car_double_jump_active],
-                ),
-                axis=1,
-        )
-            == 0
-        )
-
-        valid = chunk[:, columns.ball_position[2]] > 0
-        valid &= (demolished_by < 0).all(axis=1)
-        valid &= (car_positions[..., 2] >= 10.0).all(axis=1)
-        valid &= (car_positions[..., 2] <= 40.0).all(axis=1)
-        valid &= (up_z >= 0.95).all(axis=1)
-        valid &= inactive.all(axis=1)
-        local_indices = np.flatnonzero(valid)
-        if not len(local_indices):
-            continue
+        local_indices = np.arange(len(chunk))
 
         rotations = chunk[np.ix_(local_indices, columns.car_rotation)].reshape(-1, 2, 4)
         rotation_norm = np.linalg.vector_norm(rotations, axis=-1)
