@@ -93,8 +93,8 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument(
         "--trueskill-simulations",
         type=int,
-        default=600,
-        help="matches per opponent; 600 * 3 opponents * 2 sides = 3,600 games",
+        default=450,
+        help="matches per opponent; 450 * 4 opponents * 2 sides = 3,600 games",
     )
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
     parser.add_argument("--trueskill-draw-probability", type=float, default=0.3)
