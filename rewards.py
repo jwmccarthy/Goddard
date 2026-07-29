@@ -107,6 +107,7 @@ class SeerReward:
             .clamp_min(0.0)
             .pow(0.2836)
         )
+        ball_to_goal = opponent_goal - ball_position
         previous_ball_position = previous.ball_position[:, None, :]
         previous_ball_to_goal = opponent_goal - previous_ball_position
         ball_goal_progress = (
@@ -128,7 +129,6 @@ class SeerReward:
         distance_player_ball = torch.exp(
             -0.5 * (distance_to_ball - BALL_RADIUS).clamp_min(0.0) / CAR_MAX_SPEED
         )
-        ball_to_goal = opponent_goal - ball_position
         distance_ball_goal = torch.exp(
             -0.5
             * (ball_to_goal.norm(dim=-1) - GOAL_DISTANCE_OFFSET).clamp_min(0.0)
