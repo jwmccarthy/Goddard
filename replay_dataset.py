@@ -30,6 +30,8 @@ USER_AGENT = "babytowniv-rl-dataset/1.0"
 MAX_REQUEST_RATE = 5.0
 SHARD_SCHEMA_VERSION = 3
 GOAL_EXCLUSION_SECONDS = 5.0
+RESET_EVENT_OFFSET_SECONDS = 3.0
+RESET_EVENT_WINDOW_SECONDS = 0.5
 REPLAY_PATH = re.compile(
     r"^/dl/replay/"
     r"(?P<id>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$",
@@ -693,6 +695,30 @@ def _select_live_gameplay(
     return frames[_live_gameplay_mask(frames, columns, goal_times)]
 
 
+def _reset_candidate_mask(
+    frames:  np.ndarray,
+    columns: list[str],
+) -> np.ndarray:
+    """Select live-play frames near kickoff and goal transitions."""
+    if not len(frames):
+        return np.zeros(0, dtype=np.bool_)
+    live = _live_gameplay_mask(frames, columns, [])
+    frame_times = frames[:, columns.index("frame time")]
+    starts = np.flatnonzero(live & ~np.r_[False, live[:-1]])
+    ends = np.flatnonzero(live[:-1] & ~live[1:])
+    candidates = np.zeros(len(frames), dtype=np.bool_)
+
+    for start in starts:
+        target = frame_times[start] + RESET_EVENT_OFFSET_SECONDS
+        candidates |= np.abs(frame_times - target) <= RESET_EVENT_WINDOW_SECONDS
+
+    for end in ends:
+        target = frame_times[end] - RESET_EVENT_OFFSET_SECONDS
+        candidates |= np.abs(frame_times - target) <= RESET_EVENT_WINDOW_SECONDS
+
+    return candidates & live
+
+
 def _live_gameplay_mask(
     frames:     np.ndarray,
     columns:    list[str],
@@ -804,7 +830,10 @@ def build_dataset(
     dataset_root = output / dataset_name
     dataset_root.mkdir(exist_ok=True)
 
-    shards, columns, fps = _inspect_shards(frame_directory, replay_ids)
+    reset_only = dataset_name == "reset_dataset"
+    shards, columns, fps = _inspect_shards(
+        frame_directory, replay_ids, reset_only=reset_only
+    )
     source = _dataset_source(output)
     generation_directory = _write_dataset_generation(
         dataset_root,
@@ -813,6 +842,7 @@ def build_dataset(
         columns,
         fps,
         source,
+        reset_only=reset_only,
     )
     _publish_generation(dataset_root, generation_directory.name)
     print(
@@ -824,6 +854,8 @@ def build_dataset(
 def _inspect_shards(
     frame_directory: Path,
     replay_ids:      list[str],
+    *,
+    reset_only:      bool = False,
 ) -> tuple[list[tuple[str, int]], list[str], float]:
     expected_columns = replay_columns()
     shards = []
@@ -846,7 +878,13 @@ def _inspect_shards(
                 fps = shard_fps
             elif fps != shard_fps:
                 raise ValueError(f"Incompatible parsed shard: {replay_id}")
-            shards.append((replay_id, len(frames)))
+            count = (
+                int(_reset_candidate_mask(frames, shard_columns).sum())
+                if reset_only
+                else len(frames)
+            )
+            if count:
+                shards.append((replay_id, count))
 
     total_frames = sum(frame_count for _, frame_count in shards)
     if total_frames == 0 or fps is None:
@@ -861,6 +899,7 @@ def _write_dataset_generation(
     columns:         list[str],
     fps:             float,
     source:          str,
+    reset_only:      bool = False,
 ) -> Path:
     total_frames = sum(frame_count for _, frame_count in shards)
     generation = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
@@ -887,8 +926,15 @@ def _write_dataset_generation(
             with np.load(
                 frame_directory / f"{replay_id}.npz", allow_pickle=False
             ) as shard:
+                selected = shard["frames"]
+                if reset_only:
+                    selected = selected[_reset_candidate_mask(selected, columns)]
+                if len(selected) != frame_count:
+                    raise ValueError(
+                        f"Reset candidate count changed for replay {replay_id}"
+                    )
                 end = offset + frame_count
-                frames[offset:end] = shard["frames"]
+                frames[offset:end] = selected
                 replay_index[offset:end] = index
             replay_records.append(
                 {
