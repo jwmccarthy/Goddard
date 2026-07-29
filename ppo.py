@@ -100,8 +100,8 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--trueskill-draw-probability", type=float, default=0.3)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
     parser.add_argument("--reward-scale",               type=float, default=1.0)
-    parser.add_argument("--goal-score-weight",          type=float, default=1.25)
-    parser.add_argument("--goal-score-weight-end",      type=float, default=1.45)
+    parser.add_argument("--goal-score-weight",          type=float, default=5.0)
+    parser.add_argument("--goal-score-weight-end",      type=float, default=5.0)
     parser.add_argument(
         "--normalize-rewards",
         action=argparse.BooleanOptionalAction,
