@@ -81,22 +81,25 @@ def main() -> None:
 
         latest_id = paths[-1].stem.removeprefix("policy_")
         results = []
-        latest = policies[latest_id]
-        opponents = paths[:-1]
-        total_games = len(opponents) * arguments.games * 2
+        pairs = [
+            (left, right)
+            for index, left in enumerate(paths)
+            for right in paths[index + 1 :]
+        ]
+        total_games = len(pairs) * arguments.games * 2
         print(
-            f"Evaluating {latest_id} against {len(opponents)} checkpoints; "
+            f"Evaluating {len(paths)} checkpoints across {len(pairs)} pairs; "
             f"{total_games:,} games total",
             flush=True,
         )
-        for index, path in enumerate(opponents, start=1):
-            opponent_id = path.stem.removeprefix("policy_")
-            opponent = policies[opponent_id]
-            left = evaluate_pair(latest, opponent, environment, arguments.games, arguments.max_ticks)
-            right = -evaluate_pair(opponent, latest, environment, arguments.games, arguments.max_ticks)
+        for index, (left_path, right_path) in enumerate(pairs, start=1):
+            left_id = left_path.stem.removeprefix("policy_")
+            right_id = right_path.stem.removeprefix("policy_")
+            left = evaluate_pair(policies[left_id], policies[right_id], environment, arguments.games, arguments.max_ticks)
+            right = -evaluate_pair(policies[right_id], policies[left_id], environment, arguments.games, arguments.max_ticks)
             outcomes = torch.cat((left, right))
-            left_rating = ratings[latest_id]
-            right_rating = ratings[opponent_id]
+            left_rating = ratings[left_id]
+            right_rating = ratings[right_id]
             for outcome in outcomes.tolist():
                 if outcome > 0:
                     left_rating, right_rating = trueskill.rate_1vs1(
@@ -110,17 +113,18 @@ def main() -> None:
                     left_rating, right_rating = trueskill.rate_1vs1(
                         left_rating, right_rating, drawn=True
                     )
-            ratings[latest_id] = left_rating
-            ratings[opponent_id] = right_rating
+            ratings[left_id] = left_rating
+            ratings[right_id] = right_rating
             results.append({
-                "opponent": opponent_id,
+                "left": left_id,
+                "right": right_id,
                 "games": len(outcomes),
                 "win_rate": float(outcomes.gt(0).float().mean()),
                 "draw_rate": float(outcomes.eq(0).float().mean()),
                 "loss_rate": float(outcomes.lt(0).float().mean()),
             })
             print(
-                f"[{index}/{len(opponents)}] {latest_id} vs {opponent_id} "
+                f"[{index}/{len(pairs)}] {left_id} vs {right_id} "
                 f"win={results[-1]['win_rate']:.3f} "
                 f"draw={results[-1]['draw_rate']:.3f}",
                 flush=True,
