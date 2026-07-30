@@ -42,6 +42,7 @@ class SeerRewardWeights:
     aerial_touch:         float = 1.0
     angular_velocity:     float = 0.01
     flip_reset:           float = 0.0
+    win_probability:      float = 10.0
 
 
 class SeerReward:
@@ -103,6 +104,29 @@ class SeerReward:
             score_for_actor.gt(0)
             * goal_time_bonus
             * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
+        )
+        score_difference = self._score_difference + context.events.score_delta
+        remaining_seconds = (120.0 - goal_time).clamp_min(0.0)
+        expected_goals = remaining_seconds / 60.0
+        variance = (2.0 * expected_goals).clamp_min(1e-6)
+        win_probability = 0.5 * (
+            1.0
+            + torch.erf(
+                (score_difference[:, None].float() - 0.5)
+                / variance.sqrt()
+                / 2.0**0.5
+            )
+        )
+        previous_win_probability = 0.5 * (
+            1.0
+            + torch.erf(
+                (self._score_difference[:, None].float() - 0.5)
+                / variance.sqrt()
+                / 2.0**0.5
+            )
+        )
+        win_probability_progress = (
+            team_sign * (win_probability - previous_win_probability)
         )
 
         boost_current = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
@@ -237,6 +261,7 @@ class SeerReward:
             "aerial_touch":         weights.aerial_touch * aerial_touch,
             "angular_velocity":     weights.angular_velocity * angular_velocity,
             "flip_reset":           weights.flip_reset * flip_reset,
+            "win_probability":      weights.win_probability * win_probability_progress,
         }
 
         components = self._scale_components(components)
@@ -257,7 +282,9 @@ class SeerReward:
 
         done = context.events.done
         self._episode_steps += 1
+        self._score_difference += context.events.score_delta
         self._episode_steps[done] = 0
+        self._score_difference[done] = 0
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
 
@@ -294,6 +321,7 @@ class SeerReward:
         self._touch_decay = torch.ones(expected, device=device)
         self._last_touch = torch.zeros(expected, dtype=torch.bool, device=device)
         self._episode_steps = torch.zeros(expected[0], dtype=torch.float32, device=device)
+        self._score_difference = torch.zeros(expected[0], dtype=torch.float32, device=device)
         self._count = 0
         self._mean = torch.zeros((), device=device)
         self._variance = torch.ones((), device=device)
