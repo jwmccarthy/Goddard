@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import trueskill
 
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect.runner import _reset_state
@@ -70,6 +71,7 @@ def main() -> None:
     )
     config = SimpleNamespace(hidden_size=256)
     policies = {}
+    ratings = {path.stem.removeprefix("policy_"): trueskill.Rating() for path in paths}
     try:
         for path in paths:
             policy, _ = build_policy_and_critic(environment, config)
@@ -93,6 +95,23 @@ def main() -> None:
             left = evaluate_pair(latest, opponent, environment, arguments.games, arguments.max_ticks)
             right = -evaluate_pair(opponent, latest, environment, arguments.games, arguments.max_ticks)
             outcomes = torch.cat((left, right))
+            left_rating = ratings[latest_id]
+            right_rating = ratings[opponent_id]
+            for outcome in outcomes.tolist():
+                if outcome > 0:
+                    left_rating, right_rating = trueskill.rate_1vs1(
+                        left_rating, right_rating
+                    )
+                elif outcome < 0:
+                    right_rating, left_rating = trueskill.rate_1vs1(
+                        right_rating, left_rating
+                    )
+                else:
+                    left_rating, right_rating = trueskill.rate_1vs1(
+                        left_rating, right_rating, drawn=True
+                    )
+            ratings[latest_id] = left_rating
+            ratings[opponent_id] = right_rating
             results.append({
                 "opponent": opponent_id,
                 "games": len(outcomes),
@@ -110,7 +129,28 @@ def main() -> None:
         environment.close()
 
     output = arguments.output or arguments.checkpoint_dir / "population_eval.json"
-    output.write_text(json.dumps({"latest": latest_id, "games_per_side": arguments.games, "matchups": results}, indent=2) + "\n")
+    population = [
+        {
+            "checkpoint": checkpoint_id,
+            "mu": rating.mu,
+            "sigma": rating.sigma,
+            "skill": rating.mu - 3.0 * rating.sigma,
+        }
+        for checkpoint_id, rating in ratings.items()
+    ]
+    population.sort(key=lambda row: row["mu"], reverse=True)
+    output.write_text(
+        json.dumps(
+            {
+                "latest": latest_id,
+                "games_per_side": arguments.games,
+                "matchups": results,
+                "true_skill": population,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     print(output)
 
 
