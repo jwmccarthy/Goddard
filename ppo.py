@@ -58,7 +58,7 @@ class SyntheticMatchResetProvider:
 
     def __call__(self, reset_mask: torch.Tensor):
         state = dict(self.provider(reset_mask))
-        indices = reset_mask.nonzero(as_tuple=True)[0]
+        indices = state["simulation_indices"]
         remaining = torch.randint(
             0,
             REGULATION_TICKS + 1,
