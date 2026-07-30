@@ -21,8 +21,8 @@ def evaluate_pair(blue, orange, environment, games: int, max_ticks: int) -> torc
 
     for _ in range(max_ticks):
         grouped = observation.view(games, 2, -1)
-        blue_output = blue.act(grouped[:, 0], blue_state)
-        orange_output = orange.act(grouped[:, 1], orange_state)
+        blue_output = blue.act(grouped[:, 0], blue_state, deterministic=True)
+        orange_output = orange.act(grouped[:, 1], orange_state, deterministic=True)
         action = torch.stack((blue_output.action, orange_output.action), dim=1).flatten(0, 1)
         observation, reward, terminated, truncated, _ = environment.step(action)
         done = (terminated | truncated).view(games, 2).any(dim=-1)
