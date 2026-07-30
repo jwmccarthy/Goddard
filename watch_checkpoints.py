@@ -125,7 +125,7 @@ class SpectatorState:
         self.reset = threading.Event()
         self.sequence = 0
         self.frame: dict | None = None
-        self.pending_match: tuple[Path, Path, bool, bool] | None = None
+        self.pending_match: tuple[Path, Path, bool, bool, int] | None = None
 
     def publish(self, frame: dict) -> None:
         with self.condition:
@@ -139,6 +139,7 @@ class SpectatorState:
         orange_path:    Path,
         sample_actions: bool,
         replay_resets:  bool,
+        fast_forward:   int,
     ) -> None:
         with self.condition:
             self.pending_match = (
@@ -146,6 +147,7 @@ class SpectatorState:
                 orange_path,
                 sample_actions,
                 replay_resets,
+                fast_forward,
             )
 
     def take_match(self) -> tuple[Path, Path, bool, bool] | None:
@@ -400,6 +402,7 @@ def simulate(
                     next_orange_path,
                     next_sample,
                     next_replay_resets,
+                    next_fast_forward,
                 ) = pending_match
                 try:
                     next_blue, next_orange = load_pair(
@@ -416,6 +419,7 @@ def simulate(
                     orange = next_orange
                     sample_actions = next_sample
                     replay_resets = next_replay_resets
+                    fast_forward = next_fast_forward
                     observations = next_observations
                     hidden = [blue.initial_state(1), orange.initial_state(1)]
                     blue_score = orange_score = 0
@@ -514,6 +518,9 @@ def make_handler(
                 replay_resets = payload.get("replay_resets", False)
                 if not isinstance(replay_resets, bool):
                     raise TypeError("replay_resets must be a Boolean")
+                fast_forward = payload.get("fast_forward", 1)
+                if not isinstance(fast_forward, int) or not 1 <= fast_forward <= 64:
+                    raise ValueError("fast_forward must be an integer between 1 and 64")
                 blue = inspect_checkpoint(registry.directory, blue_path)
                 orange = inspect_checkpoint(registry.directory, orange_path)
                 if blue.observation_size != orange.observation_size:
@@ -533,6 +540,7 @@ def make_handler(
                 orange_path,
                 sample_actions,
                 replay_resets,
+                fast_forward,
             )
             self.send_response(HTTPStatus.ACCEPTED)
             self.end_headers()

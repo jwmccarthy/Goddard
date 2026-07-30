@@ -12,6 +12,7 @@ const checkpointDirectory = document.getElementById('checkpointDirectory');
 const blueCheckpoint = document.getElementById('blueCheckpoint');
 const orangeCheckpoint = document.getElementById('orangeCheckpoint');
 const sampleActions = document.getElementById('sampleActions');
+const fastForward = document.getElementById('fastForward');
 const replayResets = document.getElementById('replayResets');
 const applyMatch = document.getElementById('applyMatch');
 
@@ -275,6 +276,7 @@ applyMatch.addEventListener('click', async () => {
         orange: orangeCheckpoint.value,
         sample_actions: sampleActions.checked,
         replay_resets: replayResets.checked,
+        fast_forward: Number(fastForward.value),
       }),
     });
     if (!response.ok) throw new Error(await response.text());
