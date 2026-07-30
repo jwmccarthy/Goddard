@@ -89,7 +89,7 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--snapshot-interval",          type=int,   default=16)
     parser.add_argument("--opponent-pool-size",         type=int,   default=8)
     parser.add_argument("--historical-policies",        type=int,   default=4)
-    parser.add_argument("--trueskill-interval",         type=int,   default=32_000_000)
+    parser.add_argument("--trueskill-interval",         type=int,   default=100_000_000)
     parser.add_argument(
         "--trueskill-simulations",
         type=int,
@@ -97,6 +97,12 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
         help="matches per opponent; 450 * 4 opponents * 2 sides = 3,600 games",
     )
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
+    parser.add_argument(
+        "--trueskill-all-population",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="evaluate the newest checkpoint against every archived checkpoint",
+    )
     parser.add_argument("--trueskill-draw-probability", type=float, default=0.3)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
     parser.add_argument("--reward-scale",               type=float, default=1.0)
@@ -561,11 +567,7 @@ def main(algorithm: str = "ppo") -> None:
             opponents=arguments.trueskill_opponents,
             draw_probability=arguments.trueskill_draw_probability,
             seed=arguments.seed,
-            fixed_opponents={
-                "initial": runner.opponent_pool.policy(
-                    0, environment.device
-                )
-            },
+            all_population=arguments.trueskill_all_population,
         )
         training_checkpointer = TrainingCheckpointer(
             checkpoint_dir / "training_latest.pt",
