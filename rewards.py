@@ -109,14 +109,15 @@ class SeerReward:
             * goal_time_bonus
             * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
         )
-        score_difference = self._synthetic_score[:, None]
+        previous_score_difference = self._synthetic_score[:, None]
+        score_difference = previous_score_difference + context.events.score_delta[:, None]
         remaining_seconds = (self._synthetic_ticks[:, None] / 120.0).clamp_min(0.0)
         expected_goals = remaining_seconds / 60.0
         variance = (2.0 * expected_goals).clamp_min(1e-6)
         win_probability = 0.5 * (
             1.0
             + torch.erf(
-                (score_difference[:, None].float() - 0.5)
+                (score_difference.float() - 0.5)
                 / variance.sqrt()
                 / 2.0**0.5
             )
@@ -124,7 +125,7 @@ class SeerReward:
         previous_win_probability = 0.5 * (
             1.0
             + torch.erf(
-                (score_difference.float() - context.events.score_delta[:, None] - 0.5)
+                (previous_score_difference.float() - 0.5)
                 / variance.sqrt()
                 / 2.0**0.5
             )
