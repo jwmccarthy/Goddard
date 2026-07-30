@@ -36,6 +36,12 @@ class SeerRewardWeights:
     boost_amount:         float = 0.00125
     forward_velocity:     float = 0.0015
     ball_goal_progress:   float = 5.0
+    player_ball_progress: float = 0.75
+    alignment_progress:   float = 0.5
+    touch_acceleration:   float = 0.25
+    aerial_touch:         float = 1.0
+    angular_velocity:     float = 0.01
+    flip_reset:           float = 0.0
 
 
 class SeerReward:
@@ -121,6 +127,11 @@ class SeerReward:
             torch.exp(-ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
             - torch.exp(-previous_ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
         )
+        previous_car_to_ball = previous_ball_position - previous.car_position
+        player_ball_progress = (
+            torch.exp(-distance_to_ball / 1410.0)
+            - torch.exp(-previous_car_to_ball.norm(dim=-1) / 1410.0)
+        )
         # Contact is valuable only when it moves the ball toward the opponent
         # goal; neutral or backward touches no longer pay a dense bonus.
         ball_touch = (
@@ -146,6 +157,34 @@ class SeerReward:
             self._cosine(car_to_ball, current.car_position - own_goal)
             + self._cosine(-car_to_ball, opponent_goal - current.car_position)
         )
+        previous_alignment = 0.5 * (
+            self._cosine(
+                previous_car_to_ball, previous.car_position - own_goal
+            )
+            + self._cosine(
+                -previous_car_to_ball,
+                opponent_goal - previous.car_position,
+            )
+        )
+        alignment_progress = align_ball_goal - previous_alignment
+        ball_acceleration = (
+            current.ball_velocity - previous.ball_velocity
+        ).norm(dim=-1, keepdim=True) / CAR_MAX_SPEED
+        average_height = 0.5 * (
+            current.car_position[..., 2] + ball_position[..., 2]
+        )
+        height_factor = ((average_height - 150.0) / CEILING_Z).clamp(0.0, 1.0)
+        touch_acceleration = touches * (1.0 - height_factor) * ball_acceleration
+        aerial_touch = touches * height_factor * (2.0 - current.car_on_ground.float())
+        angular_velocity = current.car_angular_velocity.norm(dim=-1) / 5.5
+        flip_reset = (
+            touches
+            & previous.car_has_flipped
+            & ~current.car_has_flipped
+            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
+            & (ball_position - current.car_position).norm(dim=-1).lt(2.0 * BALL_RADIUS)
+            & self._cosine(ball_position - current.car_position, -current.car_up).gt(0.9)
+        ).float()
         closest_to_ball = distance_to_ball.eq(
             distance_to_ball.min(dim=-1, keepdim=True).values
         ).float()
@@ -192,6 +231,12 @@ class SeerReward:
             "boost_amount":         weights.boost_amount * boost_amount,
             "forward_velocity":     weights.forward_velocity * forward_velocity,
             "ball_goal_progress":   weights.ball_goal_progress * ball_goal_progress,
+            "player_ball_progress": weights.player_ball_progress * player_ball_progress,
+            "alignment_progress":   weights.alignment_progress * alignment_progress,
+            "touch_acceleration":   weights.touch_acceleration * touch_acceleration,
+            "aerial_touch":         weights.aerial_touch * aerial_touch,
+            "angular_velocity":     weights.angular_velocity * angular_velocity,
+            "flip_reset":           weights.flip_reset * flip_reset,
         }
 
         components = self._scale_components(components)
