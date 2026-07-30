@@ -17,7 +17,6 @@ from jarl.collect import (
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
-    TrueSkillEvaluator,
 )
 from jarl.envs import DatasetResetSampler
 from jarl.learn import (
@@ -89,27 +88,6 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--snapshot-interval",          type=int,   default=16)
     parser.add_argument("--opponent-pool-size",         type=int,   default=8)
     parser.add_argument("--historical-policies",        type=int,   default=4)
-    parser.add_argument("--trueskill-interval",         type=int,   default=100_000_000)
-    parser.add_argument(
-        "--trueskill-simulations",
-        type=int,
-        default=450,
-        help="matches per opponent; 450 * 4 opponents * 2 sides = 3,600 games",
-    )
-    parser.add_argument("--trueskill-opponents",        type=int,   default=3)
-    parser.add_argument(
-        "--trueskill-eval",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="run TrueSkill evaluations during training",
-    )
-    parser.add_argument(
-        "--trueskill-all-population",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="evaluate the newest checkpoint against every archived checkpoint",
-    )
-    parser.add_argument("--trueskill-draw-probability", type=float, default=0.3)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
     parser.add_argument("--reward-scale",               type=float, default=1.0)
     parser.add_argument("--goal-score-weight",          type=float, default=5.0)
@@ -170,9 +148,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "snapshot-interval":      arguments.snapshot_interval,
         "opponent-pool-size":     arguments.opponent_pool_size,
         "historical-policies":    arguments.historical_policies,
-        "trueskill-interval":     arguments.trueskill_interval,
-        "trueskill-simulations":  arguments.trueskill_simulations,
-        "trueskill-opponents":    arguments.trueskill_opponents,
     }
     invalid = [
         name
@@ -212,10 +187,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         0.0 <= arguments.replay_reset_probability <= 1.0
     ):
         raise ValueError("replay-reset-probability must be between zero and one")
-    if not math.isfinite(arguments.trueskill_draw_probability) or not (
-        0.0 <= arguments.trueskill_draw_probability < 1.0
-    ):
-        raise ValueError("trueskill-draw-probability must be between zero and one")
     if not math.isfinite(arguments.gae_lambda) or arguments.gae_lambda > 1.0:
         raise ValueError("gae-lambda cannot exceed one")
     if arguments.gamma is not None and (
@@ -545,37 +516,6 @@ def main(algorithm: str = "ppo") -> None:
         )
         logger = Logger(log_dir=str(run_dir))
 
-        def make_evaluation_environment():
-            return CARLTorchVectorEnv(
-                n_sim=arguments.trueskill_simulations,
-                n_blue=arguments.n_blue,
-                n_orange=arguments.n_orange,
-                seed=arguments.seed + 1,
-                frameskip=arguments.frameskip,
-                max_ticks=arguments.max_ticks,
-                no_touch_timeout_seconds=arguments.no_touch_timeout,
-                synchronize=False,
-                normalize=arguments.normalize,
-            )
-
-        if arguments.trueskill_eval:
-            evaluator = TrueSkillEvaluator(
-                policy=policy,
-                opponent_pool=runner.opponent_pool,
-                env_factory=make_evaluation_environment,
-                logger=logger,
-                checkpoint_dir=checkpoint_dir,
-                interval=arguments.trueskill_interval,
-                num_matches=arguments.trueskill_simulations,
-                team_sizes=(arguments.n_blue, arguments.n_orange),
-                max_steps=(
-                    arguments.max_ticks + arguments.frameskip - 1
-                ) // arguments.frameskip,
-                opponents=arguments.trueskill_opponents,
-                draw_probability=arguments.trueskill_draw_probability,
-                seed=arguments.seed,
-                all_population=arguments.trueskill_all_population,
-            )
         training_checkpointer = TrainingCheckpointer(
             checkpoint_dir / "training_latest.pt",
             **training_objects,
@@ -586,7 +526,7 @@ def main(algorithm: str = "ppo") -> None:
             learner,
             OnPolicySchedule(),
             logger=logger,
-            checkpoint=evaluator,
+            checkpoint=None,
             value_scheduler=value_scheduler,
             update_callback=training_checkpointer,
         )
