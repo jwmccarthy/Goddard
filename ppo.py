@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 
-from carl.gymnasium import CARLTorchVectorEnv
+from carl.gymnasium import CARLTorchVectorEnv, REGULATION_TICKS
 from jarl.collect import (
     LogProbCapture,
     RecurrentStateCapture,
@@ -50,6 +50,33 @@ from jarl.transform import GAE, TeamSpirit
 
 from rewards import SeerReward
 from replay_states import load_replay_dataset
+
+
+class SyntheticMatchResetProvider:
+    def __init__(self, provider) -> None:
+        self.provider = provider
+
+    def __call__(self, reset_mask: torch.Tensor):
+        state = dict(self.provider(reset_mask))
+        indices = reset_mask.nonzero(as_tuple=True)[0]
+        remaining = torch.randint(
+            0,
+            REGULATION_TICKS + 1,
+            (len(indices),),
+            device=reset_mask.device,
+        )
+        elapsed = REGULATION_TICKS - remaining
+        elapsed_minutes = elapsed.float() / (120.0 * 60.0)
+        scores = torch.poisson(
+            elapsed_minutes[:, None].expand(-1, 2)
+        ).to(torch.int32)
+        state.update(
+            simulation_indices=indices,
+            blue_score=scores[:, 0],
+            orange_score=scores[:, 1],
+            episode_ticks=elapsed.to(torch.int32),
+        )
+        return state
 from training_checkpoint import TrainingCheckpointer
 
 
@@ -466,6 +493,7 @@ def main(algorithm: str = "ppo") -> None:
         probability=arguments.replay_reset_probability,
         seed=arguments.seed,
     )
+    reset_sampler = SyntheticMatchResetProvider(reset_sampler)
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=arguments.n_blue,
