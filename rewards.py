@@ -12,6 +12,7 @@ CEILING_Z = 2044.0
 GOAL_Y = 5124.25
 BACK_WALL_Y = 5120.0
 GOAL_DISTANCE_OFFSET = GOAL_Y - BACK_WALL_Y + BALL_RADIUS
+GOAL_TIME_SCALE_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,13 @@ class SeerReward:
 
         score_for_actor = context.events.score_delta[:, None] * team_sign
         ball_speed = current.ball_velocity.norm(dim=-1, keepdim=True)
-        goal_scored = score_for_actor.gt(0) * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
+        goal_time = self._episode_steps[:, None] / 15.0
+        goal_time_bonus = 0.5 + torch.exp(-goal_time / GOAL_TIME_SCALE_SECONDS)
+        goal_scored = (
+            score_for_actor.gt(0)
+            * goal_time_bonus
+            * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
+        )
 
         boost_current = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
         boost_previous = (previous.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
@@ -204,6 +211,8 @@ class SeerReward:
         )
 
         done = context.events.done
+        self._episode_steps += 1
+        self._episode_steps[done] = 0
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
 
@@ -239,6 +248,7 @@ class SeerReward:
             return
         self._touch_decay = torch.ones(expected, device=device)
         self._last_touch = torch.zeros(expected, dtype=torch.bool, device=device)
+        self._episode_steps = torch.zeros(expected[0], dtype=torch.float32, device=device)
         self._count = 0
         self._mean = torch.zeros((), device=device)
         self._variance = torch.ones((), device=device)
