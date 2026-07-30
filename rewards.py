@@ -13,6 +13,7 @@ GOAL_Y = 5124.25
 BACK_WALL_Y = 5120.0
 GOAL_DISTANCE_OFFSET = GOAL_Y - BACK_WALL_Y + BALL_RADIUS
 GOAL_TIME_SCALE_SECONDS = 60.0
+MATCH_TICKS = 5 * 60 * 120
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,8 @@ class SeerReward:
         self._diagnostic_sums = None
         self._diagnostic_squares = None
         self._diagnostic_steps = None
+        self._synthetic_score = None
+        self._synthetic_ticks = None
 
     def set_goal_scored_weight(self, value: float) -> None:
         if value <= 0:
@@ -98,15 +101,16 @@ class SeerReward:
 
         score_for_actor = context.events.score_delta[:, None] * team_sign
         ball_speed = current.ball_velocity.norm(dim=-1, keepdim=True)
-        goal_time = context.episode_ticks[:, None] / 120.0
+        self._initialize_synthetic_context(context)
+        goal_time = self._synthetic_ticks[:, None] / 120.0
         goal_time_bonus = 0.5 + torch.exp(-goal_time / GOAL_TIME_SCALE_SECONDS)
         goal_scored = (
             score_for_actor.gt(0)
             * goal_time_bonus
             * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
         )
-        score_difference = context.score_difference[:, None]
-        remaining_seconds = (120.0 - goal_time).clamp_min(0.0)
+        score_difference = self._synthetic_score[:, None]
+        remaining_seconds = (self._synthetic_ticks[:, None] / 120.0).clamp_min(0.0)
         expected_goals = remaining_seconds / 60.0
         variance = (2.0 * expected_goals).clamp_min(1e-6)
         win_probability = 0.5 * (
@@ -282,6 +286,8 @@ class SeerReward:
 
         done = context.events.done
         self._episode_steps += 1
+        self._synthetic_score += context.events.score_delta
+        self._synthetic_ticks.sub_(120).clamp_min_(0)
         self._episode_steps[done] = 0
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
@@ -325,6 +331,24 @@ class SeerReward:
         self._diagnostic_sums = None
         self._diagnostic_squares = None
         self._diagnostic_steps = None
+        self._synthetic_score = torch.zeros(expected[0], device=device)
+        self._synthetic_ticks = torch.zeros(expected[0], device=device)
+
+    def _initialize_synthetic_context(self, context: RewardContext) -> None:
+        """Assign a fresh plausible scoreline and clock to each reset state."""
+        reset = self._episode_steps.eq(0)
+        if not reset.any():
+            return
+
+        ticks = torch.randint(
+            0, MATCH_TICKS + 1, (reset.sum(),), device=self._synthetic_ticks.device
+        ).float()
+        elapsed_minutes = (MATCH_TICKS - ticks) / (120.0 * 60.0)
+        goals = torch.poisson(
+            elapsed_minutes[:, None].expand(-1, 2) * (1.0 / 1.0)
+        ).diff(dim=-1).squeeze(-1)
+        self._synthetic_ticks[reset] = ticks
+        self._synthetic_score[reset] = goals
 
     def _diagnostics(
         self,
