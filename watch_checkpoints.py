@@ -435,31 +435,30 @@ def simulate(
                 round_number = 1
                 tick = 0
 
-            for _ in range(fast_forward):
-                with torch.inference_mode():
-                    blue_output = blue.act(
-                        observations[0:1],
-                        hidden[0],
-                        deterministic=not sample_actions,
-                    )
-                    orange_output = orange.act(
-                        observations[1:2],
-                        hidden[1],
-                        deterministic=not sample_actions,
-                    )
-                hidden = [blue_output.next_state, orange_output.next_state]
-                actions = torch.cat((blue_output.action, orange_output.action), dim=0)
-                observations, reward, terminated, truncated, _ = environment.step(actions)
-                tick += tick_skip
-                goal = int(reward[0].item())
-                if goal > 0:
-                    blue_score += goal
-                elif goal < 0:
-                    orange_score -= goal
-                if (terminated | truncated).any():
-                    hidden = [blue.initial_state(1), orange.initial_state(1)]
-                    round_number += 1
-                    tick = 0
+            with torch.inference_mode():
+                blue_output = blue.act(
+                    observations[0:1],
+                    hidden[0],
+                    deterministic=not sample_actions,
+                )
+                orange_output = orange.act(
+                    observations[1:2],
+                    hidden[1],
+                    deterministic=not sample_actions,
+                )
+            hidden = [blue_output.next_state, orange_output.next_state]
+            actions = torch.cat((blue_output.action, orange_output.action), dim=0)
+            observations, reward, terminated, truncated, _ = environment.step(actions)
+            tick += tick_skip
+            goal = int(reward[0].item())
+            if goal > 0:
+                blue_score += goal
+            elif goal < 0:
+                orange_score -= goal
+            if (terminated | truncated).any():
+                hidden = [blue.initial_state(1), orange.initial_state(1)]
+                round_number += 1
+                tick = 0
 
             state.publish(
                 render_frame(
@@ -476,7 +475,7 @@ def simulate(
                 )
             )
 
-            next_step += fast_forward * tick_skip / 120.0
+            next_step += tick_skip / (120.0 * fast_forward)
             delay = next_step - time.perf_counter()
             if delay > 0:
                 state.stop.wait(delay)
