@@ -98,6 +98,12 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     )
     parser.add_argument("--trueskill-opponents",        type=int,   default=3)
     parser.add_argument(
+        "--trueskill-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="run TrueSkill evaluations during training",
+    )
+    parser.add_argument(
         "--trueskill-all-population",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -552,23 +558,24 @@ def main(algorithm: str = "ppo") -> None:
                 normalize=arguments.normalize,
             )
 
-        evaluator = TrueSkillEvaluator(
-            policy=policy,
-            opponent_pool=runner.opponent_pool,
-            env_factory=make_evaluation_environment,
-            logger=logger,
-            checkpoint_dir=checkpoint_dir,
-            interval=arguments.trueskill_interval,
-            num_matches=arguments.trueskill_simulations,
-            team_sizes=(arguments.n_blue, arguments.n_orange),
-            max_steps=(
-                arguments.max_ticks + arguments.frameskip - 1
-            ) // arguments.frameskip,
-            opponents=arguments.trueskill_opponents,
-            draw_probability=arguments.trueskill_draw_probability,
-            seed=arguments.seed,
-            all_population=arguments.trueskill_all_population,
-        )
+        if arguments.trueskill_eval:
+            evaluator = TrueSkillEvaluator(
+                policy=policy,
+                opponent_pool=runner.opponent_pool,
+                env_factory=make_evaluation_environment,
+                logger=logger,
+                checkpoint_dir=checkpoint_dir,
+                interval=arguments.trueskill_interval,
+                num_matches=arguments.trueskill_simulations,
+                team_sizes=(arguments.n_blue, arguments.n_orange),
+                max_steps=(
+                    arguments.max_ticks + arguments.frameskip - 1
+                ) // arguments.frameskip,
+                opponents=arguments.trueskill_opponents,
+                draw_probability=arguments.trueskill_draw_probability,
+                seed=arguments.seed,
+                all_population=arguments.trueskill_all_population,
+            )
         training_checkpointer = TrainingCheckpointer(
             checkpoint_dir / "training_latest.pt",
             **training_objects,
