@@ -72,8 +72,8 @@ class SyntheticMatchResetProvider:
         ).to(torch.int32)
         state.update(
             simulation_indices=indices,
-            blue_score=scores[:, 0],
-            orange_score=scores[:, 1],
+            blue_score=scores[:, 0].contiguous(),
+            orange_score=scores[:, 1].contiguous(),
             episode_ticks=elapsed.to(torch.int32),
         )
         return state
