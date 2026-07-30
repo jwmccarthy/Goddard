@@ -80,7 +80,14 @@ def main() -> None:
         latest_id = paths[-1].stem.removeprefix("policy_")
         results = []
         latest = policies[latest_id]
-        for path in paths[:-1]:
+        opponents = paths[:-1]
+        total_games = len(opponents) * arguments.games * 2
+        print(
+            f"Evaluating {latest_id} against {len(opponents)} checkpoints; "
+            f"{total_games:,} games total",
+            flush=True,
+        )
+        for index, path in enumerate(opponents, start=1):
             opponent_id = path.stem.removeprefix("policy_")
             opponent = policies[opponent_id]
             left = evaluate_pair(latest, opponent, environment, arguments.games, arguments.max_ticks)
@@ -93,6 +100,12 @@ def main() -> None:
                 "draw_rate": float(outcomes.eq(0).float().mean()),
                 "loss_rate": float(outcomes.lt(0).float().mean()),
             })
+            print(
+                f"[{index}/{len(opponents)}] {latest_id} vs {opponent_id} "
+                f"win={results[-1]['win_rate']:.3f} "
+                f"draw={results[-1]['draw_rate']:.3f}",
+                flush=True,
+            )
     finally:
         environment.close()
 
