@@ -98,14 +98,14 @@ class SeerReward:
 
         score_for_actor = context.events.score_delta[:, None] * team_sign
         ball_speed = current.ball_velocity.norm(dim=-1, keepdim=True)
-        goal_time = self._episode_steps[:, None] / 15.0
+        goal_time = context.episode_ticks[:, None] / 120.0
         goal_time_bonus = 0.5 + torch.exp(-goal_time / GOAL_TIME_SCALE_SECONDS)
         goal_scored = (
             score_for_actor.gt(0)
             * goal_time_bonus
             * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
         )
-        score_difference = self._score_difference + context.events.score_delta
+        score_difference = context.score_difference[:, None]
         remaining_seconds = (120.0 - goal_time).clamp_min(0.0)
         expected_goals = remaining_seconds / 60.0
         variance = (2.0 * expected_goals).clamp_min(1e-6)
@@ -120,7 +120,7 @@ class SeerReward:
         previous_win_probability = 0.5 * (
             1.0
             + torch.erf(
-                (self._score_difference[:, None].float() - 0.5)
+                (score_difference.float() - context.events.score_delta[:, None] - 0.5)
                 / variance.sqrt()
                 / 2.0**0.5
             )
@@ -282,9 +282,7 @@ class SeerReward:
 
         done = context.events.done
         self._episode_steps += 1
-        self._score_difference += context.events.score_delta
         self._episode_steps[done] = 0
-        self._score_difference[done] = 0
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
 
@@ -321,7 +319,6 @@ class SeerReward:
         self._touch_decay = torch.ones(expected, device=device)
         self._last_touch = torch.zeros(expected, dtype=torch.bool, device=device)
         self._episode_steps = torch.zeros(expected[0], dtype=torch.float32, device=device)
-        self._score_difference = torch.zeros(expected[0], dtype=torch.float32, device=device)
         self._count = 0
         self._mean = torch.zeros((), device=device)
         self._variance = torch.ones((), device=device)
