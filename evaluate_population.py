@@ -39,13 +39,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint_dir", type=Path)
     parser.add_argument("--games", type=int, default=50)
+    parser.add_argument("--checkpoint-stride", type=int, default=1)
     parser.add_argument("--max-ticks", type=int, default=14_400)
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()
     if arguments.games < 1:
         raise ValueError("games must be positive")
+    if arguments.checkpoint_stride < 1:
+        raise ValueError("checkpoint-stride must be positive")
 
     paths = sorted(arguments.checkpoint_dir.glob("policy_*.pt"))
+    if arguments.checkpoint_stride > 1:
+        paths = paths[:: arguments.checkpoint_stride]
+        latest = sorted(arguments.checkpoint_dir.glob("policy_*.pt"))[-1]
+        if paths[-1] != latest:
+            paths.append(latest)
     if len(paths) < 2:
         raise ValueError("at least two policy checkpoints are required")
     device = torch.device("cuda:0")
