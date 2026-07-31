@@ -27,6 +27,7 @@ from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.modules.utils import init_layer
 
 from replay_states import load_replay_dataset
+from nexto import NextoPolicy
 
 
 CAR_OFFSET = (13.8757, 0.0, 20.755)
@@ -302,7 +303,7 @@ def render_frame(
     raw:             torch.Tensor,
     checkpoint_root: Path,
     blue_path:       Path,
-    orange_path:     Path,
+    orange_path:     Path | None,
     blue_score:      int,
     orange_score:    int,
     round_number:    int,
@@ -348,11 +349,19 @@ def render_frame(
             "path":       blue_path.relative_to(checkpoint_root).as_posix(),
             "score":      blue_score,
         },
-        "orange": {
-            "checkpoint": checkpoint_label(orange_path),
-            "path":       orange_path.relative_to(checkpoint_root).as_posix(),
-            "score":      orange_score,
-        },
+        "orange": (
+            {
+                "checkpoint": checkpoint_label(orange_path),
+                "path":       orange_path.relative_to(checkpoint_root).as_posix(),
+                "score":      orange_score,
+            }
+            if orange_path is not None
+            else {
+                "checkpoint": "Nexto",
+                "path":       "nexto",
+                "score":      orange_score,
+            }
+        ),
         "cars": cars,
         "ball": {"pos": vector(ball[:3])},
     }
@@ -362,7 +371,7 @@ def simulate(
     state:           SpectatorState,
     checkpoint_root: Path,
     blue_path:       Path,
-    orange_path:     Path,
+    orange_path:     Path | None,
     tick_skip:       int,
     max_ticks:       int,
     sample_actions:  bool,
@@ -371,6 +380,7 @@ def simulate(
     replay_dataset:  Path,
     seed:            int,
     fast_forward:   int,
+    nexto_checkpoint: Path | None,
 ) -> None:
     environment = CARLTorchVectorEnv(
         n_sim=1,
@@ -385,7 +395,12 @@ def simulate(
     reset_controller = ReplayResetController(replay_dataset, seed)
 
     try:
-        blue, orange = load_pair(blue_path, orange_path, environment)
+        blue = load_actor(blue_path, environment)
+        orange = (
+            NextoPolicy(nexto_checkpoint, environment.device)
+            if nexto_checkpoint is not None
+            else load_actor(orange_path, environment)
+        )
         reset_controller.configure(environment, replay_resets)
         observations = environment.reset()
         hidden = [blue.initial_state(1), orange.initial_state(1)]
@@ -405,8 +420,11 @@ def simulate(
                     next_fast_forward,
                 ) = pending_match
                 try:
-                    next_blue, next_orange = load_pair(
-                        next_blue_path, next_orange_path, environment
+                    next_blue = load_actor(next_blue_path, environment)
+                    next_orange = (
+                        NextoPolicy(nexto_checkpoint, environment.device)
+                        if nexto_checkpoint is not None
+                        else load_actor(next_orange_path, environment)
                     )
                     reset_controller.configure(environment, next_replay_resets)
                     next_observations = environment.reset()
@@ -414,7 +432,9 @@ def simulate(
                     state.publish({"error": f"{type(error).__name__}: {error}"})
                 else:
                     blue_path = next_blue_path
-                    orange_path = next_orange_path
+                    orange_path = (
+                        None if nexto_checkpoint is not None else next_orange_path
+                    )
                     blue = next_blue
                     orange = next_orange
                     sample_actions = next_sample
@@ -441,11 +461,18 @@ def simulate(
                     hidden[0],
                     deterministic=not sample_actions,
                 )
-                orange_output = orange.act(
-                    observations[1:2],
-                    hidden[1],
-                    deterministic=not sample_actions,
-                )
+                if nexto_checkpoint is None:
+                    orange_output = orange.act(
+                        observations[1:2],
+                        hidden[1],
+                        deterministic=not sample_actions,
+                    )
+                else:
+                    orange_output = orange.act_from_raw(
+                        torch.from_dlpack(environment._env.get_state()).clone(),
+                        hidden[1],
+                        car_index=1,
+                    )
             hidden = [blue_output.next_state, orange_output.next_state]
             actions = torch.cat((blue_output.action, orange_output.action), dim=0)
             observations, reward, terminated, truncated, _ = environment.step(actions)
@@ -619,6 +646,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=Path, default=root / "checkpoints")
     parser.add_argument("--blue")
     parser.add_argument("--orange")
+    parser.add_argument("--nexto", action="store_true")
+    parser.add_argument(
+        "--nexto-checkpoint",
+        type=Path,
+        default=root / "data" / "nexto" / "nexto-model.pt",
+    )
     parser.add_argument("--tick-skip", type=int, default=8)
     parser.add_argument("--fast-forward", type=int, default=1)
     parser.add_argument("--max-ticks", type=int, default=4096)
@@ -640,8 +673,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--open", action="store_true")
     arguments = parser.parse_args()
 
-    if (arguments.blue is None) != (arguments.orange is None):
+    if not arguments.nexto and (arguments.blue is None) != (arguments.orange is None):
         parser.error("--blue and --orange must be provided together")
+    if arguments.nexto and arguments.orange is not None:
+        parser.error("--orange cannot be used with --nexto")
+    if arguments.nexto and not arguments.nexto_checkpoint.is_file():
+        parser.error(f"Nexto checkpoint does not exist: {arguments.nexto_checkpoint}")
     if arguments.tick_skip < 1 or arguments.max_ticks < 1 or arguments.fast_forward < 1:
         parser.error("tick, episode, and fast-forward values must be positive")
     if not 1 <= arguments.port <= 65535:
@@ -655,7 +692,19 @@ def main() -> None:
         raise RuntimeError("CARL checkpoint playback requires CUDA")
 
     registry = CheckpointRegistry(arguments.checkpoint_dir)
-    if arguments.blue is None:
+    if arguments.nexto:
+        checkpoints = registry.list()
+        if arguments.blue is None and not checkpoints:
+            raise FileNotFoundError(
+                f"Need a current-format checkpoint under {registry.directory}"
+            )
+        blue_path = (
+            checkpoints[0].path
+            if arguments.blue is None
+            else registry.resolve(arguments.blue)
+        )
+        orange_path = None
+    elif arguments.blue is None:
         blue_path, orange_path = registry.newest_pair()
     else:
         blue_path = registry.resolve(arguments.blue)
@@ -683,6 +732,7 @@ def main() -> None:
             arguments.replay_dataset,
             arguments.seed,
             arguments.fast_forward,
+            arguments.nexto_checkpoint if arguments.nexto else None,
         ),
         daemon=True,
     )
@@ -690,7 +740,7 @@ def main() -> None:
 
     url = f"http://{arguments.host}:{arguments.port}"
     print(f"Blue:   {blue_path}")
-    print(f"Orange: {orange_path}")
+    print(f"Orange: {orange_path or 'Nexto'}")
     print(f"Viewer: {url}")
     if arguments.open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

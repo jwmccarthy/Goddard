@@ -113,6 +113,15 @@ Start the browser viewer with:
 uv run python watch_checkpoints.py --open
 ```
 
+Watch the newest Goddard checkpoint against Nexto with:
+
+```bash
+uv run python watch_checkpoints.py \
+    --nexto \
+    --nexto-checkpoint data/nexto/nexto-model.pt \
+    --open
+```
+
 The viewer runs at `http://127.0.0.1:8788`. It scans `checkpoints/` every five seconds. The menu selects a run directory and a checkpoint for each team. It also supports sampled actions and random replay starting states. Pass `--normalize` when viewing checkpoints trained with normalized observations; the default remains raw for older checkpoints.
 
 Drag to orbit. Right drag to pan. Scroll to zoom. Use WASD, Space, and Ctrl to move the camera. Press `R` to reset the match.
