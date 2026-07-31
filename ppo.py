@@ -92,7 +92,7 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument(
         "--no-touch-timeout",
         type=float,
-        default=16.0,
+        default=30.0,
         help="end an episode after this many seconds without a ball touch",
     )
     parser.add_argument("--rollout-steps",              type=int,   default=512)

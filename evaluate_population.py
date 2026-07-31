@@ -67,7 +67,7 @@ def main() -> None:
         max_ticks=arguments.max_ticks,
         synchronize=False,
         normalize=True,
-        no_touch_timeout_seconds=16.0,
+        no_touch_timeout_seconds=30.0,
     )
     config = SimpleNamespace(hidden_size=256)
     policies = {}
