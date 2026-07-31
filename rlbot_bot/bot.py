@@ -37,6 +37,16 @@ RELATIVE_CAR_VELOCITY_SCALE = 2.0 * 2300.0
 GOAL_CENTER_Y = 5120.0
 GOAL_CENTER_Z = 321.3875
 ARENA_DIAGONAL = 14692.54
+KICKOFF_CONTROLS = np.asarray(
+    44 * [[1, 0, 0, 0, 0, 0, 1, 0]]
+    + 16 * [[1, -1, 0, 0, 0, 0, 1, 0]]
+    + 8 * [[1, 0, 0, 0, 0, 1, 1, 0]]
+    + 4 * [[1, 0, 0, 0, 0, 0, 1, 0]]
+    + 4 * [[1, 0, -0.7, 0.8, 0, 1, 1, 0]]
+    + 52 * [[1, 0, 1, 0, 0, 0, 1, 0]]
+    + 40 * [[0, 0, 0.5, 0, 1, 0, 0, 0]],
+    dtype=np.float32,
+)
 
 
 class GoddardPolicy(nn.Module):
@@ -76,6 +86,7 @@ class GoddardBot(Bot):
         self.last_inference_frame = -10**9
         self.last_game_time = -math.inf
         self.last_match_phase = None
+        self.kickoff_tick = None
         self.previous_boost = {}
         self.packet_pad_indices = self._map_boost_pads()
 
@@ -109,6 +120,7 @@ class GoddardBot(Bot):
             self.hidden.zero_()
             self.last_inference_frame = -10**9
             self.last_match_phase = phase
+            self.kickoff_tick = 0
             self.controller = flat.ControllerState()
             return self.controller
         kickoff_started = (
@@ -124,6 +136,7 @@ class GoddardBot(Bot):
             self.hidden.zero_()
         if kickoff_started:
             self.last_inference_frame = -10**9
+            self.kickoff_tick = 0
         self.last_match_phase = phase
         self.last_game_time = now
 
@@ -136,11 +149,41 @@ class GoddardBot(Bot):
             logits, next_hidden = self.policy(observation, self.hidden)
             action = self._action(logits[0], observation[0])
         self.hidden = next_hidden.detach()
-        self.controller = self._decode(action)
+        kickoff_control = self._kickoff_control(packet)
+        self.controller = (
+            kickoff_control if kickoff_control is not None else self._decode(action)
+        )
         self.previous_boost = {
             index: car.boost for index, car in enumerate(packet.players)
         }
         return self.controller
+
+    def _kickoff_control(self, packet) -> flat.ControllerState | None:
+        if self.kickoff_tick is None or not packet.balls:
+            return None
+        ball = packet.balls[0].physics
+        position = self._vector(ball.location)
+        velocity = self._vector(ball.velocity)
+        if (
+            np.max(np.abs(position[:2])) >= 1.0
+            or np.max(np.abs(velocity)) >= 1.0
+            or self.kickoff_tick >= len(KICKOFF_CONTROLS)
+        ):
+            self.kickoff_tick = None
+            return None
+
+        control = KICKOFF_CONTROLS[self.kickoff_tick]
+        self.kickoff_tick += 8
+        return flat.ControllerState(
+            throttle=float(control[0]),
+            steer=float(control[1]),
+            pitch=float(control[2]),
+            yaw=float(control[3]),
+            roll=float(control[4]),
+            jump=bool(control[5]),
+            boost=bool(control[6]),
+            handbrake=bool(control[7]),
+        )
 
     def _observation(self, packet) -> np.ndarray:
         invert = self.team == 1
