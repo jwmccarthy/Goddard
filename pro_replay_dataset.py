@@ -98,13 +98,19 @@ def main() -> None:
                         "UPDATE replays SET downloaded = 1 WHERE id = ?", (replay_id,)
                     )
                     continue
-                time.sleep(0.5)
-                with session.get(
-                    f"{API}/replays/{replay_id}/file",
-                    headers=headers,
-                    stream=True,
-                    timeout=120,
-                ) as download:
+                time.sleep(0.6)
+                while True:
+                    download = session.get(
+                        f"{API}/replays/{replay_id}/file",
+                        headers=headers,
+                        stream=True,
+                        timeout=120,
+                    )
+                    if download.status_code != 429:
+                        break
+                    download.close()
+                    time.sleep(float(download.headers.get("Retry-After", 30)))
+                with download:
                     download.raise_for_status()
                     with tempfile.NamedTemporaryFile(
                         mode="wb", dir=replay_dir, suffix=".part", delete=False
