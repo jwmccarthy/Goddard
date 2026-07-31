@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -27,24 +26,6 @@ NEXTO_BOOST_POSITIONS = (
     (3072.0, 4096.0, 70.0), (-1792.0, 4184.0, 70.0),
     (1792.0, 4184.0, 70.0), (0.0, 4240.0, 70.0),
 )
-
-KICKOFF_CONTROLS = torch.tensor(
-    44 * [[1, 0, 0, 0, 0, 0, 1, 0]]
-    + 16 * [[1, -1, 0, 0, 0, 0, 1, 0]]
-    + 8 * [[1, 0, 0, 0, 0, 1, 1, 0]]
-    + 4 * [[1, 0, 0, 0, 0, 0, 1, 0]]
-    + 4 * [[1, 0, -0.7, 0.8, 0, 1, 1, 0]]
-    + 52 * [[1, 0, 1, 0, 0, 0, 1, 0]]
-    + 40 * [[0, 0, 0.5, 0, 1, 0, 0, 0]],
-    dtype=torch.float32,
-)
-
-
-@dataclass
-class NextoState:
-    previous_action: torch.Tensor
-    kickoff_tick: torch.Tensor
-
 
 def _lookup_table() -> torch.Tensor:
     actions = []
@@ -97,69 +78,26 @@ class NextoPolicy(nn.Module):
     def device(self) -> torch.device:
         return self.lookup.device
 
-    def initial_state(self, batch_size: int) -> NextoState:
-        return NextoState(
-            previous_action=torch.zeros(batch_size, 8, device=self.device),
-            kickoff_tick=torch.zeros(
-                batch_size, dtype=torch.int64, device=self.device
-            ),
-        )
+    def initial_state(self, batch_size: int) -> torch.Tensor:
+        return torch.zeros(batch_size, 8, device=self.device)
 
     @torch.no_grad()
     def act_from_raw(
         self,
         raw: torch.Tensor,
-        state: NextoState | torch.Tensor,
+        state: torch.Tensor,
         car_index: int,
     ) -> PolicyOutput:
         action_device = raw.device
-        if isinstance(state, NextoState):
-            previous_action = state.previous_action
-            kickoff_tick = state.kickoff_tick
-        else:
-            previous_action = state
-            kickoff_tick = torch.zeros(
-                len(raw), dtype=torch.int64, device=self.device
-            )
         query, values, mask = self._observation(
-            raw.cpu(), previous_action.cpu(), car_index
+            raw.cpu(), state.cpu(), car_index
         )
         logits, _ = self.model((query, values, mask))
         controls = self.lookup[logits.argmax(dim=-1)]
-        controls, kickoff_tick = self._apply_kickoff(
-            controls, raw.cpu(), kickoff_tick
-        )
         return PolicyOutput(
             action=self._encode_controls(controls).to(action_device),
-            next_state=NextoState(controls, kickoff_tick),
+            next_state=controls,
         )
-
-    def _apply_kickoff(
-        self,
-        controls: torch.Tensor,
-        raw: torch.Tensor,
-        kickoff_tick: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        centered = raw[:, :2].abs().amax(dim=1).lt(1.0)
-        stationary = raw[:, 3:6].abs().amax(dim=1).lt(1.0)
-        restarting = centered & stationary & kickoff_tick.lt(0)
-        kickoff_tick = torch.where(
-            restarting, torch.zeros_like(kickoff_tick), kickoff_tick
-        )
-        active = centered & stationary & kickoff_tick.lt(len(KICKOFF_CONTROLS))
-        if active.any():
-            controls = controls.clone()
-            controls[active] = KICKOFF_CONTROLS[kickoff_tick[active]]
-        kickoff_tick = torch.where(
-            active,
-            kickoff_tick + 8,
-            torch.where(
-                centered & stationary,
-                kickoff_tick,
-                -torch.ones_like(kickoff_tick),
-            ),
-        )
-        return controls, kickoff_tick
 
     def _observation(
         self,
