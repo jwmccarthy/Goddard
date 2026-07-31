@@ -1,8 +1,10 @@
 import argparse
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -44,9 +46,52 @@ def elite_duel(replay: dict, verified: set[str]) -> bool:
     )
 
 
+class BallchasingClient:
+    def __init__(self, token: str, requests_per_second: float) -> None:
+        self.headers = {"Authorization": token}
+        self.interval = 1.0 / requests_per_second
+        self.next_request = 0.0
+        self.lock = threading.Lock()
+        self.local = threading.local()
+
+    def get(self, url: str, **kwargs) -> requests.Response:
+        for attempt in range(6):
+            with self.lock:
+                delay = max(0.0, self.next_request - time.monotonic())
+                if delay:
+                    time.sleep(delay)
+                self.next_request = time.monotonic() + self.interval
+
+            try:
+                response = self._session().get(
+                    url, headers=self.headers, timeout=120, **kwargs
+                )
+            except requests.RequestException:
+                if attempt == 5:
+                    raise
+                time.sleep(min(30.0, 2.0**attempt))
+                continue
+
+            if response.status_code not in {429, 500, 502, 503, 504}:
+                return response
+            retry_after = float(response.headers.get("Retry-After", 2.0**attempt))
+            response.close()
+            with self.lock:
+                self.next_request = max(
+                    self.next_request, time.monotonic() + retry_after
+                )
+        raise RuntimeError(f"Ballchasing request failed after retries: {url}")
+
+    def _session(self) -> requests.Session:
+        session = getattr(self.local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self.local.session = session
+        return session
+
+
 def discover_pool(
-    session: requests.Session,
-    headers: dict[str, str],
+    client: BallchasingClient,
     pool_size: int,
     replay_limit: int,
     progress: Progress,
@@ -63,11 +108,7 @@ def discover_pool(
     ]
     inspected = 0
     while url and inspected < replay_limit:
-        time.sleep(0.5)
-        response = session.get(url, headers=headers, params=params, timeout=60)
-        if response.status_code == 429:
-            time.sleep(float(response.headers.get("Retry-After", 30)))
-            continue
+        response = client.get(url, params=params)
         response.raise_for_status()
         payload = response.json()
         for replay in payload.get("list", []):
@@ -93,16 +134,46 @@ def discover_pool(
     return {identity: names.get(identity, identity) for identity in ranked}
 
 
+def download_replay(
+    client: BallchasingClient,
+    replay_id: str,
+    output: Path,
+) -> str:
+    temporary_path = None
+    try:
+        with client.get(f"{API}/replays/{replay_id}/file", stream=True) as response:
+            response.raise_for_status()
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=output.parent, suffix=".part", delete=False
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                for chunk in response.iter_content(1024 * 1024):
+                    if chunk:
+                        temporary.write(chunk)
+        os.replace(temporary_path, output)
+        return replay_id
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path("data/pro-1v1"))
     parser.add_argument("--target", type=int, default=100_000)
     parser.add_argument("--pool-size", type=int, default=100)
     parser.add_argument("--discovery-limit", type=int, default=20_000)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--requests-per-second", type=float, default=2.0)
     arguments = parser.parse_args()
     token = os.environ.get("BALLCHASING_TOKEN")
     if not token:
         raise RuntimeError("BALLCHASING_TOKEN is required")
+    if arguments.workers < 1:
+        parser.error("--workers must be positive")
+    if not 0 < arguments.requests_per_second <= 2:
+        parser.error("--requests-per-second must be in (0, 2]")
 
     arguments.output.mkdir(parents=True, exist_ok=True)
     replay_dir = arguments.output / "replays"
@@ -112,8 +183,7 @@ def main() -> None:
         "CREATE TABLE IF NOT EXISTS replays ("
         "id TEXT PRIMARY KEY, date TEXT, blue TEXT, orange TEXT, downloaded INTEGER)"
     )
-    headers = {"Authorization": token}
-    session = requests.Session()
+    client = BallchasingClient(token, arguments.requests_per_second)
     progress = Progress(
         TextColumn("[bold]{task.description}"),
         BarColumn(),
@@ -128,8 +198,7 @@ def main() -> None:
         progress.update(discovery_task, completed=arguments.discovery_limit)
     else:
         pool = discover_pool(
-            session,
-            headers,
+            client,
             arguments.pool_size,
             arguments.discovery_limit,
             progress,
@@ -144,71 +213,78 @@ def main() -> None:
         "download", total=arguments.target, completed=downloaded
     )
 
-    for source_id in verified:
-        url = f"{API}/replays"
-        params = [
-            ("player-id", source_id),
-            ("pro", "true"),
-            ("count", "200"),
-            ("sort-by", "replay-date"),
-            ("sort-dir", "desc"),
-        ]
-        while url and downloaded < arguments.target:
-            time.sleep(0.5)
-            response = session.get(url, headers=headers, params=params, timeout=60)
-            if response.status_code == 429:
-                time.sleep(float(response.headers.get("Retry-After", 30)))
+    pending: dict[Future[str], str] = {}
+    scheduled: set[str] = set()
+
+    def drain(block: bool) -> None:
+        nonlocal downloaded
+        if not pending:
+            return
+        done = (
+            {future for future in pending if future.done()}
+            if not block
+            else wait(pending, return_when=FIRST_COMPLETED).done
+        )
+        for future in done:
+            replay_id = pending.pop(future)
+            try:
+                future.result()
+            except Exception as error:
+                scheduled.discard(replay_id)
+                progress.console.print(f"[red]{replay_id}: {error}")
                 continue
-            response.raise_for_status()
-            payload = response.json()
-            for replay in payload.get("list", []):
-                if not elite_duel(replay, verified):
-                    continue
-                replay_id = replay["id"]
-                blue = player_id(replay["blue"]["players"][0])
-                orange = player_id(replay["orange"]["players"][0])
-                database.execute(
-                    "INSERT OR IGNORE INTO replays VALUES (?, ?, ?, ?, 0)",
-                    (replay_id, replay.get("date"), blue, orange),
-                )
-                output = replay_dir / f"{replay_id}.replay"
-                if output.is_file():
+            database.execute(
+                "UPDATE replays SET downloaded = 1 WHERE id = ?", (replay_id,)
+            )
+            downloaded += 1
+            progress.update(download_task, completed=downloaded)
+        database.commit()
+
+    with ThreadPoolExecutor(max_workers=arguments.workers) as executor:
+        for source_id in verified:
+            url = f"{API}/replays"
+            params = [
+                ("player-id", source_id),
+                ("pro", "true"),
+                ("count", "200"),
+                ("sort-by", "replay-date"),
+                ("sort-dir", "desc"),
+            ]
+            while url and downloaded + len(pending) < arguments.target:
+                response = client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+                for replay in payload.get("list", []):
+                    if not elite_duel(replay, verified):
+                        continue
+                    replay_id = replay["id"]
+                    blue = player_id(replay["blue"]["players"][0])
+                    orange = player_id(replay["orange"]["players"][0])
                     database.execute(
-                        "UPDATE replays SET downloaded = 1 WHERE id = ?", (replay_id,)
+                        "INSERT OR IGNORE INTO replays VALUES (?, ?, ?, ?, 0)",
+                        (replay_id, replay.get("date"), blue, orange),
                     )
-                    continue
-                time.sleep(0.6)
-                while True:
-                    download = session.get(
-                        f"{API}/replays/{replay_id}/file",
-                        headers=headers,
-                        stream=True,
-                        timeout=120,
-                    )
-                    if download.status_code != 429:
+                    output = replay_dir / f"{replay_id}.replay"
+                    if output.is_file():
+                        database.execute(
+                            "UPDATE replays SET downloaded = 1 WHERE id = ?",
+                            (replay_id,),
+                        )
+                        continue
+                    if replay_id in scheduled:
+                        continue
+                    scheduled.add(replay_id)
+                    future = executor.submit(download_replay, client, replay_id, output)
+                    pending[future] = replay_id
+                    if len(pending) >= arguments.workers * 2:
+                        drain(block=True)
+                    if downloaded + len(pending) >= arguments.target:
                         break
-                    download.close()
-                    time.sleep(float(download.headers.get("Retry-After", 30)))
-                with download:
-                    download.raise_for_status()
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb", dir=replay_dir, suffix=".part", delete=False
-                    ) as temporary:
-                        temporary_path = Path(temporary.name)
-                        for chunk in download.iter_content(1024 * 1024):
-                            if chunk:
-                                temporary.write(chunk)
-                    os.replace(temporary_path, output)
-                database.execute(
-                    "UPDATE replays SET downloaded = 1 WHERE id = ?", (replay_id,)
-                )
-                database.commit()
-                downloaded += 1
-                progress.update(download_task, completed=downloaded)
-                if downloaded >= arguments.target:
-                    break
-            url = payload.get("next")
-            params = None
+                drain(block=False)
+                url = payload.get("next")
+                params = None
+        while pending:
+            drain(block=True)
     database.close()
     progress.stop()
 
