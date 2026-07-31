@@ -1,8 +1,10 @@
 import argparse
+import json
 import os
 import sqlite3
 import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 
 import requests
@@ -41,10 +43,58 @@ def elite_duel(replay: dict, verified: set[str]) -> bool:
     )
 
 
+def discover_pool(
+    session: requests.Session,
+    headers: dict[str, str],
+    pool_size: int,
+    replay_limit: int,
+) -> dict[str, str]:
+    counts = Counter()
+    names = {}
+    url = f"{API}/replays"
+    params = [
+        ("pro", "true"),
+        ("count", "200"),
+        ("sort-by", "replay-date"),
+        ("sort-dir", "desc"),
+    ]
+    inspected = 0
+    while url and inspected < replay_limit:
+        time.sleep(0.5)
+        response = session.get(url, headers=headers, params=params, timeout=60)
+        if response.status_code == 429:
+            time.sleep(float(response.headers.get("Retry-After", 30)))
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        for replay in payload.get("list", []):
+            blue = replay.get("blue", {}).get("players", [])
+            orange = replay.get("orange", {}).get("players", [])
+            if len(blue) != 1 or len(orange) != 1:
+                continue
+            inspected += 1
+            for player in (*blue, *orange):
+                identity = player_id(player)
+                counts[identity] += 1
+                names[identity] = player.get("name") or identity
+        url = payload.get("next")
+        params = None
+
+    selected = set(PLAYERS.values())
+    selected.update(identity for identity, _ in counts.most_common(pool_size))
+    ranked = sorted(selected, key=lambda identity: counts[identity], reverse=True)
+    preferred = list(dict.fromkeys(PLAYERS.values()))
+    ranked = preferred + [identity for identity in ranked if identity not in preferred]
+    ranked = ranked[:pool_size]
+    return {identity: names.get(identity, identity) for identity in ranked}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path("data/pro-1v1"))
     parser.add_argument("--target", type=int, default=100_000)
+    parser.add_argument("--pool-size", type=int, default=100)
+    parser.add_argument("--discovery-limit", type=int, default=20_000)
     arguments = parser.parse_args()
     token = os.environ.get("BALLCHASING_TOKEN")
     if not token:
@@ -60,12 +110,23 @@ def main() -> None:
     )
     headers = {"Authorization": token}
     session = requests.Session()
-    verified = set(PLAYERS.values())
+    pool_path = arguments.output / "player_pool.json"
+    if pool_path.is_file():
+        pool = json.loads(pool_path.read_text())
+    else:
+        pool = discover_pool(
+            session,
+            headers,
+            arguments.pool_size,
+            arguments.discovery_limit,
+        )
+        pool_path.write_text(json.dumps(pool, indent=2) + "\n")
+    verified = set(pool)
     downloaded = database.execute(
         "SELECT count(*) FROM replays WHERE downloaded = 1"
     ).fetchone()[0]
 
-    for source_id in PLAYERS.values():
+    for source_id in verified:
         url = f"{API}/replays"
         params = [
             ("player-id", source_id),
