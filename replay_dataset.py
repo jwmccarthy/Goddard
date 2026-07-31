@@ -713,6 +713,18 @@ def _reset_candidate_mask(
     ball_z = frames[:, columns.index("Ball - position z")]
     car_z = frames[:, columns.index("player 0 - position z")]
     ball_y = frames[:, columns.index("Ball - position y")]
+    ball_x = frames[:, columns.index("Ball - position x")]
+    car0_x = frames[:, columns.index("player 0 - position x")]
+    car0_y = frames[:, columns.index("player 0 - position y")]
+    car1_x = frames[:, columns.index("player 1 - position x")]
+    car1_y = frames[:, columns.index("player 1 - position y")]
+    kickoff_like = (
+        np.hypot(ball_x[candidates], ball_y[candidates]) < 10.0
+    ) & (np.hypot(car0_x[candidates], car0_y[candidates]) > 2000.0) & (
+        np.hypot(car1_x[candidates], car1_y[candidates]) > 2000.0
+    )
+    kickoff_candidates = candidates[kickoff_like]
+    candidates = candidates[~kickoff_like]
     buckets = (
         (ball_z[candidates] > 180.0).astype(np.int32)
         + 2 * (car_z[candidates] > 100.0).astype(np.int32)
@@ -724,10 +736,25 @@ def _reset_candidate_mask(
         members = candidates[buckets == bucket]
         if len(members):
             selected.append(members[np.linspace(0, len(members) - 1, min(quota, len(members)), dtype=int)])
+    kickoff_quota = max(1, RESET_SAMPLES_PER_REPLAY // 50)
+    if len(kickoff_candidates):
+        selected.append(
+            kickoff_candidates[
+                np.linspace(
+                    0,
+                    len(kickoff_candidates) - 1,
+                    min(kickoff_quota, len(kickoff_candidates)),
+                    dtype=int,
+                )
+            ]
+        )
     selected = np.concatenate(selected) if selected else candidates
     if len(selected) < RESET_SAMPLES_PER_REPLAY:
         remaining = np.setdiff1d(candidates, selected, assume_unique=False)
-        selected = np.concatenate((selected, remaining[: RESET_SAMPLES_PER_REPLAY - len(selected)]))
+        count = min(RESET_SAMPLES_PER_REPLAY - len(selected), len(remaining))
+        selected = np.concatenate(
+            (selected, remaining[np.linspace(0, len(remaining) - 1, count, dtype=int)])
+        )
     mask = np.zeros(len(frames), dtype=np.bool_)
     mask[selected[:RESET_SAMPLES_PER_REPLAY]] = True
     return mask
