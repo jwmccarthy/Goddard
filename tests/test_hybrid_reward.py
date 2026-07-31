@@ -62,8 +62,8 @@ class HybridRewardTests(unittest.TestCase):
 
     def test_ball_state_rewards_are_normalized_and_attributed(self):
         weights = SeerRewardWeights()
-        self.assertEqual(weights.ball_height, 0.00025)
-        self.assertEqual(weights.ball_velocity, 0.00025)
+        self.assertEqual(weights.ball_height, 0.0)
+        self.assertEqual(weights.ball_velocity, 0.0)
         height, velocity = SeerReward._ball_state_rewards(
             torch.tensor([[[0.0, 0.0, CEILING_Z]]]),
             torch.tensor([[BALL_MAX_SPEED]]),
@@ -72,6 +72,27 @@ class HybridRewardTests(unittest.TestCase):
 
         torch.testing.assert_close(height, torch.tensor([[1.0, 0.0]]))
         torch.testing.assert_close(velocity, torch.tensor([[1.0, 0.0]]))
+
+    def test_legacy_occupancy_rewards_are_disabled(self):
+        weights = SeerRewardWeights()
+        names = (
+            "ball_height",
+            "ball_velocity",
+            "distance_player_ball",
+            "distance_ball_goal",
+            "facing_ball",
+            "align_ball_goal",
+            "closest_to_ball",
+            "touched_last",
+            "behind_ball",
+            "velocity_player_ball",
+            "kickoff",
+            "velocity",
+            "boost_amount",
+            "forward_velocity",
+        )
+
+        self.assertTrue(all(getattr(weights, name) == 0.0 for name in names))
 
     def test_nexto_mechanics_reward_components(self):
         previous = self.raw_state()

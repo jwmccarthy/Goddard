@@ -130,4 +130,4 @@ The page loads Three.js from `unpkg.com`, so the browser needs internet access.
 
 ## Reward
 
-`SeerReward` combines Nexto-style scoring, match-state, touch mechanics, boost economy, demos, and positional shaping. It converts the result to zero sum team rewards and normalizes it with running statistics unless `--no-normalize-rewards` is passed. TensorBoard records per-component episode means and raw, zero-sum, and normalized aggregate means and RMS scales.
+`SeerReward` combines Nexto-style scoring, match-state, touch mechanics, boost economy, demos, and potential-difference shaping. Persistent occupancy rewards are disabled so maintaining proximity, speed, boost, or defensive position cannot be farmed indefinitely. The result is converted to zero sum team rewards and normalized with running statistics unless `--no-normalize-rewards` is passed. TensorBoard records per-component episode means and raw, zero-sum, and normalized aggregate means and RMS scales.
