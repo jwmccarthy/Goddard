@@ -117,8 +117,8 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--historical-policies",        type=int,   default=4)
     parser.add_argument("--team-spirit",                type=float, default=1.0)
     parser.add_argument("--reward-scale",               type=float, default=1.0)
-    parser.add_argument("--goal-score-weight",          type=float, default=5.0)
-    parser.add_argument("--goal-score-weight-end",      type=float, default=5.0)
+    parser.add_argument("--goal-score-weight",          type=float, default=10.0)
+    parser.add_argument("--goal-score-weight-end",      type=float, default=10.0)
     parser.add_argument(
         "--normalize-rewards",
         action=argparse.BooleanOptionalAction,

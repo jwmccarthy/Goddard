@@ -10,20 +10,24 @@ BALL_MAX_SPEED = 6000.0
 CAR_MAX_SPEED = 2300.0
 CEILING_Z = 2044.0
 GOAL_Y = 5124.25
+GOAL_HEIGHT = 642.775
 BACK_WALL_Y = 5120.0
 GOAL_DISTANCE_OFFSET = GOAL_Y - BACK_WALL_Y + BALL_RADIUS
-GOAL_TIME_SCALE_SECONDS = 60.0
+NEXTO_TOUCH_HEIGHT_SCALE = 2250.0
 MATCH_TICKS = 5 * 60 * 120
 
 
 @dataclass(frozen=True)
 class SeerRewardWeights:
-    goal_scored:          float = 5.0
-    boost_difference:     float = 0.1
-    ball_touch:           float = 0.02
+    goal_scored:          float = 10.0
+    goal_speed_bonus:     float = 2.5
+    goal_distance_bonus:  float = 2.5
+    boost_gain:           float = 1.0
+    boost_loss:           float = 0.5
+    ball_touch:           float = 0.0
     ball_height:          float = 0.00025
     ball_velocity:        float = 0.00025
-    demo:                 float = 0.3
+    demo:                 float = 5.0
     distance_player_ball: float = 0.0025
     distance_ball_goal:   float = 0.0025
     facing_ball:          float = 0.000625
@@ -42,7 +46,8 @@ class SeerRewardWeights:
     touch_acceleration:   float = 0.25
     aerial_touch:         float = 1.0
     angular_velocity:     float = 0.01
-    flip_reset:           float = 0.0
+    flip_reset:           float = 10.0
+    touch_grass:          float = 0.005
     win_probability:      float = 10.0
 
 
@@ -70,8 +75,6 @@ class SeerReward:
         self._diagnostic_sums = None
         self._diagnostic_squares = None
         self._diagnostic_steps = None
-        self._synthetic_score = None
-        self._synthetic_ticks = None
 
     def set_goal_scored_weight(self, value: float) -> None:
         if value <= 0:
@@ -100,18 +103,21 @@ class SeerReward:
         own_goal[..., 1].neg_()
 
         score_for_actor = context.events.score_delta[:, None] * team_sign
+        scored = score_for_actor.clamp_min(0.0)
+        goal_scored = scored
         ball_speed = current.ball_velocity.norm(dim=-1, keepdim=True)
-        self._initialize_synthetic_context(context)
-        goal_time = self._synthetic_ticks[:, None] / 120.0
-        goal_time_bonus = 0.5 + torch.exp(-goal_time / GOAL_TIME_SCALE_SECONDS)
-        goal_scored = (
-            score_for_actor.gt(0)
-            * goal_time_bonus
-            * (1.0 + 0.5 * ball_speed / BALL_MAX_SPEED)
+        goal_speed_bonus = (
+            scored
+            * previous.ball_velocity.norm(dim=-1, keepdim=True)
+            / BALL_MAX_SPEED
         )
-        previous_score_difference = self._synthetic_score[:, None]
-        score_difference = previous_score_difference + context.events.score_delta[:, None]
-        remaining_seconds = (self._synthetic_ticks[:, None] / 120.0).clamp_min(0.0)
+        score_difference = context.score_difference[:, None]
+        previous_score_difference = (
+            score_difference - context.events.score_delta[:, None]
+        )
+        remaining_seconds = (
+            (MATCH_TICKS - context.episode_ticks[:, None]) / 120.0
+        ).clamp_min(0.0)
         expected_goals = remaining_seconds / 60.0
         variance = (2.0 * expected_goals).clamp_min(1e-6)
         win_probability = 0.5 * (
@@ -130,6 +136,33 @@ class SeerReward:
                 / 2.0**0.5
             )
         )
+        overtime = context.overtime[:, None]
+        win_probability = torch.where(
+            overtime,
+            torch.where(
+                score_difference.gt(0),
+                torch.ones_like(win_probability),
+                torch.where(
+                    score_difference.lt(0),
+                    torch.zeros_like(win_probability),
+                    torch.full_like(win_probability, 0.5),
+                ),
+            ),
+            win_probability,
+        )
+        previous_win_probability = torch.where(
+            overtime,
+            torch.where(
+                previous_score_difference.gt(0),
+                torch.ones_like(previous_win_probability),
+                torch.where(
+                    previous_score_difference.lt(0),
+                    torch.zeros_like(previous_win_probability),
+                    torch.full_like(previous_win_probability, 0.5),
+                ),
+            ),
+            previous_win_probability,
+        )
         win_probability_progress = (
             team_sign * (win_probability - previous_win_probability)
         )
@@ -137,6 +170,10 @@ class SeerReward:
         boost_current = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
         boost_previous = (previous.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
         boost_difference = boost_current - boost_previous
+        boost_gain = boost_difference.clamp_min(0.0)
+        boost_loss = (-boost_difference).clamp_min(0.0) * (
+            1.0 - current.car_position[..., 2] / GOAL_HEIGHT
+        ).clamp(0.0, 1.0)
 
         touches = current.car_ball_touches
         self._touch_decay = torch.where(
@@ -171,7 +208,9 @@ class SeerReward:
         )
 
         newly_demoed = current.car_demoed & ~previous.car_demoed
-        demo = self._opponent_team_mean(newly_demoed.float())
+        demo = 0.5 * (
+            self._opponent_team_mean(newly_demoed.float()) - newly_demoed.float()
+        )
 
         distance_player_ball = torch.exp(
             -0.5 * (distance_to_ball - BALL_RADIUS).clamp_min(0.0) / CAR_MAX_SPEED
@@ -199,20 +238,28 @@ class SeerReward:
         ball_acceleration = (
             current.ball_velocity - previous.ball_velocity
         ).norm(dim=-1, keepdim=True) / CAR_MAX_SPEED
-        average_height = 0.5 * (
-            current.car_position[..., 2] + ball_position[..., 2]
-        )
-        height_factor = ((average_height - 150.0) / CEILING_Z).clamp(0.0, 1.0)
-        touch_acceleration = touches * (1.0 - height_factor) * ball_acceleration
-        aerial_touch = touches * height_factor * (2.0 - current.car_on_ground.float())
+        touch_acceleration = touches * ball_acceleration
+        aerial_touch = touches * (
+            ball_position[..., 2] / NEXTO_TOUCH_HEIGHT_SCALE
+        ).clamp_min(0.0)
         angular_velocity = current.car_angular_velocity.norm(dim=-1) / 5.5
+        previously_spent_flip = (
+            previous.car_has_flipped | previous.car_has_double_jumped
+        )
+        flip_available = ~(
+            current.car_has_flipped | current.car_has_double_jumped
+        )
         flip_reset = (
             touches
-            & previous.car_has_flipped
-            & ~current.car_has_flipped
+            & previously_spent_flip
+            & flip_available
             & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
             & (ball_position - current.car_position).norm(dim=-1).lt(2.0 * BALL_RADIUS)
             & self._cosine(ball_position - current.car_position, -current.car_up).gt(0.9)
+        ).float()
+        touch_grass = (
+            current.car_on_ground
+            & current.car_position[..., 2].lt(BALL_RADIUS)
         ).float()
         closest_to_ball = distance_to_ball.eq(
             distance_to_ball.min(dim=-1, keepdim=True).values
@@ -238,11 +285,20 @@ class SeerReward:
         forward_velocity = (current.car_forward * current.car_velocity).sum(
             dim=-1
         ) / CAR_MAX_SPEED
+        defender_distance = self._opponent_team_mean(
+            (current.car_position - previous_ball_position).norm(dim=-1)
+        )
+        goal_distance_bonus = scored * (
+            1.0 - torch.exp(-defender_distance / CAR_MAX_SPEED)
+        )
 
         weights = self.weights
         components = {
             "goal_scored":          weights.goal_scored * goal_scored,
-            "boost_difference":     weights.boost_difference * boost_difference,
+            "goal_speed_bonus":     weights.goal_speed_bonus * goal_speed_bonus,
+            "goal_distance_bonus":  weights.goal_distance_bonus * goal_distance_bonus,
+            "boost_gain":           weights.boost_gain * boost_gain,
+            "boost_loss":          -weights.boost_loss * boost_loss,
             "ball_touch":           weights.ball_touch * ball_touch,
             "ball_height":          weights.ball_height * ball_height,
             "ball_velocity":        weights.ball_velocity * ball_velocity,
@@ -266,6 +322,7 @@ class SeerReward:
             "aerial_touch":         weights.aerial_touch * aerial_touch,
             "angular_velocity":     weights.angular_velocity * angular_velocity,
             "flip_reset":           weights.flip_reset * flip_reset,
+            "touch_grass":         -weights.touch_grass * touch_grass,
             "win_probability":      weights.win_probability * win_probability_progress,
         }
 
@@ -286,10 +343,6 @@ class SeerReward:
         )
 
         done = context.events.done
-        self._episode_steps += 1
-        self._synthetic_score += context.events.score_delta
-        self._synthetic_ticks.sub_(120).clamp_min_(0)
-        self._episode_steps[done] = 0
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
 
@@ -325,31 +378,12 @@ class SeerReward:
             return
         self._touch_decay = torch.ones(expected, device=device)
         self._last_touch = torch.zeros(expected, dtype=torch.bool, device=device)
-        self._episode_steps = torch.zeros(expected[0], dtype=torch.float32, device=device)
         self._count = 0
         self._mean = torch.zeros((), device=device)
         self._variance = torch.ones((), device=device)
         self._diagnostic_sums = None
         self._diagnostic_squares = None
         self._diagnostic_steps = None
-        self._synthetic_score = torch.zeros(expected[0], device=device)
-        self._synthetic_ticks = torch.zeros(expected[0], device=device)
-
-    def _initialize_synthetic_context(self, context: RewardContext) -> None:
-        """Assign a fresh plausible scoreline and clock to each reset state."""
-        reset = self._episode_steps.eq(0)
-        if not reset.any():
-            return
-
-        ticks = torch.randint(
-            0, MATCH_TICKS + 1, (reset.sum(),), device=self._synthetic_ticks.device
-        ).float()
-        elapsed_minutes = (MATCH_TICKS - ticks) / (120.0 * 60.0)
-        goals = torch.poisson(
-            elapsed_minutes[:, None].expand(-1, 2) * (1.0 / 1.0)
-        ).diff(dim=-1).squeeze(-1)
-        self._synthetic_ticks[reset] = ticks
-        self._synthetic_score[reset] = goals
 
     def _diagnostics(
         self,
