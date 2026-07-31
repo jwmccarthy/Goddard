@@ -1,12 +1,10 @@
 import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-import json
 import os
 import sqlite3
 import tempfile
 import threading
 import time
-from collections import Counter
 from pathlib import Path
 
 import requests
@@ -14,21 +12,6 @@ from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 
 
 API = "https://ballchasing.com/api"
-PLAYERS = {
-    "zen":      "steam:76561198144145654",
-    "vatira":   "steam:76561198960239428",
-    "exotiik":  "steam:76561198258466111",
-    "atow":     "steam:76561198289610054",
-    "juicy":    "steam:76561199013030566",
-    "stizzy":   "steam:76561199047701758",
-    "seikoo":   "steam:76561199013057612",
-    "oski":     "steam:76561198381037239",
-    "joreuz":   "steam:76561198974429177",
-    "crr":      "steam:76561198845948731",
-    "rezears":  "steam:76561198994499073",
-    "mawkzy":   "epic:6ea3d3d4f992494dacd7f757ff4e2b1a",
-    "diaz":     "steam:76561198880724484",
-}
 
 
 def player_id(player: dict) -> str:
@@ -36,14 +19,10 @@ def player_id(player: dict) -> str:
     return f"{identity.get('platform')}:{identity.get('id')}"
 
 
-def elite_duel(replay: dict, verified: set[str]) -> bool:
+def pro_duel(replay: dict) -> bool:
     blue = replay.get("blue", {}).get("players", [])
     orange = replay.get("orange", {}).get("players", [])
-    return (
-        len(blue) == len(orange) == 1
-        and player_id(blue[0]) in verified
-        and player_id(orange[0]) in verified
-    )
+    return len(blue) == len(orange) == 1
 
 
 class BallchasingClient:
@@ -80,10 +59,11 @@ class BallchasingClient:
 
             if response.status_code not in {429, 500, 502, 503, 504}:
                 return response
+            status = response.status_code
             retry_after = float(response.headers.get("Retry-After", 2.0**attempt))
             response.close()
             print(
-                f"{self.name} request returned {response.status_code}; "
+                f"{self.name} request returned {status}; "
                 f"waiting {retry_after:g}s",
                 flush=True,
             )
@@ -101,55 +81,21 @@ class BallchasingClient:
         return session
 
 
-def discover_pool(
-    client: BallchasingClient,
-    pool_size: int,
-    replay_limit: int,
-    progress: Progress,
-    task: int,
-) -> dict[str, str]:
-    counts = Counter()
-    names = {}
-    url = f"{API}/replays"
-    params = [
-        ("pro", "true"),
-        ("count", "200"),
-        ("sort-by", "replay-date"),
-        ("sort-dir", "desc"),
-    ]
-    inspected = 0
-    while url and inspected < replay_limit:
-        response = client.get(url, params=params)
-        response.raise_for_status()
-        payload = response.json()
-        for replay in payload.get("list", []):
-            blue = replay.get("blue", {}).get("players", [])
-            orange = replay.get("orange", {}).get("players", [])
-            if len(blue) != 1 or len(orange) != 1:
-                continue
-            inspected += 1
-            progress.update(task, completed=inspected)
-            for player in (*blue, *orange):
-                identity = player_id(player)
-                counts[identity] += 1
-                names[identity] = player.get("name") or identity
-        url = payload.get("next")
-        params = None
+def uses_octane_hitbox(path: Path) -> bool:
+    import subtr_actor
 
-    selected = set(PLAYERS.values())
-    selected.update(identity for identity, _ in counts.most_common(pool_size))
-    ranked = sorted(selected, key=lambda identity: counts[identity], reverse=True)
-    preferred = list(dict.fromkeys(PLAYERS.values()))
-    ranked = preferred + [identity for identity in ranked if identity not in preferred]
-    ranked = ranked[:pool_size]
-    return {identity: names.get(identity, identity) for identity in ranked}
+    metadata = subtr_actor.get_replay_meta(str(path))["replay_meta"]
+    players = (*metadata["team_zero"], *metadata["team_one"])
+    return len(players) == 2 and all(
+        player.get("car_hitbox_family") == "Octane" for player in players
+    )
 
 
 def download_replay(
     client: BallchasingClient,
     replay_id: str,
     output: Path,
-) -> str:
+) -> tuple[str, bool]:
     temporary_path = None
     try:
         with client.get(f"{API}/replays/{replay_id}/file", stream=True) as response:
@@ -161,8 +107,12 @@ def download_replay(
                 for chunk in response.iter_content(1024 * 1024):
                     if chunk:
                         temporary.write(chunk)
-        os.replace(temporary_path, output)
-        return replay_id
+        eligible = uses_octane_hitbox(temporary_path)
+        if eligible:
+            os.replace(temporary_path, output)
+        else:
+            temporary_path.unlink()
+        return replay_id, eligible
     except BaseException:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -173,8 +123,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path("data/pro-1v1"))
     parser.add_argument("--target", type=int, default=100_000)
-    parser.add_argument("--pool-size", type=int, default=100)
-    parser.add_argument("--discovery-limit", type=int, default=20_000)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--requests-per-second", type=float, default=2.0)
     parser.add_argument("--list-requests-per-second", type=float, default=16.0)
@@ -197,6 +145,16 @@ def main() -> None:
         "CREATE TABLE IF NOT EXISTS replays ("
         "id TEXT PRIMARY KEY, date TEXT, blue TEXT, orange TEXT, downloaded INTEGER)"
     )
+    columns = {
+        row[1] for row in database.execute("PRAGMA table_info(replays)").fetchall()
+    }
+    if "octane" not in columns:
+        database.execute("ALTER TABLE replays ADD COLUMN octane INTEGER")
+    database.execute(
+        "CREATE TABLE IF NOT EXISTS collector_state ("
+        "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    database.commit()
     listing_client = BallchasingClient(
         token, arguments.list_requests_per_second, "metadata"
     )
@@ -210,31 +168,38 @@ def main() -> None:
         TextColumn("{task.completed:,.0f}/{task.total:,.0f}"),
     )
     progress.start()
-    discovery_task = progress.add_task("discover", total=arguments.discovery_limit)
-    pool_path = arguments.output / "player_pool.json"
-    if pool_path.is_file():
-        pool = json.loads(pool_path.read_text())
-        progress.update(discovery_task, completed=arguments.discovery_limit)
-    else:
-        pool = discover_pool(
-            listing_client,
-            arguments.pool_size,
-            arguments.discovery_limit,
-            progress,
-            discovery_task,
+
+    unknown = database.execute(
+        "SELECT id FROM replays WHERE downloaded = 1 AND octane IS NULL"
+    ).fetchall()
+    validate_task = progress.add_task("validate", total=len(unknown))
+    for (replay_id,) in unknown:
+        output = replay_dir / f"{replay_id}.replay"
+        eligible = output.is_file() and uses_octane_hitbox(output)
+        if not eligible:
+            output.unlink(missing_ok=True)
+        database.execute(
+            "UPDATE replays SET downloaded = ?, octane = ? WHERE id = ?",
+            (int(eligible), int(eligible), replay_id),
         )
-        pool_path.write_text(json.dumps(pool, indent=2) + "\n")
-    verified = set(pool)
+        progress.advance(validate_task)
+    database.commit()
+
     downloaded = database.execute(
         "SELECT count(*) FROM replays WHERE downloaded = 1"
     ).fetchone()[0]
     download_task = progress.add_task(
         "download", total=arguments.target, completed=downloaded
     )
-    scan_task = progress.add_task("scan players", total=len(verified))
+    discovered = database.execute("SELECT count(*) FROM replays").fetchone()[0]
+    scan_task = progress.add_task(
+        "pro 1v1 found", total=arguments.target, completed=discovered
+    )
 
-    pending: dict[Future[str], str] = {}
-    scheduled: set[str] = set()
+    pending: dict[Future[tuple[str, bool]], str] = {}
+    scheduled = {
+        row[0] for row in database.execute("SELECT id FROM replays WHERE octane = 0")
+    }
 
     def drain(block: bool) -> None:
         nonlocal downloaded
@@ -248,30 +213,39 @@ def main() -> None:
         for future in done:
             replay_id = pending.pop(future)
             try:
-                future.result()
+                _, eligible = future.result()
             except Exception as error:
                 scheduled.discard(replay_id)
                 progress.console.print(f"[red]{replay_id}: {error}")
                 continue
             database.execute(
-                "UPDATE replays SET downloaded = 1 WHERE id = ?", (replay_id,)
+                "UPDATE replays SET downloaded = ?, octane = ? WHERE id = ?",
+                (int(eligible), int(eligible), replay_id),
             )
-            downloaded += 1
-            progress.update(download_task, completed=downloaded)
+            if eligible:
+                downloaded += 1
+                progress.update(download_task, completed=downloaded)
         database.commit()
 
     with ThreadPoolExecutor(max_workers=arguments.workers) as executor:
         # Resume files discovered before an interruption without rescanning first.
         for (replay_id,) in database.execute(
-            "SELECT id FROM replays WHERE downloaded = 0"
+            "SELECT id FROM replays WHERE downloaded = 0 AND octane IS NOT 0"
         ):
             output = replay_dir / f"{replay_id}.replay"
             if output.is_file():
+                eligible = uses_octane_hitbox(output)
+                if not eligible:
+                    output.unlink()
                 database.execute(
-                    "UPDATE replays SET downloaded = 1 WHERE id = ?", (replay_id,)
+                    "UPDATE replays SET downloaded = ?, octane = ? WHERE id = ?",
+                    (int(eligible), int(eligible), replay_id),
                 )
-                downloaded += 1
-                progress.update(download_task, completed=downloaded)
+                if eligible:
+                    downloaded += 1
+                    progress.update(download_task, completed=downloaded)
+                else:
+                    scheduled.add(replay_id)
                 continue
             scheduled.add(replay_id)
             future = executor.submit(
@@ -284,51 +258,60 @@ def main() -> None:
         while pending:
             drain(block=True)
 
-        for source_id in verified:
-            url = f"{API}/replays"
-            params = [
-                ("player-id", source_id),
-                ("pro", "true"),
-                ("count", "200"),
-                ("sort-by", "replay-date"),
-                ("sort-dir", "desc"),
-            ]
-            while url and downloaded + len(pending) < arguments.target:
-                response = listing_client.get(url, params=params)
-                response.raise_for_status()
-                payload = response.json()
-                for replay in payload.get("list", []):
-                    if not elite_duel(replay, verified):
-                        continue
-                    replay_id = replay["id"]
-                    blue = player_id(replay["blue"]["players"][0])
-                    orange = player_id(replay["orange"]["players"][0])
-                    database.execute(
-                        "INSERT OR IGNORE INTO replays VALUES (?, ?, ?, ?, 0)",
-                        (replay_id, replay.get("date"), blue, orange),
-                    )
-                    output = replay_dir / f"{replay_id}.replay"
-                    if output.is_file():
-                        database.execute(
-                            "UPDATE replays SET downloaded = 1 WHERE id = ?",
-                            (replay_id,),
-                        )
-                        continue
-                    if replay_id in scheduled:
-                        continue
-                    scheduled.add(replay_id)
-                    future = executor.submit(
-                        download_replay, download_client, replay_id, output
-                    )
-                    pending[future] = replay_id
-                    if len(pending) >= arguments.workers * 2:
-                        drain(block=True)
-                    if downloaded + len(pending) >= arguments.target:
-                        break
-                drain(block=False)
-                url = payload.get("next")
-                params = None
-            progress.advance(scan_task)
+        cursor = database.execute(
+            "SELECT value FROM collector_state WHERE key = 'pro_scan_cursor'"
+        ).fetchone()
+        url = cursor[0] if cursor else f"{API}/replays"
+        params = None if cursor else [
+            ("pro", "true"),
+            ("count", "200"),
+            ("sort-by", "replay-date"),
+            ("sort-dir", "desc"),
+        ]
+        while url and downloaded + len(pending) < arguments.target:
+            response = listing_client.get(url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+            for replay in payload.get("list", []):
+                if not pro_duel(replay):
+                    continue
+                replay_id = replay["id"]
+                blue = player_id(replay["blue"]["players"][0])
+                orange = player_id(replay["orange"]["players"][0])
+                inserted = database.execute(
+                    "INSERT OR IGNORE INTO replays "
+                    "(id, date, blue, orange, downloaded, octane) "
+                    "VALUES (?, ?, ?, ?, 0, NULL)",
+                    (replay_id, replay.get("date"), blue, orange),
+                )
+                if inserted.rowcount:
+                    progress.advance(scan_task)
+                output = replay_dir / f"{replay_id}.replay"
+                if output.is_file():
+                    continue
+                if replay_id in scheduled:
+                    continue
+                scheduled.add(replay_id)
+                future = executor.submit(
+                    download_replay, download_client, replay_id, output
+                )
+                pending[future] = replay_id
+                if len(pending) >= arguments.workers * 2:
+                    drain(block=True)
+            drain(block=False)
+            url = payload.get("next")
+            params = None
+            if url:
+                database.execute(
+                    "INSERT OR REPLACE INTO collector_state VALUES "
+                    "('pro_scan_cursor', ?)",
+                    (url,),
+                )
+            else:
+                database.execute(
+                    "DELETE FROM collector_state WHERE key = 'pro_scan_cursor'"
+                )
+            database.commit()
         while pending:
             drain(block=True)
     database.close()
