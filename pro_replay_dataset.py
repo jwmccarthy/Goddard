@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 import requests
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 
 
 API = "https://ballchasing.com/api"
@@ -48,6 +49,8 @@ def discover_pool(
     headers: dict[str, str],
     pool_size: int,
     replay_limit: int,
+    progress: Progress,
+    task: int,
 ) -> dict[str, str]:
     counts = Counter()
     names = {}
@@ -73,6 +76,7 @@ def discover_pool(
             if len(blue) != 1 or len(orange) != 1:
                 continue
             inspected += 1
+            progress.update(task, completed=inspected)
             for player in (*blue, *orange):
                 identity = player_id(player)
                 counts[identity] += 1
@@ -110,21 +114,35 @@ def main() -> None:
     )
     headers = {"Authorization": token}
     session = requests.Session()
+    progress = Progress(
+        TextColumn("[bold]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("{task.completed:,.0f}/{task.total:,.0f}"),
+    )
+    progress.start()
+    discovery_task = progress.add_task("discover", total=arguments.discovery_limit)
     pool_path = arguments.output / "player_pool.json"
     if pool_path.is_file():
         pool = json.loads(pool_path.read_text())
+        progress.update(discovery_task, completed=arguments.discovery_limit)
     else:
         pool = discover_pool(
             session,
             headers,
             arguments.pool_size,
             arguments.discovery_limit,
+            progress,
+            discovery_task,
         )
         pool_path.write_text(json.dumps(pool, indent=2) + "\n")
     verified = set(pool)
     downloaded = database.execute(
         "SELECT count(*) FROM replays WHERE downloaded = 1"
     ).fetchone()[0]
+    download_task = progress.add_task(
+        "download", total=arguments.target, completed=downloaded
+    )
 
     for source_id in verified:
         url = f"{API}/replays"
@@ -186,12 +204,13 @@ def main() -> None:
                 )
                 database.commit()
                 downloaded += 1
-                print(f"Downloaded {downloaded:,}: {replay_id}", flush=True)
+                progress.update(download_task, completed=downloaded)
                 if downloaded >= arguments.target:
                     break
             url = payload.get("next")
             params = None
     database.close()
+    progress.stop()
 
 
 if __name__ == "__main__":
