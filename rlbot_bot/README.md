@@ -11,4 +11,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File \
   'C:\Users\jack\RLBotGoddard\run.ps1'
 ```
 
-The adapter runs deterministic policy inference at 15 Hz and expects a 1v1 match.
+The adapter runs deterministic policy inference at 15 Hz, reproduces CARL's
+normalized 137-feature 1v1 observation, and expects a 1v1 match.

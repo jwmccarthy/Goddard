@@ -1,5 +1,4 @@
 import math
-import time
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +32,10 @@ INVERTED_PAD_INDICES = np.asarray(
     dtype=np.int64,
 )
 POSITION_SCALE = np.asarray((4108.0, 6000.0, 2076.0), dtype=np.float32)
+RELATIVE_BALL_VELOCITY_SCALE = 6000.0 + 2300.0
+RELATIVE_CAR_VELOCITY_SCALE = 2.0 * 2300.0
+GOAL_CENTER_Y = 5120.0
+GOAL_CENTER_Z = 321.3875
 ARENA_DIAGONAL = 14692.54
 
 
@@ -40,7 +43,7 @@ class GoddardPolicy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.head = nn.Module()
-        self.head.model = nn.Sequential(nn.Linear(119, 256), nn.ReLU())
+        self.head.model = nn.Sequential(nn.Linear(137, 256), nn.ReLU())
         self.body = nn.Module()
         self.body.rnn = nn.GRU(256, 256)
         self.foot = nn.Module()
@@ -70,9 +73,9 @@ class GoddardBot(Bot):
         self.policy.eval().requires_grad_(False)
         self.hidden = torch.zeros(1, 1, 256)
         self.controller = flat.ControllerState()
-        self.last_inference_time = -math.inf
+        self.last_inference_frame = -10**9
         self.last_game_time = -math.inf
-        self.was_kickoff_pause = False
+        self.last_match_phase = None
         self.previous_boost = {}
         self.packet_pad_indices = self._map_boost_pads()
 
@@ -100,24 +103,39 @@ class GoddardBot(Bot):
 
     def get_output(self, packet: flat.GamePacket) -> flat.ControllerState:
         now = float(packet.match_info.seconds_elapsed)
-        kickoff_pause = packet.match_info.match_phase in (
-            flat.MatchPhase.Countdown,
-            flat.MatchPhase.Kickoff,
-        )
-        kickoff_started = kickoff_pause and not self.was_kickoff_pause
-        if now < self.last_game_time or kickoff_started or packet.players[self.index].demolished_timeout > 0:
+        frame = int(packet.match_info.frame_num)
+        phase = packet.match_info.match_phase
+        if phase == flat.MatchPhase.Countdown:
             self.hidden.zero_()
-        self.was_kickoff_pause = kickoff_pause
+            self.last_inference_frame = -10**9
+            self.last_match_phase = phase
+            self.controller = flat.ControllerState()
+            return self.controller
+        kickoff_started = (
+            self.last_match_phase == flat.MatchPhase.Countdown
+            and phase in (flat.MatchPhase.Kickoff, flat.MatchPhase.Active)
+        )
+        if (
+            now < self.last_game_time
+            or frame < self.last_inference_frame
+            or kickoff_started
+            or packet.players[self.index].demolished_timeout > 0
+        ):
+            self.hidden.zero_()
+        if kickoff_started:
+            self.last_inference_frame = -10**9
+        self.last_match_phase = phase
         self.last_game_time = now
 
-        if now - self.last_inference_time < 1.0 / 15.0:
+        if frame - self.last_inference_frame < 8:
             return self.controller
-        self.last_inference_time = now
+        self.last_inference_frame = frame
 
         observation = torch.from_numpy(self._observation(packet)).unsqueeze(0)
         with torch.inference_mode():
-            logits, self.hidden = self.policy(observation, self.hidden)
+            logits, next_hidden = self.policy(observation, self.hidden)
             action = self._action(logits[0], observation[0])
+        self.hidden = next_hidden.detach()
         self.controller = self._decode(action)
         self.previous_boost = {
             index: car.boost for index, car in enumerate(packet.players)
@@ -128,31 +146,68 @@ class GoddardBot(Bot):
         invert = self.team == 1
         values = []
         if not packet.balls:
-            return np.zeros(119, dtype=np.float32)
-        values.extend(self._physics(packet.balls[0].physics, invert, ball=True))
-        values.extend(self._car(packet.players[self.index], invert, self.index))
+            return np.zeros(137, dtype=np.float32)
+        ball = packet.balls[0].physics
+        ego = packet.players[self.index]
+        values.extend(self._physics(ball, invert, ball=True))
+        values.extend(self._car(ego, invert, self.index))
         opponents = [
             index for index, car in enumerate(packet.players)
             if car.team != self.team
         ]
         if not opponents:
             raise RuntimeError("Goddard requires a 1v1 opponent")
-        values.extend(self._car(packet.players[opponents[0]], invert, opponents[0]))
+        opponent = packet.players[opponents[0]]
+        values.extend(self._car(opponent, invert, opponents[0]))
 
         pad_order = INVERTED_PAD_INDICES if invert else np.arange(34)
         values.extend(
             float(packet.boost_pads[self.packet_pad_indices[index]].is_active)
             for index in pad_order
         )
-        car = packet.players[self.index].physics.location
-        car_position = np.asarray((car.x, car.y, car.z), dtype=np.float32)
+        ego_position = self._vector(ego.physics.location)
         values.extend(
-            np.linalg.norm(car_position - BOOST_PAD_POSITIONS[index]) / ARENA_DIAGONAL
+            np.linalg.norm(ego_position - BOOST_PAD_POSITIONS[index]) / ARENA_DIAGONAL
             for index in pad_order
         )
+        ball_position = self._vector(ball.location)
+        ball_velocity = self._vector(ball.velocity)
+        ego_velocity = self._vector(ego.physics.velocity)
+        opponent_position = self._vector(opponent.physics.location)
+        opponent_velocity = self._vector(opponent.physics.velocity)
+        values.extend(
+            self._invert(ball_position - ego_position, invert)
+            / (2.0 * POSITION_SCALE)
+        )
+        values.extend(
+            self._invert(ball_velocity - ego_velocity, invert)
+            / RELATIVE_BALL_VELOCITY_SCALE
+        )
+        values.extend(
+            self._invert(opponent_position - ego_position, invert)
+            / (2.0 * POSITION_SCALE)
+        )
+        values.extend(
+            self._invert(opponent_velocity - ego_velocity, invert)
+            / RELATIVE_CAR_VELOCITY_SCALE
+        )
+        own_goal = np.asarray(
+            (0.0, GOAL_CENTER_Y if invert else -GOAL_CENTER_Y, GOAL_CENTER_Z),
+            dtype=np.float32,
+        )
+        opponent_goal = own_goal.copy()
+        opponent_goal[1] *= -1.0
+        values.extend(
+            self._invert(own_goal - ball_position, invert)
+            / (2.0 * POSITION_SCALE)
+        )
+        values.extend(
+            self._invert(opponent_goal - ball_position, invert)
+            / (2.0 * POSITION_SCALE)
+        )
         observation = np.asarray(values, dtype=np.float32)
-        if observation.shape != (119,):
-            raise RuntimeError(f"expected 119 observations, got {observation.shape}")
+        if observation.shape != (137,):
+            raise RuntimeError(f"expected 137 observations, got {observation.shape}")
         return observation
 
     @staticmethod
@@ -213,7 +268,9 @@ class GoddardBot(Bot):
         mask = torch.ones(18, dtype=torch.bool)
         on_ground = bool(observation[25])
         has_boost = observation[24] > 0
-        jump_available = on_ground or not (bool(observation[27]) and bool(observation[28]))
+        jump_available = on_ground or (
+            not bool(observation[27]) and not bool(observation[28])
+        )
         mask[4:6] = not on_ground
         mask[10] = on_ground
         mask[12] = has_boost
