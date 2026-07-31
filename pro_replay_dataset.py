@@ -84,7 +84,10 @@ class BallchasingClient:
 def uses_octane_hitbox(path: Path) -> bool:
     import subtr_actor
 
-    metadata = subtr_actor.get_replay_meta(str(path))["replay_meta"]
+    try:
+        metadata = subtr_actor.get_replay_meta(str(path))["replay_meta"]
+    except Exception:
+        return False
     players = (*metadata["team_zero"], *metadata["team_one"])
     return len(players) == 2 and all(
         player.get("car_hitbox_family") == "Octane" for player in players

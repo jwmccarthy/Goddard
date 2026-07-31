@@ -35,6 +35,13 @@ class ProReplayDatasetTests(unittest.TestCase):
         with patch.dict(sys.modules, {"subtr_actor": subtr_actor}):
             self.assertTrue(uses_octane_hitbox(Path("replay.replay")))
 
+    def test_octane_filter_rejects_unparseable_replays(self):
+        subtr_actor = Mock()
+        subtr_actor.get_replay_meta.side_effect = Exception("unsupported mode")
+
+        with patch.dict(sys.modules, {"subtr_actor": subtr_actor}):
+            self.assertFalse(uses_octane_hitbox(Path("replay.replay")))
+
 
 if __name__ == "__main__":
     unittest.main()
