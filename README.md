@@ -50,7 +50,7 @@ Training loads the reset dataset onto `cuda:0`. By default, 70 percent of comple
 
 CARL observations are normalized by physical limits by default; use `--no-normalize` to retain raw observations. Actor and critic recurrent networks are independent. Learning rate, entropy coefficient, reward goal weight, and credit half-life follow linear schedules over actual learner transitions. The defaults use `1e-5 -> 5e-6`, `0.01 -> 0.005`, a constant goal weight of `10`, and `10s -> 20s`, respectively.
 
-The default recurrent setup uses 512-step rollouts, 16-step sequences, 32 PPO epochs, a 30-second no-touch timeout, and episodes up to 120 seconds. Episode lengths are logged in frameskipped policy steps, matching Nexto. Every schedule is recorded under `Schedule/*` in TensorBoard. Passing `--gamma` replaces the credit half-life schedule with a constant discount.
+The default recurrent setup uses 512-step rollouts, 16-step sequences, 32 PPO epochs, a 30-second no-touch timeout, five-minute regulation, and at most five additional minutes of overtime. Episode lengths are logged in frameskipped policy steps, matching Nexto. Every schedule is recorded under `Schedule/*` in TensorBoard. Passing `--gamma` replaces the credit half-life schedule with a constant discount.
 
 The default setup runs 1,024 parallel 1v1 simulations. Self play uses the current policy in 80 percent of matches and a saved policy in 20 percent. TrueSkill evaluation runs every 32,000,000 learner transitions.
 

@@ -93,7 +93,7 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--n-blue",                     type=int,   default=1)
     parser.add_argument("--n-orange",                   type=int,   default=1)
     parser.add_argument("--frameskip",                  type=int,   default=8)
-    parser.add_argument("--max-ticks",                  type=int,   default=14_400)
+    parser.add_argument("--max-ticks",                  type=int,   default=36_000)
     parser.add_argument(
         "--no-touch-timeout",
         type=float,

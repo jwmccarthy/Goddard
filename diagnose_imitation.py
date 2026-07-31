@@ -312,7 +312,7 @@ def main() -> None:
         n_orange=1,
         seed=arguments.seed,
         frameskip=arguments.frameskip,
-        max_ticks=14_400,
+        max_ticks=36_000,
         synchronize=False,
         reset_state_provider=reset_sampler,
         normalize=True,

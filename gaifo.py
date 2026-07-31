@@ -70,7 +70,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--n-blue",                          type=int,   default=1)
     parser.add_argument("--n-orange",                        type=int,   default=1)
     parser.add_argument("--frameskip",                       type=int,   default=8)
-    parser.add_argument("--max-ticks",                       type=int,   default=14_400)
+    parser.add_argument("--max-ticks",                       type=int,   default=36_000)
     parser.add_argument("--rollout-steps",                   type=int,   default=512)
     parser.add_argument("--sequence-length",                 type=int,   default=16)
     parser.add_argument("--hidden-size",                     type=int,   default=256)

@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("checkpoint_dir", type=Path)
     parser.add_argument("--games", type=int, default=50)
     parser.add_argument("--checkpoint-stride", type=int, default=1)
-    parser.add_argument("--max-ticks", type=int, default=14_400)
+    parser.add_argument("--max-ticks", type=int, default=36_000)
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()
     if arguments.games < 1:
