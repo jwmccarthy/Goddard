@@ -47,9 +47,15 @@ def elite_duel(replay: dict, verified: set[str]) -> bool:
 
 
 class BallchasingClient:
-    def __init__(self, token: str, requests_per_second: float) -> None:
+    def __init__(
+        self,
+        token: str,
+        requests_per_second: float,
+        name: str,
+    ) -> None:
         self.headers = {"Authorization": token}
         self.interval = 1.0 / requests_per_second
+        self.name = name
         self.next_request = 0.0
         self.lock = threading.Lock()
         self.local = threading.local()
@@ -76,6 +82,11 @@ class BallchasingClient:
                 return response
             retry_after = float(response.headers.get("Retry-After", 2.0**attempt))
             response.close()
+            print(
+                f"{self.name} request returned {response.status_code}; "
+                f"waiting {retry_after:g}s",
+                flush=True,
+            )
             with self.lock:
                 self.next_request = max(
                     self.next_request, time.monotonic() + retry_after
@@ -166,6 +177,7 @@ def main() -> None:
     parser.add_argument("--discovery-limit", type=int, default=20_000)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--requests-per-second", type=float, default=2.0)
+    parser.add_argument("--list-requests-per-second", type=float, default=16.0)
     arguments = parser.parse_args()
     token = os.environ.get("BALLCHASING_TOKEN")
     if not token:
@@ -174,6 +186,8 @@ def main() -> None:
         parser.error("--workers must be positive")
     if not 0 < arguments.requests_per_second <= 2:
         parser.error("--requests-per-second must be in (0, 2]")
+    if not 0 < arguments.list_requests_per_second <= 16:
+        parser.error("--list-requests-per-second must be in (0, 16]")
 
     arguments.output.mkdir(parents=True, exist_ok=True)
     replay_dir = arguments.output / "replays"
@@ -183,7 +197,12 @@ def main() -> None:
         "CREATE TABLE IF NOT EXISTS replays ("
         "id TEXT PRIMARY KEY, date TEXT, blue TEXT, orange TEXT, downloaded INTEGER)"
     )
-    client = BallchasingClient(token, arguments.requests_per_second)
+    listing_client = BallchasingClient(
+        token, arguments.list_requests_per_second, "metadata"
+    )
+    download_client = BallchasingClient(
+        token, arguments.requests_per_second, "download"
+    )
     progress = Progress(
         TextColumn("[bold]{task.description}"),
         BarColumn(),
@@ -198,7 +217,7 @@ def main() -> None:
         progress.update(discovery_task, completed=arguments.discovery_limit)
     else:
         pool = discover_pool(
-            client,
+            listing_client,
             arguments.pool_size,
             arguments.discovery_limit,
             progress,
@@ -212,6 +231,7 @@ def main() -> None:
     download_task = progress.add_task(
         "download", total=arguments.target, completed=downloaded
     )
+    scan_task = progress.add_task("scan players", total=len(verified))
 
     pending: dict[Future[str], str] = {}
     scheduled: set[str] = set()
@@ -241,6 +261,29 @@ def main() -> None:
         database.commit()
 
     with ThreadPoolExecutor(max_workers=arguments.workers) as executor:
+        # Resume files discovered before an interruption without rescanning first.
+        for (replay_id,) in database.execute(
+            "SELECT id FROM replays WHERE downloaded = 0"
+        ):
+            output = replay_dir / f"{replay_id}.replay"
+            if output.is_file():
+                database.execute(
+                    "UPDATE replays SET downloaded = 1 WHERE id = ?", (replay_id,)
+                )
+                downloaded += 1
+                progress.update(download_task, completed=downloaded)
+                continue
+            scheduled.add(replay_id)
+            future = executor.submit(
+                download_replay, download_client, replay_id, output
+            )
+            pending[future] = replay_id
+            if len(pending) >= arguments.workers * 2:
+                drain(block=True)
+        database.commit()
+        while pending:
+            drain(block=True)
+
         for source_id in verified:
             url = f"{API}/replays"
             params = [
@@ -251,7 +294,7 @@ def main() -> None:
                 ("sort-dir", "desc"),
             ]
             while url and downloaded + len(pending) < arguments.target:
-                response = client.get(url, params=params)
+                response = listing_client.get(url, params=params)
                 response.raise_for_status()
                 payload = response.json()
                 for replay in payload.get("list", []):
@@ -274,7 +317,9 @@ def main() -> None:
                     if replay_id in scheduled:
                         continue
                     scheduled.add(replay_id)
-                    future = executor.submit(download_replay, client, replay_id, output)
+                    future = executor.submit(
+                        download_replay, download_client, replay_id, output
+                    )
                     pending[future] = replay_id
                     if len(pending) >= arguments.workers * 2:
                         drain(block=True)
@@ -283,6 +328,7 @@ def main() -> None:
                 drain(block=False)
                 url = payload.get("next")
                 params = None
+            progress.advance(scan_task)
         while pending:
             drain(block=True)
     database.close()
