@@ -57,7 +57,10 @@ class SyntheticMatchResetProvider:
         self.provider = provider
 
     def __call__(self, reset_mask: torch.Tensor):
-        state = dict(self.provider(reset_mask))
+        sample = self.provider(reset_mask)
+        if sample is None:
+            return None
+        state = dict(sample)
         indices = state["simulation_indices"]
         remaining = torch.randint(
             0,
@@ -77,6 +80,8 @@ class SyntheticMatchResetProvider:
             episode_ticks=elapsed.to(torch.int32),
         )
         return state
+
+
 from training_checkpoint import TrainingCheckpointer
 
 
