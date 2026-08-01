@@ -33,7 +33,6 @@ GOAL_EXCLUSION_SECONDS = 5.0
 RESET_EVENT_OFFSET_SECONDS = 3.0
 RESET_EVENT_WINDOW_SECONDS = 0.5
 RESET_SAMPLES_PER_REPLAY = 480
-RESET_HISTORY_LENGTH = 16
 REPLAY_PATH = re.compile(
     r"^/dl/replay/"
     r"(?P<id>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$",
@@ -1002,21 +1001,6 @@ def _write_dataset_generation(
             dtype=np.int32,
             shape=(total_frames,),
         )
-        histories = None
-        history_valid = None
-        if reset_only:
-            histories = np.lib.format.open_memmap(
-                generation_directory / "histories.npy",
-                mode="w+",
-                dtype=np.float32,
-                shape=(total_frames, RESET_HISTORY_LENGTH, len(columns)),
-            )
-            history_valid = np.lib.format.open_memmap(
-                generation_directory / "history_valid.npy",
-                mode="w+",
-                dtype=np.bool_,
-                shape=(total_frames, RESET_HISTORY_LENGTH),
-            )
         replay_records = []
         offset = 0
 
@@ -1040,50 +1024,6 @@ def _write_dataset_generation(
                 end = offset + frame_count
                 frames[offset:end] = selected
                 replay_index[offset:end] = index
-                if histories is not None:
-                    history_offsets = np.arange(-RESET_HISTORY_LENGTH, 0)
-                    history_indices = np.maximum(
-                        selected_indices[:, None] + history_offsets[None, :], 0
-                    )
-                    histories[offset:end] = source_frames[history_indices]
-                    in_bounds = (
-                        selected_indices[:, None] + history_offsets[None, :]
-                    ) >= 0
-                    sequence_indices = np.concatenate(
-                        (history_indices, selected_indices[:, None]), axis=1
-                    )
-                    frame_times = source_frames[
-                        sequence_indices, columns.index("frame time")
-                    ]
-                    contiguous = np.diff(frame_times, axis=1)
-                    contiguous = (contiguous > 0.0) & (
-                        contiguous <= 1.5 / fps
-                    )
-                    ball_columns = tuple(
-                        columns.index(f"Ball - position {axis}")
-                        for axis in "xyz"
-                    )
-                    ball_positions = source_frames[
-                        sequence_indices[..., None], ball_columns
-                    ]
-                    contiguous &= np.linalg.norm(
-                        np.diff(ball_positions, axis=1), axis=-1
-                    ) <= 750.0
-                    for player in range(2):
-                        car_columns = tuple(
-                            columns.index(f"player {player} - position {axis}")
-                            for axis in "xyz"
-                        )
-                        car_positions = source_frames[
-                            sequence_indices[..., None], car_columns
-                        ]
-                        contiguous &= np.linalg.norm(
-                            np.diff(car_positions, axis=1), axis=-1
-                        ) <= 350.0
-                    reaches_target = np.logical_and.accumulate(
-                        contiguous[:, ::-1], axis=1
-                    )[:, ::-1]
-                    history_valid[offset:end] = in_bounds & reaches_target
             replay_records.append(
                 {
                     "replay_id": replay_id,
@@ -1095,13 +1035,8 @@ def _write_dataset_generation(
 
         frames.flush()
         replay_index.flush()
-        if histories is not None:
-            histories.flush()
-            history_valid.flush()
         del frames
         del replay_index
-        del histories
-        del history_valid
 
         metadata = {
             "schema_version": SHARD_SCHEMA_VERSION,
@@ -1109,7 +1044,6 @@ def _write_dataset_generation(
             "source":         source,
             "fps":            fps,
             "frame_count":    total_frames,
-            "history_length": RESET_HISTORY_LENGTH if reset_only else 0,
             "columns":        columns,
             "replays":        replay_records,
         }

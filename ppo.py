@@ -82,51 +82,6 @@ class SyntheticMatchResetProvider:
         return state
 
 
-class ReplayRecurrentWarmup:
-    def __init__(self, critic_capture: RecurrentCriticCapture) -> None:
-        self.critic_capture = critic_capture
-
-    @torch.no_grad()
-    def __call__(self, runner: SelfPlayRunner, reset_mask: torch.Tensor) -> None:
-        auxiliary = runner.env.last_reset_aux or {}
-        observations = auxiliary.get("warmup_observation")
-        actor_indices = auxiliary.get("warmup_actor_indices")
-        valid = auxiliary.get("warmup_valid")
-        if observations is None or actor_indices is None or not len(actor_indices):
-            return
-
-        actor_mask = torch.zeros(runner.n_envs, dtype=torch.bool, device=observations.device)
-        actor_mask[actor_indices] = True
-
-        for index, observation in enumerate(observations):
-            step_mask = actor_mask
-            if valid is not None:
-                step_mask = actor_mask.clone()
-                step_mask[actor_indices] &= valid[index]
-            if not step_mask.any():
-                continue
-            step_learner_mask = step_mask & runner.matchmaker.learner_mask
-            if step_learner_mask.any():
-                _, next_state = runner.policy.body_features(
-                    observation[step_learner_mask], runner.state[step_learner_mask]
-                )
-                runner.state[step_learner_mask] = next_state
-
-            opponent_ids = runner.matchmaker.opponent_ids
-            for snapshot_id in opponent_ids[step_mask & ~step_learner_mask].unique().tolist():
-                opponent_mask = step_mask & opponent_ids.eq(snapshot_id)
-                opponent = runner.opponent_pool.policy(snapshot_id, observation.device)
-                _, next_state = opponent.body_features(
-                    observation[opponent_mask], runner.state[opponent_mask]
-                )
-                runner.state[opponent_mask] = next_state
-
-            _, critic_state = self.critic_capture.critic.body_features(
-                observation[step_mask], self.critic_capture.state[step_mask]
-            )
-            self.critic_capture.state[step_mask] = critic_state
-
-
 from training_checkpoint import TrainingCheckpointer
 
 
@@ -384,7 +339,6 @@ def build_ppo(
         device=environment.device,
         seed=arguments.seed,
     )
-    critic_capture = RecurrentCriticCapture(critic)
     runner = SelfPlayRunner(
         env=environment,
         policy=policy,
@@ -396,9 +350,8 @@ def build_ppo(
         captures=(
             LogProbCapture(),
             RecurrentStateCapture(),
-            critic_capture,
+            RecurrentCriticCapture(critic),
         ),
-        reset_hooks=(ReplayRecurrentWarmup(critic_capture),),
     )
 
     policy_optimizer = Adam(policy.parameters(), lr=arguments.learning_rate)

@@ -33,36 +33,16 @@ def load_replay_dataset(
     dataset_root: Path,
     device:       str | torch.device,
 ) -> TensorDataset:
-    metadata, frames, histories, history_valid = _load_active_generation(dataset_root)
+    metadata, frames = _load_active_generation(dataset_root)
     columns = _resolve_columns(metadata["columns"])
     valid_indices = _validate_and_select_frames(frames, columns)
     data = _load_state_tensors(frames, valid_indices, columns, device)
-    if histories is not None:
-        history_length = histories.shape[1]
-        history_frames = histories.reshape(-1, histories.shape[-1])
-        history_data = _load_state_tensors(
-            history_frames,
-            np.arange(len(history_frames)),
-            columns,
-            device,
-        )
-        data.update(
-            {
-                f"warmup_{name}": value.reshape(
-                    len(frames), history_length, *value.shape[1:]
-                )
-                for name, value in history_data.items()
-            }
-        )
-        data["warmup_valid"] = torch.from_numpy(
-            np.array(history_valid, copy=True)
-        ).to(device)
     return TensorDataset(TensorBatch(data))
 
 
 def _load_active_generation(
     dataset_root: Path,
-) -> tuple[dict, np.ndarray, np.ndarray | None, np.ndarray | None]:
+) -> tuple[dict, np.ndarray]:
     generation = _read_current_generation(dataset_root)
     directory = dataset_root / generation
     metadata_path = directory / "metadata.json"
@@ -90,29 +70,7 @@ def _load_active_generation(
         if not np.isfinite(frames[start : start + CHUNK_SIZE]).all():
             raise ValueError("Replay frames contain non-finite values")
 
-    histories_path = directory / "histories.npy"
-    histories = None
-    history_valid = None
-    history_length = int(metadata.get("history_length", 0))
-    if history_length:
-        if not histories_path.is_file():
-            raise ValueError("Replay dataset history is missing")
-        histories = np.load(histories_path, mmap_mode="r", allow_pickle=False)
-        history_valid_path = directory / "history_valid.npy"
-        if not history_valid_path.is_file():
-            raise ValueError("Replay dataset history validity mask is missing")
-        history_valid = np.load(
-            history_valid_path, mmap_mode="r", allow_pickle=False
-        )
-        expected_history_shape = (len(frames), history_length, len(expected_columns))
-        if histories.dtype != np.float32 or histories.shape != expected_history_shape:
-            raise ValueError("Replay dataset history shape is invalid")
-        if history_valid.dtype != np.bool_ or history_valid.shape != (
-            len(frames), history_length
-        ):
-            raise ValueError("Replay dataset history validity shape is invalid")
-
-    return metadata, frames, histories, history_valid
+    return metadata, frames
 
 
 def _read_current_generation(dataset_root: Path) -> str:
