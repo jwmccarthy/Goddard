@@ -33,6 +33,7 @@ GOAL_EXCLUSION_SECONDS = 5.0
 RESET_EVENT_OFFSET_SECONDS = 3.0
 RESET_EVENT_WINDOW_SECONDS = 0.5
 RESET_SAMPLES_PER_REPLAY = 480
+RESET_HISTORY_LENGTH = 16
 REPLAY_PATH = re.compile(
     r"^/dl/replay/"
     r"(?P<id>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$",
@@ -716,8 +717,10 @@ def _reset_candidate_mask(
     ball_x = frames[:, columns.index("Ball - position x")]
     car0_x = frames[:, columns.index("player 0 - position x")]
     car0_y = frames[:, columns.index("player 0 - position y")]
+    car0_z = frames[:, columns.index("player 0 - position z")]
     car1_x = frames[:, columns.index("player 1 - position x")]
     car1_y = frames[:, columns.index("player 1 - position y")]
+    car1_z = frames[:, columns.index("player 1 - position z")]
     kickoff_like = (
         np.hypot(ball_x[candidates], ball_y[candidates]) < 10.0
     ) & (np.hypot(car0_x[candidates], car0_y[candidates]) > 2000.0) & (
@@ -725,13 +728,44 @@ def _reset_candidate_mask(
     )
     kickoff_candidates = candidates[kickoff_like]
     candidates = candidates[~kickoff_like]
+    ball_airborne = ball_z[candidates] > 2.0 * 91.25
+    car_airborne = (car0_z[candidates] > 1.5 * 91.25) | (
+        car1_z[candidates] > 1.5 * 91.25
+    )
+    ball_near_car = (
+        np.minimum(
+            np.hypot(ball_x[candidates] - car0_x[candidates], ball_y[candidates] - car0_y[candidates]),
+            np.hypot(ball_x[candidates] - car1_x[candidates], ball_y[candidates] - car1_y[candidates]),
+        ) < 1400.0
+    )
+    car_on_wall = (
+        (np.abs(car0_x[candidates]) > 3800.0)
+        | (np.abs(car1_x[candidates]) > 3800.0)
+        | (np.abs(car0_y[candidates]) > 4800.0)
+        | (np.abs(car1_y[candidates]) > 4800.0)
+    )
+    aerial_like = ball_airborne & ball_near_car & (car_airborne | car_on_wall)
+    aerial_candidates = candidates[aerial_like]
+    candidates = candidates[~aerial_like]
     buckets = (
         (ball_z[candidates] > 180.0).astype(np.int32)
         + 2 * (car_z[candidates] > 100.0).astype(np.int32)
         + 4 * (np.abs(ball_y[candidates]) > 2560.0).astype(np.int32)
     )
     selected = []
-    quota = max(1, RESET_SAMPLES_PER_REPLAY // 8)
+    aerial_quota = max(1, RESET_SAMPLES_PER_REPLAY // 4)
+    if len(aerial_candidates):
+        selected.append(
+            aerial_candidates[
+                np.linspace(
+                    0,
+                    len(aerial_candidates) - 1,
+                    min(aerial_quota, len(aerial_candidates)),
+                    dtype=int,
+                )
+            ]
+        )
+    quota = max(1, (RESET_SAMPLES_PER_REPLAY - aerial_quota) // 8)
     for bucket in range(8):
         members = candidates[buckets == bucket]
         if len(members):
@@ -960,6 +994,21 @@ def _write_dataset_generation(
             dtype=np.int32,
             shape=(total_frames,),
         )
+        histories = None
+        history_valid = None
+        if reset_only:
+            histories = np.lib.format.open_memmap(
+                generation_directory / "histories.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(total_frames, RESET_HISTORY_LENGTH, len(columns)),
+            )
+            history_valid = np.lib.format.open_memmap(
+                generation_directory / "history_valid.npy",
+                mode="w+",
+                dtype=np.bool_,
+                shape=(total_frames, RESET_HISTORY_LENGTH),
+            )
         replay_records = []
         offset = 0
 
@@ -967,9 +1016,13 @@ def _write_dataset_generation(
             with np.load(
                 frame_directory / f"{replay_id}.npz", allow_pickle=False
             ) as shard:
-                selected = shard["frames"]
+                source_frames = shard["frames"]
+                selected = source_frames
                 if reset_only:
-                    selected = selected[_reset_candidate_mask(selected, columns)]
+                    selected_indices = np.flatnonzero(
+                        _reset_candidate_mask(source_frames, columns)
+                    )
+                    selected = source_frames[selected_indices]
                 if len(selected) != frame_count:
                     raise ValueError(
                         f"Reset candidate count changed for replay {replay_id}"
@@ -977,6 +1030,15 @@ def _write_dataset_generation(
                 end = offset + frame_count
                 frames[offset:end] = selected
                 replay_index[offset:end] = index
+                if histories is not None:
+                    history_offsets = np.arange(-RESET_HISTORY_LENGTH, 0)
+                    history_indices = np.maximum(
+                        selected_indices[:, None] + history_offsets[None, :], 0
+                    )
+                    histories[offset:end] = source_frames[history_indices]
+                    history_valid[offset:end] = (
+                        selected_indices[:, None] + history_offsets[None, :]
+                    ) >= 0
             replay_records.append(
                 {
                     "replay_id": replay_id,
@@ -988,8 +1050,13 @@ def _write_dataset_generation(
 
         frames.flush()
         replay_index.flush()
+        if histories is not None:
+            histories.flush()
+            history_valid.flush()
         del frames
         del replay_index
+        del histories
+        del history_valid
 
         metadata = {
             "schema_version": SHARD_SCHEMA_VERSION,
@@ -997,6 +1064,7 @@ def _write_dataset_generation(
             "source":         source,
             "fps":            fps,
             "frame_count":    total_frames,
+            "history_length": RESET_HISTORY_LENGTH if reset_only else 0,
             "columns":        columns,
             "replays":        replay_records,
         }
