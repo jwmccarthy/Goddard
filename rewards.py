@@ -12,6 +12,7 @@ CEILING_Z = 2044.0
 GOAL_Y = 5124.25
 GOAL_HEIGHT = 642.775
 BACK_WALL_Y = 5120.0
+SIDE_WALL_X = 4096.0
 GOAL_DISTANCE_OFFSET = GOAL_Y - BACK_WALL_Y + BALL_RADIUS
 NEXTO_TOUCH_HEIGHT_SCALE = 2250.0
 MATCH_TICKS = 5 * 60 * 120
@@ -49,6 +50,10 @@ class SeerRewardWeights:
     flip_reset:           float = 10.0
     touch_grass:          float = 0.005
     win_probability:      float = 10.0
+    goal_time_bonus:      float = 1.0
+    air_dribble_start:    float = 0.5
+    air_dribble_progress: float = 1.0
+    air_dribble_complete: float = 1.0
 
 
 class SeerReward:
@@ -75,6 +80,9 @@ class SeerReward:
         self._diagnostic_sums = None
         self._diagnostic_squares = None
         self._diagnostic_steps = None
+        self._air_active = None
+        self._air_contacts = None
+        self._air_last_touch_tick = None
 
     def set_goal_scored_weight(self, value: float) -> None:
         if value <= 0:
@@ -118,6 +126,10 @@ class SeerReward:
         remaining_seconds = (
             (MATCH_TICKS - context.episode_ticks[:, None]) / 120.0
         ).clamp_min(0.0)
+        goal_time_bonus = scored * (
+            remaining_seconds / (5.0 * 60.0)
+        ).clamp(0.0, 1.0)
+        goal_scored = scored + self.weights.goal_time_bonus * goal_time_bonus
         expected_goals = remaining_seconds / 60.0
         variance = (2.0 * expected_goals).clamp_min(1e-6)
         win_probability = 0.5 * (
@@ -176,6 +188,7 @@ class SeerReward:
         ).clamp(0.0, 1.0)
 
         touches = current.car_ball_touches
+        previous_touches = previous.car_ball_touches
         self._touch_decay = torch.where(
             touches,
             (self._touch_decay * 0.95).clamp_min(0.1),
@@ -193,6 +206,51 @@ class SeerReward:
             torch.exp(-ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
             - torch.exp(-previous_ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
         )
+
+        # Track short air-dribble sequences. Rewards require new contacts or
+        # positive state changes, so stable airborne states do not pay.
+        new_air_touch = touches & ~previous_touches
+        car_airborne = ~current.car_on_ground & current.car_position[..., 2].gt(
+            1.5 * BALL_RADIUS
+        )
+        ball_airborne = ball_position[..., 2].gt(2.0 * BALL_RADIUS)
+        wall_clearance = torch.minimum(
+            (SIDE_WALL_X - ball_position[..., 0].abs()) / SIDE_WALL_X,
+            (BACK_WALL_Y - ball_position[..., 1].abs()) / BACK_WALL_Y,
+        ).clamp(0.0, 1.0)
+        air_height = (
+            (ball_position[..., 2] - 2.0 * BALL_RADIUS)
+            / (CEILING_Z - 2.0 * BALL_RADIUS)
+        ).clamp(0.0, 1.0)
+        air_start = new_air_touch & car_airborne & ball_airborne & wall_clearance.gt(0.1)
+        self._air_active |= air_start
+        self._air_contacts += air_start.to(self._air_contacts.dtype)
+        self._air_last_touch_tick = torch.where(
+            new_air_touch, context.episode_ticks[:, None], self._air_last_touch_tick
+        )
+        air_timeout = context.episode_ticks[:, None] - self._air_last_touch_tick > 30
+        air_invalid = (~ball_airborne) | current.car_on_ground | wall_clearance.lt(0.02)
+        air_sequence = self._air_active & ~air_invalid & ~air_timeout
+        previous_height = (
+            (previous_ball_position[..., 2] - 2.0 * BALL_RADIUS)
+            / (CEILING_Z - 2.0 * BALL_RADIUS)
+        ).clamp(0.0, 1.0)
+        air_height_progress = (air_height - previous_height).clamp_min(0.0)
+        air_lift = (
+            (current.ball_velocity[..., 2] - previous.ball_velocity[..., 2])
+            / CAR_MAX_SPEED
+        ).clamp_min(0.0)
+        air_dribble_start = air_start.float() * air_height * wall_clearance
+        air_dribble_progress = air_sequence.float() * (
+            air_height_progress + ball_goal_progress.clamp_min(0.0) + air_lift
+        )
+        air_dribble_complete = (
+            self._air_active & (self._air_contacts >= 2)
+            & (air_height_progress + ball_goal_progress).gt(0.01)
+            & (air_invalid | air_timeout)
+        ).float()
+        self._air_active &= ~air_invalid & ~air_timeout
+        self._air_contacts *= self._air_active.to(self._air_contacts.dtype)
         previous_car_to_ball = previous_ball_position - previous.car_position
         player_ball_progress = (
             torch.exp(-distance_to_ball / 1410.0)
@@ -320,6 +378,9 @@ class SeerReward:
             "alignment_progress":   weights.alignment_progress * alignment_progress,
             "touch_acceleration":   weights.touch_acceleration * touch_acceleration,
             "aerial_touch":         weights.aerial_touch * aerial_touch,
+            "air_dribble_start":    weights.air_dribble_start * air_dribble_start,
+            "air_dribble_progress": weights.air_dribble_progress * air_dribble_progress,
+            "air_dribble_complete": weights.air_dribble_complete * air_dribble_complete,
             "angular_velocity":     weights.angular_velocity * angular_velocity,
             "flip_reset":           weights.flip_reset * flip_reset,
             "touch_grass":         -weights.touch_grass * touch_grass,
@@ -345,6 +406,9 @@ class SeerReward:
         done = context.events.done
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
+        self._air_active[done] = False
+        self._air_contacts[done] = 0.0
+        self._air_last_touch_tick[done] = 0
 
         if self.log_diagnostics:
             return RewardResult(reward, info)
@@ -405,9 +469,12 @@ class SeerReward:
             self._diagnostic_squares = torch.zeros(
                 (*raw.shape, 3), dtype=raw.dtype, device=raw.device
             )
-            self._diagnostic_steps = torch.zeros(
-                raw.shape, dtype=torch.int64, device=raw.device
-            )
+        self._diagnostic_steps = torch.zeros(
+            raw.shape, dtype=torch.int64, device=raw.device
+        )
+        self._air_active = torch.zeros(expected, dtype=torch.bool, device=device)
+        self._air_contacts = torch.zeros(expected, device=device)
+        self._air_last_touch_tick = torch.zeros(expected, dtype=torch.int64, device=device)
 
         self._diagnostic_sums[..., : len(names)] += values
         self._diagnostic_sums[..., len(names) :] += aggregates
