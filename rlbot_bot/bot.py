@@ -112,8 +112,8 @@ class GoddardBot(Bot):
             self.controller = flat.ControllerState()
             return self.controller
         kickoff_started = (
-            self.last_match_phase == flat.MatchPhase.Countdown
-            and phase in (flat.MatchPhase.Kickoff, flat.MatchPhase.Active)
+            phase == flat.MatchPhase.Kickoff
+            and self.last_match_phase != flat.MatchPhase.Kickoff
         )
         if (
             now < self.last_game_time
