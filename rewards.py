@@ -453,6 +453,9 @@ class SeerReward:
         self._diagnostic_sums = None
         self._diagnostic_squares = None
         self._diagnostic_steps = None
+        self._air_active = torch.zeros(expected, dtype=torch.bool, device=device)
+        self._air_contacts = torch.zeros(expected, device=device)
+        self._air_last_touch_tick = torch.zeros(expected, dtype=torch.int64, device=device)
 
     def _diagnostics(
         self,
@@ -477,9 +480,6 @@ class SeerReward:
         self._diagnostic_steps = torch.zeros(
             raw.shape, dtype=torch.int64, device=raw.device
         )
-        self._air_active = torch.zeros(expected, dtype=torch.bool, device=device)
-        self._air_contacts = torch.zeros(expected, device=device)
-        self._air_last_touch_tick = torch.zeros(expected, dtype=torch.int64, device=device)
 
         self._diagnostic_sums[..., : len(names)] += values
         self._diagnostic_sums[..., len(names) :] += aggregates
