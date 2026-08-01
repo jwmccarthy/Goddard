@@ -438,7 +438,12 @@ class SeerReward:
 
     def _ensure_state(self, n_sim: int, device: torch.device) -> None:
         expected = (n_sim, self.n_cars)
-        if self._touch_decay is not None and self._touch_decay.shape == expected:
+        if (
+            self._touch_decay is not None
+            and self._touch_decay.shape == expected
+            and self._air_active is not None
+            and self._air_active.shape == expected
+        ):
             return
         self._touch_decay = torch.ones(expected, device=device)
         self._last_touch = torch.zeros(expected, dtype=torch.bool, device=device)
