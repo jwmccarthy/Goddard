@@ -498,6 +498,7 @@ def main(algorithm: str = "ppo") -> None:
         probability=arguments.replay_reset_probability,
         seed=arguments.seed,
     )
+    reset_sampler = SyntheticMatchResetProvider(reset_sampler)
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=arguments.n_blue,
