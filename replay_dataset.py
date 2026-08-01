@@ -1046,9 +1046,44 @@ def _write_dataset_generation(
                         selected_indices[:, None] + history_offsets[None, :], 0
                     )
                     histories[offset:end] = source_frames[history_indices]
-                    history_valid[offset:end] = (
+                    in_bounds = (
                         selected_indices[:, None] + history_offsets[None, :]
                     ) >= 0
+                    sequence_indices = np.concatenate(
+                        (history_indices, selected_indices[:, None]), axis=1
+                    )
+                    frame_times = source_frames[
+                        sequence_indices, columns.index("frame time")
+                    ]
+                    contiguous = np.diff(frame_times, axis=1)
+                    contiguous = (contiguous > 0.0) & (
+                        contiguous <= 1.5 / fps
+                    )
+                    ball_columns = tuple(
+                        columns.index(f"Ball - position {axis}")
+                        for axis in "xyz"
+                    )
+                    ball_positions = source_frames[
+                        sequence_indices[..., None], ball_columns
+                    ]
+                    contiguous &= np.linalg.norm(
+                        np.diff(ball_positions, axis=1), axis=-1
+                    ) <= 750.0
+                    for player in range(2):
+                        car_columns = tuple(
+                            columns.index(f"player {player} - position {axis}")
+                            for axis in "xyz"
+                        )
+                        car_positions = source_frames[
+                            sequence_indices[..., None], car_columns
+                        ]
+                        contiguous &= np.linalg.norm(
+                            np.diff(car_positions, axis=1), axis=-1
+                        ) <= 350.0
+                    reaches_target = np.logical_and.accumulate(
+                        contiguous[:, ::-1], axis=1
+                    )[:, ::-1]
+                    history_valid[offset:end] = in_bounds & reaches_target
             replay_records.append(
                 {
                     "replay_id": replay_id,
