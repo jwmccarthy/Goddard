@@ -54,6 +54,7 @@ class SeerRewardWeights:
     air_dribble_start:    float = 0.5
     air_dribble_progress: float = 1.0
     air_dribble_complete: float = 1.0
+    air_dribble_goal_scale: float = 10.0
     kickoff_first_touch:   float = 0.25
     kickoff_side_change:   float = 0.5
 
@@ -293,9 +294,13 @@ class SeerReward:
         )
         air_dribble_complete = (
             air_qualified
-            & (air_height_progress + ball_goal_progress).gt(0.01)
-            & (air_invalid | air_timeout)
+            & (
+                (air_height_progress + ball_goal_progress).gt(0.01)
+                | scored.bool()
+            )
+            & (air_invalid | air_timeout | scored.bool())
         ).float()
+        air_dribble_complete *= 1.0 + self.weights.air_dribble_goal_scale * scored
         self._air_active &= ~air_invalid & ~air_timeout
         self._air_contacts *= self._air_active.to(self._air_contacts.dtype)
         previous_car_to_ball = previous_ball_position - previous.car_position
