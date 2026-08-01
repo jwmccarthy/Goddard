@@ -189,7 +189,7 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument(
         "--replay-dataset",
         type=Path,
-        default=Path("data/ballchasing-ssl-1v1/reset_dataset"),
+        default=Path("data/pro-1v1-reset/reset_dataset"),
     )
     parser.add_argument("--replay-reset-probability",   type=float, default=0.7)
     parser.add_argument(

@@ -700,13 +700,14 @@ def _select_live_gameplay(
 def _reset_candidate_mask(
     frames:  np.ndarray,
     columns: list[str],
+    sample_count: int = RESET_SAMPLES_PER_REPLAY,
 ) -> np.ndarray:
     """Select live-play frames near kickoff and goal transitions."""
     if not len(frames):
         return np.zeros(0, dtype=np.bool_)
     live = _live_gameplay_mask(frames, columns, [])
     candidates = np.flatnonzero(live)
-    if len(candidates) <= RESET_SAMPLES_PER_REPLAY:
+    if len(candidates) <= sample_count:
         return live
 
     # Stratify by ball height, car height, and field half so ordinary grounded
@@ -753,7 +754,7 @@ def _reset_candidate_mask(
         + 4 * (np.abs(ball_y[candidates]) > 2560.0).astype(np.int32)
     )
     selected = []
-    aerial_quota = max(1, RESET_SAMPLES_PER_REPLAY // 4)
+    aerial_quota = max(1, sample_count // 4)
     if len(aerial_candidates):
         selected.append(
             aerial_candidates[
@@ -765,12 +766,12 @@ def _reset_candidate_mask(
                 )
             ]
         )
-    quota = max(1, (RESET_SAMPLES_PER_REPLAY - aerial_quota) // 8)
+    quota = max(1, (sample_count - aerial_quota) // 8)
     for bucket in range(8):
         members = candidates[buckets == bucket]
         if len(members):
             selected.append(members[np.linspace(0, len(members) - 1, min(quota, len(members)), dtype=int)])
-    kickoff_quota = max(1, RESET_SAMPLES_PER_REPLAY // 50)
+    kickoff_quota = max(1, sample_count // 50)
     if len(kickoff_candidates):
         selected.append(
             kickoff_candidates[
@@ -783,14 +784,14 @@ def _reset_candidate_mask(
             ]
         )
     selected = np.concatenate(selected) if selected else candidates
-    if len(selected) < RESET_SAMPLES_PER_REPLAY:
+    if len(selected) < sample_count:
         remaining = np.setdiff1d(candidates, selected, assume_unique=False)
-        count = min(RESET_SAMPLES_PER_REPLAY - len(selected), len(remaining))
+        count = min(sample_count - len(selected), len(remaining))
         selected = np.concatenate(
             (selected, remaining[np.linspace(0, len(remaining) - 1, count, dtype=int)])
         )
     mask = np.zeros(len(frames), dtype=np.bool_)
-    mask[selected[:RESET_SAMPLES_PER_REPLAY]] = True
+    mask[selected[:sample_count]] = True
     return mask
 
 
@@ -897,6 +898,7 @@ def build_dataset(
     output:       Path,
     replay_ids:   list[str],
     dataset_name: str = "dataset",
+    reset_samples_per_replay: int = RESET_SAMPLES_PER_REPLAY,
 ) -> None:
     if not replay_ids:
         raise ValueError("No parsed replays are available to build")
@@ -907,7 +909,8 @@ def build_dataset(
 
     reset_only = dataset_name == "reset_dataset"
     shards, columns, fps = _inspect_shards(
-        frame_directory, replay_ids, reset_only=reset_only
+        frame_directory, replay_ids, reset_only=reset_only,
+        reset_samples_per_replay=reset_samples_per_replay,
     )
     source = _dataset_source(output)
     generation_directory = _write_dataset_generation(
@@ -918,6 +921,7 @@ def build_dataset(
         fps,
         source,
         reset_only=reset_only,
+        reset_samples_per_replay=reset_samples_per_replay,
     )
     _publish_generation(dataset_root, generation_directory.name)
     print(
@@ -931,6 +935,7 @@ def _inspect_shards(
     replay_ids:      list[str],
     *,
     reset_only:      bool = False,
+    reset_samples_per_replay: int = RESET_SAMPLES_PER_REPLAY,
 ) -> tuple[list[tuple[str, int]], list[str], float]:
     expected_columns = replay_columns()
     shards = []
@@ -954,7 +959,9 @@ def _inspect_shards(
             elif fps != shard_fps:
                 raise ValueError(f"Incompatible parsed shard: {replay_id}")
             count = (
-                int(_reset_candidate_mask(frames, shard_columns).sum())
+                int(_reset_candidate_mask(
+                    frames, shard_columns, reset_samples_per_replay
+                ).sum())
                 if reset_only
                 else len(frames)
             )
@@ -975,6 +982,7 @@ def _write_dataset_generation(
     fps:             float,
     source:          str,
     reset_only:      bool = False,
+    reset_samples_per_replay: int = RESET_SAMPLES_PER_REPLAY,
 ) -> Path:
     total_frames = sum(frame_count for _, frame_count in shards)
     generation = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
@@ -1020,7 +1028,9 @@ def _write_dataset_generation(
                 selected = source_frames
                 if reset_only:
                     selected_indices = np.flatnonzero(
-                        _reset_candidate_mask(source_frames, columns)
+                        _reset_candidate_mask(
+                            source_frames, columns, reset_samples_per_replay
+                        )
                     )
                     selected = source_frames[selected_indices]
                 if len(selected) != frame_count:
@@ -1150,6 +1160,73 @@ def parse_replays(arguments: argparse.Namespace) -> None:
             build_dataset(output, sorted(validated_replay_ids))
     finally:
         manifest.close()
+
+
+def build_pro_reset_dataset(arguments: argparse.Namespace) -> None:
+    replay_directory = arguments.source / "replays"
+    frame_directory = arguments.output / "frames"
+    frame_directory.mkdir(parents=True, exist_ok=True)
+    candidates = sorted(
+        replay_directory.glob("*.replay"),
+        key=lambda path: hashlib.sha256(path.stem.encode()).digest(),
+    )[: arguments.replays + max(64, arguments.replays // 4)]
+    if len(candidates) < arguments.replays:
+        raise ValueError("Not enough pro replay files are available")
+
+    with ProcessPoolExecutor(max_workers=arguments.workers) as executor:
+        futures = {
+            executor.submit(
+                _try_parse_replay_file,
+                path,
+                frame_directory,
+                arguments.fps,
+                file_sha256(path),
+            ): path.stem
+            for path in candidates
+        }
+        replay_ids = []
+        for future in as_completed(futures):
+            result = future.result()
+            if isinstance(result, str):
+                print(f"Skipped pro replay {futures[future]}: {result}")
+                continue
+            replay_ids.append(result.replay_id)
+            print(f"Parsed pro replay {len(replay_ids)}/{arguments.replays}")
+
+    if len(replay_ids) < arguments.replays:
+        raise RuntimeError(
+            f"Only {len(replay_ids)} of {arguments.replays} pro replays parsed"
+        )
+
+    build_dataset(
+        arguments.output,
+        sorted(replay_ids[: arguments.replays]),
+        dataset_name="reset_dataset",
+        reset_samples_per_replay=math.ceil(
+            arguments.states / arguments.replays
+        ),
+    )
+
+
+def _try_parse_replay_file(
+    replay_path: Path,
+    frame_directory: Path,
+    fps: float,
+    source_sha256: str,
+) -> ParseResult | str:
+    try:
+        existing = valid_parsed_shard(
+            frame_directory / f"{replay_path.stem}.npz",
+            fps,
+            source_sha256,
+        )
+        if existing is not None:
+            return ParseResult(replay_path.stem, existing)
+        return parse_replay_file(
+            replay_path, frame_directory, fps, source_sha256
+        )
+    except BaseException as error:
+        return f"{type(error).__name__}: {error}"
 
 
 def _classify_replays(
@@ -1291,6 +1368,18 @@ def parse_arguments() -> argparse.Namespace:
     parse.add_argument("--limit", type=positive_int)
     parse.add_argument("--skip-build", action="store_true")
     parse.set_defaults(func=parse_replays)
+    pro_reset = subparsers.add_parser(
+        "pro-reset", help="build a stratified reset dataset from pro replays"
+    )
+    pro_reset.add_argument("--source", type=Path, default=Path("data/pro-1v1"))
+    pro_reset.add_argument(
+        "--output", type=Path, default=Path("data/pro-1v1-reset")
+    )
+    pro_reset.add_argument("--replays", type=positive_int, default=4096)
+    pro_reset.add_argument("--states", type=positive_int, default=256_000)
+    pro_reset.add_argument("--workers", type=positive_int, default=8)
+    pro_reset.add_argument("--fps", type=positive_float, default=10.0)
+    pro_reset.set_defaults(func=build_pro_reset_dataset)
     return parser.parse_args()
 
 
