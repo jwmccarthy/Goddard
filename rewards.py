@@ -237,7 +237,7 @@ class SeerReward:
         ).clamp(0.0, 1.0)
         air_height_progress = (air_height - previous_height).clamp_min(0.0)
         air_lift = (
-            (current.ball_velocity[..., 2] - previous.ball_velocity[..., 2])
+            (current.ball_velocity[:, 2] - previous.ball_velocity[:, 2])[:, None]
             / CAR_MAX_SPEED
         ).clamp_min(0.0)
         air_dribble_start = air_start.float() * air_height * wall_clearance
