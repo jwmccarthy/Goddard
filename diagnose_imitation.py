@@ -30,6 +30,10 @@ PROJECTED_FEATURES = (
     *(f"opponent_forward_{axis}" for axis in "xyz"),
     *(f"opponent_up_{axis}" for axis in "xyz"),
     "opponent_boost",
+    *(f"own_to_ball_{axis}" for axis in "xyz"),
+    *(f"own_to_opponent_{axis}" for axis in "xyz"),
+    *(f"ball_to_own_goal_{axis}" for axis in "xyz"),
+    *(f"ball_to_opponent_goal_{axis}" for axis in "xyz"),
 )
 
 
@@ -62,7 +66,14 @@ def parse_arguments() -> argparse.Namespace:
 
 def project(observation: torch.Tensor) -> torch.Tensor:
     return torch.cat(
-        (observation[..., :9], observation[..., 9:25], observation[..., 30:46]),
+        (
+            observation[..., :9],
+            observation[..., 9:25],
+            observation[..., 30:46],
+            observation[..., 119:122],
+            observation[..., 125:128],
+            observation[..., 131:137],
+        ),
         dim=-1,
     )
 
@@ -326,9 +337,10 @@ def main() -> None:
             arguments.sequence_length,
         )
         environment.reset_state_provider = None
-        carl_kickoff = torch.cat(
-            [environment.reset().cpu() for _ in range(8)]
-        )
+        with torch.inference_mode():
+            carl_kickoff = torch.cat(
+                [environment.reset().cpu() for _ in range(8)]
+            )
     finally:
         environment.close()
 
@@ -343,13 +355,25 @@ def main() -> None:
         generator=generator,
     )
     expert = expert_dataset.data["observation"][expert_indices].float()
+    if expert.shape[1] > arguments.sequence_length:
+        starts = torch.randint(
+            expert.shape[1] - arguments.sequence_length + 1,
+            (len(expert),),
+            generator=generator,
+        )
+        offsets = torch.arange(arguments.sequence_length)
+        expert = expert[
+            torch.arange(len(expert))[:, None],
+            starts[:, None] + offsets,
+        ]
     expert_has_kickoff = kickoff_wait_mask(expert.flatten(0, 1)).reshape(
         len(expert), arguments.sequence_length
     ).any(dim=1)
     agent_has_kickoff = kickoff_wait_mask(agent.flatten(0, 1)).reshape(
         len(agent), arguments.sequence_length
     ).any(dim=1)
-    expert_frames = expert_dataset.data["observation"].reshape(-1, 119)
+    expert_observation = expert_dataset.data["observation"]
+    expert_frames = expert_observation.reshape(-1, expert_observation.shape[-1])
     expert_kickoff = expert_frames[kickoff_wait_mask(expert_frames)].float()
     carl_kickoff = carl_kickoff[kickoff_wait_mask(carl_kickoff)]
     expert = project(expert)

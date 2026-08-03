@@ -17,7 +17,6 @@ from jarl.collect import (
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
-    TrueSkillEvaluator,
 )
 from jarl.envs import DatasetResetSampler
 from jarl.learn import (
@@ -85,10 +84,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--snapshot-interval",               type=int,   default=16)
     parser.add_argument("--opponent-pool-size",              type=int,   default=8)
     parser.add_argument("--historical-policies",             type=int,   default=4)
-    parser.add_argument("--trueskill-interval",              type=int,   default=32_000_000)
-    parser.add_argument("--trueskill-simulations",           type=int,   default=64)
-    parser.add_argument("--trueskill-opponents",             type=int,   default=3)
-    parser.add_argument("--trueskill-draw-probability",      type=float, default=0.9)
     parser.add_argument("--reward-scale",                    type=float, default=1.0)
     parser.add_argument("--goal-score-weight",               type=float, default=1.25)
     parser.add_argument("--shaping-coef",                    type=float, default=1.0)
@@ -111,22 +106,29 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir",                  type=Path,  default=Path("checkpoints"))
     parser.add_argument("--resume-checkpoint",               type=Path,  default=None)
     parser.add_argument(
+        "--initialize-from-ppo",
+        type=Path,
+        default=None,
+        help="initialize policy and critic weights from a PPO training checkpoint",
+    )
+    parser.add_argument(
         "--replay-dataset",
         type=Path,
-        default=Path("data/ballchasing-ssl-1v1/reset_dataset"),
+        default=Path("data/pro-1v1-reset/reset_dataset"),
     )
     parser.add_argument(
         "--expert-dataset",
         type=Path,
-        default=Path("data/ballchasing-ssl-1v1/expert_dataset"),
+        default=Path("data/pro-1v1/expert_dataset"),
     )
     parser.add_argument("--replay-reset-probability",        type=float, default=0.7)
     parser.add_argument("--discriminator-batch-size",        type=int,   default=2048)
     parser.add_argument("--discriminator-reward-batch-size", type=int,   default=4096)
     parser.add_argument("--discriminator-update-interval",   type=int,   default=1)
     parser.add_argument("--discriminator-epochs",            type=int,   default=2)
-    parser.add_argument("--discriminator-learning-rate",     type=float, default=3e-4)
-    parser.add_argument("--discriminator-noise-std",         type=float, default=0.01)
+    parser.add_argument("--discriminator-learning-rate",     type=float, default=1e-4)
+    parser.add_argument("--discriminator-noise-std",         type=float, default=0.05)
+    parser.add_argument("--discriminator-label-smoothing",   type=float, default=0.1)
     parser.add_argument(
         "--normalize",
         action=argparse.BooleanOptionalAction,
@@ -159,9 +161,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "snapshot-interval":      arguments.snapshot_interval,
         "opponent-pool-size":     arguments.opponent_pool_size,
         "historical-policies":    arguments.historical_policies,
-        "trueskill-interval":     arguments.trueskill_interval,
-        "trueskill-simulations":  arguments.trueskill_simulations,
-        "trueskill-opponents":    arguments.trueskill_opponents,
         "discriminator-batch-size": arguments.discriminator_batch_size,
         "discriminator-reward-batch-size": (
             arguments.discriminator_reward_batch_size
@@ -213,10 +212,11 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         or arguments.discriminator_noise_std < 0
     ):
         raise ValueError("discriminator-noise-std cannot be negative")
-    if not math.isfinite(arguments.trueskill_draw_probability) or not (
-        0.0 <= arguments.trueskill_draw_probability < 1.0
+    if (
+        not math.isfinite(arguments.discriminator_label_smoothing)
+        or not 0.0 <= arguments.discriminator_label_smoothing < 0.5
     ):
-        raise ValueError("trueskill-draw-probability must be between zero and one")
+        raise ValueError("discriminator-label-smoothing must be in [0, 0.5)")
     if not math.isfinite(arguments.gae_lambda) or arguments.gae_lambda > 1.0:
         raise ValueError("gae-lambda cannot exceed one")
     if arguments.gamma is not None and (
@@ -225,6 +225,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("gamma must be in (0, 1]")
     if arguments.n_blue != 1 or arguments.n_orange != 1:
         raise ValueError("The replay dataset currently supports only 1v1 training")
+    if not arguments.normalize:
+        raise ValueError("GAIfO expert observations require normalized observations")
     if not arguments.replay_dataset.is_dir():
         raise ValueError(f"Replay dataset does not exist: {arguments.replay_dataset}")
     if not arguments.expert_dataset.is_dir():
@@ -235,6 +237,21 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
     ):
         raise ValueError(
             f"Resume checkpoint does not exist: {arguments.resume_checkpoint}"
+        )
+    if (
+        arguments.initialize_from_ppo is not None
+        and not arguments.initialize_from_ppo.is_file()
+    ):
+        raise ValueError(
+            "PPO initialization checkpoint does not exist: "
+            f"{arguments.initialize_from_ppo}"
+        )
+    if (
+        arguments.resume_checkpoint is not None
+        and arguments.initialize_from_ppo is not None
+    ):
+        raise ValueError(
+            "--resume-checkpoint and --initialize-from-ppo are mutually exclusive"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
@@ -340,7 +357,10 @@ def build_ppo(
             batch_size=arguments.discriminator_batch_size,
             epochs=arguments.discriminator_epochs,
         ),
-        loss=SequenceGAIFOLoss(discriminator),
+        loss=SequenceGAIFOLoss(
+            discriminator,
+            label_smoothing=arguments.discriminator_label_smoothing,
+        ),
         optimizer_step=OptimizerStep(discriminator, discriminator_optimizer),
         section="Discriminator",
     )
@@ -526,8 +546,15 @@ def main() -> None:
             )
         )
         reward_function.set_goal_scored_weight(arguments.goal_score_weight)
-    evaluator = None
     try:
+        expert_observation_dim = expert_dataset.data["observation"].shape[-1]
+        environment_observation_dim = environment.single_observation_space.shape[0]
+        if expert_observation_dim != environment_observation_dim:
+            raise ValueError(
+                "Expert dataset observation dimension does not match CARL "
+                f"({expert_observation_dim} != {environment_observation_dim}); "
+                "rebuild the expert dataset"
+            )
         if arguments.total_timesteps < environment.n_envs:
             raise ValueError(
                 "total-timesteps must include at least one vector step "
@@ -549,6 +576,12 @@ def main() -> None:
                 modules,
                 environment.device,
             )
+        elif arguments.initialize_from_ppo is not None:
+            TrainingCheckpointer.load_module_subset(
+                arguments.initialize_from_ppo,
+                {"policy": policy, "critic": critic},
+                environment.device,
+            )
         runner, rollout, ppo, value_scheduler, training_objects = build_ppo(
             environment,
             policy,
@@ -566,34 +599,6 @@ def main() -> None:
             format_spec=",.4f",
         )
 
-        def make_evaluation_environment():
-            return CARLTorchVectorEnv(
-                n_sim=arguments.trueskill_simulations,
-                n_blue=arguments.n_blue,
-                n_orange=arguments.n_orange,
-                seed=arguments.seed + 1,
-                frameskip=arguments.frameskip,
-                max_ticks=arguments.max_ticks,
-                synchronize=False,
-                normalize=arguments.normalize,
-            )
-
-        evaluator = TrueSkillEvaluator(
-            policy=policy,
-            opponent_pool=runner.opponent_pool,
-            env_factory=make_evaluation_environment,
-            logger=logger,
-            checkpoint_dir=checkpoint_dir,
-            interval=arguments.trueskill_interval,
-            num_matches=arguments.trueskill_simulations,
-            team_sizes=(arguments.n_blue, arguments.n_orange),
-            max_steps=(
-                arguments.max_ticks + arguments.frameskip - 1
-            ) // arguments.frameskip,
-            opponents=arguments.trueskill_opponents,
-            draw_probability=arguments.trueskill_draw_probability,
-            seed=arguments.seed,
-        )
         training_checkpointer = TrainingCheckpointer(
             checkpoint_dir / "training_latest.pt",
             **training_objects,
@@ -604,7 +609,6 @@ def main() -> None:
             ppo,
             OnPolicySchedule(),
             logger=logger,
-            checkpoint=evaluator,
             value_scheduler=value_scheduler,
             update_callback=training_checkpointer,
         )
@@ -620,8 +624,6 @@ def main() -> None:
             discriminator.state_dict(), checkpoint_dir / "discriminator_final.pt"
         )
     finally:
-        if evaluator is not None:
-            evaluator.close()
         environment.close()
 
 

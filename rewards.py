@@ -86,11 +86,15 @@ class SeerReward:
         self._diagnostic_squares = None
         self._diagnostic_steps = None
         self._air_active = None
+        self._air_setup_active = None
         self._air_contacts = None
         self._air_last_touch_tick = None
+        self._air_setup_tick = None
         self._air_start_tick = None
         self._air_start_height = None
         self._air_wall_route = None
+        self._air_qualified = None
+        self._air_strong = None
         self._air_last_wall_tick = None
         self._kickoff_start_tick = None
         self._kickoff_touched = None
@@ -245,8 +249,8 @@ class SeerReward:
             - torch.exp(-previous_ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
         )
 
-        # Ground and wall launches share one sequence state, but route-specific
-        # setup terms make both paths discoverable.
+        # Attribute a controlled aerial sequence to the car that first creates
+        # a viable ground pop or wall release, not merely to any aerial touch.
         new_air_touch = touches & ~previous_touches
         car_airborne = ~current.car_on_ground & current.car_position[..., 2].gt(
             1.5 * BALL_RADIUS
@@ -283,15 +287,49 @@ class SeerReward:
             car_near_wall, ticks, self._air_last_wall_tick
         )
         recent_wall = ticks - self._air_last_wall_tick <= 30
-        valid_air_contact = new_air_touch & car_airborne & ball_airborne
-        wall_start = (
-            valid_air_contact & ~self._air_active & recent_wall
+        ball_rising = current.ball_velocity[:, 2, None].gt(150.0)
+        gained_lift = current.ball_velocity[:, 2, None].gt(
+            previous.ball_velocity[:, 2, None] + 50.0
+        )
+        ball_moving_inward = (wall_clearance - previous_wall_clearance).gt(0.002)
+        ground_launch = (
+            new_air_touch
+            & (current.car_on_ground | previous.car_on_ground)
+            & ball_position[..., 2].lt(4.0 * BALL_RADIUS)
+            & ball_rising
+            & gained_lift
+            & ~ball_near_wall
+        )
+        wall_launch = (
+            new_air_touch
+            & recent_wall
             & (ball_near_wall | car_near_wall)
+            & ball_position[..., 2].gt(1.5 * BALL_RADIUS)
+            & ball_rising
+            & (gained_lift | ball_moving_inward)
         )
-        ground_start = (
-            valid_air_contact & ~self._air_active & ~wall_start
+        launch_setup = (ground_launch | wall_launch) & ~self._air_active
+        self._air_setup_active |= launch_setup
+        self._air_setup_tick = torch.where(
+            launch_setup, ticks, self._air_setup_tick
         )
-        air_start = wall_start | ground_start
+        self._air_wall_route = torch.where(
+            launch_setup, wall_launch, self._air_wall_route
+        )
+        setup_expired = ticks - self._air_setup_tick > 90
+        self._air_setup_active &= ~setup_expired
+
+        valid_air_contact = new_air_touch & car_airborne & ball_airborne
+        setup_followup = valid_air_contact & self._air_setup_active
+        # Replay resets can begin midway through a mechanic. This conservative
+        # fallback recovers those sequences without rewarding low aerial hits.
+        replay_midair_start = (
+            valid_air_contact
+            & ~self._air_setup_active
+            & ball_position[..., 2].gt(4.0 * BALL_RADIUS)
+            & distance_to_ball.lt(2.5 * BALL_RADIUS)
+        )
+        air_start = ~self._air_active & (setup_followup | replay_midair_start)
         self._air_start_tick = torch.where(
             air_start, context.episode_ticks[:, None], self._air_start_tick
         )
@@ -299,8 +337,9 @@ class SeerReward:
             air_start, air_height, self._air_start_height
         )
         self._air_wall_route = torch.where(
-            air_start, wall_start, self._air_wall_route
+            air_start & replay_midair_start, recent_wall, self._air_wall_route
         )
+        self._air_setup_active &= ~air_start
         sequence_contact = valid_air_contact & (self._air_active | air_start)
         self._air_contacts += sequence_contact.to(self._air_contacts.dtype)
         self._air_active |= air_start
@@ -308,7 +347,8 @@ class SeerReward:
             sequence_contact, ticks, self._air_last_touch_tick
         )
         air_timeout = ticks - self._air_last_touch_tick > 45
-        air_invalid = (~ball_airborne) | current.car_on_ground
+        car_on_floor = current.car_on_ground & current.car_position[..., 2].lt(120.0)
+        air_invalid = (~ball_airborne) | car_on_floor
         air_duration = ticks - self._air_start_tick
         air_qualified = (
             self._air_active & (self._air_contacts >= 2)
@@ -319,40 +359,52 @@ class SeerReward:
             air_qualified & (self._air_contacts >= 3) & air_duration.ge(18)
             & (air_height - self._air_start_height).ge(250.0 / CEILING_Z)
         )
-        ground_setup = (
-            new_air_touch & (current.car_on_ground | previous.car_on_ground)
-        ).float() * (air_height_progress + air_lift)
-        wall_setup = (new_air_touch & (ball_near_wall | car_near_wall)).float() * (
-            air_height_progress
-            + (wall_clearance - previous_wall_clearance).clamp_min(0.0)
+        launch_quality = (
+            current.ball_velocity[:, 2, None] / CAR_MAX_SPEED
+        ).clamp(0.0, 1.0)
+        wall_release = (
+            (wall_clearance - previous_wall_clearance).clamp_min(0.0) * 20.0
+        ).clamp_max(1.0)
+        air_dribble_setup = launch_setup.float() * (
+            0.5 + launch_quality + wall_launch.float() * wall_release
         )
-        air_dribble_setup = ground_setup + wall_setup
-        air_dribble_start = air_start.float() * (0.25 + air_height)
+        air_dribble_start = air_start.float() * (0.5 + air_height)
         air_dribble_contact = (
             sequence_contact & ~air_start
-        ).float() * (0.1 + air_height)
+        ).float() * (0.25 + air_height)
         current_proximity = torch.exp(-distance_to_ball / 700.0)
         previous_proximity = torch.exp(
             -(previous_ball_position - previous.car_position).norm(dim=-1) / 700.0
         )
         control_progress = (current_proximity - previous_proximity).clamp_min(0.0)
+        controlled = (
+            distance_to_ball.lt(4.0 * BALL_RADIUS)
+            & current.car_position[..., 2].lt(ball_position[..., 2] + BALL_RADIUS)
+        ).float()
         route_progress = torch.where(
             self._air_wall_route,
             (wall_clearance - previous_wall_clearance).clamp_min(0.0),
             torch.zeros_like(wall_clearance),
         )
         progress_scale = (self._air_contacts / 3.0).clamp(0.25, 1.0)
-        air_dribble_progress = self._air_active.float() * progress_scale * (
+        air_dribble_progress = self._air_active.float() * controlled * progress_scale * (
             air_height_progress + ball_goal_progress.clamp_min(0.0)
             + air_lift + control_progress + route_progress
         )
         air_ended = air_invalid | air_timeout | scored.bool()
-        air_dribble_complete = (
-            air_qualified & air_ended
-        ).float()
-        air_dribble_complete *= 1.0 + strong_air_dribble.float()
-        air_dribble_complete *= 1.0 + self.weights.air_dribble_goal_scale * scored
+        newly_qualified = air_qualified & ~self._air_qualified
+        newly_strong = strong_air_dribble & ~self._air_strong
+        air_dribble_complete = newly_qualified.float() + newly_strong.float()
+        air_dribble_complete += (
+            self._air_qualified.float()
+            * self.weights.air_dribble_goal_scale
+            * scored
+        )
+        self._air_qualified |= air_qualified
+        self._air_strong |= strong_air_dribble
         self._air_active &= ~air_ended
+        self._air_qualified &= self._air_active
+        self._air_strong &= self._air_active
         self._air_contacts *= self._air_active.to(self._air_contacts.dtype)
         previous_car_to_ball = previous_ball_position - previous.car_position
         player_ball_progress = (
@@ -514,11 +566,15 @@ class SeerReward:
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
         self._air_active[done] = False
+        self._air_setup_active[done] = False
         self._air_contacts[done] = 0.0
         self._air_last_touch_tick[done] = 0
+        self._air_setup_tick[done] = 0
         self._air_start_tick[done] = 0
         self._air_start_height[done] = 0.0
         self._air_wall_route[done] = False
+        self._air_qualified[done] = False
+        self._air_strong[done] = False
         self._air_last_wall_tick[done] = -10_000
         self._kickoff_start_tick[done] = -1
         self._kickoff_touched[done] = False
@@ -570,11 +626,15 @@ class SeerReward:
         self._diagnostic_squares = None
         self._diagnostic_steps = None
         self._air_active = torch.zeros(expected, dtype=torch.bool, device=device)
+        self._air_setup_active = torch.zeros(expected, dtype=torch.bool, device=device)
         self._air_contacts = torch.zeros(expected, device=device)
         self._air_last_touch_tick = torch.zeros(expected, dtype=torch.int64, device=device)
+        self._air_setup_tick = torch.zeros(expected, dtype=torch.int64, device=device)
         self._air_start_tick = torch.zeros(expected, dtype=torch.int64, device=device)
         self._air_start_height = torch.zeros(expected, device=device)
         self._air_wall_route = torch.zeros(expected, dtype=torch.bool, device=device)
+        self._air_qualified = torch.zeros(expected, dtype=torch.bool, device=device)
+        self._air_strong = torch.zeros(expected, dtype=torch.bool, device=device)
         self._air_last_wall_tick = torch.full(
             expected, -10_000, dtype=torch.int64, device=device
         )

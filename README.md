@@ -34,6 +34,20 @@ Split the replay IDs and reparse the expert half directly from the raw replay fi
 uv run python imitation_dataset.py --expert-count 512 --frameskip 8 --history-length 64
 ```
 
+For the pro replay collection, randomly sample expert demonstrations across the full
+eligible replay collection. The seed makes the selection reproducible, and this does
+not modify the 513,344-state reset dataset:
+
+```bash
+uv run python imitation_dataset.py \
+    --source data/pro-1v1 \
+    --random-source-replays \
+    --expert-count 1200 \
+    --seed 0 \
+    --frameskip 8 \
+    --history-length 64
+```
+
 Downloads and parser state are stored under `data/ballchasing-ssl-1v1`. `reset_dataset/CURRENT` names the active sampled starting-position generation. `expert_dataset/CURRENT` names the active contiguous observation-sequence generation. GAIfO only reads `expert_dataset`; it never forms sequences from `reset_dataset`.
 
 The collector uses the `babytowniv-rl-dataset/1.0` user agent and limits requests to five per second. The download manifest stores file hashes and supports resumed runs.
@@ -83,11 +97,23 @@ Train with the sequence-level imitation reward using:
 uv run python gaifo.py --total-timesteps 100000000
 ```
 
-`gaifo.py` requires an expert dataset whose history length is at least the configured training sequence length. Each expert history comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz), using replay IDs disjoint from the sampled starting-position dataset. Training randomly crops each longer expert history to match `--sequence-length`, so one 64-observation artifact supports 16-, 32-, and 64-observation discriminators. The recurrent discriminator classifies complete observation sequences rather than explicit transition pairs. The discriminator reward `softplus(-logit)` is emitted once at the final step of each valid sequence. Sequences that cross episode boundaries are excluded from discriminator updates and receive zero imitation reward.
+GAIfO defaults to `data/pro-1v1-reset/reset_dataset` for replay starts and
+`data/pro-1v1/expert_dataset` for contiguous expert sequences. Expert observations
+are normalized, so GAIfO does not support `--no-normalize`.
+
+Initialize GAIfO's policy and critic from a PPO training checkpoint while starting
+the discriminator, optimizers, schedules, and counters fresh with:
+
+```bash
+uv run python gaifo.py \
+    --initialize-from-ppo checkpoints/<ppo-run>/training_latest.pt
+```
+
+`gaifo.py` requires an expert dataset whose history length is at least the configured training sequence length. Each expert history comes directly from contiguous raw replay samples at the policy control rate (`120 / frameskip` Hz). The original split workflow keeps expert and reset replay IDs disjoint; the pro workflow samples randomly across the full eligible replay collection. Training randomly crops each longer expert history to match `--sequence-length`, so one 64-observation artifact supports 16-, 32-, and 64-observation discriminators. The recurrent discriminator trains on overlapping windows and emits a bounded logit reward after every step using the latest valid window, shortened near rollout and episode boundaries. Windows never cross episode boundaries.
 
 GAIfO uses full-strength imitation plus CARL's goal reward by default. Pass `--seer-reward` to add the default Seer components; all non-goal shaping then linearly anneals to zero over total training timesteps while goal scoring remains active. Configure its initial strength with `--shaping-coef`.
 
-PPO updates every rollout. Configure discriminator training cadence with `--discriminator-update-interval`; `1` trains it every PPO update, while `N` trains it on the first update and every `N` updates thereafter. Reward inference still runs every rollout using the latest discriminator.
+PPO and the discriminator update every rollout. The discriminator uses 0.1 label smoothing and 0.05 input noise to limit saturation. Configure a slower cadence with `--discriminator-update-interval`; `N` trains it on the first update and every `N` updates thereafter. Reward inference still runs every rollout using the latest discriminator.
 
 Run a small GAIfO training check with:
 

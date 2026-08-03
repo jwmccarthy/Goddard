@@ -37,21 +37,37 @@ class SequenceDiscriminator(nn.Module):
         if noise_std < 0:
             raise ValueError("noise standard deviation cannot be negative")
         self.noise_std = noise_std
-        self.recurrent = nn.GRU(41, hidden_size, batch_first=True)
+        self.recurrent = nn.GRU(53, hidden_size, batch_first=True)
         self.output = nn.Linear(hidden_size, 1)
 
     def project(self, observation: torch.Tensor) -> torch.Tensor:
         ball = observation[..., :9]
         own_car = observation[..., 9:25]
         opponent = observation[..., 30:46]
-        return torch.cat((ball, own_car, opponent), dim=-1)
+        own_to_ball = observation[..., 119:122]
+        own_to_opponent = observation[..., 125:128]
+        ball_to_goals = observation[..., 131:137]
+        return torch.cat(
+            (
+                ball,
+                own_car,
+                opponent,
+                own_to_ball,
+                own_to_opponent,
+                ball_to_goals,
+            ),
+            dim=-1,
+        )
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        return self.forward_steps(observation)[..., -1]
+
+    def forward_steps(self, observation: torch.Tensor) -> torch.Tensor:
         observation = self.project(observation)
         if self.training and self.noise_std:
             observation = observation + torch.randn_like(observation) * self.noise_std
-        _, final_state = self.recurrent(observation)
-        return self.output(final_state[-1]).squeeze(-1)
+        output, _ = self.recurrent(observation)
+        return self.output(output).squeeze(-1)
 
 
 class SequenceGAIFOMinibatches:
@@ -70,22 +86,23 @@ class SequenceGAIFOMinibatches:
         self.epochs = epochs
 
     def __call__(self, rollout: TensorBatch):
-        observation = _sequence_grid(rollout["observation"], self.sequence_length)
+        horizon, num_envs = rollout["observation"].shape[:2]
+        window_count = horizon - self.sequence_length + 1
+        if window_count < 1:
+            raise ValueError("rollout horizon must be at least the sequence length")
         valid = torch.ones(
-            observation.shape[0],
-            observation.shape[2],
+            window_count,
+            num_envs,
             dtype=torch.bool,
             device=rollout.device,
         )
-        if "learner_mask" in rollout:
-            valid &= _sequence_grid(
-                rollout["learner_mask"], self.sequence_length
-            ).bool().all(dim=1)
-        for field in ("terminated", "truncated"):
-            if field in rollout:
-                valid &= ~_sequence_grid(
-                    rollout[field], self.sequence_length
-                ).bool().any(dim=1)
+        for start in range(window_count):
+            stop = start + self.sequence_length
+            if "learner_mask" in rollout:
+                valid[start] &= rollout["learner_mask"][start:stop].bool().all(dim=0)
+            for field in ("terminated", "truncated"):
+                if field in rollout:
+                    valid[start] &= ~rollout[field][start:stop].bool().any(dim=0)
 
         coordinates = valid.nonzero()
         if len(coordinates) < self.batch_size:
@@ -99,10 +116,16 @@ class SequenceGAIFOMinibatches:
                 batch_indices = indices[start : start + self.batch_size]
                 if len(batch_indices) == self.batch_size:
                     selected = coordinates[batch_indices]
-                    chunk, environment = selected.unbind(dim=1)
+                    start_index, environment = selected.unbind(dim=1)
+                    offsets = torch.arange(
+                        self.sequence_length, device=rollout.device
+                    )
                     agent_sequences = TensorBatch(
                         {
-                            "observation": observation[chunk, :, environment],
+                            "observation": rollout["observation"][
+                                start_index[:, None] + offsets,
+                                environment[:, None],
+                            ],
                         }
                     )
                     yield self._build_batch(agent_sequences)
@@ -140,13 +163,25 @@ class SequenceGAIFOMinibatches:
 
 
 class SequenceGAIFOLoss:
-    def __init__(self, discriminator: SequenceDiscriminator) -> None:
+    def __init__(
+        self,
+        discriminator: SequenceDiscriminator,
+        label_smoothing: float = 0.1,
+    ) -> None:
+        if not 0.0 <= label_smoothing < 0.5:
+            raise ValueError("label smoothing must be in [0, 0.5)")
         self.discriminator = discriminator
+        self.label_smoothing = label_smoothing
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
-        score = self.discriminator(batch["observation"])
+        score = self.discriminator.forward_steps(batch["observation"])
         target = batch["is_agent"]
-        loss = F.binary_cross_entropy_with_logits(score, target)
+        smoothed_target = target.lerp(
+            torch.full_like(target, 0.5),
+            2.0 * self.label_smoothing,
+        )
+        smoothed_target = smoothed_target[:, None].expand_as(score)
+        loss = F.binary_cross_entropy_with_logits(score, smoothed_target)
         is_agent = target.bool()
         return LossOutput(
             loss,
@@ -165,57 +200,64 @@ class SequenceDiscriminatorReward:
         sequence_length: int,
         batch_size: int = 4096,
         output_field: str = "imitation_reward",
+        reward_scale: float = 0.7,
+        logit_clip: float = 10.0,
     ) -> None:
-        if sequence_length < 1 or batch_size < 1:
-            raise ValueError("sequence length and batch size must be positive")
+        if min(sequence_length, batch_size, reward_scale, logit_clip) <= 0:
+            raise ValueError("lengths, batch size, and reward scales must be positive")
         self.discriminator = discriminator
         self.sequence_length = sequence_length
         self.batch_size = batch_size
         self.output_field = output_field
+        self.reward_scale = reward_scale
+        self.logit_clip = logit_clip
 
     @torch.no_grad()
     def __call__(self, batch: TensorBatch, context) -> TensorBatch:
-        observation = _sequence_grid(batch["observation"], self.sequence_length)
-        valid = torch.ones(
-            observation.shape[0],
-            observation.shape[2],
-            dtype=torch.bool,
-            device=batch.device,
-        )
-        if "learner_mask" in batch:
-            valid &= _sequence_grid(
-                batch["learner_mask"], self.sequence_length
-            ).bool().all(dim=1)
-        for field in ("terminated", "truncated"):
-            if field in batch:
-                valid &= ~_sequence_grid(
-                    batch[field], self.sequence_length
-                ).bool().any(dim=1)
-
-        sequence_reward = torch.zeros(
-            valid.shape,
+        reward = torch.zeros(
+            batch["observation"].shape[:2],
             dtype=batch["observation"].dtype,
             device=batch.device,
         )
-        coordinates = valid.nonzero()
+        horizon, num_envs = reward.shape
+        age = torch.zeros(num_envs, dtype=torch.int64, device=batch.device)
+        ages = torch.empty_like(reward, dtype=torch.int64)
+        valid = torch.ones_like(reward, dtype=torch.bool)
+        boundary = torch.zeros_like(reward, dtype=torch.bool)
+        for field in ("terminated", "truncated"):
+            if field in batch:
+                boundary |= batch[field].bool()
+        if "learner_mask" in batch:
+            valid &= batch["learner_mask"].bool()
+        valid &= ~boundary
+        for step in range(horizon):
+            if step:
+                age = torch.where(boundary[step - 1], 0, age)
+            age = (age + 1).clamp_max(self.sequence_length)
+            ages[step] = age
+
         was_training = self.discriminator.training
         self.discriminator.eval()
         try:
-            for start in range(0, len(coordinates), self.batch_size):
-                selected = coordinates[start : start + self.batch_size]
-                chunk, environment = selected.unbind(dim=1)
-                score = self.discriminator(observation[chunk, :, environment])
-                sequence_reward[chunk, environment] = F.softplus(-score)
+            for length in range(1, self.sequence_length + 1):
+                coordinates = (valid & ages.eq(length)).nonzero()
+                offsets = torch.arange(length, device=batch.device)
+                for start in range(0, len(coordinates), self.batch_size):
+                    selected = coordinates[start : start + self.batch_size]
+                    step, environment = selected.unbind(dim=1)
+                    observation = batch["observation"][
+                        step[:, None] - length + 1 + offsets,
+                        environment[:, None],
+                    ]
+                    score = self.discriminator(observation).clamp(
+                        -self.logit_clip, self.logit_clip
+                    )
+                    reward[step, environment] = (
+                        self.reward_scale / self.sequence_length
+                    ) * (1.0 - score / self.logit_clip)
         finally:
             self.discriminator.train(was_training)
 
-        horizon, num_envs = batch["observation"].shape[:2]
-        reward = torch.zeros(
-            (horizon, num_envs),
-            dtype=sequence_reward.dtype,
-            device=sequence_reward.device,
-        )
-        reward.reshape(-1, self.sequence_length, num_envs)[:, -1] = sequence_reward
         return batch.with_fields(**{self.output_field: reward})
 
 

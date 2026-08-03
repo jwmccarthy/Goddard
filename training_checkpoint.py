@@ -78,6 +78,23 @@ class TrainingCheckpointer:
         for name, module in modules.items():
             module.load_state_dict(state["modules"][name])
 
+    @classmethod
+    def load_module_subset(
+        cls,
+        path: Path,
+        modules: dict[str, torch.nn.Module],
+        device: torch.device | str,
+    ) -> None:
+        state = torch.load(path, map_location=device, weights_only=False)
+        state = cls._upgrade(state)
+        missing = modules.keys() - state["modules"].keys()
+        if missing:
+            raise ValueError(
+                f"training checkpoint modules are missing: {sorted(missing)}"
+            )
+        for name, module in modules.items():
+            module.load_state_dict(state["modules"][name])
+
     @staticmethod
     def _require_names(kind: str, saved: dict, current: dict) -> None:
         if saved.keys() != current.keys():

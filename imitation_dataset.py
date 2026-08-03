@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import tempfile
 from datetime import datetime, timezone
 
@@ -29,7 +30,7 @@ from replay_states import (
 
 PHYSICS_HZ = 120
 SPLIT_SALT = b"goddard-replay-split-v1\0"
-EXPERT_SCHEMA_VERSION = 9
+EXPERT_SCHEMA_VERSION = 10
 EXPERT_GLOBAL_FEATURES = [
     *GLOBAL_FEATURES,
     "CurrentTime",
@@ -162,7 +163,7 @@ def parse_expert_replay(
         raise ValueError("Expert replay demolition values are invalid")
     valid_indices = valid_indices[(demolished < 0).all(axis=1)]
     if len(valid_indices) < history_length:
-        return _empty_histories(history_length)
+        return _empty_histories(history_length, encoder.environment._env.obs_dim)
 
     rotations = frames[np.ix_(valid_indices, state_columns.car_rotation)].reshape(
         -1, 2, 4
@@ -199,7 +200,7 @@ def parse_expert_replay(
         range(run_start, len(pair) - history_length + 2, history_length)
     )
     if not starts:
-        return _empty_histories(history_length)
+        return _empty_histories(history_length, encoder.environment._env.obs_dim)
 
     history_indices = np.asarray(starts)[:, None] + np.arange(history_length)
     observation = observations[history_indices].transpose(0, 2, 1, 3)
@@ -208,8 +209,8 @@ def parse_expert_replay(
     )
 
 
-def _empty_histories(history_length: int) -> np.ndarray:
-    return np.empty((0, history_length, 119), dtype=np.float32)
+def _empty_histories(history_length: int, observation_dim: int) -> np.ndarray:
+    return np.empty((0, history_length, observation_dim), dtype=np.float32)
 
 
 def write_expert_shard(
@@ -255,32 +256,51 @@ def build_expert_dataset(
     shards = root / "shards"
     shards.mkdir(parents=True, exist_ok=True)
     encoder = ObservationEncoder(batch_size)
+    valid_replay_ids = []
 
     try:
         for index, replay_id in enumerate(replay_ids, start=1):
             shard = shards / f"{replay_id}.npz"
-            if not _valid_expert_shard(shard, frameskip, history_length):
-                observation = parse_expert_replay(
-                    source / "replays" / f"{replay_id}.replay",
-                    frameskip,
-                    history_length,
-                    encoder,
+            try:
+                if not _valid_expert_shard(shard, frameskip, history_length):
+                    observation = parse_expert_replay(
+                        source / "replays" / f"{replay_id}.replay",
+                        frameskip,
+                        history_length,
+                        encoder,
+                    )
+                    write_expert_shard(
+                        shard,
+                        observation,
+                        replay_id,
+                        frameskip,
+                        history_length,
+                    )
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                    raise
+                shard.unlink(missing_ok=True)
+                print(
+                    f"Skipped expert replay {replay_id}: "
+                    f"{type(error).__name__}: {error}"
                 )
-                write_expert_shard(
-                    shard,
-                    observation,
-                    replay_id,
-                    frameskip,
-                    history_length,
-                )
+                continue
+            valid_replay_ids.append(replay_id)
             print(f"Expert replay {index}/{len(replay_ids)}: {replay_id}")
     finally:
         encoder.close()
+    if not valid_replay_ids:
+        raise ValueError("No valid expert replays were parsed")
 
     counts = []
-    for replay_id in replay_ids:
+    observation_dims = set()
+    for replay_id in valid_replay_ids:
         with np.load(shards / f"{replay_id}.npz", allow_pickle=False) as shard:
             counts.append(len(shard["observation"]))
+            observation_dims.add(shard["observation"].shape[-1])
+    if len(observation_dims) != 1:
+        raise ValueError("Expert shards have inconsistent observation dimensions")
+    observation_dim = observation_dims.pop()
 
     generation = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     directory = root / generation
@@ -290,11 +310,11 @@ def build_expert_dataset(
         directory / "observation.npy",
         mode="w+",
         dtype=np.float32,
-        shape=(total, history_length, 119),
+        shape=(total, history_length, observation_dim),
     )
 
     offset = 0
-    for replay_id, count in zip(replay_ids, counts):
+    for replay_id, count in zip(valid_replay_ids, counts):
         with np.load(shards / f"{replay_id}.npz", allow_pickle=False) as shard:
             stop = offset + count
             observation[offset:stop] = shard["observation"]
@@ -308,12 +328,12 @@ def build_expert_dataset(
         "physics_hz":             PHYSICS_HZ,
         "sample_hz":              PHYSICS_HZ / frameskip,
         "history_length":         history_length,
-        "observation_dim":        119,
+        "observation_dim":        observation_dim,
         "history_count":          total,
         "goal_buffer_seconds":    5.0,
         "live_gameplay_only":     True,
         "demoed_states_removed": True,
-        "replay_ids":             replay_ids,
+        "replay_ids":             valid_replay_ids,
     }
     (directory / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     (root / "CURRENT").write_text(generation + "\n")
@@ -334,7 +354,9 @@ def _valid_expert_shard(
                 and int(shard["frameskip"]) == frameskip
                 and int(shard["history_length"]) == history_length
                 and shard["observation"].dtype == np.float32
-                and shard["observation"].shape[1:] == (history_length, 119)
+                and shard["observation"].ndim == 3
+                and shard["observation"].shape[1] == history_length
+                and shard["observation"].shape[2] >= 46
             )
     except (KeyError, OSError, ValueError):
         return False
@@ -355,9 +377,17 @@ def load_expert_dataset(
     history_length = metadata.get("history_length", 0)
     if history_length < sequence_length:
         raise ValueError("Expert dataset history is shorter than training sequences")
-    observation = torch.from_numpy(
-        np.load(directory / "observation.npy", mmap_mode="c", allow_pickle=False)
+    observation_array = np.load(
+        directory / "observation.npy", mmap_mode="c", allow_pickle=False
     )
+    expected_shape = (
+        metadata.get("history_count"),
+        history_length,
+        metadata.get("observation_dim"),
+    )
+    if observation_array.shape != expected_shape or observation_array.dtype != np.float32:
+        raise ValueError("Expert observation artifact does not match its metadata")
+    observation = torch.from_numpy(observation_array)
     return TensorDataset(
         TensorBatch(
             {
@@ -398,6 +428,72 @@ def build_split(
     print(f"Expert dataset: {directory}")
 
 
+def reset_replay_ids(root: Path) -> list[str]:
+    generation = (root / "CURRENT").read_text().strip()
+    metadata = json.loads((root / generation / "metadata.json").read_text())
+    replay_ids = [record.get("replay_id") for record in metadata.get("replays", [])]
+    if not replay_ids or any(not isinstance(replay_id, str) for replay_id in replay_ids):
+        raise ValueError("Reset dataset metadata has no valid replay IDs")
+    if len(replay_ids) != len(set(replay_ids)):
+        raise ValueError("Reset dataset metadata contains duplicate replay IDs")
+    return replay_ids
+
+
+def build_expert_from_reset_replays(
+    source:          Path,
+    reset_dataset:   Path,
+    expert_count:    int,
+    frameskip:       int,
+    history_length:  int,
+    batch_size:      int,
+) -> None:
+    replay_ids = reset_replay_ids(reset_dataset)
+    expert_ids, _ = replay_split(replay_ids, expert_count)
+    missing = [
+        replay_id
+        for replay_id in expert_ids
+        if not (source / "replays" / f"{replay_id}.replay").is_file()
+    ]
+    if missing:
+        raise ValueError(
+            f"Raw replay files are missing for {len(missing)} selected expert replays"
+        )
+    directory = build_expert_dataset(
+        source, expert_ids, frameskip, history_length, batch_size
+    )
+    print(f"Expert replays: {len(expert_ids)}")
+    print(f"Expert dataset: {directory}")
+
+
+def random_source_replay_ids(
+    source: Path,
+    expert_count: int,
+    seed: int,
+) -> list[str]:
+    replay_ids = sorted(path.stem for path in (source / "replays").glob("*.replay"))
+    if expert_count > len(replay_ids):
+        raise ValueError(
+            f"Requested {expert_count} expert replays, but only {len(replay_ids)} exist"
+        )
+    return random.Random(seed).sample(replay_ids, expert_count)
+
+
+def build_random_source_experts(
+    source:          Path,
+    expert_count:    int,
+    frameskip:       int,
+    history_length:  int,
+    batch_size:      int,
+    seed:            int,
+) -> None:
+    replay_ids = random_source_replay_ids(source, expert_count, seed)
+    directory = build_expert_dataset(
+        source, replay_ids, frameskip, history_length, batch_size
+    )
+    print(f"Expert replays: {len(replay_ids)}")
+    print(f"Expert dataset: {directory}")
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build disjoint replay reset and GAIfO datasets"
@@ -411,6 +507,21 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--frameskip", type=int, default=8)
     parser.add_argument("--history-length", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--random-source-replays",
+        action="store_true",
+        help="sample expert demonstrations from every replay under SOURCE",
+    )
+    parser.add_argument(
+        "--reset-dataset",
+        type=Path,
+        default=None,
+        help=(
+            "build only expert sequences from replay IDs in this reset dataset; "
+            "the reset dataset is not modified"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -423,13 +534,36 @@ def main() -> None:
         arguments.batch_size,
     ) < 1:
         raise ValueError("counts, frameskip, and history length must be positive")
-    build_split(
-        arguments.source,
-        arguments.expert_count,
-        arguments.frameskip,
-        arguments.history_length,
-        arguments.batch_size,
-    )
+    if arguments.random_source_replays and arguments.reset_dataset is not None:
+        raise ValueError(
+            "--random-source-replays and --reset-dataset are mutually exclusive"
+        )
+    if arguments.random_source_replays:
+        build_random_source_experts(
+            arguments.source,
+            arguments.expert_count,
+            arguments.frameskip,
+            arguments.history_length,
+            arguments.batch_size,
+            arguments.seed,
+        )
+    elif arguments.reset_dataset is None:
+        build_split(
+            arguments.source,
+            arguments.expert_count,
+            arguments.frameskip,
+            arguments.history_length,
+            arguments.batch_size,
+        )
+    else:
+        build_expert_from_reset_replays(
+            arguments.source,
+            arguments.reset_dataset,
+            arguments.expert_count,
+            arguments.frameskip,
+            arguments.history_length,
+            arguments.batch_size,
+        )
 
 
 if __name__ == "__main__":

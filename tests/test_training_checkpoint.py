@@ -60,6 +60,26 @@ class TrainingCheckpointTests(unittest.TestCase):
         torch.testing.assert_close(target.weight, source.weight)
         torch.testing.assert_close(target.bias, source.bias)
 
+    def test_module_subset_preload_ignores_additional_modules(self):
+        policy = torch.nn.Linear(2, 1)
+        critic = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.SGD(policy.parameters(), lr=0.1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "training_latest.pt"
+            TrainingCheckpointer(
+                path,
+                modules={"policy": policy, "critic": critic},
+                optimizers={"policy": optimizer},
+            )(SimpleNamespace(clock=Clock()))
+            target = torch.nn.Linear(2, 1)
+            TrainingCheckpointer.load_module_subset(
+                path, {"policy": target}, "cpu"
+            )
+
+        torch.testing.assert_close(target.weight, policy.weight)
+        torch.testing.assert_close(target.bias, policy.bias)
+
     def test_legacy_value_function_key_is_migrated_to_critic(self):
         for version in (1, 2):
             with self.subTest(version=version):
