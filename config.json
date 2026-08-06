@@ -1,0 +1,6 @@
+{
+    "api": {
+        "retries": 5,
+        "url":     "https://ballchasing.com/api"
+    }
+}

@@ -15,19 +15,24 @@ import threading
 import time
 import webbrowser
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+SUPPORT_ROOT = PROJECT_ROOT.parent / "_Goddard"
+import sys
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SUPPORT_ROOT))
+
 import torch
 import torch.nn as nn
 
 import carl
 from carl.gymnasium import CARLTorchVectorEnv
-from jarl.envs import DatasetResetSampler
 from jarl.modules import GRU, MLP
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.modules.utils import init_layer
 
-from replay_states import load_replay_dataset
 from nexto import NextoPolicy
+from curriculum.wall_to_air import WallToAirResetProvider
 
 
 CAR_OFFSET = (13.8757, 0.0, 20.755)
@@ -83,12 +88,14 @@ class CheckpointRegistry:
 
     def newest_pair(self) -> tuple[Path, Path]:
         checkpoints = self.list()
-        if len(checkpoints) < 2:
+        if not checkpoints:
             raise FileNotFoundError(
-                f"Need two current-format checkpoints under {self.directory}"
+                f"Need a current-format checkpoint under {self.directory}"
             )
 
         newest = checkpoints[0]
+        if len(checkpoints) == 1:
+            return newest.path, newest.path
         for candidate in checkpoints[1:]:
             if candidate.observation_size == newest.observation_size:
                 return newest.path, candidate.path
@@ -166,17 +173,19 @@ class ReplayResetController:
     ) -> None:
         self.dataset_path = dataset_path
         self.seed = seed
-        self.sampler: DatasetResetSampler | None = None
+        self.sampler: WallToAirResetProvider | None = None
 
     def configure(
         self,
         environment: CARLTorchVectorEnv,
         enabled:     bool,
     ) -> None:
-        if enabled and self.sampler is None:
-            dataset = load_replay_dataset(self.dataset_path, environment.device)
-            self.sampler = DatasetResetSampler(dataset, seed=self.seed)
-        environment.reset_state_provider = self.sampler if enabled else None
+        if self.sampler is None:
+            self.sampler = WallToAirResetProvider(
+                device=environment.device,
+                seed=self.seed,
+            )
+        environment.reset_state_provider = self.sampler
 
 
 def actor_state_dict(path: Path) -> dict[str, torch.Tensor]:
@@ -210,25 +219,26 @@ def inspect_checkpoint(root: Path, path: Path) -> CheckpointMetadata:
 
 
 def actor_dimensions(state: dict[str, torch.Tensor]) -> tuple[int, int]:
+    foot = state["foot.model.0.weight"]
     head = state["head.model.0.weight"]
-    if head.ndim != 2:
+    if foot.ndim != 2 or head.ndim != 2:
         raise ValueError("Checkpoint has an incompatible actor architecture")
 
-    hidden_size, observation_size = head.shape
+    hidden_size, observation_size = foot.shape
     half_hidden = hidden_size // 2
     expected_shapes = {
-        "head.model.0.weight":      (hidden_size, observation_size),
-        "head.model.0.bias":        (hidden_size,),
+        "foot.model.0.weight":      (hidden_size, observation_size),
+        "foot.model.0.bias":        (hidden_size,),
         "body.rnn.weight_ih_l0":    (3 * hidden_size, hidden_size),
         "body.rnn.weight_hh_l0":    (3 * hidden_size, hidden_size),
         "body.rnn.bias_ih_l0":      (3 * hidden_size,),
         "body.rnn.bias_hh_l0":      (3 * hidden_size,),
-        "foot.model.0.weight":      (hidden_size, hidden_size),
-        "foot.model.0.bias":        (hidden_size,),
-        "foot.model.2.weight":      (half_hidden, hidden_size),
-        "foot.model.2.bias":        (half_hidden,),
-        "foot.model.4.weight":      (ACTION_LOGITS, half_hidden),
-        "foot.model.4.bias":        (ACTION_LOGITS,),
+        "head.model.0.weight":      (hidden_size, hidden_size),
+        "head.model.0.bias":        (hidden_size,),
+        "head.model.2.weight":      (half_hidden, hidden_size),
+        "head.model.2.bias":        (half_hidden,),
+        "head.model.4.weight":      (ACTION_LOGITS, half_hidden),
+        "head.model.4.bias":        (ACTION_LOGITS,),
     }
     if hidden_size < 2 or any(
         key not in state or tuple(state[key].shape) != shape
@@ -242,19 +252,17 @@ def build_actor(
     environment: CARLTorchVectorEnv,
     hidden_size: int,
 ) -> MultiCategoricalPolicy:
-    head = LinearEncoder(hidden_size, func=nn.ReLU).build(environment)
-    body = GRU(hidden_size=hidden_size).build(head.feats)
     actor = MultiCategoricalPolicy(
-        head=head,
-        body=body,
-        foot=MLP(
+        foot=LinearEncoder(hidden_size, func=nn.ReLU),
+        body=GRU(hidden_size=hidden_size),
+        head=MLP(
             dims=[hidden_size, hidden_size // 2],
             func=nn.LeakyReLU,
             out_init_func=partial(init_layer, std=0.01),
         ),
         action_codec=environment.action_codec,
     )
-    return actor.build_composed(environment, body.feats).to(environment.device)
+    return actor.build(environment).to(environment.device)
 
 
 def load_actor(
@@ -641,7 +649,7 @@ def make_handler(
 
 
 def parse_arguments() -> argparse.Namespace:
-    root = Path(__file__).resolve().parent
+    root = PROJECT_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, default=root / "checkpoints")
     parser.add_argument("--blue")
@@ -654,7 +662,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--tick-skip", type=int, default=8)
     parser.add_argument("--fast-forward", type=int, default=1)
-    parser.add_argument("--max-ticks", type=int, default=4096)
+    parser.add_argument("--max-ticks", type=int, default=1200)
     parser.add_argument("--sample-actions", action="store_true")
     parser.add_argument("--replay-resets", action="store_true")
     parser.add_argument(
@@ -710,7 +718,7 @@ def main() -> None:
         blue_path = registry.resolve(arguments.blue)
         orange_path = registry.resolve(arguments.orange)
 
-    root = Path(__file__).resolve().parent
+    root = SUPPORT_ROOT
     frontend = root / "web" / "checkpoint"
     arena = Path(carl.__file__).resolve().parent / "assets" / "arena.obj"
     if not frontend.is_dir() or not arena.is_file():

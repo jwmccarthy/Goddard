@@ -1,8 +1,6 @@
-.venv/
-.opencode/
-.ruff*
+.env
+.vscode/
 __pycache__/
+**/__pycache__/
 checkpoints/
-data/
 runs/
-.opencode

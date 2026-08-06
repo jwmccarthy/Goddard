@@ -1,6 +1,4 @@
 import argparse
-import math
-from dataclasses import replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -9,24 +7,21 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 
-from carl.gymnasium import CARLTorchVectorEnv, REGULATION_TICKS
+from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
     LogProbCapture,
     RecurrentStateCapture,
-    RecurrentCriticCapture,
+    CriticCapture,
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
 )
-from jarl.envs import DatasetResetSampler
 from jarl.learn import (
     Algorithm,
     IndependentOptimizerSteps,
     OptimizerStep,
     PPOConfig,
     PPOLoss,
-    SPOConfig,
-    SPOLoss,
     Update,
 )
 from jarl.log.logger import Logger
@@ -36,23 +31,18 @@ from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.modules.utils import init_layer
 from jarl.runtime import (
-    ConstantSchedule,
-    LinearSchedule,
-    MappedSchedule,
     OnPolicySchedule,
-    ScheduledValue,
     Trainer,
-    ValueScheduler,
 )
 from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
-from rewards import SeerReward
-from replay_states import load_replay_dataset
+from curriculum.wall_to_air import WallToAirResetProvider, WallToAirReward, MATCH_TICKS
 
 
 class SyntheticMatchResetProvider:
+    
     def __init__(self, provider) -> None:
         self.provider = provider
 
@@ -64,11 +54,11 @@ class SyntheticMatchResetProvider:
         indices = state["simulation_indices"]
         remaining = torch.randint(
             0,
-            REGULATION_TICKS + 1,
+            MATCH_TICKS + 1,
             (len(indices),),
             device=reset_mask.device,
         )
-        elapsed = REGULATION_TICKS - remaining
+        elapsed = MATCH_TICKS - remaining
         elapsed_minutes = elapsed.float() / (120.0 * 60.0)
         scores = torch.poisson(
             elapsed_minutes[:, None].expand(-1, 2)
@@ -82,9 +72,6 @@ class SyntheticMatchResetProvider:
         return state
 
 
-from training_checkpoint import TrainingCheckpointer
-
-
 def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=f"Train a {algorithm.upper()} Rocket League agent"
@@ -93,7 +80,7 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     parser.add_argument("--n-blue",                     type=int,   default=1)
     parser.add_argument("--n-orange",                   type=int,   default=1)
     parser.add_argument("--frameskip",                  type=int,   default=8)
-    parser.add_argument("--max-ticks",                  type=int,   default=36_000)
+    parser.add_argument("--max-ticks",                  type=int,   default=1_200)
     parser.add_argument(
         "--no-touch-timeout",
         type=float,
@@ -157,163 +144,62 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_arguments(arguments: argparse.Namespace) -> None:
-    positive = {
-        "num-simulations":        arguments.num_simulations,
-        "n-blue":                 arguments.n_blue,
-        "n-orange":               arguments.n_orange,
-        "frameskip":              arguments.frameskip,
-        "max-ticks":              arguments.max_ticks,
-        "rollout-steps":          arguments.rollout_steps,
-        "sequence-length":        arguments.sequence_length,
-        "hidden-size":            arguments.hidden_size,
-        "total-timesteps":        arguments.total_timesteps,
-        "minibatch-size":         arguments.minibatch_size,
-        "learning-rate":          arguments.learning_rate,
-        "epochs":                 arguments.epochs,
-        "reward-scale":           arguments.reward_scale,
-        "discount-half-life":     arguments.discount_half_life,
-        "discount-half-life-end": arguments.discount_half_life_end,
-        "goal-score-weight":      arguments.goal_score_weight,
-        "goal-score-weight-end":  arguments.goal_score_weight_end,
-        "gae-lambda":             arguments.gae_lambda,
-        "snapshot-interval":      arguments.snapshot_interval,
-        "opponent-pool-size":     arguments.opponent_pool_size,
-        "historical-policies":    arguments.historical_policies,
-    }
-    invalid = [
-        name
-        for name, value in positive.items()
-        if not math.isfinite(value) or value <= 0
-    ]
-    if invalid:
-        raise ValueError(f"Arguments must be positive: {', '.join(invalid)}")
-    if arguments.rollout_steps % arguments.sequence_length:
-        raise ValueError("rollout-steps must be divisible by sequence-length")
-    if arguments.minibatch_size % arguments.sequence_length:
-        raise ValueError("minibatch-size must be divisible by sequence-length")
-    if arguments.opponent_pool_size < 3:
-        raise ValueError("opponent-pool-size must be at least three")
-    if arguments.historical_policies >= arguments.opponent_pool_size:
-        raise ValueError("historical-policies must be smaller than opponent-pool-size")
-    if not math.isfinite(arguments.self_play_current) or not (
-        0.0 <= arguments.self_play_current <= 1.0
-    ):
-        raise ValueError("self-play-current must be between zero and one")
-    if not math.isfinite(arguments.team_spirit) or not (
-        0.0 <= arguments.team_spirit <= 1.0
-    ):
-        raise ValueError("team-spirit must be between zero and one")
-    if (
-        not math.isfinite(arguments.entropy_coef)
-        or not math.isfinite(arguments.entropy_coef_end)
-        or arguments.entropy_coef < 0
-        or arguments.entropy_coef_end < 0
-    ):
-        raise ValueError("entropy coefficients cannot be negative")
-    if not math.isfinite(arguments.learning_rate_end_factor) or not (
-        0.0 < arguments.learning_rate_end_factor <= 1.0
-    ):
-        raise ValueError("learning-rate-end-factor must be in (0, 1]")
-    if not math.isfinite(arguments.replay_reset_probability) or not (
-        0.0 <= arguments.replay_reset_probability <= 1.0
-    ):
-        raise ValueError("replay-reset-probability must be between zero and one")
-    if not math.isfinite(arguments.gae_lambda) or arguments.gae_lambda > 1.0:
-        raise ValueError("gae-lambda cannot exceed one")
-    if arguments.gamma is not None and (
-        not math.isfinite(arguments.gamma) or not 0.0 < arguments.gamma <= 1.0
-    ):
-        raise ValueError("gamma must be in (0, 1]")
-    if arguments.n_blue != 1 or arguments.n_orange != 1:
-        raise ValueError("The replay dataset currently supports only 1v1 training")
-    if not arguments.replay_dataset.is_dir():
-        raise ValueError(f"Replay dataset does not exist: {arguments.replay_dataset}")
-    if (
-        arguments.resume_checkpoint is not None
-        and not arguments.resume_checkpoint.is_file()
-    ):
-        raise ValueError(
-            f"Resume checkpoint does not exist: {arguments.resume_checkpoint}"
-        )
-    if not torch.cuda.is_available():
-        raise RuntimeError("CARL requires a CUDA-capable GPU")
-    if arguments.bf16 and not torch.cuda.is_bf16_supported():
-        raise RuntimeError("--bf16 requires a CUDA device with BF16 support")
-    if not math.isfinite(arguments.no_touch_timeout) or arguments.no_touch_timeout <= 0:
-        raise ValueError("no-touch-timeout must be positive and finite")
-
 
 def build_policy_and_critic(
     environment: CARLTorchVectorEnv,
     arguments: argparse.Namespace,
 ):
-    actor_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
-    actor_body = GRU(hidden_size=arguments.hidden_size).build(actor_head.feats)
     actor = MultiCategoricalPolicy(
-        head=actor_head,
-        body=actor_body,
-        foot=MLP(
+        foot=LinearEncoder(arguments.hidden_size, func=nn.ReLU),
+        body=GRU(hidden_size=arguments.hidden_size),
+        head=MLP(
             dims=[arguments.hidden_size, arguments.hidden_size // 2],
             func=nn.LeakyReLU,
             out_init_func=partial(init_layer, std=0.01),
         ),
         action_codec=environment.action_codec,
     )
-    actor.build_composed(environment, actor_body.feats).to(environment.device)
+    actor.build(environment).to(environment.device)
 
-    critic_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
-    critic_body = GRU(hidden_size=arguments.hidden_size).build(critic_head.feats)
     critic = Critic(
-        head=critic_head,
-        body=critic_body,
-        foot=MLP(
+        foot=LinearEncoder(arguments.hidden_size, func=nn.ReLU),
+        body=GRU(hidden_size=arguments.hidden_size),
+        head=MLP(
             dims=[arguments.hidden_size // 2, arguments.hidden_size // 4],
             func=nn.LeakyReLU,
             out_init_func=partial(init_layer, std=1.0),
         ),
     )
-    critic.build_composed(environment, critic_body.feats).to(environment.device)
+    critic.build(environment).to(environment.device)
     return actor, critic
 
 
 def build_policy_loss(
-    algorithm: str,
     policy,
     critic,
     entropy_coef: float,
     bf16: bool = False,
 ):
-    if algorithm == "ppo":
-        return PPOLoss(
-            policy,
-            critic,
-            PPOConfig(clip=0.2, entropy_coef=entropy_coef, bf16=bf16),
-        )
-    if algorithm == "spo":
-        return SPOLoss(
-            policy,
-            critic,
-            SPOConfig(ratio_epsilon=0.2, entropy_coef=entropy_coef),
-        )
-    raise ValueError(f"unknown policy optimization algorithm: {algorithm}")
-
+    return PPOLoss(
+        policy,
+        critic,
+        PPOConfig(clip=0.2, entropy_coef=entropy_coef, bf16=bf16),
+    )
 
 def build_ppo(
     environment: CARLTorchVectorEnv,
     policy,
     critic,
-    reward_function: SeerReward,
     arguments: argparse.Namespace,
-    checkpoint_dir: Path,
     algorithm: str = "ppo",
-) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler, dict]:
+) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm]:
     rollout = RolloutBuffer(
         horizon=arguments.rollout_steps,
         num_envs=environment.n_envs,
         device=environment.device,
         copy_on_finish=False,
     )
+    checkpoint_dir = Path("checkpoints") / datetime.now().strftime("%Y%m%d-%H%M%S")
     snapshot_rollout_timesteps = int(
         environment.n_envs
         * (1.0 + arguments.self_play_current)
@@ -323,10 +209,7 @@ def build_ppo(
     opponent_pool = SnapshotPool(
         policy=policy,
         max_size=arguments.opponent_pool_size,
-        snapshot_interval=(
-            snapshot_rollout_timesteps * arguments.snapshot_interval
-        ),
-        initial_snapshot_interval=snapshot_rollout_timesteps,
+        snapshot_interval=snapshot_rollout_timesteps * arguments.snapshot_interval,
         active_cache_size=max(4, arguments.historical_policies * 2),
         seed=arguments.seed,
         checkpoint_dir=checkpoint_dir,
@@ -350,7 +233,7 @@ def build_ppo(
         captures=(
             LogProbCapture(),
             RecurrentStateCapture(),
-            RecurrentCriticCapture(critic),
+            CriticCapture(critic),
         ),
     )
 
@@ -362,7 +245,6 @@ def build_ppo(
     )
     gae = GAE(gamma=initial_gamma, lambda_=arguments.gae_lambda)
     policy_loss = build_policy_loss(
-        algorithm,
         policy,
         critic,
         arguments.entropy_coef,
@@ -407,98 +289,21 @@ def build_ppo(
         ),
         section=algorithm.upper(),
     )
-    learning_rate = LinearSchedule(
-        arguments.learning_rate,
-        arguments.learning_rate * arguments.learning_rate_end_factor,
-    )
-    entropy_coef = LinearSchedule(
-        arguments.entropy_coef,
-        arguments.entropy_coef_end,
-    )
-    if arguments.gamma is None:
-        half_life = LinearSchedule(
-            arguments.discount_half_life,
-            arguments.discount_half_life_end,
-        )
-        gamma = MappedSchedule(
-            half_life,
-            lambda seconds: 0.5 ** (1.0 / (actions_per_second * seconds)),
-        )
-    else:
-        half_life = None
-        gamma = ConstantSchedule(arguments.gamma)
-    goal_score_weight = LinearSchedule(
-        arguments.goal_score_weight,
-        arguments.goal_score_weight_end,
-    )
-
-    def set_learning_rate(value: float) -> None:
-        for optimizer in (policy_optimizer, critic_optimizer):
-            for parameter_group in optimizer.param_groups:
-                parameter_group["lr"] = value
-
-    def set_entropy_coef(value: float) -> None:
-        policy_loss.config = replace(policy_loss.config, entropy_coef=value)
-
-    scheduled_values = [
-        ScheduledValue("learning_rate", learning_rate, set_learning_rate),
-        ScheduledValue("entropy_coef", entropy_coef, set_entropy_coef),
-    ]
-
-    if half_life is not None:
-        scheduled_values.append(
-            ScheduledValue.metric("discount_half_life", half_life)
-        )
-
-    scheduled_values.extend(
-        (
-            ScheduledValue.attribute(
-                "gamma",
-                gae,
-                "gamma",
-                gamma,
-            ),
-            ScheduledValue(
-                "goal_score_weight",
-                goal_score_weight,
-                reward_function.set_goal_scored_weight,
-            ),
-        )
-    )
-    value_scheduler = ValueScheduler(*scheduled_values)
-    return runner, rollout, Algorithm(update), value_scheduler, {
-        "modules": {
-            "policy": policy,
-            "critic": critic,
-        },
-        "optimizers": {
-            "policy": policy_optimizer,
-            "critic": critic_optimizer,
-        },
-    }
+    return runner, rollout, Algorithm(update)
 
 
 def main(algorithm: str = "ppo") -> None:
     arguments = parse_arguments(algorithm)
-    validate_arguments(arguments)
     torch.manual_seed(arguments.seed)
     prefix = "goddard" if algorithm == "ppo" else f"goddard-{algorithm}"
     run_id = arguments.run_name or datetime.now().strftime(
         f"{prefix}-%Y%m%d-%H%M%S"
     )
     run_dir = arguments.tensorboard_dir / run_id
-    checkpoint_dir = arguments.checkpoint_dir / run_id
 
-    replay_dataset = load_replay_dataset(
-        arguments.replay_dataset,
-        device="cuda:0",
+    reset_sampler = SyntheticMatchResetProvider(
+        WallToAirResetProvider(device="cuda:0", seed=arguments.seed)
     )
-    reset_sampler = DatasetResetSampler(
-        replay_dataset,
-        probability=arguments.replay_reset_probability,
-        seed=arguments.seed,
-    )
-    reset_sampler = SyntheticMatchResetProvider(reset_sampler)
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=arguments.n_blue,
@@ -512,47 +317,20 @@ def main(algorithm: str = "ppo") -> None:
         reset_state_provider=reset_sampler,
         normalize=arguments.normalize,
     )
-    reward_function = environment.register_reward(
-        SeerReward(
-            n_blue=arguments.n_blue,
-            n_orange=arguments.n_orange,
-            normalize=arguments.normalize_rewards,
-            log_diagnostics=True,
-        )
+    environment.register_reward(
+        WallToAirReward()
     )
-    evaluator = None
     try:
-        if arguments.total_timesteps < environment.n_envs:
-            raise ValueError(
-                "total-timesteps must include at least one vector step "
-                f"({environment.n_envs:,} actor timesteps)"
-            )
         policy, critic = build_policy_and_critic(environment, arguments)
-        modules = {
-            "policy": policy,
-            "critic": critic,
-        }
-        if arguments.resume_checkpoint is not None:
-            TrainingCheckpointer.load_modules(
-                arguments.resume_checkpoint,
-                modules,
-                environment.device,
-            )
-        runner, rollout, learner, value_scheduler, training_objects = build_ppo(
+        runner, rollout, learner = build_ppo(
             environment,
             policy,
             critic,
-            reward_function,
             arguments,
-            checkpoint_dir,
             algorithm,
         )
         logger = Logger(log_dir=str(run_dir))
 
-        training_checkpointer = TrainingCheckpointer(
-            checkpoint_dir / "training_latest.pt",
-            **training_objects,
-        )
         trainer = Trainer(
             runner,
             rollout,
@@ -560,20 +338,10 @@ def main(algorithm: str = "ppo") -> None:
             OnPolicySchedule(),
             logger=logger,
             checkpoint=None,
-            value_scheduler=value_scheduler,
-            update_callback=training_checkpointer,
+            update_callback=None,
         )
-        if arguments.resume_checkpoint is not None:
-            trainer.clock = training_checkpointer.load(
-                arguments.resume_checkpoint,
-                environment.device,
-            )
         trainer.run(arguments.total_timesteps)
-        training_checkpointer(trainer)
-        torch.save(policy.state_dict(), checkpoint_dir / "actor_critic_final.pt")
     finally:
-        if evaluator is not None:
-            evaluator.close()
         environment.close()
 
 
