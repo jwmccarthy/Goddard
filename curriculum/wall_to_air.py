@@ -342,20 +342,20 @@ class WallToAirReward:
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         state = self._state(context)
+        goal_reward = self._goal_reward(context, state)
+        goal_reward = goal_reward - goal_reward.mean(dim=-1, keepdim=True)
 
-        reward = (
+        return (
             (
                 self._ball_goal_progress(state)
                 + self._touch_reward(state)
                 + self._approach_reward(state)
                 + self._air_dribble_reward(context, state)
             ) * state.height_mult
-            + self._goal_reward(context, state)
+            + goal_reward
             + self._air_position_reward(state)
             + self._air_boost_reward(state)
         )
-
-        return reward - reward.mean(dim=-1, keepdim=True)
 
     def _state(self, context: RewardContext) -> _RewardState:
         curr = context.current
