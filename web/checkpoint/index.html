@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Goddard Checkpoints</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; background: #070a10; color: #eef4fc; font-family: system-ui, sans-serif; }
+    #view { position: fixed; inset: 0; }
+    #score, #picker, #status { position: fixed; border: 1px solid #ffffff24; border-radius: 8px; background: #070a10d9; backdrop-filter: blur(8px); }
+    #score { top: 18px; left: 50%; transform: translateX(-50%); display: flex; gap: 18px; align-items: center; padding: 10px 16px; font: 600 12px ui-monospace, monospace; }
+    #blue { color: #49a8ff; } #orange { color: #ff8b45; } #goals { font-size: 22px; }
+    #picker { top: 18px; right: 18px; width: 280px; display: grid; gap: 8px; padding: 12px; }
+    label { display: grid; gap: 4px; color: #b6c1d0; font: 11px ui-monospace, monospace; }
+    select, button { width: 100%; padding: 7px; border: 1px solid #ffffff30; border-radius: 5px; background: #111824; color: inherit; }
+    button { background: #1d5d91; cursor: pointer; }
+    #status { bottom: 18px; left: 18px; padding: 8px 12px; font: 12px ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <div id="view"></div>
+  <div id="score"><span id="blue">BLUE</span><span id="goals">0 - 0</span><span id="orange">ORANGE</span></div>
+  <div id="picker">
+    <label>Blue checkpoint<select id="blueCheckpoint"></select></label>
+    <label>Orange checkpoint<select id="orangeCheckpoint"></select></label>
+    <label><input id="sampleActions" type="checkbox"> Sample actions</label>
+    <button id="applyMatch">Apply and reset</button>
+  </div>
+  <div id="status">connecting</div>
+  <script type="importmap">
+    {"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+  </script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

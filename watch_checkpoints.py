@@ -16,10 +16,6 @@ import time
 import webbrowser
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-SUPPORT_ROOT = PROJECT_ROOT.parent / "_Goddard"
-import sys
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(SUPPORT_ROOT))
 
 import torch
 import torch.nn as nn
@@ -669,8 +665,7 @@ def main() -> None:
         blue_path = registry.resolve(arguments.blue)
         orange_path = registry.resolve(arguments.orange)
 
-    root = SUPPORT_ROOT
-    frontend = root / "web" / "checkpoint"
+    frontend = PROJECT_ROOT / "web" / "checkpoint"
     arena = Path(carl.__file__).resolve().parent / "assets" / "arena.obj"
     if not frontend.is_dir() or not arena.is_file():
         raise FileNotFoundError("Checkpoint spectator assets are missing")
