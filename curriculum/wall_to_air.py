@@ -44,6 +44,13 @@ BALL_APPROACH_REWARD_WEIGHT = 0.05
 HEIGHT_REWARD_SCALE         = 500.0
 AIR_POSITION_REWARD_WEIGHT  = 0.02
 AIR_BOOST_REWARD_WEIGHT     = 0.005
+AIR_DRIBBLE_MIN_HEIGHT      = 700.0
+AIR_DRIBBLE_CTRL_DIST       = 250.0
+AIR_DRIBBLE_MAX_TOUCH_GAP   = 30
+AIR_DRIBBLE_MIN_GOAL_SPEED  = 500.0
+AIR_DRIBBLE_START_REWARD    = 0.10
+AIR_DRIBBLE_TOUCH_REWARD    = 0.20
+AIR_DRIBBLE_CARRY_REWARD    = 0.02
 GOAL_TIME_WEIGHT            = 1
 GOAL_SPEED_WEIGHT           = 2.5
 BALL_PROG_WEIGHT            = 5.0
@@ -315,11 +322,23 @@ class _RewardState:
     opp_goal:       th.Tensor
     curr_ball_dist: th.Tensor
     prev_ball_dist: th.Tensor
+    new_touch:       th.Tensor
+    ball_goal_speed: th.Tensor
     height_mult:    th.Tensor
     airborne:       th.Tensor
 
 
+@dataclass
+class _AirDribbleState:
+    active:      th.Tensor
+    touch_age:   th.Tensor
+    touch_count: th.Tensor
+
+
 class WallToAirReward:
+
+    def __init__(self) -> None:
+        self._air_dribble: _AirDribbleState | None = None
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         state = self._state(context)
@@ -329,6 +348,7 @@ class WallToAirReward:
                 self._ball_goal_progress(state)
                 + self._touch_reward(state)
                 + self._approach_reward(state)
+                + self._air_dribble_reward(context, state)
             ) * state.height_mult
             + self._goal_reward(context, state)
             + self._air_position_reward(state)
@@ -352,6 +372,13 @@ class WallToAirReward:
         prev_ball_dist = (
             prev.car_position - prev.ball_position[:, None, :]
         ).norm(dim=-1)
+        new_touch = (
+            curr_ball_dist <= TOUCH_RADIUS
+        ) & (prev_ball_dist > TOUCH_RADIUS)
+
+        ball_goal_speed = (
+            curr.ball_velocity[:, None, 1] * team_sign
+        ).clamp_min(0.0)
 
         height_mult = th.exp(
             (curr.ball_position[:, None, 2] - HEIGHT_MIN)
@@ -366,6 +393,8 @@ class WallToAirReward:
             opp_goal=opp_goal,
             curr_ball_dist=curr_ball_dist,
             prev_ball_dist=prev_ball_dist,
+            new_touch=new_touch,
+            ball_goal_speed=ball_goal_speed,
             height_mult=height_mult,
             airborne=airborne,
         )
@@ -421,15 +450,9 @@ class WallToAirReward:
         )
 
     def _touch_reward(self, state: _RewardState) -> th.Tensor:
-        new_touch = (
-            state.curr_ball_dist <= TOUCH_RADIUS
-        ) & (state.prev_ball_dist > TOUCH_RADIUS)
+        ball_toward_goal = state.ball_goal_speed / BALL_MAX_SPEED
 
-        ball_toward_goal = (
-            state.curr.ball_velocity[:, None, 1] * state.team_sign
-        ).clamp_min(0.0) / BALL_MAX_SPEED
-
-        return new_touch * ball_toward_goal * TOUCH_REWARD_WEIGHT
+        return state.new_touch * ball_toward_goal * TOUCH_REWARD_WEIGHT
 
     def _approach_reward(self, state: _RewardState) -> th.Tensor:
         return (
@@ -458,3 +481,74 @@ class WallToAirReward:
         ).clamp_min(0.0) / 100.0
 
         return state.airborne * boost_used * AIR_BOOST_REWARD_WEIGHT
+
+    def _air_dribble_reward(
+        self,
+        context: RewardContext,
+        state:   _RewardState,
+    ) -> th.Tensor:
+        air_dribble = self._air_dribble_state(state)
+        ball_high = state.curr.ball_position[:, None, 2] >= AIR_DRIBBLE_MIN_HEIGHT
+        goalward = state.ball_goal_speed >= AIR_DRIBBLE_MIN_GOAL_SPEED
+        controlled = (
+            state.airborne.bool()
+            & ball_high
+            & (state.curr_ball_dist <= AIR_DRIBBLE_CTRL_DIST)
+            & goalward
+        )
+        recent = air_dribble.active & (
+            air_dribble.touch_age <= AIR_DRIBBLE_MAX_TOUCH_GAP
+        )
+        start_touch = state.new_touch & controlled & ~recent
+        continued_touch = state.new_touch & controlled & recent
+
+        air_dribble.touch_age += 1
+        air_dribble.touch_age[state.new_touch] = 0
+        air_dribble.touch_count = th.where(
+            continued_touch,
+            air_dribble.touch_count + 1,
+            th.where(
+                start_touch,
+                th.ones_like(air_dribble.touch_count),
+                air_dribble.touch_count,
+            ),
+        )
+        air_dribble.active = (air_dribble.active & controlled) | start_touch | continued_touch
+
+        start_reward = start_touch * AIR_DRIBBLE_START_REWARD
+        touch_reward = (
+            continued_touch
+            * air_dribble.touch_count.float()
+            * AIR_DRIBBLE_TOUCH_REWARD
+        )
+        carry_reward = (
+            air_dribble.active
+            * state.ball_goal_speed
+            / BALL_MAX_SPEED
+            * AIR_DRIBBLE_CARRY_REWARD
+        )
+
+        done = context.events.done
+        if done.any():
+            air_dribble.active[done] = False
+            air_dribble.touch_age[done] = 0
+            air_dribble.touch_count[done] = 0
+
+        return start_reward + touch_reward + carry_reward
+
+    def _air_dribble_state(self, state: _RewardState) -> _AirDribbleState:
+        shape = state.curr_ball_dist.shape
+        device = state.curr_ball_dist.device
+
+        if (
+            self._air_dribble is None
+            or self._air_dribble.active.shape != shape
+            or self._air_dribble.active.device != device
+        ):
+            self._air_dribble = _AirDribbleState(
+                active=th.zeros(shape, dtype=th.bool, device=device),
+                touch_age=th.zeros(shape, dtype=th.int64, device=device),
+                touch_count=th.zeros(shape, dtype=th.int64, device=device),
+            )
+
+        return self._air_dribble
