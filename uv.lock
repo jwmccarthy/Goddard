@@ -209,6 +209,17 @@ nvtx = [
 ]
 
 [[package]]
+name = "dotenv"
+version = "0.9.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dotenv" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/b7/545d2c10c1fc15e48653c91efde329a790f2eecfbbf2bd16003b5db2bab0/dotenv-0.9.9-py2.py3-none-any.whl", hash = "sha256:29cf74a087b31dafdb5a446b6d7e11cbce8ed2741540e2339c69fbef92c94ce9", size = 1892, upload-time = "2025-02-19T22:15:01.647Z" },
+]
+
+[[package]]
 name = "farama-notifications"
 version = "0.0.6"
 source = { registry = "https://pypi.org/simple" }
@@ -241,8 +252,13 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "carl", extra = ["gymnasium"] },
+    { name = "dotenv" },
     { name = "jarl" },
     { name = "requests" },
+    { name = "rich" },
+    { name = "rlgym" },
+    { name = "subtr-actor-py" },
+    { name = "tenacity" },
     { name = "tensorboard" },
     { name = "torch" },
 ]
@@ -250,8 +266,13 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "carl", extras = ["gymnasium"], directory = "../CARL" },
+    { name = "dotenv", specifier = ">=0.9.9" },
     { name = "jarl", directory = "../JARL" },
     { name = "requests", specifier = ">=2.32" },
+    { name = "rich", specifier = ">=14.1.0" },
+    { name = "rlgym", specifier = ">=2.0.1" },
+    { name = "subtr-actor-py", specifier = ">=1.2.0" },
+    { name = "tenacity", specifier = ">=9.1.4" },
     { name = "tensorboard", specifier = ">=2.0" },
     { name = "torch", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu128" },
 ]
@@ -895,6 +916,15 @@ wheels = [
 ]
 
 [[package]]
+name = "python-dotenv"
+version = "1.2.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+]
+
+[[package]]
 name = "requests"
 version = "2.34.2"
 source = { registry = "https://pypi.org/simple" }
@@ -923,6 +953,21 @@ wheels = [
 ]
 
 [[package]]
+name = "rlgym"
+version = "2.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "rlgym-api" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6f/da/3cb65a1ac228e3b1d20f2bec7cc2fd047508a07830568995c163f7845f7a/rlgym-2.0.1.tar.gz", hash = "sha256:9155708e3f82a7235f9b4276ecc4dc55e56626bfdcf0ec616093179714fb4da9", size = 9457, upload-time = "2025-04-27T14:44:27.471Z" }
+
+[[package]]
+name = "rlgym-api"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b0/b1/99eb0201c0a88d35886a00c020bdb262db29a83ea02eb61ef139988d9370/rlgym-api-2.0.0.tar.gz", hash = "sha256:f1ac4ac742dd93bb7fe8c08c2af2a5b11320ff5eec2936650febb2f7baf24c83", size = 11597, upload-time = "2025-01-06T18:39:37.891Z" }
+
+[[package]]
 name = "setuptools"
 version = "81.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -941,6 +986,17 @@ wheels = [
 ]
 
 [[package]]
+name = "subtr-actor-py"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/99/19/eef9f5da18ec162417eaede1467b8ce97ff23b61b41ea398061fd44a1c2b/subtr_actor_py-1.2.0.tar.gz", hash = "sha256:31dc62ecfe0c3fa550aa5de13c7f6cc14a2371a80fe19059dfb30bffd99f9e15", size = 1962257, upload-time = "2026-07-09T07:44:05.432Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/8b/5493278db0af5f4f3756a455fe9fcceaabf7e3d2887d0cca042f498e84c5/subtr_actor_py-1.2.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:0db7a744df80867796394594f060ee639bb26b28af204b49febbbbaaf8ba4251", size = 2612311, upload-time = "2026-07-09T07:44:00.272Z" },
+    { url = "https://files.pythonhosted.org/packages/27/e5/6ae91c882890dc724c2138b707e284d6fed380dc74cc95c4cc5ad707490a/subtr_actor_py-1.2.0-cp312-cp312-win_amd64.whl", hash = "sha256:dff0b99a2b2c3a575fb0356d9f3fdbe0afbe8d02b5432d9a4348119c799a9557", size = 2191250, upload-time = "2026-07-09T07:44:01.966Z" },
+    { url = "https://files.pythonhosted.org/packages/7e/04/c598231ae08c19c9a631d21cc4488b5830ff3e5a676a5702b673bada398d/subtr_actor_py-1.2.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:3e195154638191d7fd8e77c2dc115073051330e7fdaf2bf2ece357df2970f6db", size = 2366760, upload-time = "2026-07-09T07:44:03.557Z" },
+]
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -950,6 +1006,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/83/d3/803453b36afefb7c2bb238361cd4ae6125a569b4db67cd9e79846ba2d68c/sympy-1.14.0.tar.gz", hash = "sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517", size = 7793921, upload-time = "2025-04-27T18:05:01.611Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/09/77d55d46fd61b4a135c444fc97158ef34a095e5681d0a6c10b75bf356191/sympy-1.14.0-py3-none-any.whl", hash = "sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5", size = 6299353, upload-time = "2025-04-27T18:04:59.103Z" },
+]
+
+[[package]]
+name = "tenacity"
+version = "9.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a", size = 49413, upload-time = "2026-02-07T10:45:33.841Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55", size = 28926, upload-time = "2026-02-07T10:45:32.24Z" },
 ]
 
 [[package]]

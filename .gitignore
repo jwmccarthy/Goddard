@@ -5,3 +5,8 @@ __pycache__/
 **/__pycache__/
 checkpoints/
 runs/
+.opencode
+
+# Replay datasets can contain tens of thousands of large files.
+**/*replays/*
+!**/*replays/*.py
