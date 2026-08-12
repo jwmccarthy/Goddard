@@ -282,8 +282,8 @@ def main() -> None:
         logger=logger,
         checkpoint=PeriodicCheckpoint(
             modules={
-                "policy": low_level_policy,
-                "critic": low_level_critic,
+                "policy":        low_level_policy,
+                "critic":        low_level_critic,
                 "discriminator": discriminator,
                 "skill_encoder": skill_encoder
             },
@@ -292,10 +292,7 @@ def main() -> None:
         )
     )
 
-    try:
-        trainer.run(CONFIG.total_timesteps)
-    finally:
-        env.close()
+    trainer.run(CONFIG.total_timesteps)
 
 if __name__ == "__main__":
     main()

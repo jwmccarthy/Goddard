@@ -49,22 +49,43 @@ class ReplayParser:
         )
     
     
-    def _filter(self, meta: dict, states: np.ndarray) -> np.ndarray:
+    def _filter(
+        self,
+        meta: dict,
+        states: np.ndarray,
+        match_info: dict
+    ) -> np.ndarray:
         headers = meta["column_headers"]["global_headers"]
 
         game_state_idx = headers.index("game state")
         countdown_idx = headers.index("kickoff countdown")
 
         # Keep active gameplay only
-        mask = (
+        active = (
             (states[:, countdown_idx] == 0)
             & (states[:, game_state_idx] != 53)
             & (states[:, game_state_idx] != 67)
         )
 
+        active_indices = np.flatnonzero(active)
+
+        goal_frames = match_info["goal_frames"]
+        if len(goal_frames):
+            goal_samples = np.sort(
+                goal_frames * self.fps / match_info["record_fps"]
+            )
+            five_seconds_before_goal = np.searchsorted(
+                goal_samples,
+                active_indices + 5.0 * self.fps,
+                side="left"
+            )
+            active_indices = active_indices[
+                five_seconds_before_goal < len(goal_samples)
+            ]
+
         # Remove filtering-only columns
         states = np.delete(
-            states[mask],
+            states[active_indices],
             [game_state_idx, countdown_idx],
             axis=1
         )
@@ -85,7 +106,12 @@ class ReplayParser:
             "team_sizes": (
                 len(meta["team_zero"]),
                 len(meta["team_one"]),
-            )
+            ),
+            "goal_frames": np.array(
+                [goal["frame"] for goal in headers.get("Goals", [])],
+                dtype=np.float32
+            ),
+            "record_fps": float(headers.get("RecordFPS", self.fps))
         }
 
 
@@ -225,7 +251,7 @@ class ReplayParser:
             try:
                 match_info = self._get_match_info(str(replay_file))
                 meta, states = self._parse(str(replay_file))
-                states = self._filter(meta, states)
+                states = self._filter(meta, states, match_info)
                 states = self._format(states, match_info)
                 if self.normalize:
                     states = self._normalize(states)

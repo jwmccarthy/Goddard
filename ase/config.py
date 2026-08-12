@@ -55,21 +55,21 @@ class ASEConfig:
 
     # PPO Hyperparams
     total_timesteps: int   = 10_000_000_000
-    minibatch_size:  int   = 65_536
+    minibatch_size:  int   = 16_384
     epochs:          int   = 5
-    learning_rate:   float = 3e-4
+    learning_rate:   float = 2e-5
     gamma:           float = 0.99
     gae_lambda:      float = 0.95
     clip:            float = 0.2
-    entropy_coef:    float = 0.01
+    entropy_coef:    float = 0.05
     max_grad_norm:   float = 0.5
 
     # ASE Hyperparams
     latent_dim:       int   = 64
-    beta:             float = 0.5
+    beta:             float = 2.0
     kappa:            float = 1.0
     gradient_penalty: float = 5.0
-    diversity:        float = 0.01
+    diversity:        float = 0.05
     auxiliary_batch:  int   = 4096
     auxiliary_epochs: int   = 1
 
