@@ -171,7 +171,7 @@ def simulate(state: ViewerState, args: argparse.Namespace) -> None:
                 checkpoint = latest
                 checkpoint_mtime = latest_mtime
 
-            with th.inference_mode():
+            with th.no_grad():
                 output = policy.act(
                     observation,
                     deterministic=not args.sample_actions
