@@ -14,6 +14,7 @@ from pathlib import Path
 import torch as th
 import torch.nn as nn
 
+import carl
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.modules import MLP
 from jarl.modules.layer import orthogonal_init
@@ -27,26 +28,7 @@ from modules import LatentMultiCategoricalPolicy
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-VIEWER = """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ASE Checkpoint Watcher</title>
-<style>
-html,body{margin:0;height:100%;background:#090d16;color:#dce8ff;font:14px system-ui}
-main{display:grid;grid-template-rows:auto 1fr;height:100%}
-header{display:flex;gap:24px;padding:12px 18px;background:#111827;border-bottom:1px solid #29344a}
-strong{color:#fff}button{margin-left:auto;background:#22304a;color:#fff;border:1px solid #465b80;padding:6px 14px;border-radius:4px}
-canvas{width:100%;height:100%}
-</style>
-</head>
-<body><main><header><span>Checkpoint: <strong id="checkpoint">waiting</strong></span><span>Score: <strong id="score">0 - 0</strong></span><span>Latent steps: <strong id="steps">-</strong></span><button onclick="fetch('/reset',{method:'POST'})">Reset</button></header><canvas id="field"></canvas></main>
-<script>
-const canvas=document.getElementById('field'),ctx=canvas.getContext('2d');let frame=null;
-new EventSource('/stream').onmessage=e=>{frame=JSON.parse(e.data);if(frame.error){document.getElementById('checkpoint').textContent=frame.error;return}document.getElementById('checkpoint').textContent=frame.checkpoint;document.getElementById('score').textContent=`${frame.blue_score} - ${frame.orange_score}`;document.getElementById('steps').textContent=frame.latent_steps.join(', ')};
-function draw(){const d=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(canvas.width!==w*d||canvas.height!==h*d){canvas.width=w*d;canvas.height=h*d}ctx.setTransform(d,0,0,d,0,0);ctx.clearRect(0,0,w,h);const scale=Math.min(w/9000,h/12500),cx=w/2,cy=h/2;ctx.strokeStyle='#587093';ctx.lineWidth=2;ctx.strokeRect(cx-4096*scale,cy-5120*scale,8192*scale,10240*scale);ctx.beginPath();ctx.moveTo(cx-4096*scale,cy);ctx.lineTo(cx+4096*scale,cy);ctx.stroke();if(frame&&!frame.error){const xy=p=>[cx+p[0]*scale,cy-p[1]*scale];for(const car of frame.cars){const [x,y]=xy(car.position),angle=Math.atan2(-car.forward[1],car.forward[0]);ctx.save();ctx.translate(x,y);ctx.rotate(angle);ctx.fillStyle=car.team===0?'#3b82f6':'#f97316';ctx.fillRect(-16,-10,32,20);ctx.restore()}const [bx,by]=xy(frame.ball);ctx.beginPath();ctx.arc(bx,by,10,0,Math.PI*2);ctx.fillStyle='#f8fafc';ctx.fill()}requestAnimationFrame(draw)}draw();
-</script></body></html>"""
+CAR_OFFSET = (13.8757, 0.0, 20.755)
 
 
 class ViewerState:
@@ -109,19 +91,33 @@ def frame_from_state(
 ) -> dict:
     cars = state[9:53].view(2, 22)
 
+    rendered_cars = []
+    for index, car in enumerate(cars):
+        forward = car[9:12]
+        up = car[12:15]
+        right = th.linalg.cross(up, forward, dim=-1)
+        position = (
+            car[0:3]
+            + forward * CAR_OFFSET[0]
+            + right * CAR_OFFSET[1]
+            + up * CAR_OFFSET[2]
+        )
+
+        rendered_cars.append({
+            "team": index,
+            "pos": position.cpu().tolist(),
+            "fwd": forward.cpu().tolist(),
+            "rgt": right.cpu().tolist(),
+            "up": up.cpu().tolist(),
+            "demoed": bool(car[17])
+        })
+
     return {
         "checkpoint": checkpoint.name,
         "blue_score": blue_score,
         "orange_score": orange_score,
-        "ball": state[0:3].cpu().tolist(),
-        "cars": [
-            {
-                "team": index,
-                "position": car[0:3].cpu().tolist(),
-                "forward": car[9:12].cpu().tolist()
-            }
-            for index, car in enumerate(cars)
-        ],
+        "ball": {"pos": state[0:3].cpu().tolist()},
+        "cars": rendered_cars,
         "latent_steps": latents.steps.cpu().tolist()
     }
 
@@ -212,7 +208,7 @@ def simulate(state: ViewerState, args: argparse.Namespace) -> None:
         env.close()
 
 
-def make_handler(state: ViewerState):
+def make_handler(state: ViewerState, frontend: Path, arena: Path):
     class Handler(BaseHTTPRequestHandler):
 
         def do_POST(self) -> None:
@@ -225,16 +221,29 @@ def make_handler(state: ViewerState):
             self.end_headers()
 
         def do_GET(self) -> None:
-            if self.path == "/stream":
+            if self.path == "/api/stream":
                 self._stream()
                 return
-            if self.path != "/":
+
+            paths = {
+                "/": frontend / "index.html",
+                "/app.js": frontend / "app.js",
+                "/arena.obj": arena
+            }
+            path = paths.get(self.path)
+            if path is None or not path.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
 
-            payload = VIEWER.encode()
+            payload = path.read_bytes()
+            content_type = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "text/javascript; charset=utf-8",
+                ".obj": "text/plain"
+            }.get(path.suffix, "application/octet-stream")
+
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -307,7 +316,15 @@ def main() -> None:
     if args.open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
+    frontend = PROJECT_ROOT / "web" / "checkpoint"
+    arena = Path(carl.__file__).resolve().parent / "assets" / "arena.obj"
+    if not frontend.is_dir() or not arena.is_file():
+        raise FileNotFoundError("checkpoint spectator assets are missing")
+
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(state, frontend, arena)
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
