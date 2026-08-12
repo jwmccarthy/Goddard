@@ -43,6 +43,7 @@ from modules import (
     SkillEncoder
 )
 from capture import LatentCapture, LatentCriticCapture
+from checkpoint import PeriodicCheckpoint
 from loss import (
     ASEPPOLoss,
     ASEReward,
@@ -278,10 +279,23 @@ def main() -> None:
         buffer,
         learner,
         OnPolicySchedule(),
-        logger=logger
+        logger=logger,
+        checkpoint=PeriodicCheckpoint(
+            modules={
+                "policy": low_level_policy,
+                "critic": low_level_critic,
+                "discriminator": discriminator,
+                "skill_encoder": skill_encoder
+            },
+            directory=CONFIG.checkpoint_dir,
+            interval=CONFIG.checkpoint_interval
+        )
     )
 
-    trainer.run(CONFIG.total_timesteps)
+    try:
+        trainer.run(CONFIG.total_timesteps)
+    finally:
+        env.close()
 
 if __name__ == "__main__":
     main()

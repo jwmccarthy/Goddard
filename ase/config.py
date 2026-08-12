@@ -74,8 +74,10 @@ class ASEConfig:
     auxiliary_epochs: int   = 1
 
     # Logging
-    expert_dir:       Path  = Path("ballchasing_replays/parsed_replays")
-    tensorboard_dir:  Path  = Path("runs")
+    expert_dir:          Path = Path("ballchasing_replays/parsed_replays")
+    tensorboard_dir:     Path = Path("runs")
+    checkpoint_dir:      Path = Path("checkpoints/ase")
+    checkpoint_interval: int  = 10_000_000
 
 
 def get_config() -> ASEConfig:

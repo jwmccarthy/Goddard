@@ -47,9 +47,15 @@ class LatentCapture(CaptureBase):
         if self.latent is None or self.steps is None:
             raise RuntimeError("latent capture must be reset before use")
 
+        return {"latent": self.advance(context.env_step.done)}
+
+    def advance(self, done: th.Tensor) -> th.Tensor:
+        if self.latent is None or self.steps is None:
+            raise RuntimeError("latent capture must be reset before use")
+
         self.current = self.latent.clone()
         done = th.as_tensor(
-            context.env_step.done,
+            done,
             dtype=th.bool,
             device=self.device
         )
@@ -62,7 +68,7 @@ class LatentCapture(CaptureBase):
             self.latent[resample] = self._sample(count)
             self.steps[resample] = self._sample_duration(count)
 
-        return {"latent": self.current}
+        return self.current
 
 
 class LatentCriticCapture(CriticCapture):
