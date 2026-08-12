@@ -70,6 +70,8 @@ env = CARLTorchVectorEnv(
 
 latent_capture = LatentCapture(
     latent_dim=CONFIG.latent_dim,
+    min_steps=8,
+    max_steps=64,
     device=DEVICE,
     seed=CONFIG.seed
 )
