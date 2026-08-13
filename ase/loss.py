@@ -25,9 +25,14 @@ class ASEReward:
     @th.no_grad()
     def __call__(self, batch: TensorBatch, context) -> TensorBatch:
         transition = (batch["observation"], batch["next_obs"])
+        done = batch["terminated"] | batch["truncated"]
+        reset = th.zeros_like(done)
+        reset[1:] = done[:-1]
 
-        imitation_reward = F.softplus(self.discriminator(transition))
-        skill_direction = self.skill_encoder(transition)
+        imitation_reward = F.softplus(
+            self.discriminator(transition, reset=reset)
+        )
+        skill_direction = self.skill_encoder(transition, reset=reset)
         skill_reward = self.kappa * (skill_direction * batch["latent"]).sum(-1)
 
         reward = imitation_reward + self.beta * skill_reward
@@ -99,10 +104,16 @@ class RecurrentDiscriminatorMinibatches(DiscriminatorMinibatches):
 
         agent = data["observation"][:chunks * self.sequence_length]
         next_obs = data["next_obs"][:chunks * self.sequence_length]
+        done = (
+            data["terminated"][:chunks * self.sequence_length]
+            | data["truncated"][:chunks * self.sequence_length]
+        )
         agent = agent.reshape(chunks, self.sequence_length, environments, -1)
         next_obs = next_obs.reshape(chunks, self.sequence_length, environments, -1)
+        done = done.reshape(chunks, self.sequence_length, environments)
         agent = agent.swapaxes(1, 2).reshape(-1, self.sequence_length, agent.shape[-1])
         next_obs = next_obs.swapaxes(1, 2).reshape(-1, self.sequence_length, next_obs.shape[-1])
+        done = done.swapaxes(1, 2).reshape(-1, self.sequence_length)
 
         for _ in range(self.epochs):
             order = th.randperm(len(agent), device=agent.device)
@@ -111,11 +122,15 @@ class RecurrentDiscriminatorMinibatches(DiscriminatorMinibatches):
                 expert = self.expert_dataset.sample(
                     len(indices), self.sequence_length + 1
                 )["observation"]
+                agent_reset = th.zeros_like(done[indices])
+                agent_reset[:, 1:] = done[indices, :-1]
                 yield TensorBatch({
-                    "agent_observation": agent[indices],
-                    "agent_next_obs": next_obs[indices],
-                    "expert_observation": expert[:, :-1],
-                    "expert_next_obs": expert[:, 1:]
+                    "agent_observation": agent[indices].swapaxes(0, 1),
+                    "agent_next_obs": next_obs[indices].swapaxes(0, 1),
+                    "agent_reset": agent_reset.swapaxes(0, 1),
+                    "expert_observation": expert[:, :-1].swapaxes(0, 1),
+                    "expert_next_obs": expert[:, 1:].swapaxes(0, 1),
+                    "expert_reset": th.zeros_like(agent_reset).swapaxes(0, 1)
                 })
 
             if self._epoch_callback is not None:
@@ -136,21 +151,23 @@ class DiscriminatorLoss:
         expert_next_obs = batch["expert_next_obs"].detach().requires_grad_(True)
 
         if hasattr(self.discriminator.body, "initial_state"):
-            expert_features = self.discriminator.expert_foot(
+            expert_input = self.discriminator.expert_foot(
                 (expert_observation, expert_next_obs)
             )
-            expert_features, _ = self.discriminator.body(expert_features)
-            expert_logits = self.discriminator.head(expert_features).squeeze(-1)
-            expert_logits = expert_logits[..., -1]
-
-            penalty_features = expert_features.detach().requires_grad_(True)
-            penalty_logits = self.discriminator.head(penalty_features).squeeze(-1)
-            penalty_logits = penalty_logits[..., -1]
-            gradients = th.autograd.grad(
-                penalty_logits.sum(),
-                penalty_features,
-                create_graph=True
+            expert_features, _ = self.discriminator.body(
+                expert_input,
+                reset=batch["expert_reset"]
             )
+            expert_logits = self.discriminator.head(expert_features).squeeze(-1)
+            noise_scale = 0.01
+            noisy_features, _ = self.discriminator.body(
+                expert_input + noise_scale * th.randn_like(expert_input),
+                reset=batch["expert_reset"]
+            )
+            noisy_logits = self.discriminator.head(noisy_features).squeeze(-1)
+            gradient_penalty = (
+                (noisy_logits - expert_logits) / noise_scale
+            ).pow(2).mean()
         else:
             expert_logits = self.discriminator.forward_expert(
                 (expert_observation, expert_next_obs)
@@ -160,22 +177,18 @@ class DiscriminatorLoss:
                 (expert_observation, expert_next_obs),
                 create_graph=True
             )
+            gradient_penalty = sum(
+                gradient.flatten(1).pow(2).sum(-1)
+                for gradient in gradients
+            ).mean()
 
         agent_logits = self.discriminator(
-            (batch["agent_observation"], batch["agent_next_obs"])
+            (batch["agent_observation"], batch["agent_next_obs"]),
+            reset=batch.get("agent_reset")
         )
-        if expert_logits.ndim > 1:
-            expert_logits = expert_logits[..., -1]
-        if agent_logits.ndim > 1:
-            agent_logits = agent_logits[..., -1]
 
         expert_loss = F.softplus(-expert_logits).mean()
         agent_loss = F.softplus(agent_logits).mean()
-
-        gradient_penalty = sum(
-            gradient.flatten(1).pow(2).sum(-1)
-            for gradient in gradients
-        ).mean()
 
         loss = expert_loss + agent_loss + self.gradient_penalty * gradient_penalty
 
@@ -200,12 +213,15 @@ class SkillEncoderLoss:
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
         valid = None
+        reset = None
         if hasattr(batch, "steps"):
             valid = batch.valid
+            reset = batch.reset
             batch = batch.steps
 
         direction = self.skill_encoder(
-            (batch["observation"], batch["next_obs"])
+            (batch["observation"], batch["next_obs"]),
+            reset=reset
         )
 
         similarity = (direction * batch["latent"].detach()).sum(-1)
@@ -245,9 +261,13 @@ class ASEPPOLoss(PPOLoss):
     def __call__(self, sample) -> LossOutput:
         output = super().__call__(sample)
 
-        batch, _, _, _, valid = self._unpack_sample(sample)
-        observation = batch["observation"][valid]
-        diversity_loss = self._diversity_loss(observation)
+        batch, state, _, reset, valid = self._unpack_sample(sample)
+        diversity_loss = self._diversity_loss(
+            batch["observation"],
+            state,
+            reset,
+            valid
+        )
 
         loss = output.loss + self.diversity * diversity_loss
 
@@ -255,21 +275,24 @@ class ASEPPOLoss(PPOLoss):
             "diversity_loss": diversity_loss
         })
 
-    def _diversity_loss(self, observation: th.Tensor) -> th.Tensor:
-        count = len(observation)
+    def _diversity_loss(self, observation, state, reset, valid) -> th.Tensor:
         latent_dim = self.policy.foot.latents.latent_dim
         latent_a = F.normalize(
-            th.randn(count, latent_dim, device=observation.device),
+            th.randn(
+                *observation.shape[:-1],
+                latent_dim,
+                device=observation.device
+            ),
             dim=-1
         )
 
         latent_b = F.normalize(
-            th.randn(count, latent_dim, device=observation.device),
+            th.randn_like(latent_a),
             dim=-1
         )
 
-        dist_a = self._dist(observation, latent_a)
-        dist_b = self._dist(observation, latent_b)
+        dist_a = self._dist(observation, latent_a, state, reset)
+        dist_b = self._dist(observation, latent_b, state, reset)
 
         policy_distance = sum(
             kl_divergence(a, b).sum(-1)
@@ -278,10 +301,17 @@ class ASEPPOLoss(PPOLoss):
 
         latent_distance = 0.5 * (1.0 - (latent_a * latent_b).sum(-1))
 
-        return ((policy_distance / latent_distance.clamp_min(1e-4)) - 1.0).pow(2).mean()
+        loss = (
+            (policy_distance / latent_distance.clamp_min(1e-4)) - 1.0
+        ).pow(2)
+        return loss[valid].mean()
 
-    def _dist(self, observation: th.Tensor, latent: th.Tensor):
-        features, _ = self.policy.body_features((observation, latent))
+    def _dist(self, observation, latent, state, reset):
+        features, _ = self.policy.body_features(
+            (observation, latent),
+            state,
+            reset
+        )
         logits = self.policy.head(features)
 
         return self.policy._grouped_distributions(logits, observation)

@@ -54,66 +54,62 @@ class ReplayParser:
         meta: dict,
         states: np.ndarray,
         match_info: dict
-    ) -> np.ndarray:
+    ) -> list[np.ndarray]:
         headers = meta["column_headers"]["global_headers"]
 
         game_state_idx = headers.index("game state")
         countdown_idx = headers.index("kickoff countdown")
 
-        # Keep the first kickoff row and active gameplay before the goal sequence.
+        game_state = states[:, game_state_idx]
+        countdown = states[:, countdown_idx]
+
+        # Keep one settled kickoff state immediately before countdown begins.
+        countdown_starts = np.zeros(len(states), dtype=bool)
+        countdown_starts[:-1] = countdown[1:] > 0
         kickoff_start = (
-            (states[:, game_state_idx] == 28)
-            & (states[:, countdown_idx] == 0)
+            (game_state == 28)
+            & (countdown == 0)
+            & countdown_starts
         )
-        gameplay = states[:, game_state_idx] == 30
-        active = (
-            kickoff_start | gameplay
-        )
-
-        active_indices = np.flatnonzero(active)
-
-        goal_frames = match_info["goal_frames"]
-        if len(goal_frames):
-            goal_samples = np.sort(
-                goal_frames * self.fps / match_info["record_fps"]
-            )
-            next_goal = np.searchsorted(
-                goal_samples,
-                active_indices,
-                side="left"
-            )
-            has_goal = next_goal < len(goal_samples)
-            goal_distance = np.full_like(
-                active_indices,
-                np.inf,
-                dtype=np.float32
-            )
-            goal_distance[has_goal] = (
-                goal_samples[next_goal[has_goal]]
-                - active_indices[has_goal]
-            )
-            active_indices = active_indices[goal_distance >= 5.0 * self.fps]
-
-        # Remove filtering-only columns
-        states = np.delete(
-            states[active_indices],
-            [game_state_idx, countdown_idx],
-            axis=1
+        kickoff_indices = np.flatnonzero(kickoff_start)
+        gameplay_indices = np.flatnonzero(game_state == 30)
+        goal_samples = np.sort(
+            match_info["goal_frames"] * self.fps / match_info["record_fps"]
         )
 
-        return states
+        segments = []
+        previous_goal = -1
+        for goal in goal_samples:
+            cutoff = goal - 5.0 * self.fps
+            kickoffs = kickoff_indices[
+                (kickoff_indices > previous_goal) & (kickoff_indices < cutoff)
+            ]
+            gameplay = gameplay_indices[
+                (gameplay_indices > previous_goal) & (gameplay_indices < cutoff)
+            ]
+
+            if len(kickoffs):
+                gameplay = gameplay[gameplay > kickoffs[-1]]
+                indices = np.concatenate((kickoffs[-1:], gameplay))
+            else:
+                indices = gameplay
+
+            if len(indices):
+                segments.append(np.delete(
+                    states[indices],
+                    [game_state_idx, countdown_idx],
+                    axis=1
+                ))
+
+            previous_goal = goal
+
+        return segments
 
     def _get_match_info(self, replay_file: str) -> dict:
         meta = subtr_actor.get_replay_meta(replay_file)["replay_meta"]
         headers = dict(meta["all_headers"])
 
-        scores = (
-            headers.get("Team0Score", 0),
-            headers.get("Team1Score", 0),
-        )
-
         return {
-            "winning_team": int(scores[1] > scores[0]),
             "team_sizes": (
                 len(meta["team_zero"]),
                 len(meta["team_one"]),
@@ -130,6 +126,7 @@ class ReplayParser:
         self,
         states: np.ndarray,
         match_info: dict,
+        observer_team: int
     ) -> np.ndarray:
         # Ball position, linear velocity, angular velocity
         ball = np.concatenate(
@@ -143,10 +140,9 @@ class ReplayParser:
 
         players = states[:, 13:].reshape(len(states), -1, 15)
 
-        # Put the winning team first
         blue_count, orange_count = match_info["team_sizes"]
 
-        if match_info["winning_team"] == 0:
+        if observer_team == 0:
             order = np.arange(blue_count + orange_count)
         else:
             order = np.concatenate(
@@ -174,7 +170,7 @@ class ReplayParser:
             axis=-1
         )
 
-        if match_info["winning_team"] == 1:
+        if observer_team == 1:
             for start in range(0, 9, 3):
                 ball[..., start:start + 2] *= -1
             for start in range(0, 15, 3):
@@ -257,20 +253,28 @@ class ReplayParser:
             replay_files,
             description="Parsing replays..."
         ):
-            output_file = output_dir / f"{replay_file.stem}.npy"
-
             try:
+                for old_output in output_dir.glob(f"{replay_file.stem}*.npy"):
+                    old_output.unlink()
+
                 match_info = self._get_match_info(str(replay_file))
                 meta, states = self._parse(str(replay_file))
-                states = self._filter(meta, states, match_info)
+                segments = self._filter(meta, states, match_info)
 
-                if not len(states):
-                    continue
-
-                states = self._format(states, match_info)
-                if self.normalize:
-                    states = self._normalize(states)
-                self._save(output_file, states)
+                for segment_index, segment in enumerate(segments):
+                    for observer_team in range(2):
+                        states = self._format(
+                            segment,
+                            match_info,
+                            observer_team
+                        )
+                        if self.normalize:
+                            states = self._normalize(states)
+                        output_file = output_dir / (
+                            f"{replay_file.stem}_s{segment_index:03d}"
+                            f"_t{observer_team}.npy"
+                        )
+                        self._save(output_file, states)
 
             except Exception as e:
                 print(f"Failed {replay_file.name}: {e}")

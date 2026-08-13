@@ -38,14 +38,25 @@ class ASEDiscriminator(CompositeNet):
             raise ValueError("agent and expert discriminator features differ")
         return self
 
-    def forward(self, transition) -> th.Tensor:
-        features, _ = self.body(self.foot(transition))
+    def forward(self, transition, state=None, reset=None) -> th.Tensor:
+        features = self.foot(transition)
+        output = (
+            self.body(features, state, reset)
+            if hasattr(self.body, "initial_state")
+            else self.body(features)
+        )
+        features = output[0] if isinstance(output, tuple) else output
         logits = self.head(features).squeeze(-1)
         return logits
 
-    def forward_expert(self, transition) -> th.Tensor:
+    def forward_expert(self, transition, state=None, reset=None) -> th.Tensor:
         features = self.expert_foot(transition)
-        features, _ = self.body(features)
+        output = (
+            self.body(features, state, reset)
+            if hasattr(self.body, "initial_state")
+            else self.body(features)
+        )
+        features = output[0] if isinstance(output, tuple) else output
         logits = self.head(features).squeeze(-1)
         return logits
 
@@ -80,9 +91,13 @@ class SkillEncoder(CompositeNet):
             out_dim=self.latent_dim,
         )
 
-    def forward(self, transition):
+    def forward(self, transition, state=None, reset=None):
         features = self.foot(transition)
-        output = self.body(features)
+        output = (
+            self.body(features, state, reset)
+            if hasattr(self.body, "initial_state")
+            else self.body(features)
+        )
         if isinstance(output, tuple):
             output = output[0]
         output = self.head(output)
