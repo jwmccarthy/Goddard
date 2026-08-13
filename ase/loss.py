@@ -109,13 +109,13 @@ class RecurrentDiscriminatorMinibatches(DiscriminatorMinibatches):
             for left in range(0, len(agent), self.batch_size):
                 indices = order[left:left + self.batch_size]
                 expert = self.expert_dataset.sample(
-                    len(indices), self.sequence_length
+                    len(indices), self.sequence_length + 1
                 )["observation"]
                 yield TensorBatch({
                     "agent_observation": agent[indices],
                     "agent_next_obs": next_obs[indices],
-                    "expert_observation": expert[:, :, 0],
-                    "expert_next_obs": expert[:, :, 1]
+                    "expert_observation": expert[:, :-1],
+                    "expert_next_obs": expert[:, 1:]
                 })
 
             if self._epoch_callback is not None:
