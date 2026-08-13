@@ -16,7 +16,7 @@ import torch.nn as nn
 
 import carl
 from carl.gymnasium import CARLTorchVectorEnv
-from jarl.modules import MLP
+from jarl.modules import GRU, MLP
 from jarl.modules.layer import orthogonal_init
 
 from capture import LatentCapture
@@ -58,12 +58,15 @@ def newest_checkpoint(directory: Path) -> Path:
 def load_policy(path: Path, env, latents):
     payload = th.load(path, map_location="cpu", weights_only=True)
     state = payload.get("policy", payload)
+    recurrent = "body.rnn.weight_ih_l0" in state
+    body = (
+        GRU(hidden_size=state["body.rnn.weight_hh_l0"].shape[1])
+        if recurrent
+        else MLP(dims=[1024, 1024, 512], func=nn.ReLU)
+    )
     policy = LatentMultiCategoricalPolicy(
         foot=LatentEncoder(latents),
-        body=MLP(
-            dims=[1024, 1024, 512],
-            func=nn.ReLU
-        ),
+        body=body,
         head=MLP(
             dims=[],
             out_init_func=orthogonal_init(0.01)
@@ -154,6 +157,7 @@ def simulate(state: ViewerState, args: argparse.Namespace) -> None:
 
         observation = env.reset()
         latents.reset(env.n_envs)
+        policy_state = policy.initial_state(env.n_envs)
         blue_score = orange_score = 0
         next_step = time.perf_counter()
 
@@ -162,6 +166,7 @@ def simulate(state: ViewerState, args: argparse.Namespace) -> None:
                 state.reset.clear()
                 observation = env.reset()
                 latents.reset(env.n_envs)
+                policy_state = policy.initial_state(env.n_envs)
                 blue_score = orange_score = 0
 
             latest = newest_checkpoint(args.checkpoint_dir)
@@ -170,15 +175,21 @@ def simulate(state: ViewerState, args: argparse.Namespace) -> None:
                 policy = load_policy(latest, env, latents)
                 checkpoint = latest
                 checkpoint_mtime = latest_mtime
+                policy_state = policy.initial_state(env.n_envs)
 
             with th.no_grad():
                 output = policy.act(
                     observation,
+                    policy_state,
                     deterministic=not args.sample_actions
                 )
                 observation, reward, terminated, truncated, _ = env.step(output.action)
 
             done = terminated | truncated
+            policy_state = output.next_state
+            if policy_state is not None and done.any():
+                policy_state = policy_state.clone()
+                policy_state[done] = 0
             latents.advance(done)
 
             goal = int(reward[0].item())
