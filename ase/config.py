@@ -51,7 +51,7 @@ class ASEConfig:
     max_ticks: int = 5 * 60 * 120
 
     # Self-play params
-    rollout: int = 8
+    rollout: int = 16
 
     # PPO Hyperparams
     total_timesteps: int   = 10_000_000_000

@@ -186,7 +186,7 @@ def build_learner(expert_data: ExpertTrajectoryDataset) -> Algorithm:
         transforms=(),
         sampler=RecurrentDiscriminatorMinibatches(
             expert_data,
-            sequence_length=16,
+            sequence_length=CONFIG.rollout,
             batch_size=CONFIG.auxiliary_batch,
             epochs=CONFIG.auxiliary_epochs
         ),
