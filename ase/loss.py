@@ -134,9 +134,31 @@ class DiscriminatorLoss:
     def __call__(self, batch: TensorBatch) -> LossOutput:
         expert_observation = batch["expert_observation"].detach().requires_grad_(True)
         expert_next_obs = batch["expert_next_obs"].detach().requires_grad_(True)
-        with th.backends.cudnn.flags(enabled=False):
+
+        if hasattr(self.discriminator.body, "initial_state"):
+            expert_features = self.discriminator.expert_foot(
+                (expert_observation, expert_next_obs)
+            )
+            expert_features, _ = self.discriminator.body(expert_features)
+            expert_logits = self.discriminator.head(expert_features).squeeze(-1)
+            expert_logits = expert_logits[..., -1]
+
+            penalty_features = expert_features.detach().requires_grad_(True)
+            penalty_logits = self.discriminator.head(penalty_features).squeeze(-1)
+            penalty_logits = penalty_logits[..., -1]
+            gradients = th.autograd.grad(
+                penalty_logits.sum(),
+                penalty_features,
+                create_graph=True
+            )
+        else:
             expert_logits = self.discriminator.forward_expert(
                 (expert_observation, expert_next_obs)
+            )
+            gradients = th.autograd.grad(
+                expert_logits.sum(),
+                (expert_observation, expert_next_obs),
+                create_graph=True
             )
 
         agent_logits = self.discriminator(
@@ -150,11 +172,6 @@ class DiscriminatorLoss:
         expert_loss = F.softplus(-expert_logits).mean()
         agent_loss = F.softplus(agent_logits).mean()
 
-        gradients = th.autograd.grad(
-            expert_logits.sum(),
-            (expert_observation, expert_next_obs),
-            create_graph=True
-        )
         gradient_penalty = sum(
             gradient.flatten(1).pow(2).sum(-1)
             for gradient in gradients

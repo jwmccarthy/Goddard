@@ -102,7 +102,7 @@ low_level_critic = Critic(
 discriminator = ASEDiscriminator(
     foot=CARLDiscriminatorEncoder(),
     expert_foot=ExpertDiscriminatorEncoder(),
-    body=GRU(hidden_size=1024),
+    body=GRU(hidden_size=512),
     head=MLP(dims=[])
 ).build(env).to(DEVICE)
 
@@ -184,7 +184,7 @@ def build_learner(expert_data: ExpertTrajectoryDataset) -> Algorithm:
         sampler=RecurrentDiscriminatorMinibatches(
             expert_data,
             sequence_length=CONFIG.rollout,
-            batch_size=CONFIG.auxiliary_batch,
+            batch_size=CONFIG.auxiliary_batch // CONFIG.rollout,
             epochs=CONFIG.auxiliary_epochs
         ),
         loss=DiscriminatorLoss(
