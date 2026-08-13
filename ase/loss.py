@@ -134,9 +134,10 @@ class DiscriminatorLoss:
     def __call__(self, batch: TensorBatch) -> LossOutput:
         expert_observation = batch["expert_observation"].detach().requires_grad_(True)
         expert_next_obs = batch["expert_next_obs"].detach().requires_grad_(True)
-        expert_logits = self.discriminator.forward_expert(
-            (expert_observation, expert_next_obs)
-        )
+        with th.backends.cudnn.flags(enabled=False):
+            expert_logits = self.discriminator.forward_expert(
+                (expert_observation, expert_next_obs)
+            )
 
         agent_logits = self.discriminator(
             (batch["agent_observation"], batch["agent_next_obs"])
