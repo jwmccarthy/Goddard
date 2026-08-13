@@ -85,6 +85,43 @@ class DiscriminatorMinibatches:
                 self._epoch_callback()
 
 
+class RecurrentDiscriminatorMinibatches(DiscriminatorMinibatches):
+
+    def __init__(self, expert_dataset, sequence_length, batch_size, epochs=1):
+        super().__init__(expert_dataset, batch_size, epochs)
+        self.sequence_length = sequence_length
+
+    def __call__(self, data: TensorBatch):
+        time, environments = data.shape[:2]
+        chunks = time // self.sequence_length
+        if chunks < 1:
+            return
+
+        agent = data["observation"][:chunks * self.sequence_length]
+        next_obs = data["next_obs"][:chunks * self.sequence_length]
+        agent = agent.reshape(chunks, self.sequence_length, environments, -1)
+        next_obs = next_obs.reshape(chunks, self.sequence_length, environments, -1)
+        agent = agent.swapaxes(1, 2).reshape(-1, self.sequence_length, agent.shape[-1])
+        next_obs = next_obs.swapaxes(1, 2).reshape(-1, self.sequence_length, next_obs.shape[-1])
+
+        for _ in range(self.epochs):
+            order = th.randperm(len(agent), device=agent.device)
+            for left in range(0, len(agent), self.batch_size):
+                indices = order[left:left + self.batch_size]
+                expert = self.expert_dataset.sample(
+                    len(indices), self.sequence_length
+                )["observation"]
+                yield TensorBatch({
+                    "agent_observation": agent[indices],
+                    "agent_next_obs": next_obs[indices],
+                    "expert_observation": expert[:, :, 0],
+                    "expert_next_obs": expert[:, :, 1]
+                })
+
+            if self._epoch_callback is not None:
+                self._epoch_callback()
+
+
 class DiscriminatorLoss:
 
     def __init__(self, discriminator, gradient_penalty: float = 5.0) -> None:

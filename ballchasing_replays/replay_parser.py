@@ -60,11 +60,14 @@ class ReplayParser:
         game_state_idx = headers.index("game state")
         countdown_idx = headers.index("kickoff countdown")
 
-        # Keep active gameplay only
+        # Keep the first kickoff row and active gameplay before the goal sequence.
+        kickoff_start = (
+            (states[:, game_state_idx] == 28)
+            & (states[:, countdown_idx] == 0)
+        )
+        gameplay = states[:, game_state_idx] == 30
         active = (
-            (states[:, countdown_idx] == 0)
-            & (states[:, game_state_idx] != 53)
-            & (states[:, game_state_idx] != 67)
+            kickoff_start | gameplay
         )
 
         active_indices = np.flatnonzero(active)
@@ -74,14 +77,22 @@ class ReplayParser:
             goal_samples = np.sort(
                 goal_frames * self.fps / match_info["record_fps"]
             )
-            five_seconds_before_goal = np.searchsorted(
+            next_goal = np.searchsorted(
                 goal_samples,
-                active_indices + 5.0 * self.fps,
+                active_indices,
                 side="left"
             )
-            active_indices = active_indices[
-                five_seconds_before_goal < len(goal_samples)
-            ]
+            has_goal = next_goal < len(goal_samples)
+            goal_distance = np.full_like(
+                active_indices,
+                np.inf,
+                dtype=np.float32
+            )
+            goal_distance[has_goal] = (
+                goal_samples[next_goal[has_goal]]
+                - active_indices[has_goal]
+            )
+            active_indices = active_indices[goal_distance >= 5.0 * self.fps]
 
         # Remove filtering-only columns
         states = np.delete(
@@ -252,6 +263,10 @@ class ReplayParser:
                 match_info = self._get_match_info(str(replay_file))
                 meta, states = self._parse(str(replay_file))
                 states = self._filter(meta, states, match_info)
+
+                if not len(states):
+                    continue
+
                 states = self._format(states, match_info)
                 if self.normalize:
                     states = self._normalize(states)

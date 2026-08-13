@@ -99,3 +99,44 @@ class LatentCriticCapture(CriticCapture):
             "baseline_value": baseline_value,
             "baseline_next_value": baseline_next_value
         }
+
+
+class LatentRecurrentCriticCapture(CaptureBase):
+
+    def __init__(self, critic, latents: LatentCapture) -> None:
+        self.critic = critic
+        self.latents = latents
+        self.state = None
+
+    def reset(self, batch_size: int) -> None:
+        self.state = self.critic.initial_state(batch_size)
+
+    @th.no_grad()
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        if self.state is None or self.latents.current is None:
+            raise RuntimeError("recurrent critic capture is not initialized")
+
+        next_obs = th.as_tensor(
+            context.env_step.next_obs,
+            device=context.observation.device
+        )
+        critic_state = self.state
+        features, next_state = self.critic.body_features(
+            (context.observation, self.latents.current),
+            critic_state
+        )
+        next_features, _ = self.critic.body_features(
+            (next_obs, self.latents.latent),
+            next_state
+        )
+        baseline_value = self.critic.value_from_features(features)
+        baseline_next_value = self.critic.value_from_features(next_features)
+        done = th.as_tensor(context.env_step.done, dtype=th.bool, device=self.state.device)
+        self.state = next_state.clone()
+        self.state[done] = 0
+
+        return {
+            "baseline_value": baseline_value,
+            "baseline_next_value": baseline_next_value,
+            "critic_state": critic_state
+        }
