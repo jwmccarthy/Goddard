@@ -139,6 +139,8 @@ def simulate(state: ViewerState, args: argparse.Namespace) -> None:
     )
     latents = LatentCapture(
         latent_dim=config.latent_dim,
+        min_steps=8,
+        max_steps=64,
         device=env.device,
         seed=args.seed
     )
@@ -301,7 +303,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--expert-limit", type=int, default=16_000_000)
     parser.add_argument("--seed", type=int, default=config.seed)
     parser.add_argument("--fast-forward", type=int, default=1)
-    parser.add_argument("--sample-actions", action="store_true")
+    parser.add_argument(
+        "--sample-actions",
+        action=argparse.BooleanOptionalAction,
+        default=True
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--open", action="store_true")
