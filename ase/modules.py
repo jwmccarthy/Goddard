@@ -39,13 +39,15 @@ class ASEDiscriminator(CompositeNet):
         return self
 
     def forward(self, transition) -> th.Tensor:
-        logits = super().forward(transition).squeeze(-1)
-        return logits[..., -1] if logits.ndim > 1 else logits
+        features, _ = self.body(self.foot(transition))
+        logits = self.head(features).squeeze(-1)
+        return logits
 
     def forward_expert(self, transition) -> th.Tensor:
         features = self.expert_foot(transition)
-        logits = self.head(self.body(features)).squeeze(-1)
-        return logits[..., -1] if logits.ndim > 1 else logits
+        features, _ = self.body(features)
+        logits = self.head(features).squeeze(-1)
+        return logits
 
 
 class LatentMultiCategoricalPolicy(MultiCategoricalPolicy):

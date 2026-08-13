@@ -141,6 +141,10 @@ class DiscriminatorLoss:
         agent_logits = self.discriminator(
             (batch["agent_observation"], batch["agent_next_obs"])
         )
+        if expert_logits.ndim > 1:
+            expert_logits = expert_logits[..., -1]
+        if agent_logits.ndim > 1:
+            agent_logits = agent_logits[..., -1]
 
         expert_loss = F.softplus(-expert_logits).mean()
         agent_loss = F.softplus(agent_logits).mean()
