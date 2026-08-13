@@ -109,10 +109,7 @@ discriminator = ASEDiscriminator(
 
 skill_encoder = SkillEncoder(
     foot=CARLDiscriminatorEncoder(),
-    body=MLP(
-        dims=[1024, 512],
-        func=nn.ReLU
-    ),
+    body=GRU(hidden_size=1024),
     head=MLP(dims=[]),
     latent_dim=CONFIG.latent_dim
 ).build(env).to(DEVICE)
@@ -204,9 +201,15 @@ def build_learner(expert_data: ExpertTrajectoryDataset) -> Algorithm:
 
     skill_update = Update(
         transforms=(),
-        sampler=RolloutMinibatches(
-            batch_size=CONFIG.auxiliary_batch,
-            epochs=CONFIG.auxiliary_epochs
+        sampler=RecurrentRolloutMinibatches(
+            sequence_length=CONFIG.rollout,
+            sequences_per_batch=CONFIG.auxiliary_batch // CONFIG.rollout,
+            epochs=CONFIG.auxiliary_epochs,
+            fields=(
+                "observation",
+                "next_obs",
+                "latent"
+            )
         ),
         loss=SkillEncoderLoss(skill_encoder, kappa=CONFIG.kappa),
         optimizer_step=OptimizerStep(

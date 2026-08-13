@@ -181,11 +181,18 @@ class SkillEncoderLoss:
         return
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
+        valid = None
+        if hasattr(batch, "steps"):
+            valid = batch.valid
+            batch = batch.steps
+
         direction = self.skill_encoder(
             (batch["observation"], batch["next_obs"])
         )
 
         similarity = (direction * batch["latent"].detach()).sum(-1)
+        if valid is not None:
+            similarity = similarity[valid]
         loss = -self.kappa * similarity.mean()
 
         return LossOutput(loss, {

@@ -81,11 +81,12 @@ class SkillEncoder(CompositeNet):
         )
 
     def forward(self, transition):
-        return F.normalize(
-            super().forward(transition),
-            p=2,
-            dim=-1,
-        )
+        features = self.foot(transition)
+        output = self.body(features)
+        if isinstance(output, tuple):
+            output = output[0]
+        output = self.head(output)
+        return F.normalize(output, p=2, dim=-1)
 
 
 class LatentGaussianPolicy(DiagonalGaussianPolicy):

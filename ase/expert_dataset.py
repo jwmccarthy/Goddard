@@ -127,10 +127,14 @@ class ExpertTrajectoryDataset:
 
         sequences = []
         seq_len = self.seq_len if limit is None else limit
+        candidates = [replay for replay in self.replays if len(replay) >= seq_len]
+
+        if not candidates:
+            raise ValueError(f"no replay contains {seq_len} observations")
 
         for _ in range(count):
-            replay = self.replays[np.random.randint(len(self.replays))]
-            start = np.random.randint(len(replay) - self.seq_len + 1)
+            replay = candidates[np.random.randint(len(candidates))]
+            start = np.random.randint(len(replay) - seq_len + 1)
             sequences.append(replay[start : start + seq_len])
 
         batch = th.from_numpy(np.stack(sequences)).to(self.device)
