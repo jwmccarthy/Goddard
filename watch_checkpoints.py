@@ -20,7 +20,7 @@ from jarl.modules import MLP
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
 
-from tracker import ExpertLookaheadEnv, ExpertReplays
+from tracker import ExpertLookaheadEnv, ExpertReplays, POSITION_SCALE
 
 
 ROOT = Path(__file__).parent
@@ -62,7 +62,43 @@ def load_policy(path: Path, env: ExpertLookaheadEnv):
     return policy.eval().requires_grad_(False)
 
 
-def frame_from_state(state: th.Tensor, checkpoint: Path, reward: th.Tensor) -> dict:
+def frame_from_expert(expert: th.Tensor) -> dict:
+    ball = expert[:9]
+    cars = expert[9:51].view(2, 21)
+    scale = th.tensor(POSITION_SCALE, device=expert.device)
+    rendered = []
+
+    for index, car in enumerate(cars):
+        forward = car[9:12]
+        up = car[12:15]
+        right = th.linalg.cross(up, forward, dim=-1)
+        position = (
+            car[:3] * scale
+            + forward * CAR_OFFSET[0]
+            + right * CAR_OFFSET[1]
+            + up * CAR_OFFSET[2]
+        )
+        rendered.append({
+            "team":   index,
+            "pos":    position.cpu().tolist(),
+            "fwd":    forward.cpu().tolist(),
+            "rgt":    right.cpu().tolist(),
+            "up":     up.cpu().tolist(),
+            "demoed": bool(car[17]),
+        })
+
+    return {
+        "ball": {"pos": (ball[:3] * scale).cpu().tolist()},
+        "cars": rendered,
+    }
+
+
+def frame_from_state(
+    state:      th.Tensor,
+    checkpoint: Path,
+    reward:     th.Tensor,
+    expert:     th.Tensor,
+) -> dict:
     cars = state[9:53].view(2, 22)
     rendered = []
 
@@ -90,6 +126,7 @@ def frame_from_state(state: th.Tensor, checkpoint: Path, reward: th.Tensor) -> d
         "reward":     reward.cpu().tolist(),
         "ball":       {"pos": state[:3].cpu().tolist()},
         "cars":       rendered,
+        "expert":     frame_from_expert(expert),
     }
 
 
@@ -112,6 +149,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         window_len=args.window_len,
         div_thresh=args.div_thresh,
         ball_range=args.ball_range,
+        ball_div_weight=args.ball_div_weight,
     )
 
     try:
@@ -142,7 +180,8 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
 
             th.cuda.synchronize(env.device)
             raw = th.from_dlpack(base._env.get_state()).clone()[0]
-            viewer.publish(frame_from_state(raw, checkpoint, reward))
+            expert = env._refs[0, 0, env._t[0]]
+            viewer.publish(frame_from_state(raw, checkpoint, reward, expert))
 
             next_step += args.frameskip / (120.0 * args.fast_forward)
             delay = next_step - time.perf_counter()
@@ -235,6 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-len", type=int, default=256)
     parser.add_argument("--div-thresh", type=float, default=0.2)
     parser.add_argument("--ball-range", type=float, default=1500.0)
+    parser.add_argument("--ball-div-weight", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fast-forward", type=int, default=1)
     parser.add_argument("--sample-actions", action=argparse.BooleanOptionalAction, default=True)

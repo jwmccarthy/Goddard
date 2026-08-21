@@ -123,11 +123,13 @@ class TrackingReward:
 
     def __init__(
         self,
-        pos_scale:  th.Tensor,
-        ball_range: float,
+        pos_scale:       th.Tensor,
+        ball_range:      float,
+        ball_div_weight: float,
     ) -> None:
         self.pos_scale = pos_scale
         self.ball_range = ball_range
+        self.ball_div_weight = ball_div_weight
 
     @staticmethod
     def _similarity(
@@ -189,7 +191,13 @@ class TrackingReward:
 
         # Ball accuracy matters most when the tracked car is near the ball.
         rew = car_rew * (1 - influence + influence * ball_rew)
-        return rew, 1 - car_rew
+        car_div = 1 - car_rew
+        ball_div = 1 - ball_rew[:, 0]
+        div = (
+            car_div.mean(dim=-1) + self.ball_div_weight * ball_div
+        ) / (1 + self.ball_div_weight)
+
+        return rew, div
 
 
 class ExpertLookaheadEnv:
@@ -203,6 +211,7 @@ class ExpertLookaheadEnv:
         window_len: int,
         div_thresh: float,
         ball_range: float = 1500.0,
+        ball_div_weight: float = 2.0,
     ) -> None:
         self.env = env
         self.replays = replays
@@ -210,12 +219,17 @@ class ExpertLookaheadEnv:
         self.window_len = window_len
         self.div_thresh = div_thresh
         self.ball_range = ball_range
+        self.ball_div_weight = ball_div_weight
         self.device = env.device
 
         self._refs: th.Tensor | None = None
         self._t = th.zeros(env.n_sim, dtype=th.long, device=self.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
-        self.reward = TrackingReward(self._pos_scale, ball_range)
+        self.reward = TrackingReward(
+            self._pos_scale,
+            ball_range,
+            ball_div_weight,
+        )
 
         size = env.single_observation_space.shape[0]
         size += lookahead * REPLAY_STATE_SIZE
@@ -306,7 +320,7 @@ class ExpertLookaheadEnv:
         rew[native] = 0
 
         end = self._t + self.lookahead >= self.window_len
-        off = div.amax(dim=-1) >= self.div_thresh
+        off = div >= self.div_thresh
         reset = ~native & (end | off)
         off_reset = reset & off & ~end
 
@@ -341,6 +355,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-len",          type=int,   default=256)
     parser.add_argument("--div-thresh",          type=float, default=0.2)
     parser.add_argument("--ball-range",          type=float, default=1500.0)
+    parser.add_argument("--ball-div-weight",     type=float, default=2.0)
     parser.add_argument("--rollout",             type=int,   default=128)
     parser.add_argument("--batch-size",          type=int,   default=16_384)
     parser.add_argument("--epochs",              type=int,   default=4)
@@ -375,6 +390,7 @@ def main() -> None:
         window_len=args.window_len,
         div_thresh=args.div_thresh,
         ball_range=args.ball_range,
+        ball_div_weight=args.ball_div_weight,
     )
 
     try:
