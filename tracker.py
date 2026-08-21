@@ -105,12 +105,12 @@ class ExpertReplays:
         limit: int | None = None,
     ) -> TensorBatch:
         length = limit or self.seq_len
-        replays = [replay for replay in self.replays if len(replay) >= length]
+        replays = [replay for replay in self.replays if replay.shape[1] >= length]
         samples = []
 
         for _ in range(count):
             replay = replays[np.random.randint(len(replays))]
-            start = np.random.randint(len(replay) - length + 1)
+            start = np.random.randint(replay.shape[1] - length + 1)
             samples.append(replay[:, start:start + length])
 
         return TensorBatch({
