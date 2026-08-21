@@ -3,23 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ASE Checkpoint Watcher</title>
+  <title>Tracker Checkpoint Viewer</title>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; overflow: hidden; background: #070a10; color: #eef4fc; font-family: system-ui, sans-serif; }
     #view { position: fixed; inset: 0; }
-    #score, #status { position: fixed; border: 1px solid #ffffff24; border-radius: 8px; background: #070a10d9; backdrop-filter: blur(8px); }
-    #score { top: 18px; left: 50%; transform: translateX(-50%); display: flex; gap: 18px; align-items: center; padding: 10px 16px; font: 600 12px ui-monospace, monospace; }
-    #blue { color: #49a8ff; }
-    #orange { color: #ff8b45; }
-    #goals { font-size: 22px; }
-    #status { bottom: 18px; left: 18px; padding: 10px 12px; font: 12px ui-monospace, monospace; }
-    button { margin-left: 12px; padding: 6px 12px; border: 1px solid #ffffff30; border-radius: 5px; background: #1d5d91; color: inherit; cursor: pointer; }
+    #status { position: fixed; bottom: 18px; left: 18px; padding: 10px 12px; border: 1px solid #ffffff24; border-radius: 8px; background: #070a10d9; font: 12px ui-monospace, monospace; }
+    button { position: fixed; top: 18px; left: 18px; padding: 6px 12px; border: 1px solid #ffffff30; border-radius: 5px; background: #1d5d91; color: inherit; cursor: pointer; }
   </style>
 </head>
 <body>
   <div id="view"></div>
-  <div id="score"><span id="blue">BLUE</span><span id="goals">0 - 0</span><span id="orange">ORANGE</span><button id="reset">Reset</button></div>
+  <button id="reset">Reset Trajectory</button>
   <div id="status">connecting</div>
   <script type="importmap">
     {"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
