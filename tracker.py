@@ -130,6 +130,19 @@ class TrackingReward:
         self.pos_scale = pos_scale
         self.ball_range = ball_range
         self.ball_div_weight = ball_div_weight
+        self.car_pos_scale = pos_scale * th.tensor(
+            (0.25, 0.20, 0.25), device=pos_scale.device
+        )
+        self.ball_pos_scale = pos_scale * th.tensor(
+            (0.20, 0.17, 0.20), device=pos_scale.device
+        )
+        self.car_weights = th.tensor(
+            (3.0, 2.0, 0.5, 0.5, 0.5, 0.25),
+            device=pos_scale.device,
+        )
+        self.ball_weights = th.tensor(
+            (3.0, 2.0, 0.5), device=pos_scale.device
+        )
 
     @staticmethod
     def _similarity(
@@ -148,11 +161,14 @@ class TrackingReward:
         car = expert[:, 9:BASE_STATE_SIZE].reshape(-1, 2, 21)
         ball = expert[:, :9]
 
-        car_rew = th.stack((
-            self._similarity(cars[:, :, :3], car[:, :, :3], self.pos_scale),
+        car_terms = th.stack((
             self._similarity(
-                cars[:, :, 3:6], car[:, :, 3:6] * CAR_MAX_SPEED,
-                CAR_MAX_SPEED,
+                cars[:, :, :3],
+                car[:, :, :3] * self.pos_scale,
+                self.car_pos_scale,
+            ),
+            self._similarity(
+                cars[:, :, 3:6], car[:, :, 3:6] * CAR_MAX_SPEED, 1000.0,
             ),
             self._similarity(
                 cars[:, :, 6:9], car[:, :, 6:9] * CAR_MAX_ANG_SPEED,
@@ -165,25 +181,29 @@ class TrackingReward:
                 car[:, :, 15, None] * BOOST_MAX,
                 BOOST_MAX,
             ),
-        ), dim=-1).mean(-1)
+        ), dim=-1)
+        car_rew = (car_terms * self.car_weights).sum(-1) / self.car_weights.sum()
 
-        ball_rew = th.stack((
+        ball_terms = th.stack((
             self._similarity(
                 state.ball_position[:, None],
                 ball[:, None, :3] * self.pos_scale,
-                self.pos_scale,
+                self.ball_pos_scale,
             ),
             self._similarity(
                 state.ball_velocity[:, None],
                 ball[:, None, 3:6] * BALL_MAX_SPEED,
-                BALL_MAX_SPEED,
+                1500.0,
             ),
             self._similarity(
                 state.ball_angular_velocity[:, None],
                 ball[:, None, 6:9] * BALL_MAX_ANG_SPEED,
                 BALL_MAX_ANG_SPEED,
             ),
-        ), dim=-1).mean(-1)
+        ), dim=-1)
+        ball_rew = (
+            ball_terms * self.ball_weights
+        ).sum(-1) / self.ball_weights.sum()
 
         ball_rew = ball_rew.expand_as(car_rew)
         distance = th.linalg.vector_norm(cars[:, :, :3] - state.ball_position[:, None], dim=-1)
@@ -353,9 +373,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frameskip",           type=int,   default=8)
     parser.add_argument("--lookahead",           type=int,   default=16)
     parser.add_argument("--window-len",          type=int,   default=256)
-    parser.add_argument("--div-thresh",          type=float, default=0.2)
+    parser.add_argument("--div-thresh",          type=float, default=0.1)
     parser.add_argument("--ball-range",          type=float, default=1500.0)
-    parser.add_argument("--ball-div-weight",     type=float, default=2.0)
+    parser.add_argument("--ball-div-weight",     type=float, default=4.0)
     parser.add_argument("--rollout",             type=int,   default=128)
     parser.add_argument("--batch-size",          type=int,   default=16_384)
     parser.add_argument("--epochs",              type=int,   default=4)
