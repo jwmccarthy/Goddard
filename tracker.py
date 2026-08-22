@@ -384,7 +384,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed",                type=int,   default=0)
     parser.add_argument("--log-dir",             type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",      type=Path,  default=Path("checkpoints/tracker"))
-    parser.add_argument("--checkpoint-interval", type=int,   default=1_000_000)
+    parser.add_argument("--checkpoint-interval", type=int,   default=10_000_000)
+    parser.add_argument("--checkpoint-keep",     type=int,   default=5)
     
     return parser.parse_args()
 
@@ -468,6 +469,7 @@ def main() -> None:
             modules={"policy": policy, "critic": critic},
             directory=args.checkpoint_dir,
             interval=args.checkpoint_interval,
+            keep=args.checkpoint_keep,
         )
         checkpoint.run()
 

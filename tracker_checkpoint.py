@@ -10,13 +10,17 @@ class PeriodicCheckpoint:
         modules:  dict[str, th.nn.Module],
         directory: Path,
         interval: int,
+        keep:     int,
     ) -> None:
         self.modules = modules
         self.directory = directory
         self.interval = interval
+        self.keep = keep
         self.step = 0
         self.next_step = interval
         self.directory.mkdir(parents=True, exist_ok=True)
+        for path in self.directory.glob("tracker_*.pt.tmp"):
+            path.unlink()
 
     def ready(self, step: int) -> bool:
         self.step = step
@@ -31,4 +35,9 @@ class PeriodicCheckpoint:
         temporary = path.with_suffix(".pt.tmp")
         th.save(payload, temporary)
         temporary.replace(path)
+
+        paths = sorted(self.directory.glob("tracker_*.pt"))
+        for old_path in paths[:-self.keep]:
+            old_path.unlink()
+
         self.next_step = self.step + self.interval
