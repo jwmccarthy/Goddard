@@ -107,7 +107,7 @@ class ExpertGoalStates:
             if valid:
                 continue
 
-            if i - start > self._min_len:
+            if i - start > self._min_len + 1:
                 demos.append(
                     th.from_numpy(observation[start:i])
                 )
@@ -125,7 +125,8 @@ class ExpertGoalStates:
         ends = self._offsets[demo_id + 1]
 
         u = th.rand(n_resets, device=self.device)
-        self._cursors[mask] = starts + (u * (ends - starts - self._min_len)).long()
+        span = ends - starts - self._min_len - 1
+        self._cursors[mask] = starts + (u * span).long()
         self._times[mask] = 0
 
         return TensorBatch({

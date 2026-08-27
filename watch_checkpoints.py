@@ -145,6 +145,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         str(args.replay_dir),
         n_env=1,
         windows=args.windows,
+        obs_limit=args.obs_limit,
         n_cars=1,
         device=base.device,
     )
@@ -274,6 +275,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--frameskip", type=int, default=8)
     parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--obs-limit", type=int, default=100_000)
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
     parser.add_argument("--divergence-distance", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=0)

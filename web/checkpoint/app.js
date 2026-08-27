@@ -36,10 +36,10 @@ function makeCar(color, opacity = 1) {
   return mesh;
 }
 
-const cars = [makeCar(0x168cff), makeCar(0xff7028)];
+const car = makeCar(0x168cff);
 const ball = new THREE.Mesh(new THREE.SphereGeometry(91.25, 24, 16), new THREE.MeshStandardMaterial({ color: 0xe9edf2 }));
 scene.add(ball);
-const ghosts = [makeCar(0x74c6ff, 0.3), makeCar(0xffbc90, 0.3)];
+const ghost = makeCar(0x74c6ff, 0.3);
 const ghostBall = new THREE.Mesh(new THREE.SphereGeometry(91.25, 24, 16), new THREE.MeshStandardMaterial({ color: 0xc8ffea, transparent: true, opacity: 0.3 }));
 scene.add(ghostBall);
 
@@ -62,10 +62,8 @@ const source = new EventSource('/api/stream');
 source.onmessage = ({ data }) => {
   const frame = JSON.parse(data);
   if (frame.error) { status.textContent = frame.error; return; }
-  setCar(cars[0], frame.cars[0]);
-  setCar(cars[1], frame.cars[1]);
-  setCar(ghosts[0], frame.expert.cars[0]);
-  setCar(ghosts[1], frame.expert.cars[1]);
+  setCar(car, frame.cars[0]);
+  setCar(ghost, frame.expert.cars[0]);
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   status.textContent = `${frame.checkpoint} | reward ${frame.reward.map((value) => value.toFixed(3)).join(' / ')}`;
