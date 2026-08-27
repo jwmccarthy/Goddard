@@ -130,6 +130,19 @@ def frame_from_state(
     }
 
 
+def publish_frame(
+    viewer:     ViewerState,
+    base:       CARLTorchVectorEnv,
+    replays:    ExpertGoalStates,
+    checkpoint: Path,
+    reward:     th.Tensor,
+) -> None:
+    th.cuda.synchronize(base.device)
+    raw = th.from_dlpack(base._env.get_state()).clone()[0]
+    expert = CARLObservation.from_tensor(replays.current(-1)[0], 1)
+    viewer.publish(frame_from_state(raw, checkpoint, reward, expert))
+
+
 def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
     base = CARLTorchVectorEnv(
         n_sim=1,
@@ -161,12 +174,25 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         policy = load_policy(checkpoint, env)
         checkpoint_mtime = checkpoint.stat().st_mtime_ns
         observation = env.reset()
+        frame_time = args.frameskip / (120.0 * args.fast_forward)
+        publish_frame(viewer, base, replays, checkpoint, th.zeros(1, device=env.device))
+        viewer.stop.wait(frame_time)
         next_step = time.perf_counter()
 
         while not viewer.stop.is_set():
             if viewer.reset.is_set():
                 viewer.reset.clear()
                 observation = env.reset()
+                publish_frame(
+                    viewer,
+                    base,
+                    replays,
+                    checkpoint,
+                    th.zeros(1, device=env.device),
+                )
+                viewer.stop.wait(frame_time)
+                next_step = time.perf_counter()
+                continue
 
             latest = newest_checkpoint(args.checkpoint_dir)
             latest_mtime = latest.stat().st_mtime_ns
@@ -182,12 +208,9 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                 ).action
                 observation, reward, _, _, _ = env.step(action)
 
-            th.cuda.synchronize(env.device)
-            raw = th.from_dlpack(base._env.get_state()).clone()[0]
-            expert = CARLObservation.from_tensor(replays.current(-1)[0], 1)
-            viewer.publish(frame_from_state(raw, checkpoint, reward, expert))
+            publish_frame(viewer, base, replays, checkpoint, reward)
 
-            next_step += args.frameskip / (120.0 * args.fast_forward)
+            next_step += frame_time
             delay = next_step - time.perf_counter()
             if delay > 0:
                 viewer.stop.wait(delay)
