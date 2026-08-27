@@ -73,7 +73,7 @@ class ExpertGoalStates:
         replays, total = [], 0
 
         self._buffer = max(windows)
-        self._min_len = 45
+        self._min_len = 30
 
         for path in Path(replay_dir).glob("*.npy"):
             demos = self._filter(np.load(path, mmap_mode="r"))
