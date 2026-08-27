@@ -42,7 +42,7 @@ def _safe_load(path: Path) -> ParsedReplay:
 
 
 def _get_active_frames(
-    replay: ParsedReplay,
+    replay:     ParsedReplay,
     frame_skip: int
 ) -> List[list[ReplayFrame]]:
     times = replay.game_df["time"].to_numpy() * 120.0
@@ -155,6 +155,15 @@ def _build_observation(frame: ReplayFrame, ego_id: str) -> np.ndarray:
         (ball.position - OPP_GOAL) / NORM_POS_REL,
     ]
 
+    touch_features = np.asarray([
+        ego.ball_touches > 0,
+        any(
+            car.ball_touches > 0
+            for car_id, car in state.cars.items()
+            if car_id != ego_id
+        ),
+    ], dtype=np.float32)
+
     return np.concatenate([
         _compose_ball(ball),
         *car_features,
@@ -162,12 +171,13 @@ def _build_observation(frame: ReplayFrame, ego_id: str) -> np.ndarray:
         *ball_relative_features,
         *car_relative_features,
         *goal_features,
+        touch_features,
     ])
 
 
 def _parse(
-    replay: ParsedReplay,
-    name: str,
+    replay:     ParsedReplay,
+    name:       str,
     output_dir: Path,
     frame_skip: int
 ) -> None:
@@ -184,7 +194,7 @@ def _parse(
             obs = np.stack([
                 _build_observation(f, ego_id)
                 for f in frames
-            ])
+            ]).astype(np.float32, copy=False)
 
             np.save(output_dir / f"{ego_id}-{i}-{name}.npy", obs)
 
@@ -213,8 +223,8 @@ def _parse_path(args: tuple[str, str, int]) -> tuple[str, str]:
 def parse(
     replay_dir: str,
     output_dir: str,
-    frame_skip: int = 2,
-    workers: int | None = None
+    frame_skip: int = 1,
+    workers:    int | None = None
 ) -> None:
     replay_dir = Path(replay_dir)
     output_dir = Path(output_dir)
@@ -231,7 +241,7 @@ def parse(
             for name, status in executor.map(_parse_path, jobs, chunksize=1):
                 if status.startswith("failed"):
                     progress.console.print(f"{status}: {name}")
-                    
+
                 progress.update(overall, description=f"{status}: {name}")
                 progress.advance(overall)
 

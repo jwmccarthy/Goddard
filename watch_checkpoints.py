@@ -15,12 +15,12 @@ import carl
 import torch as th
 import torch.nn as nn
 
-from carl.gymnasium import CARLTorchVectorEnv
+from carl.gymnasium import CARLObservation, CARLTorchVectorEnv
 from jarl.modules import MLP
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
 
-from tracker import ExpertLookaheadEnv, ExpertReplays, POSITION_SCALE
+from tracker import ExpertGoalStates, ExpertLookaheadEnv, POSITION_SCALE
 
 
 ROOT = Path(__file__).parent
@@ -62,18 +62,18 @@ def load_policy(path: Path, env: ExpertLookaheadEnv):
     return policy.eval().requires_grad_(False)
 
 
-def frame_from_expert(expert: th.Tensor) -> dict:
-    ball = expert[:9]
-    cars = expert[9:51].view(2, 21)
+def frame_from_expert(expert: CARLObservation) -> dict:
+    ball = expert.ball
+    cars = expert.cars
     scale = th.tensor(POSITION_SCALE, device=expert.device)
     rendered = []
 
-    for index, car in enumerate(cars):
-        forward = car[9:12]
-        up = car[12:15]
+    for index in range(expert.n_cars):
+        forward = cars.forward[index]
+        up = cars.up[index]
         right = th.linalg.cross(up, forward, dim=-1)
         position = (
-            car[:3] * scale
+            cars.position[index] * scale
             + forward * CAR_OFFSET[0]
             + right * CAR_OFFSET[1]
             + up * CAR_OFFSET[2]
@@ -84,11 +84,11 @@ def frame_from_expert(expert: th.Tensor) -> dict:
             "fwd":    forward.cpu().tolist(),
             "rgt":    right.cpu().tolist(),
             "up":     up.cpu().tolist(),
-            "demoed": bool(car[17]),
+            "demoed": bool(cars.demoed[index]),
         })
 
     return {
-        "ball": {"pos": (ball[:3] * scale).cpu().tolist()},
+        "ball": {"pos": (ball.position * scale).cpu().tolist()},
         "cars": rendered,
     }
 
@@ -97,9 +97,9 @@ def frame_from_state(
     state:      th.Tensor,
     checkpoint: Path,
     reward:     th.Tensor,
-    expert:     th.Tensor,
+    expert:     CARLObservation,
 ) -> dict:
-    cars = state[9:53].view(2, 22)
+    cars = state[9:31].view(1, 22)
     rendered = []
 
     for index, car in enumerate(cars):
@@ -134,22 +134,25 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
     base = CARLTorchVectorEnv(
         n_sim=1,
         n_blue=1,
-        n_orange=1,
+        n_orange=0,
         seed=args.seed,
         frameskip=args.frameskip,
         max_ticks=1_000_000,
         normalize=True,
         synchronize=True,
     )
-    replays = ExpertReplays(str(args.replay_dir), device=base.device)
+    replays = ExpertGoalStates(
+        str(args.replay_dir),
+        n_env=1,
+        windows=args.windows,
+        n_cars=1,
+        device=base.device,
+    )
     env = ExpertLookaheadEnv(
         base,
         replays,
-        lookahead=args.lookahead,
-        window_len=args.window_len,
-        div_thresh=args.div_thresh,
-        ball_range=args.ball_range,
-        ball_div_weight=args.ball_div_weight,
+        reward_scale=args.tracking_reward_scale,
+        divergence_distance=args.divergence_distance,
     )
 
     try:
@@ -180,7 +183,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
 
             th.cuda.synchronize(env.device)
             raw = th.from_dlpack(base._env.get_state()).clone()[0]
-            expert = env._refs[0, 0, env._t[0]]
+            expert = CARLObservation.from_tensor(replays.current(-1)[0], 1)
             viewer.publish(frame_from_state(raw, checkpoint, reward, expert))
 
             next_step += args.frameskip / (120.0 * args.fast_forward)
@@ -270,11 +273,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/tracker"))
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--frameskip", type=int, default=8)
-    parser.add_argument("--lookahead", type=int, default=16)
-    parser.add_argument("--window-len", type=int, default=256)
-    parser.add_argument("--div-thresh", type=float, default=0.1)
-    parser.add_argument("--ball-range", type=float, default=1500.0)
-    parser.add_argument("--ball-div-weight", type=float, default=4.0)
+    parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
+    parser.add_argument("--divergence-distance", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fast-forward", type=int, default=1)
     parser.add_argument("--sample-actions", action=argparse.BooleanOptionalAction, default=True)

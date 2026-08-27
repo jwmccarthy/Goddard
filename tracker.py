@@ -1,20 +1,19 @@
 import argparse
 
-from datetime import datetime
 from pathlib import Path
-from typing import Any
-import re
+from datetime import datetime
+from typing import Any, List
 
-import gymnasium as gym
 import numpy as np
 import torch as th
+import torch.nn as nn
+import gymnasium as gym
 
 from torch.optim import Adam
-import torch.nn as nn
-
 from carl.gymnasium import CARLTorchVectorEnv
-from carl.gymnasium.state import CarlState
-from jarl.collect import CriticCapture, LogProbCapture, SelfPlayMatchmaker, SelfPlayRunner
+from carl.gymnasium import CARLObservation
+from carl.gymnasium.state import RewardContext
+from jarl.collect import CriticCapture, LogProbCapture, Runner
 from jarl.data.batch import TensorBatch
 from jarl.learn import (
     Algorithm,
@@ -44,215 +43,207 @@ BALL_MAX_ANG_SPEED = 6.0
 CAR_MAX_SPEED      = 2300.0
 CAR_MAX_ANG_SPEED  = 5.5
 BOOST_MAX          = 100.0
-REPLAY_STATE_SIZE  = 137
-BASE_STATE_SIZE    = 51
-
-REPLAY_NAME = re.compile(r"^(.*)-(\d+)-([0-9a-f-]{36})$")
+GOAL_STATE_SIZE    = 30
 
 
-class ExpertReplays:
-    """Samples windows from saved replays."""
+class ExpertGoalStates:
+
+    _n_demos: int
+    _min_len: int
+    _windows: th.Tensor
+    _demo_id: th.Tensor
+    _replays: th.Tensor
+    _offsets: th.Tensor
+    _cursors: th.Tensor
+    _times:   th.Tensor
 
     def __init__(
         self,
         replay_dir: str,
-        seq_len:    int = 2,
+        n_env:      int,
+        windows:    List[int] = [1, 2, 4, 8],
         obs_limit:  int | None = None,
+        n_cars:     int = 2,
         device:     str | th.device = "cuda:0",
     ) -> None:
-        self.seq_len = seq_len
-        self.device = th.device(device)
 
-        groups: dict[str, list[Path]] = {}
+        self.n_cars = n_cars
+        self.device = device
 
-        for path in sorted(Path(replay_dir).glob("*.npy")):
-            match = REPLAY_NAME.match(path.stem)
-            if match is not None:
-                groups.setdefault("-".join(match.groups()[1:]), []).append(path)
+        replays, total = [], 0
 
-        self.replays: list[th.Tensor] = []
+        self._min_len = max(windows)
 
-        total = 0
+        for path in Path(replay_dir).glob("*.npy"):
+            demos = self._filter(np.load(path, mmap_mode="r"))
+            replays.extend(demos)
 
-        for paths in groups.values():
-            if len(paths) != 2:
-                continue
+            total += sum((len(d) for d in demos))
 
-            end = None if obs_limit is None else obs_limit - total
-            blue, orange = (
-                np.load(path, mmap_mode="r")[:end]
-                for path in paths
-            )
-            length = min(len(blue), len(orange))
-
-            if length >= seq_len:
-                pair = np.stack((blue[:length], orange[:length])).astype(
-                    np.float32,
-                    copy=False,
-                )
-                self.replays.append(th.from_numpy(pair).to(self.device))
-
-            total += length
             if obs_limit is not None and total >= obs_limit:
                 break
 
-        if not self.replays:
-            raise ValueError(f"no usable replays found in {replay_dir}")
+        lengths = th.tensor([len(r) for r in replays], device=device)
 
-    def sample(
-        self,
-        count: int,
-        limit: int | None = None,
-    ) -> TensorBatch:
-        length = limit or self.seq_len
-        replays = [replay for replay in self.replays if replay.shape[1] >= length]
-        samples = []
+        self._n_demos = len(replays)
+        self._demo_id = th.zeros(n_env, device=device).long()
+        self._windows = th.tensor(windows).to(device)[None, :]
+        self._replays = th.concat(replays).to(device)
+        self._offsets = th.cat((th.zeros(1, device=device, dtype=th.long), lengths.cumsum(0)))
+        self._cursors = th.zeros(n_env, device=device).long()
+        self._times   = th.zeros_like(self._cursors)
 
-        for _ in range(count):
-            replay = replays[np.random.randint(len(replays))]
-            start = np.random.randint(replay.shape[1] - length + 1)
-            samples.append(replay[:, start:start + length])
+    @property
+    def goal_size(self) -> int:
+        return self._windows.numel() * GOAL_STATE_SIZE
+
+    def _filter(self, demo: np.ndarray) -> List[th.Tensor]:
+        observation = demo[:, :-2].astype(np.float32, copy=False)
+        valid = np.append(~demo[:, -1].astype(bool), False)
+
+        demos, start = [], 0
+
+        for i, valid in enumerate(valid):
+            if valid:
+                continue
+
+            if i - start > self._min_len:
+                demos.append(
+                    th.from_numpy(observation[start:i])
+                )
+
+            start = i + 1
+
+        return demos
+
+    def reset(self, mask: th.Tensor) -> TensorBatch:
+        n_resets = mask.sum().item()
+        demo_id = th.randint(self._n_demos, (n_resets,), device=self.device)
+        self._demo_id[mask] = demo_id
+
+        starts = self._offsets[demo_id]
+        ends = self._offsets[demo_id + 1]
+
+        u = th.rand(n_resets, device=self.device)
+        self._cursors[mask] = starts + (u * (ends - starts - self._min_len)).long()
+        self._times[mask] = 0
 
         return TensorBatch({
-            "observation": th.stack(samples),
+            "observation": CARLObservation.from_tensor(
+                self._replays[self._cursors[mask]],
+                self.n_cars
+            )
         })
 
+    def current(self, offset: int = 0) -> CARLObservation:
+        return CARLObservation.from_tensor(
+            self._replays[self._cursors + offset],
+            self.n_cars,
+        )
+
+    def next_goals(
+        self,
+        obs:  th.Tensor,
+        mask: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        cursors = self._cursors if mask is None else self._cursors[mask]
+        demo_id = self._demo_id if mask is None else self._demo_id[mask]
+        goal_idx = cursors[:, None] + self._windows
+
+        goals = (
+            self._replays[goal_idx, :GOAL_STATE_SIZE]
+            - obs[:, None, :GOAL_STATE_SIZE]
+        ).flatten(-2)
+
+        if mask is None:
+            self._times += 1
+            self._cursors += 1
+            cursors = self._cursors
+        else:
+            self._times[mask] += 1
+            self._cursors[mask] += 1
+            cursors = self._cursors[mask]
+
+        end = cursors + self._min_len >= self._offsets[demo_id + 1]
+
+        return th.cat((obs, goals), dim=-1), end
 
 class TrackingReward:
-    """Scores the current CARL state against one expert replay frame."""
+    """Scores the normalized ball and ego state against the current replay frame."""
 
     def __init__(
         self,
-        pos_scale:       th.Tensor,
-        ball_range:      float,
-        ball_div_weight: float,
+        replays: ExpertGoalStates,
+        scale:   float = 1.0,
     ) -> None:
-        self.pos_scale = pos_scale
-        self.ball_range = ball_range
-        self.ball_div_weight = ball_div_weight
-        self.car_pos_scale = pos_scale * th.tensor(
-            (0.25, 0.20, 0.25), device=pos_scale.device
-        )
-        self.ball_pos_scale = pos_scale * th.tensor(
-            (0.20, 0.17, 0.20), device=pos_scale.device
-        )
-        self.car_weights = th.tensor(
-            (3.0, 2.0, 0.5, 0.5, 0.5, 0.25),
-            device=pos_scale.device,
-        )
-        self.ball_weights = th.tensor(
-            (3.0, 2.0, 0.5), device=pos_scale.device
-        )
+        self.replays = replays
+        self.scale = scale
+        self.pos_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
+        self.divergence: th.Tensor | None = None
 
-    @staticmethod
-    def _similarity(
-        actual: th.Tensor,
-        target: th.Tensor,
-        scale:  th.Tensor | float,
-    ) -> th.Tensor:
-        return th.exp(-((actual - target) / scale).square().mean(dim=-1))
+    def __call__(self, context: RewardContext) -> th.Tensor:
+        actual = context.current_observation
+        target = self.replays.current()
+        actual_ego = actual.cars.ego
+        target_ego = target.cars.ego
 
-    def __call__(
-        self,
-        state:  CarlState,
-        expert: th.Tensor,
-    ) -> tuple[th.Tensor, th.Tensor]:
-        cars = state.car_values
-        car = expert[:, 9:BASE_STATE_SIZE].reshape(-1, 2, 21)
-        ball = expert[:, :9]
+        position_error = th.stack((
+            (actual.ball.position - target.ball.position) * self.pos_scale,
+            (actual_ego.position - target_ego.position) * self.pos_scale,
+        ), dim=1)
 
-        car_terms = th.stack((
-            self._similarity(
-                cars[:, :, :3],
-                car[:, :, :3] * self.pos_scale,
-                self.car_pos_scale,
-            ),
-            self._similarity(
-                cars[:, :, 3:6], car[:, :, 3:6] * CAR_MAX_SPEED, 1000.0,
-            ),
-            self._similarity(
-                cars[:, :, 6:9], car[:, :, 6:9] * CAR_MAX_ANG_SPEED,
-                CAR_MAX_ANG_SPEED,
-            ),
-            self._similarity(cars[:, :, 9:12], car[:, :, 9:12], 1.0),
-            self._similarity(cars[:, :, 12:15], car[:, :, 12:15], 1.0),
-            self._similarity(
-                cars[:, :, 15, None],
-                car[:, :, 15, None] * BOOST_MAX,
-                BOOST_MAX,
-            ),
+        velocity_error = th.stack((
+            (actual.ball.velocity - target.ball.velocity) * (BALL_MAX_SPEED / 100),
+            (actual_ego.velocity - target_ego.velocity) * (CAR_MAX_SPEED / 100),
+        ), dim=1)
+
+        angular_velocity_error = th.stack((
+            (actual.ball.angular_velocity - target.ball.angular_velocity)
+            * BALL_MAX_ANG_SPEED,
+            (actual_ego.angular_velocity - target_ego.angular_velocity)
+            * CAR_MAX_ANG_SPEED,
+        ), dim=1)
+
+        rotation_error = th.cat((
+            actual_ego.forward - target_ego.forward,
+            actual_ego.up - target_ego.up,
         ), dim=-1)
-        car_rew = (car_terms * self.car_weights).sum(-1) / self.car_weights.sum()
 
-        ball_terms = th.stack((
-            self._similarity(
-                state.ball_position[:, None],
-                ball[:, None, :3] * self.pos_scale,
-                self.ball_pos_scale,
-            ),
-            self._similarity(
-                state.ball_velocity[:, None],
-                ball[:, None, 3:6] * BALL_MAX_SPEED,
-                1500.0,
-            ),
-            self._similarity(
-                state.ball_angular_velocity[:, None],
-                ball[:, None, 6:9] * BALL_MAX_ANG_SPEED,
-                BALL_MAX_ANG_SPEED,
-            ),
-        ), dim=-1)
-        ball_rew = (
-            ball_terms * self.ball_weights
-        ).sum(-1) / self.ball_weights.sum()
+        position_mse = position_error.square().sum(-1).mean(-1)
+        rotation_mse = rotation_error.square().sum(-1)
+        velocity_mse = velocity_error.square().sum(-1).mean(-1)
+        angular_velocity_mse = angular_velocity_error.square().sum(-1).mean(-1)
 
-        ball_rew = ball_rew.expand_as(car_rew)
-        distance = th.linalg.vector_norm(cars[:, :, :3] - state.ball_position[:, None], dim=-1)
-        influence = th.exp(-distance / self.ball_range)
+        reward = (
+            0.5 * th.exp(-100.0 * position_mse)
+            + 0.3 * th.exp(-10.0 * rotation_mse)
+            + 0.1 * th.exp(-0.1 * velocity_mse)
+            + 0.1 * th.exp(-0.1 * angular_velocity_mse)
+        )
 
-        # Ball accuracy matters most when the tracked car is near the ball.
-        rew = car_rew * (1 - influence + influence * ball_rew)
-        car_div = 1 - car_rew
-        ball_div = 1 - ball_rew[:, 0]
-        div = (
-            car_div.mean(dim=-1) + self.ball_div_weight * ball_div
-        ) / (1 + self.ball_div_weight)
+        self.divergence = th.linalg.vector_norm(position_error, dim=-1).amax(-1)
 
-        return rew, div
+        return self.scale * reward[:, None]
 
 
 class ExpertLookaheadEnv:
-    """Adds a rolling expert target sequence and tracking reward to a CARL env."""
+    """Adds replay goal states and replay-backed resets to a blue-only CARL env."""
 
     def __init__(
         self,
-        env:        CARLTorchVectorEnv,
-        replays:    ExpertReplays,
-        lookahead:  int,
-        window_len: int,
-        div_thresh: float,
-        ball_range: float = 1500.0,
-        ball_div_weight: float = 2.0,
+        env:                 CARLTorchVectorEnv,
+        replays:             ExpertGoalStates,
+        reward_scale:        float = 1.0,
+        divergence_distance: float = 5.0,
     ) -> None:
         self.env = env
         self.replays = replays
-        self.lookahead = lookahead
-        self.window_len = window_len
-        self.div_thresh = div_thresh
-        self.ball_range = ball_range
-        self.ball_div_weight = ball_div_weight
         self.device = env.device
-
-        self._refs: th.Tensor | None = None
-        self._t = th.zeros(env.n_sim, dtype=th.long, device=self.device)
+        self.divergence_distance = divergence_distance
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
-        self.reward = TrackingReward(
-            self._pos_scale,
-            ball_range,
-            ball_div_weight,
-        )
 
         size = env.single_observation_space.shape[0]
-        size += lookahead * REPLAY_STATE_SIZE
+        size += replays.goal_size
 
         self.single_observation_space = gym.spaces.Box(
             -np.inf,
@@ -268,6 +259,8 @@ class ExpertLookaheadEnv:
         self.single_action_space = env.single_action_space
 
         self.env.reset_state_provider = self._reset_state
+        self.reward = TrackingReward(replays, reward_scale)
+        self.env.register_reward(self.reward)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.env, name)
@@ -277,115 +270,89 @@ class ExpertLookaheadEnv:
         if not len(idx):
             return None
 
-        ref = self.replays.sample(len(idx), self.window_len)["observation"]
-        if self._refs is None:
-            self._refs = th.empty(
-                self.env.n_sim,
-                self.env.n_cars,
-                self.window_len,
-                REPLAY_STATE_SIZE,
-                device=self.device,
-            )
-
-        # Keep each simulation's full reference window for rolling lookahead
-        self._refs[idx] = ref
-        self._t[idx] = 0
-
-        expert = ref[:, 0, 0]
-        ball = expert[:, :9]
-        cars = expert[:, 9:BASE_STATE_SIZE].reshape(-1, 2, 21)
+        expert = self.replays.reset(mask)["observation"]
+        ball = expert.ball
+        cars = expert.cars
 
         return TensorBatch({
             "simulation_indices":    idx,
-            "ball_position":         ball[:, :3] * self._pos_scale,
-            "ball_velocity":         ball[:, 3:6] * BALL_MAX_SPEED,
-            "ball_angular_velocity": ball[:, 6:9] * BALL_MAX_ANG_SPEED,
-            "car_position":          cars[:, :, :3] * self._pos_scale,
-            "car_rotation":          forward_up_to_quat(cars[:, :, 9:12], cars[:, :, 12:15]),
-            "car_velocity":          cars[:, :, 3:6] * CAR_MAX_SPEED,
-            "car_angular_velocity":  cars[:, :, 6:9] * CAR_MAX_ANG_SPEED,
-            "car_demoed":            cars[:, :, 17].bool(),
-            "car_boost":             cars[:, :, 15] * BOOST_MAX,
+            "ball_position":         ball.position * self._pos_scale,
+            "ball_velocity":         ball.velocity * BALL_MAX_SPEED,
+            "ball_angular_velocity": ball.angular_velocity * BALL_MAX_ANG_SPEED,
+            "car_position":          cars.position * self._pos_scale,
+            "car_rotation":          forward_up_to_quat(cars.forward, cars.up),
+            "car_velocity":          cars.velocity * CAR_MAX_SPEED,
+            "car_angular_velocity":  cars.angular_velocity * CAR_MAX_ANG_SPEED,
+            "car_demoed":            cars.demoed,
+            "car_boost":             cars.boost * BOOST_MAX,
             "blue_score":            th.zeros(len(idx), dtype=th.int32, device=self.device),
             "orange_score":          th.zeros(len(idx), dtype=th.int32, device=self.device),
             "episode_ticks":         th.zeros(len(idx), dtype=th.int32, device=self.device),
         })
 
-    def _append_lookahead(self, obs: th.Tensor) -> th.Tensor:
-        offsets = th.arange(1, self.lookahead + 1, device=self.device)
-        steps = self._t[:, None, None] + offsets
-        sims = th.arange(self.env.n_sim, device=self.device)[:, None, None]
-        cars = th.arange(self.env.n_cars, device=self.device)[None, :, None]
-        targets = self._refs[sims, cars, steps]
-
-        return th.cat((obs, targets.reshape(self.env.n_envs, -1)), dim=-1)
+    def _pad_goals(self, obs: th.Tensor) -> th.Tensor:
+        goal_size = self.single_observation_space.shape[0] - obs.shape[-1]
+        return th.nn.functional.pad(obs, (0, goal_size))
 
     def reset(self, **kwargs: Any) -> th.Tensor:
-        return self._append_lookahead(self.env.reset(**kwargs))
+        obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
+        return obs
 
     def step(self, action: th.Tensor | np.ndarray):
-        obs, _, term, trunc, info = self.env.step(action)
-        native = (term | trunc).reshape(
-            self.env.n_sim,
-            self.env.n_cars,
-        ).any(dim=1)
+        obs, reward, term, trunc, info = self.env.step(action)
+        native = term | trunc
+        obs, end = self.replays.next_goals(obs)
 
-        self._t += 1
-        self._t[native] = 0
+        if self.reward.divergence is None:
+            raise RuntimeError("tracking reward did not compute divergence")
 
-        idx = th.arange(self.env.n_sim, device=self.device)
-        expert = self._refs[idx, 0, self._t]
-        state = self.env._carl_state(self.env._env.get_transition_state())
-        rew, div = self.reward(state, expert)
-        rew[native] = 0
+        end_reset = end & ~native
 
-        end = self._t + self.lookahead >= self.window_len
-        off = div >= self.div_thresh
-        reset = ~native & (end | off)
-        off_reset = reset & off & ~end
+        divergence_reset = (
+            self.reward.divergence >= self.divergence_distance
+        ) & ~native & ~end_reset
 
-        # CARL auto-resets game endings, but not tracker-specific endings
-        if reset.any():
-            self.env._apply_reset_state(reset)
-            self.env._clear_sim_stats(reset)
-            obs = self.env._observe()
-
-        reset = reset[:, None].expand(-1, self.env.n_cars).reshape(-1)
-        end = end.repeat_interleave(self.env.n_cars)
-        off_reset = off_reset.repeat_interleave(self.env.n_cars)
-
-        term = term | (reset & end)
-        trunc = trunc | (reset & off_reset)
-        rew = rew.reshape(-1)
+        reset = end_reset | divergence_reset
 
         if "final_obs" in info:
             info = dict(info)
-            info["final_obs"] = self._append_lookahead(info["final_obs"])
+            info["final_obs"] = self._pad_goals(info["final_obs"])
 
-        return self._append_lookahead(obs), rew, term, trunc, info
+        if reset.any():
+            info = dict(info)
+            final_obs = info.get("final_obs", obs.clone())
+            final_obs[reset] = obs[reset]
+            info["final_obs"] = final_obs
+            info["_final_obs"] = native | reset
+
+            self.env._apply_reset_state(reset)
+            self.env._clear_sim_stats(reset)
+            reset_obs = self.env._observe()[reset]
+            reset_obs, _ = self.replays.next_goals(reset_obs, reset)
+            obs[reset] = reset_obs
+
+        return obs, reward, term | end_reset, trunc | divergence_reset, info
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO trajectory trackers.")
 
-    parser.add_argument("--replay-dir",          type=Path,  required=True)
-    parser.add_argument("--n-sim",               type=int,   default=256)
-    parser.add_argument("--frameskip",           type=int,   default=8)
-    parser.add_argument("--lookahead",           type=int,   default=16)
-    parser.add_argument("--window-len",          type=int,   default=256)
-    parser.add_argument("--div-thresh",          type=float, default=0.1)
-    parser.add_argument("--ball-range",          type=float, default=1500.0)
-    parser.add_argument("--ball-div-weight",     type=float, default=4.0)
-    parser.add_argument("--rollout",             type=int,   default=128)
-    parser.add_argument("--batch-size",          type=int,   default=16_384)
-    parser.add_argument("--epochs",              type=int,   default=4)
-    parser.add_argument("--lr",                  type=float, default=3e-4)
-    parser.add_argument("--timesteps",           type=int,   default=1_000_000_000)
-    parser.add_argument("--seed",                type=int,   default=0)
-    parser.add_argument("--log-dir",             type=Path,  default=Path("runs"))
-    parser.add_argument("--checkpoint-dir",      type=Path,  default=Path("checkpoints/tracker"))
-    parser.add_argument("--checkpoint-interval", type=int,   default=10_000_000)
-    parser.add_argument("--checkpoint-keep",     type=int,   default=5)
+    parser.add_argument("--replay-dir",            type=str,   required=True)
+    parser.add_argument("--n-sim",                 type=int,   default=256)
+    parser.add_argument("--frameskip",             type=int,   default=8)
+    parser.add_argument("--windows",               type=int,   nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
+    parser.add_argument("--divergence-distance",   type=float, default=5.0)
+    parser.add_argument("--rollout",               type=int,   default=128)
+    parser.add_argument("--batch-size",            type=int,   default=16_384)
+    parser.add_argument("--epochs",                type=int,   default=4)
+    parser.add_argument("--lr",                    type=float, default=3e-4)
+    parser.add_argument("--timesteps",             type=int,   default=1_000_000_000)
+    parser.add_argument("--seed",                  type=int,   default=0)
+    parser.add_argument("--log-dir",               type=Path,  default=Path("runs"))
+    parser.add_argument("--checkpoint-dir",        type=Path,  default=Path("checkpoints/tracker"))
+    parser.add_argument("--checkpoint-interval",   type=int,   default=10_000_000)
+    parser.add_argument("--checkpoint-keep",       type=int,   default=5)
     
     return parser.parse_args()
 
@@ -397,94 +364,87 @@ def main() -> None:
     base_env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=1,
-        n_orange=1,
+        n_orange=0,
         seed=args.seed,
         frameskip=args.frameskip,
         max_ticks=1_000_000,
         normalize=True,
     )
-    replays = ExpertReplays(str(args.replay_dir), device=base_env.device)
+
+    replays = ExpertGoalStates(
+        args.replay_dir,
+        n_env=args.n_sim,
+        windows=args.windows,
+        n_cars=1,
+        device=base_env.device,
+    )
     env = ExpertLookaheadEnv(
         base_env,
         replays,
-        lookahead=args.lookahead,
-        window_len=args.window_len,
-        div_thresh=args.div_thresh,
-        ball_range=args.ball_range,
-        ball_div_weight=args.ball_div_weight,
+        reward_scale=args.tracking_reward_scale,
+        divergence_distance=args.divergence_distance,
     )
 
-    try:
-        policy = MultiCategoricalPolicy(
-            foot=LinearEncoder(512, func=nn.ReLU),
-            body=MLP(dims=[512, 512], func=nn.ReLU),
-            head=MLP(dims=[]),
-            action_codec=env.action_codec,
-        ).build(env).to(env.device)
+    policy = MultiCategoricalPolicy(
+        foot=LinearEncoder(512, func=nn.ReLU),
+        body=MLP(dims=[512, 512], func=nn.ReLU),
+        head=MLP(dims=[]),
+        action_codec=env.action_codec,
+    ).build(env).to(env.device)
 
-        critic = Critic(
-            foot=LinearEncoder(512, func=nn.ReLU),
-            body=MLP(dims=[512, 512], func=nn.ReLU),
-            head=MLP(dims=[]),
-        ).build(env).to(env.device)
+    critic = Critic(
+        foot=LinearEncoder(512, func=nn.ReLU),
+        body=MLP(dims=[512, 512], func=nn.ReLU),
+        head=MLP(dims=[]),
+    ).build(env).to(env.device)
 
-        buffer = RolloutBuffer(
-            horizon=args.rollout,
-            num_envs=env.n_envs,
-            device=env.device,
-            copy_on_finish=False,
-        )
-        runner = SelfPlayRunner(
-            env=env,
-            policy=policy,
-            buffer=buffer,
-            opponent_pool=None,
-            matchmaker=SelfPlayMatchmaker(
-                num_matches=env.n_sim,
-                team_sizes=(1, 1),
-                current_fraction=1.0,
-                historical_ids=(),
-                device=env.device,
-                seed=args.seed,
-            ),
-            captures=(LogProbCapture(), CriticCapture(critic)),
-        )
+    buffer = RolloutBuffer(
+        horizon=args.rollout,
+        num_envs=env.n_envs,
+        device=env.device,
+        copy_on_finish=False,
+    )
+    runner = Runner(
+        env=env,
+        policy=policy,
+        buffer=buffer,
+        captures=(LogProbCapture(), CriticCapture(critic)),
+    )
 
-        update = Update(
-            transforms=(GAE(gamma=0.99, lambda_=0.95),),
-            sampler=RolloutMinibatches(
-                batch_size=args.batch_size,
-                epochs=args.epochs,
-            ),
-            loss=PPOLoss(policy, critic, PPOConfig(clip=0.2, entropy_coef=0.01)),
-            optimizer_step=IndependentOptimizerSteps(
-                OptimizerStep(policy, Adam(policy.parameters(), lr=args.lr)),
-                OptimizerStep(critic, Adam(critic.parameters(), lr=args.lr)),
-            ),
-            section="PPO",
-        )
+    update = Update(
+        transforms=(GAE(gamma=0.99, lambda_=0.95),),
+        sampler=RolloutMinibatches(
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+        ),
+        loss=PPOLoss(policy, critic, PPOConfig(clip=0.2, entropy_coef=0.01)),
+        optimizer_step=IndependentOptimizerSteps(
+            OptimizerStep(policy, Adam(policy.parameters(), lr=args.lr)),
+            OptimizerStep(critic, Adam(critic.parameters(), lr=args.lr)),
+        ),
+        section="PPO",
+    )
 
-        run_id = datetime.now().strftime("tracker-%Y%m%d-%H%M%S")
-        checkpoint = PeriodicCheckpoint(
-            modules={"policy": policy, "critic": critic},
-            directory=args.checkpoint_dir,
-            interval=args.checkpoint_interval,
-            keep=args.checkpoint_keep,
-        )
-        checkpoint.run()
+    run_id = datetime.now().strftime("tracker-%Y%m%d-%H%M%S")
 
-        trainer = Trainer(
-            runner,
-            buffer,
-            Algorithm(update),
-            OnPolicySchedule(),
-            logger=Logger(log_dir=str(args.log_dir / run_id)),
-            checkpoint=checkpoint,
-        )
-        
-        trainer.run(args.timesteps)
-    finally:
-        env.close()
+    checkpoint = PeriodicCheckpoint(
+        modules={"policy": policy, "critic": critic},
+        directory=args.checkpoint_dir,
+        interval=args.checkpoint_interval,
+        keep=args.checkpoint_keep,
+    )
+    checkpoint.run()
+
+    trainer = Trainer(
+        runner,
+        buffer,
+        Algorithm(update),
+        OnPolicySchedule(),
+        logger=Logger(log_dir=str(args.log_dir / run_id)),
+        checkpoint=checkpoint,
+    )
+
+    trainer.run(args.timesteps)
 
 
 if __name__ == "__main__":
