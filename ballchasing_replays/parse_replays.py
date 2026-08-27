@@ -41,10 +41,7 @@ def _safe_load(path: Path) -> ParsedReplay:
         return
 
 
-def _get_active_frames(
-    replay:     ParsedReplay,
-    frame_skip: int
-) -> List[list[ReplayFrame]]:
+def _get_active_frames(replay: ParsedReplay) -> List[list[ReplayFrame]]:
     times = replay.game_df["time"].to_numpy() * 120.0
     periods = replay.analyzer["gameplay_periods"]
     bounds = [
@@ -55,16 +52,13 @@ def _get_active_frames(
         for period in periods
     ]
     segments = [[] for _ in bounds]
-    counts = [0] * len(bounds)
 
     for frame in replay_to_rlgym(replay):
         tick = frame.state.tick_count
 
         for index, (start, end) in enumerate(bounds):
             if start <= tick < end:
-                if counts[index] % frame_skip == 0:
-                    segments[index].append(frame)
-                counts[index] += 1
+                segments[index].append(frame)
                 break
 
     return segments
@@ -175,26 +169,88 @@ def _build_observation(frame: ReplayFrame, ego_id: str) -> np.ndarray:
     ])
 
 
+def _resample_observations(
+    ticks:       np.ndarray,
+    observations: np.ndarray,
+    tick_skip:   int,
+    n_cars:      int,
+) -> np.ndarray:
+    ticks, unique = np.unique(ticks, return_index=True)
+    observations = observations[unique]
+
+    if len(ticks) < 2:
+        return observations.astype(np.float32, copy=False)
+
+    target_ticks = ticks[0] + np.arange(
+        int((ticks[-1] - ticks[0]) // tick_skip) + 1
+    ) * tick_skip
+
+    resampled = np.stack([
+        np.interp(target_ticks, ticks, observations[:, column])
+        for column in range(observations.shape[1])
+    ], axis=-1)
+
+    right = np.searchsorted(ticks, target_ticks).clip(0, len(ticks) - 1)
+    left = (right - 1).clip(0, len(ticks) - 1)
+    nearest = np.where(
+        target_ticks - ticks[left] <= ticks[right] - target_ticks,
+        left,
+        right,
+    )
+
+    discrete = []
+
+    for index in range(n_cars):
+        car_start = 9 + 21 * index
+        discrete.extend(range(car_start + 16, car_start + 21))
+
+        forward = resampled[:, car_start + 9:car_start + 12]
+        forward /= np.linalg.norm(forward, axis=-1, keepdims=True).clip(1e-8)
+        up = resampled[:, car_start + 12:car_start + 15]
+        up -= np.sum(up * forward, axis=-1, keepdims=True) * forward
+        up /= np.linalg.norm(up, axis=-1, keepdims=True).clip(1e-8)
+
+    boost_start = 9 + 21 * n_cars
+    discrete.extend(range(boost_start, boost_start + len(BOOST_PAD_POSITIONS)))
+    resampled[:, discrete] = observations[nearest][:, discrete]
+
+    resampled[:, -2:] = 0
+
+    for source, touch in np.argwhere(observations[:, -2:] > 0.5):
+        target = np.abs(target_ticks - ticks[source]).argmin()
+        resampled[target, -2 + touch] = 1
+
+    return resampled.astype(np.float32, copy=False)
+
+
 def _parse(
     replay:     ParsedReplay,
     name:       str,
     output_dir: Path,
     frame_skip: int
 ) -> None:
-    active_frames = _get_active_frames(replay, frame_skip)
-    
-    if not active_frames or not active_frames[0]:
+    active_frames = _get_active_frames(replay)
+
+    if not active_frames or not any(active_frames):
         return
 
-    for ego_id in list(active_frames[0][0].state.cars.keys()):
+    first = next(frames[0] for frames in active_frames if frames)
+    for ego_id in list(first.state.cars.keys()):
         for i, frames in enumerate(active_frames):
             if not frames:
                 continue
 
-            obs = np.stack([
+            ticks = np.asarray([frame.state.tick_count for frame in frames])
+            observations = np.stack([
                 _build_observation(f, ego_id)
                 for f in frames
             ]).astype(np.float32, copy=False)
+            obs = _resample_observations(
+                ticks,
+                observations,
+                frame_skip,
+                len(first.state.cars),
+            )
 
             np.save(output_dir / f"{ego_id}-{i}-{name}.npy", obs)
 
@@ -223,7 +279,7 @@ def _parse_path(args: tuple[str, str, int]) -> tuple[str, str]:
 def parse(
     replay_dir: str,
     output_dir: str,
-    frame_skip: int = 1,
+    frame_skip: int = 4,
     workers:    int | None = None
 ) -> None:
     replay_dir = Path(replay_dir)

@@ -109,7 +109,7 @@ class ExpertGoalStates:
 
             if i - start > self._min_len + 1:
                 demos.append(
-                    th.from_numpy(observation[start:i])
+                    th.from_numpy(observation[start:i].copy())
                 )
 
             start = i + 1
