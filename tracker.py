@@ -49,7 +49,7 @@ GOAL_STATE_SIZE    = 30
 class ExpertGoalStates:
 
     _n_demos: int
-    _min_len: int
+    _buffer:  int
     _windows: th.Tensor
     _demo_id: th.Tensor
     _replays: th.Tensor
@@ -72,7 +72,8 @@ class ExpertGoalStates:
 
         replays, total = [], 0
 
-        self._min_len = max(windows)
+        self._buffer = max(windows)
+        self._min_len = 45
 
         for path in Path(replay_dir).glob("*.npy"):
             demos = self._filter(np.load(path, mmap_mode="r"))
@@ -108,7 +109,7 @@ class ExpertGoalStates:
             if valid:
                 continue
 
-            if i - start > self._min_len + 1:
+            if i - start >= self._min_len:
                 demos.append(
                     th.from_numpy(observation[start:i].copy())
                 )
@@ -126,7 +127,7 @@ class ExpertGoalStates:
         ends = self._offsets[demo_id + 1]
 
         u = th.rand(n_resets, device=self.device)
-        span = ends - starts - self._min_len - 1
+        span = ends - starts - self._buffer - 1
         self._cursors[mask] = starts + (u * span).long()
         self._times[mask] = 0
 
@@ -166,7 +167,7 @@ class ExpertGoalStates:
             self._cursors[mask] += 1
             cursors = self._cursors[mask]
 
-        end = cursors + self._min_len >= self._offsets[demo_id + 1]
+        end = cursors + self._buffer >= self._offsets[demo_id + 1]
 
         return th.cat((obs, goals), dim=-1), end
 
