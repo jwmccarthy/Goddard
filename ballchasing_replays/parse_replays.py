@@ -1,16 +1,17 @@
 import numpy as np
 
 from pathlib import Path
-from typing import List, Tuple, Set
+from tempfile import TemporaryDirectory
+from typing import List
 from concurrent.futures import ProcessPoolExecutor
 import os
 from rich.progress import Progress
 
+from carl.gymnasium.state import BOOST_PAD_POSITIONS as CARL_BOOST_PAD_POSITIONS
 from rlgym.rocket_league.api import Car, PhysicsObject
 from rlgym_tools.rocket_league.replays.convert import replay_to_rlgym
 from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay
 from rlgym_tools.rocket_league.replays.replay_frame import ReplayFrame
-from rlgym.rocket_league.common_values import BOOST_LOCATIONS
 
 
 NORM_POS = np.array([4108, 6000, 2076])
@@ -28,10 +29,22 @@ NORM_POS_REL = 2 * NORM_POS
 NORM_BALL_VEL_REL = NORM_BALL_VEL + NORM_CAR_VEL
 NORM_CAR_VEL_REL = 2 * NORM_CAR_VEL
 
+MAX_POSITION_RESIDUAL = 0.5
+MIN_IMPULSE_SPEED_CHANGE = 2.0
+SCHEMA_VERSION = 2
+
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
 
-BOOST_PAD_POSITIONS = np.asarray(BOOST_LOCATIONS, dtype=np.float32)
+BOOST_PAD_POSITIONS = np.asarray(CARL_BOOST_PAD_POSITIONS, dtype=np.float32)
+CARL_TO_RLGYM_PAD = np.asarray([
+    15, 18, 29, 30, 3, 4, 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12,
+    13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33,
+])
+INVERTED_PAD = np.asarray([
+    1, 0, 5, 4, 3, 2, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23,
+    22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6,
+])
 
 
 def _safe_load(path: Path) -> ParsedReplay:
@@ -39,6 +52,19 @@ def _safe_load(path: Path) -> ParsedReplay:
         return ParsedReplay.load(path)
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         return
+
+
+def _valid_replay(replay: ParsedReplay) -> bool:
+    players = replay.metadata.get("players", [])
+    delta = replay.game_df["delta"].to_numpy()
+    return (
+        len(players) == 2
+        and len(replay.player_dfs) == 2
+        and sum(bool(player["is_orange"]) for player in players) == 1
+        and np.isfinite(delta).all()
+        and np.isfinite(replay.game_df["time"]).all()
+        and 25 < 1 / delta.mean() < 35
+    )
 
 
 def _get_active_frames(replay: ParsedReplay) -> List[list[ReplayFrame]]:
@@ -123,8 +149,9 @@ def _build_observation(frame: ReplayFrame, ego_id: str) -> np.ndarray:
         for car_id, physics in zip(car_ids, car_physics)
     ]
 
+    pad_indices = CARL_TO_RLGYM_PAD[INVERTED_PAD if invert else np.arange(34)]
     boost_features = [
-        state.boost_pad_timers <= 0,
+        state.boost_pad_timers[pad_indices] <= 0,
         np.linalg.norm(
             BOOST_PAD_POSITIONS - ego_physics.position,
             axis=-1,
@@ -132,21 +159,21 @@ def _build_observation(frame: ReplayFrame, ego_id: str) -> np.ndarray:
     ]
 
     ball_relative_features = [
-        (ego_physics.position - ball.position)               / NORM_POS_REL,
-        (ego_physics.linear_velocity - ball.linear_velocity) / NORM_BALL_VEL_REL,
+        (ball.position - ego_physics.position)               / NORM_POS_REL,
+        (ball.linear_velocity - ego_physics.linear_velocity) / NORM_BALL_VEL_REL,
     ]
 
     car_relative_features = [
         np.concatenate([
-            (ego_physics.position - physics.position)               / NORM_POS_REL,
-            (ego_physics.linear_velocity - physics.linear_velocity) / NORM_CAR_VEL_REL,
+            (physics.position - ego_physics.position)               / NORM_POS_REL,
+            (physics.linear_velocity - ego_physics.linear_velocity) / NORM_CAR_VEL_REL,
         ])
         for physics in car_physics[1:]
     ]
 
     goal_features = [
-        (ball.position - OWN_GOAL) / NORM_POS_REL,
-        (ball.position - OPP_GOAL) / NORM_POS_REL,
+        (OWN_GOAL - ball.position) / NORM_POS_REL,
+        (OPP_GOAL - ball.position) / NORM_POS_REL,
     ]
 
     touch_features = np.asarray([
@@ -170,16 +197,55 @@ def _build_observation(frame: ReplayFrame, ego_id: str) -> np.ndarray:
 
 
 def _resample_observations(
-    ticks:       np.ndarray,
+    ticks:        np.ndarray,
     observations: np.ndarray,
-    tick_skip:   int,
-    n_cars:      int,
+    tick_skip:    int,
+    n_cars:       int,
 ) -> np.ndarray:
     ticks, unique = np.unique(ticks, return_index=True)
-    observations = observations[unique]
+    observations = observations[unique].copy()
 
     if len(ticks) < 2:
         return observations.astype(np.float32, copy=False)
+
+    physics = [(0, NORM_BALL_VEL, None)] + [
+        (9 + 21 * index, NORM_CAR_VEL, NORM_CAR_ANG)
+        for index in range(n_cars)
+    ]
+
+    for start, velocity_scale, angular_scale in physics:
+        position = observations[:, start:start + 3]
+        velocity = observations[:, start + 3:start + 6] * velocity_scale
+        repeated = np.all(np.diff(position, axis=0) == 0, axis=-1)
+        repeated &= np.linalg.norm(velocity[1:], axis=-1) > 1
+        rows = np.flatnonzero(repeated) + 1
+
+        for column in range(start, start + 3):
+            observations[rows, column] = np.nan
+            valid = ~np.isnan(observations[:, column])
+            observations[:, column] = np.interp(
+                ticks,
+                ticks[valid],
+                observations[valid, column],
+            )
+
+        if angular_scale is not None:
+            basis = observations[:, start + 9:start + 15]
+            angular_velocity = (
+                observations[:, start + 6:start + 9] * angular_scale
+            )
+            repeated = np.all(np.diff(basis, axis=0) == 0, axis=-1)
+            repeated &= np.linalg.norm(angular_velocity[1:], axis=-1) > 1e-3
+            rows = np.flatnonzero(repeated) + 1
+
+            for column in range(start + 9, start + 15):
+                observations[rows, column] = np.nan
+                valid = ~np.isnan(observations[:, column])
+                observations[:, column] = np.interp(
+                    ticks,
+                    ticks[valid],
+                    observations[valid, column],
+                )
 
     target_ticks = ticks[0] + np.arange(
         int((ticks[-1] - ticks[0]) // tick_skip) + 1
@@ -223,44 +289,106 @@ def _resample_observations(
     return resampled.astype(np.float32, copy=False)
 
 
+def _mark_discontinuities(
+    observations: np.ndarray,
+    tick_skip:    int,
+) -> np.ndarray:
+    if len(observations) < 2:
+        return np.pad(observations, ((0, 0), (0, 1)))
+
+    touches = (
+        observations[:-1, -2:].any(axis=-1)
+        | observations[1:, -2:].any(axis=-1)
+    )
+    discontinuity = np.zeros(len(observations) - 1, dtype=bool)
+    physics = [(0, NORM_BALL_VEL), (9, NORM_CAR_VEL)]
+
+    for start, velocity_scale in physics:
+        position = observations[:, start:start + 3] * NORM_POS
+        velocity = observations[:, start + 3:start + 6] * velocity_scale
+
+        expected_displacement = (
+            velocity[:-1] + velocity[1:]
+        ) * (tick_skip / 240.0)
+
+        residual = np.linalg.norm(
+            np.diff(position, axis=0) - expected_displacement,
+            axis=-1,
+        ) / 100
+
+        speed_change = np.linalg.norm(
+            np.diff(velocity, axis=0),
+            axis=-1,
+        ) / 100
+
+        discontinuity |= (
+            (residual > MAX_POSITION_RESIDUAL)
+            & (speed_change < MIN_IMPULSE_SPEED_CHANGE)
+            & ~touches
+        )
+
+    return np.concatenate((
+        observations,
+        np.pad(discontinuity[:, None], ((1, 0), (0, 0))),
+    ), axis=-1)
+
+
 def _parse(
     replay:     ParsedReplay,
     name:       str,
     output_dir: Path,
     frame_skip: int
-) -> None:
+) -> int:
     active_frames = _get_active_frames(replay)
 
     if not active_frames or not any(active_frames):
-        return
+        return 0
 
     first = next(frames[0] for frames in active_frames if frames)
+    written = 0
+
     for ego_id in list(first.state.cars.keys()):
         for i, frames in enumerate(active_frames):
             if not frames:
                 continue
 
             ticks = np.asarray([frame.state.tick_count for frame in frames])
+            if not np.isfinite(ticks).all() or np.any(np.diff(ticks) <= 0):
+                continue
+
             observations = np.stack([
                 _build_observation(f, ego_id)
                 for f in frames
             ]).astype(np.float32, copy=False)
-            obs = _resample_observations(
+
+            observations = _resample_observations(
                 ticks,
                 observations,
                 frame_skip,
                 len(first.state.cars),
             )
 
-            np.save(output_dir / f"{ego_id}-{i}-{name}.npy", obs)
+            obs = _mark_discontinuities(
+                observations,
+                frame_skip,
+            )
+            if not np.isfinite(obs).all():
+                continue
 
+            np.save(output_dir / f"{ego_id}-{i}-{name}.npy", obs)
+            written += 1
+
+    return written
 
 def _parse_path(args: tuple[str, str, int]) -> tuple[str, str]:
     replay_path, output_path, frame_skip = args
     path = Path(replay_path)
     output_dir = Path(output_path)
+    complete = output_dir / (
+        f".{path.stem}.v{SCHEMA_VERSION}-fs{frame_skip}.complete"
+    )
 
-    if list(output_dir.glob(f"*{path.stem}.npy")):
+    if complete.exists():
         return path.name, "skipped"
 
     try:
@@ -268,8 +396,20 @@ def _parse_path(args: tuple[str, str, int]) -> tuple[str, str]:
 
         if replay is None:
             return path.name, "failed to load"
+        if not _valid_replay(replay):
+            return path.name, "filtered"
 
-        _parse(replay, path.stem, output_dir, frame_skip)
+        with TemporaryDirectory(dir=output_dir) as temporary:
+            temporary = Path(temporary)
+            written = _parse(replay, path.stem, temporary, frame_skip)
+            if not written:
+                return path.name, "filtered"
+
+            for existing in output_dir.glob(f"*{path.stem}.npy"):
+                existing.unlink()
+            for output in temporary.glob("*.npy"):
+                output.replace(output_dir / output.name)
+            complete.touch()
     except Exception as error:
         return path.name, f"failed ({type(error).__name__}: {error})"
 
@@ -287,6 +427,7 @@ def parse(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths = list(replay_dir.glob("*.replay"))
+    paths.reverse()
     cores = workers or min(6, max(1, (os.cpu_count() or 2) - 4))
     jobs = [(str(path), str(output_dir), frame_skip) for path in paths]
 

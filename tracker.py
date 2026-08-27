@@ -98,8 +98,9 @@ class ExpertGoalStates:
         return self._windows.numel() * GOAL_STATE_SIZE
 
     def _filter(self, demo: np.ndarray) -> List[th.Tensor]:
-        observation = demo[:, :-2].astype(np.float32, copy=False)
-        valid = np.append(~demo[:, -1].astype(bool), False)
+        observation = demo[:, :-3].astype(np.float32, copy=False)
+        invalid = demo[:, -2:].astype(bool).any(axis=-1)
+        valid = np.append(~invalid, False)
 
         demos, start = [], 0
 

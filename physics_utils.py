@@ -9,7 +9,7 @@ def forward_up_to_quat(forward: th.Tensor, up: th.Tensor) -> th.Tensor:
     )
     up = th.linalg.cross(forward, right, dim=-1)
 
-    m = th.stack((right, up, forward), dim=-1)
+    m = th.stack((forward, right, up), dim=-1)
 
     xx, yy, zz = m[..., 0, 0], m[..., 1, 1], m[..., 2, 2]
     xy, yz, zx = m[..., 0, 1], m[..., 1, 2], m[..., 2, 0]
@@ -22,4 +22,5 @@ def forward_up_to_quat(forward: th.Tensor, up: th.Tensor) -> th.Tensor:
         th.copysign((1 - xx - yy + zz).clamp_min(0).sqrt(), yx - xy),
     ), dim=-1)
 
-    return th.nn.functional.normalize(q, dim=-1)
+    q = th.nn.functional.normalize(q, dim=-1)
+    return q[..., (1, 2, 3, 0)]
