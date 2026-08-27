@@ -55,12 +55,16 @@ def _safe_load(path: Path) -> ParsedReplay:
 
 
 def _valid_replay(replay: ParsedReplay) -> bool:
-    players = replay.metadata.get("players", [])
+    players = {
+        str(player["unique_id"]): player
+        for player in replay.metadata.get("players", [])
+    }
+    active = [players.get(str(player_id)) for player_id in replay.player_dfs]
     delta = replay.game_df["delta"].to_numpy()
     return (
-        len(players) == 2
-        and len(replay.player_dfs) == 2
-        and sum(bool(player["is_orange"]) for player in players) == 1
+        len(active) == 2
+        and all(player is not None for player in active)
+        and sum(bool(player["is_orange"]) for player in active) == 1
         and np.isfinite(delta).all()
         and np.isfinite(replay.game_df["time"]).all()
         and 25 < 1 / delta.mean() < 35

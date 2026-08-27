@@ -171,7 +171,7 @@ class ExpertGoalStates:
         return th.cat((obs, goals), dim=-1), end
 
 class TrackingReward:
-    """Scores the normalized ball and ego state against the current replay frame."""
+    """Scores ego state and car-relative ball motion against the replay."""
 
     def __init__(
         self,
@@ -190,12 +190,20 @@ class TrackingReward:
         target_ego = target.cars.ego
 
         position_error = th.stack((
-            (actual.ball.position - target.ball.position) * self.pos_scale,
+            (
+                actual.ball.position - actual_ego.position
+                - target.ball.position + target_ego.position
+            ) * self.pos_scale,
             (actual_ego.position - target_ego.position) * self.pos_scale,
         ), dim=1)
 
         velocity_error = th.stack((
-            (actual.ball.velocity - target.ball.velocity) * (BALL_MAX_SPEED / 100),
+            (
+                actual.ball.velocity * BALL_MAX_SPEED
+                - actual_ego.velocity * CAR_MAX_SPEED
+                - target.ball.velocity * BALL_MAX_SPEED
+                + target_ego.velocity * CAR_MAX_SPEED
+            ) / 100,
             (actual_ego.velocity - target_ego.velocity) * (CAR_MAX_SPEED / 100),
         ), dim=1)
 
@@ -341,7 +349,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--replay-dir",            type=str,   required=True)
     parser.add_argument("--n-sim",                 type=int,   default=256)
-    parser.add_argument("--frameskip",             type=int,   default=8)
+    parser.add_argument("--frameskip",             type=int,   default=4)
     parser.add_argument("--windows",               type=int,   nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
     parser.add_argument("--divergence-distance",   type=float, default=5.0)
