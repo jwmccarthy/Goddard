@@ -182,7 +182,7 @@ class TrackingReward:
         self.replays = replays
         self.scale = scale
         self.pos_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
-        self.divergence: th.Tensor | None = None
+        self.value: th.Tensor | None = None
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         actual = context.current_observation
@@ -232,7 +232,7 @@ class TrackingReward:
             + 0.1 * th.exp(-0.1 * angular_velocity_mse)
         )
 
-        self.divergence = th.linalg.vector_norm(position_error, dim=-1).amax(-1)
+        self.value = reward
 
         return self.scale * reward[:, None]
 
@@ -245,12 +245,12 @@ class ExpertLookaheadEnv:
         env:                 CARLTorchVectorEnv,
         replays:             ExpertGoalStates,
         reward_scale:        float = 1.0,
-        divergence_distance: float = 5.0,
+        minimum_reward:      float = 0.1,
     ) -> None:
         self.env = env
         self.replays = replays
         self.device = env.device
-        self.divergence_distance = divergence_distance
+        self.minimum_reward = minimum_reward
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
 
         size = env.single_observation_space.shape[0]
@@ -314,16 +314,16 @@ class ExpertLookaheadEnv:
         native = term | trunc
         obs, end = self.replays.next_goals(obs)
 
-        if self.reward.divergence is None:
-            raise RuntimeError("tracking reward did not compute divergence")
+        if self.reward.value is None:
+            raise RuntimeError("tracking reward did not compute a value")
 
         end_reset = end & ~native
 
-        divergence_reset = (
-            self.reward.divergence >= self.divergence_distance
+        reward_reset = (
+            self.reward.value < self.minimum_reward
         ) & ~native & ~end_reset
 
-        reset = end_reset | divergence_reset
+        reset = end_reset | reward_reset
 
         if "final_obs" in info:
             info = dict(info)
@@ -342,7 +342,7 @@ class ExpertLookaheadEnv:
             reset_obs, _ = self.replays.next_goals(reset_obs, reset)
             obs[reset] = reset_obs
 
-        return obs, reward, term | end_reset, trunc | divergence_reset, info
+        return obs, reward, term | end_reset, trunc | reward_reset, info
 
 
 def parse_args() -> argparse.Namespace:
@@ -353,7 +353,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frameskip",             type=int,   default=4)
     parser.add_argument("--windows",               type=int,   nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
-    parser.add_argument("--divergence-distance",   type=float, default=5.0)
+    parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--rollout",               type=int,   default=128)
     parser.add_argument("--batch-size",            type=int,   default=16_384)
     parser.add_argument("--epochs",                type=int,   default=4)
@@ -393,7 +393,7 @@ def main() -> None:
         base_env,
         replays,
         reward_scale=args.tracking_reward_scale,
-        divergence_distance=args.divergence_distance,
+        minimum_reward=args.minimum_tracking_reward,
     )
 
     policy = MultiCategoricalPolicy(

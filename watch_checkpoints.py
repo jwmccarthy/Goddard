@@ -166,7 +166,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         base,
         replays,
         reward_scale=args.tracking_reward_scale,
-        divergence_distance=args.divergence_distance,
+        minimum_reward=args.minimum_tracking_reward,
     )
 
     try:
@@ -300,7 +300,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--obs-limit", type=int, default=100_000)
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
-    parser.add_argument("--divergence-distance", type=float, default=5.0)
+    parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fast-forward", type=int, default=1)
     parser.add_argument("--sample-actions", action=argparse.BooleanOptionalAction, default=True)
