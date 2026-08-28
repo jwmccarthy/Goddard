@@ -297,7 +297,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/tracker"))
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--obs-limit", type=int, default=100_000)
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
