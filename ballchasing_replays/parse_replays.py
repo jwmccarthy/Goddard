@@ -1,4 +1,6 @@
 import numpy as np
+import hashlib
+import json
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -341,7 +343,8 @@ def _parse(
     replay:     ParsedReplay,
     name:       str,
     output_dir: Path,
-    frame_skip: int
+    frame_skip: int,
+    pov_players: tuple[str, ...] | None = None,
 ) -> int:
     active_frames = _get_active_frames(replay)
 
@@ -349,9 +352,21 @@ def _parse(
         return 0
 
     first = next(frames[0] for frames in active_frames if frames)
+    ego_ids = list(first.state.cars.keys())
+
+    if pov_players is not None:
+        selected = set(pov_players)
+        cars_by_id = {str(car_id): car_id for car_id in first.state.cars}
+        ego_ids = [
+            cars_by_id[str(player["unique_id"])]
+            for player in replay.metadata.get("players", [])
+            if str(player.get("online_id")) in selected
+            and str(player["unique_id"]) in cars_by_id
+        ]
+
     written = 0
 
-    for ego_id in list(first.state.cars.keys()):
+    for ego_id in ego_ids:
         for i, frames in enumerate(active_frames):
             if not frames:
                 continue
@@ -384,12 +399,18 @@ def _parse(
 
     return written
 
-def _parse_path(args: tuple[str, str, int]) -> tuple[str, str]:
-    replay_path, output_path, frame_skip = args
+def _parse_path(
+    args: tuple[str, str, int, tuple[str, ...] | None]
+) -> tuple[str, str]:
+    replay_path, output_path, frame_skip, pov_players = args
     path = Path(replay_path)
     output_dir = Path(output_path)
+    pov_suffix = ""
+    if pov_players is not None:
+        digest = hashlib.sha256(",".join(pov_players).encode()).hexdigest()[:12]
+        pov_suffix = f"-pov-{digest}"
     complete = output_dir / (
-        f".{path.stem}.v{SCHEMA_VERSION}-fs{frame_skip}.complete"
+        f".{path.stem}.v{SCHEMA_VERSION}-fs{frame_skip}{pov_suffix}.complete"
     )
 
     if complete.exists():
@@ -405,7 +426,13 @@ def _parse_path(args: tuple[str, str, int]) -> tuple[str, str]:
 
         with TemporaryDirectory(dir=output_dir) as temporary:
             temporary = Path(temporary)
-            written = _parse(replay, path.stem, temporary, frame_skip)
+            written = _parse(
+                replay,
+                path.stem,
+                temporary,
+                frame_skip,
+                pov_players,
+            )
             if not written:
                 return path.name, "filtered"
 
@@ -424,16 +451,32 @@ def parse(
     replay_dir: str,
     output_dir: str,
     frame_skip: int = 4,
-    workers:    int | None = None
+    workers:    int | None = None,
+    pov_manifest: str | None = None,
 ) -> None:
     replay_dir = Path(replay_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest_path = Path(pov_manifest) if pov_manifest else replay_dir / "pov_players.json"
+    manifest = (
+        json.loads(manifest_path.read_text())
+        if manifest_path.exists()
+        else {}
+    )
+
     paths = list(replay_dir.glob("*.replay"))
     paths.reverse()
     cores = workers or min(6, max(1, (os.cpu_count() or 2) - 4))
-    jobs = [(str(path), str(output_dir), frame_skip) for path in paths]
+    jobs = [
+        (
+            str(path),
+            str(output_dir),
+            frame_skip,
+            tuple(manifest[path.stem]) if path.stem in manifest else None,
+        )
+        for path in paths
+    ]
 
     with Progress() as progress:
         overall = progress.add_task("Replays", total=len(paths))

@@ -49,7 +49,6 @@ GOAL_STATE_SIZE    = 30
 class ExpertGoalStates:
 
     _n_demos: int
-    _buffer:  int
     _windows: th.Tensor
     _demo_id: th.Tensor
     _replays: th.Tensor
@@ -72,7 +71,6 @@ class ExpertGoalStates:
 
         replays, total = [], 0
 
-        self._buffer = max(windows)
         self._min_len = 30
 
         for path in Path(replay_dir).glob("*.npy"):
@@ -123,12 +121,7 @@ class ExpertGoalStates:
         demo_id = th.randint(self._n_demos, (n_resets,), device=self.device)
         self._demo_id[mask] = demo_id
 
-        starts = self._offsets[demo_id]
-        ends = self._offsets[demo_id + 1]
-
-        u = th.rand(n_resets, device=self.device)
-        span = ends - starts - self._buffer - 1
-        self._cursors[mask] = starts + (u * span).long()
+        self._cursors[mask] = self._offsets[demo_id]
         self._times[mask] = 0
 
         return TensorBatch({
@@ -138,10 +131,14 @@ class ExpertGoalStates:
             )
         })
 
-    def current(self, offset: int = 0) -> CARLObservation:
+    def current(
+        self,
+        offset: int = 0,
+        n_cars: int | None = None,
+    ) -> CARLObservation:
         return CARLObservation.from_tensor(
             self._replays[self._cursors + offset],
-            self.n_cars,
+            self.n_cars if n_cars is None else n_cars,
         )
 
     def next_goals(
@@ -151,7 +148,11 @@ class ExpertGoalStates:
     ) -> tuple[th.Tensor, th.Tensor]:
         cursors = self._cursors if mask is None else self._cursors[mask]
         demo_id = self._demo_id if mask is None else self._demo_id[mask]
-        goal_idx = cursors[:, None] + self._windows
+        ends = self._offsets[demo_id + 1]
+        goal_idx = th.minimum(
+            cursors[:, None] + self._windows,
+            ends[:, None] - 1,
+        )
 
         goals = (
             self._replays[goal_idx, :GOAL_STATE_SIZE]
@@ -167,7 +168,7 @@ class ExpertGoalStates:
             self._cursors[mask] += 1
             cursors = self._cursors[mask]
 
-        end = cursors + self._buffer >= self._offsets[demo_id + 1]
+        end = cursors >= ends
 
         return th.cat((obs, goals), dim=-1), end
 
@@ -196,6 +197,7 @@ class TrackingReward:
             actual.ball.position - actual_ego.position
             - target.ball.position + target_ego.position
         ) * self.position_scale
+
         car_position_error = (
             actual_ego.position - target_ego.position
         ) * self.position_scale
@@ -246,11 +248,11 @@ class ExpertLookaheadEnv:
 
     def __init__(
         self,
-        env:                 CARLTorchVectorEnv,
-        replays:             ExpertGoalStates,
-        reward_scale:        float = 1.0,
-        ball_scale:          float = 1.0,
-        minimum_reward:      float = 0.1,
+        env:            CARLTorchVectorEnv,
+        replays:        ExpertGoalStates,
+        reward_scale:   float = 1.0,
+        ball_scale:     float = 1.0,
+        minimum_reward: float = 0.1,
     ) -> None:
         self.env = env
         self.replays = replays

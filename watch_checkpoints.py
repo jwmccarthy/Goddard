@@ -139,7 +139,7 @@ def publish_frame(
 ) -> None:
     th.cuda.synchronize(base.device)
     raw = th.from_dlpack(base._env.get_state()).clone()[0]
-    expert = CARLObservation.from_tensor(replays.current(-1)[0], 1)
+    expert = CARLObservation.from_tensor(replays.current(-1, n_cars=2)[0], 2)
     viewer.publish(frame_from_state(raw, checkpoint, reward, expert))
 
 

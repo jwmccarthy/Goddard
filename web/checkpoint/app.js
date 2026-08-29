@@ -40,6 +40,7 @@ const car = makeCar(0x168cff);
 const ball = new THREE.Mesh(new THREE.SphereGeometry(91.25, 24, 16), new THREE.MeshStandardMaterial({ color: 0xe9edf2 }));
 scene.add(ball);
 const ghost = makeCar(0x74c6ff, 0.3);
+const opponentGhost = makeCar(0xff7d66, 0.3);
 const ghostBall = new THREE.Mesh(new THREE.SphereGeometry(91.25, 24, 16), new THREE.MeshStandardMaterial({ color: 0xc8ffea, transparent: true, opacity: 0.3 }));
 scene.add(ghostBall);
 
@@ -64,6 +65,7 @@ source.onmessage = ({ data }) => {
   if (frame.error) { status.textContent = frame.error; return; }
   setCar(car, frame.cars[0]);
   setCar(ghost, frame.expert.cars[0]);
+  setCar(opponentGhost, frame.expert.cars[1]);
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   status.textContent = `${frame.checkpoint} | reward ${frame.reward.map((value) => value.toFixed(3)).join(' / ')}`;

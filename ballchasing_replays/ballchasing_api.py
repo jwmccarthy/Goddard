@@ -102,15 +102,21 @@ class BallchasingClient:
         path = output_dir / f"{replay_id}.replay"
         path.write_bytes(response.content)
 
-    def find_replays(self, **params: Any) -> list[str]:
+    def find_replay_entries(self, **params: Any) -> list[dict[str, Any]]:
         page = self._get(f"{API_URL}/replays", **params)
-        replay_ids = [replay["id"] for replay in page.replays]
+        replays = list(page.replays)
 
         while page.next_url:
             page = self._get(page.next_url)
-            replay_ids.extend(replay["id"] for replay in page.replays)
+            replays.extend(page.replays)
 
-        return replay_ids
+        return replays
+
+    def find_replays(self, **params: Any) -> list[str]:
+        return [
+            replay["id"]
+            for replay in self.find_replay_entries(**params)
+        ]
 
     def download_replays(
         self,
