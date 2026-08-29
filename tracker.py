@@ -180,10 +180,12 @@ class TrackingReward:
         replays: ExpertGoalStates,
         scale:      float = 1.0,
         ball_scale: float = 1.0,
+        car_scale:  float = 1.0,
     ) -> None:
         self.replays = replays
         self.scale = scale
         self.ball_scale = ball_scale
+        self.car_scale = car_scale
         self.position_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
         self.value: th.Tensor | None = None
 
@@ -232,7 +234,7 @@ class TrackingReward:
 
         ball_position_score = th.exp(-self.ball_scale * ball_position_mse)
         reward = ball_position_score * (
-            0.5 * th.exp(-50.0 * car_position_mse)
+            0.5 * th.exp(-self.car_scale * car_position_mse)
             + 0.3 * th.exp(-10.0 * rotation_mse)
             + 0.1 * th.exp(-0.1 * velocity_mse)
             + 0.1 * th.exp(-0.1 * angular_velocity_mse)
@@ -252,6 +254,7 @@ class ExpertLookaheadEnv:
         replays:        ExpertGoalStates,
         reward_scale:   float = 1.0,
         ball_scale:     float = 1.0,
+        car_scale:      float = 1.0,
         minimum_reward: float = 0.1,
     ) -> None:
         self.env = env
@@ -277,7 +280,7 @@ class ExpertLookaheadEnv:
         self.single_action_space = env.single_action_space
 
         self.env.reset_state_provider = self._reset_state
-        self.reward = TrackingReward(replays, reward_scale, ball_scale)
+        self.reward = TrackingReward(replays, reward_scale, ball_scale, car_scale)
         self.env.register_reward(self.reward)
 
     def __getattr__(self, name: str) -> Any:
@@ -361,6 +364,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows",                 type=int,   nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--ball-scale",              type=float, default=1.0)
+    parser.add_argument("--car-scale",               type=float, default=1.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
@@ -402,6 +406,7 @@ def main() -> None:
         replays,
         reward_scale=args.tracking_reward_scale,
         ball_scale=args.ball_scale,
+        car_scale=args.car_scale,
         minimum_reward=args.minimum_tracking_reward,
     )
 

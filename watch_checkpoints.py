@@ -167,6 +167,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         replays,
         reward_scale=args.tracking_reward_scale,
         ball_scale=args.ball_scale,
+        car_scale=args.car_scale,
         minimum_reward=args.minimum_tracking_reward,
     )
 
@@ -302,6 +303,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs-limit", type=int, default=100_000)
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
     parser.add_argument("--ball-scale", type=float, default=1.0)
+    parser.add_argument("--car-scale", type=float, default=1.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fast-forward", type=int, default=1)
