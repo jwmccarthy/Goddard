@@ -378,7 +378,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
     parser.add_argument("--epochs",                  type=int,   default=4)
-    parser.add_argument("--lr",                      type=float, default=3e-4)
+    parser.add_argument("--lr",                      type=float, default=1e-4)
+    parser.add_argument("--max-grad-norm",           type=float, default=0.5)
     parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
     parser.add_argument("--seed",                    type=int,   default=0)
     parser.add_argument("--log-dir",                 type=Path,  default=Path("runs"))
@@ -453,8 +454,16 @@ def main() -> None:
         ),
         loss=PPOLoss(policy, critic, PPOConfig(clip=0.2, entropy_coef=0.01)),
         optimizer_step=IndependentOptimizerSteps(
-            OptimizerStep(policy, Adam(policy.parameters(), lr=args.lr)),
-            OptimizerStep(critic, Adam(critic.parameters(), lr=args.lr)),
+            OptimizerStep(
+                policy,
+                Adam(policy.parameters(), lr=args.lr),
+                max_grad_norm=args.max_grad_norm,
+            ),
+            OptimizerStep(
+                critic,
+                Adam(critic.parameters(), lr=args.lr),
+                max_grad_norm=args.max_grad_norm,
+            ),
         ),
         section="PPO",
     )
