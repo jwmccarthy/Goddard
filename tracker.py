@@ -72,6 +72,7 @@ class ExpertGoalStates:
         replays, total = [], 0
 
         self._min_len = 30
+        self._min_touches = 3
 
         for path in Path(replay_dir).glob("*.npy"):
             demos = self._filter(np.load(path, mmap_mode="r"))
@@ -98,6 +99,7 @@ class ExpertGoalStates:
 
     def _filter(self, demo: np.ndarray) -> List[th.Tensor]:
         observation = demo[:, :-3].astype(np.float32, copy=False)
+        ego_touch = demo[:, -3].astype(bool)
         invalid = demo[:, -2:].astype(bool).any(axis=-1)
         valid = np.append(~invalid, False)
 
@@ -107,7 +109,15 @@ class ExpertGoalStates:
             if valid:
                 continue
 
-            if i - start >= self._min_len:
+            touches = ego_touch[start:i]
+            touch_count = (
+                int(touches[0])
+                + np.count_nonzero(touches[1:] & ~touches[:-1])
+                if len(touches)
+                else 0
+            )
+
+            if i - start >= self._min_len and touch_count >= self._min_touches:
                 demos.append(
                     th.from_numpy(observation[start:i].copy())
                 )
@@ -121,7 +131,11 @@ class ExpertGoalStates:
         demo_id = th.randint(self._n_demos, (n_resets,), device=self.device)
         self._demo_id[mask] = demo_id
 
-        self._cursors[mask] = self._offsets[demo_id]
+        starts = self._offsets[demo_id]
+        spans = self._offsets[demo_id + 1] - starts - 1
+        self._cursors[mask] = starts + (
+            th.rand(n_resets, device=self.device) * spans
+        ).long()
         self._times[mask] = 0
 
         return TensorBatch({
