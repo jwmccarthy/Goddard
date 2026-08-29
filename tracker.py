@@ -177,11 +177,13 @@ class TrackingReward:
     def __init__(
         self,
         replays: ExpertGoalStates,
-        scale:   float = 1.0,
+        scale:      float = 1.0,
+        ball_scale: float = 1.0,
     ) -> None:
         self.replays = replays
         self.scale = scale
-        self.pos_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
+        self.ball_scale = ball_scale
+        self.position_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
         self.value: th.Tensor | None = None
 
     def __call__(self, context: RewardContext) -> th.Tensor:
@@ -190,13 +192,13 @@ class TrackingReward:
         actual_ego = actual.cars.ego
         target_ego = target.cars.ego
 
-        position_error = th.stack((
-            (
-                actual.ball.position - actual_ego.position
-                - target.ball.position + target_ego.position
-            ) * self.pos_scale,
-            (actual_ego.position - target_ego.position) * self.pos_scale,
-        ), dim=1)
+        ball_position_error = (
+            actual.ball.position - actual_ego.position
+            - target.ball.position + target_ego.position
+        ) * self.position_scale
+        car_position_error = (
+            actual_ego.position - target_ego.position
+        ) * self.position_scale
 
         velocity_error = th.stack((
             (
@@ -220,13 +222,15 @@ class TrackingReward:
             actual_ego.up - target_ego.up,
         ), dim=-1)
 
-        position_mse = position_error.square().sum(-1).mean(-1)
+        ball_position_mse = ball_position_error.square().sum(-1)
+        car_position_mse = car_position_error.square().sum(-1)
         rotation_mse = rotation_error.square().sum(-1)
         velocity_mse = velocity_error.square().sum(-1).mean(-1)
         angular_velocity_mse = angular_velocity_error.square().sum(-1).mean(-1)
 
-        reward = (
-            0.5 * th.exp(-100.0 * position_mse)
+        ball_position_score = th.exp(-self.ball_scale * ball_position_mse)
+        reward = ball_position_score * (
+            0.5 * th.exp(-50.0 * car_position_mse)
             + 0.3 * th.exp(-10.0 * rotation_mse)
             + 0.1 * th.exp(-0.1 * velocity_mse)
             + 0.1 * th.exp(-0.1 * angular_velocity_mse)
@@ -245,6 +249,7 @@ class ExpertLookaheadEnv:
         env:                 CARLTorchVectorEnv,
         replays:             ExpertGoalStates,
         reward_scale:        float = 1.0,
+        ball_scale:          float = 1.0,
         minimum_reward:      float = 0.1,
     ) -> None:
         self.env = env
@@ -270,7 +275,7 @@ class ExpertLookaheadEnv:
         self.single_action_space = env.single_action_space
 
         self.env.reset_state_provider = self._reset_state
-        self.reward = TrackingReward(replays, reward_scale)
+        self.reward = TrackingReward(replays, reward_scale, ball_scale)
         self.env.register_reward(self.reward)
 
     def __getattr__(self, name: str) -> Any:
@@ -353,6 +358,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frameskip",               type=int,   default=4)
     parser.add_argument("--windows",                 type=int,   nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
+    parser.add_argument("--ball-scale",              type=float, default=1.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
@@ -393,6 +399,7 @@ def main() -> None:
         base_env,
         replays,
         reward_scale=args.tracking_reward_scale,
+        ball_scale=args.ball_scale,
         minimum_reward=args.minimum_tracking_reward,
     )
 
