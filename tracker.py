@@ -110,12 +110,7 @@ class ExpertGoalStates:
                 continue
 
             touches = ego_touch[start:i]
-            touch_count = (
-                int(touches[0])
-                + np.count_nonzero(touches[1:] & ~touches[:-1])
-                if len(touches)
-                else 0
-            )
+            touch_count = np.count_nonzero(touches)
 
             if i - start >= self._min_len and touch_count >= self._min_touches:
                 demos.append(
