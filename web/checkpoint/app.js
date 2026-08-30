@@ -49,6 +49,7 @@ const field = new THREE.Mesh(
 );
 field.position.z = -4;
 field.receiveShadow = true;
+field.renderOrder = -2;
 scene.add(field);
 
 function addLine(points, color = 0xedf5f1, opacity = 0.62) {
@@ -82,9 +83,14 @@ new OBJLoader().load('/arena.obj', (arena) => {
       color: 0x7897a0,
       transparent: true,
       opacity: 0.2,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: 2,
+      polygonOffsetUnits: 2,
       roughness: 0.65,
       side: THREE.DoubleSide,
     });
+    child.renderOrder = -1;
   });
   arena.rotation.z = Math.PI / 2;
   scene.add(arena);
@@ -92,10 +98,15 @@ new OBJLoader().load('/arena.obj', (arena) => {
 
 function makeCar(color, opacity = 1) {
   const group = new THREE.Group();
+  const translucent = opacity < 1;
   const material = new THREE.MeshStandardMaterial({
     color,
-    transparent: opacity < 1,
+    transparent: translucent,
     opacity,
+    depthWrite: !translucent,
+    polygonOffset: translucent,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
     roughness: 0.36,
     metalness: 0.08,
   });
@@ -106,11 +117,20 @@ function makeCar(color, opacity = 1) {
 
   const nose = new THREE.Mesh(
     new THREE.ConeGeometry(17, 38, 3),
-    new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: opacity < 1, opacity }),
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      transparent: translucent,
+      opacity,
+      depthWrite: !translucent,
+      polygonOffset: translucent,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
+    }),
   );
   nose.rotation.z = -Math.PI / 2;
   nose.position.x = 75;
   group.add(nose);
+  group.renderOrder = translucent ? 2 : 1;
   scene.add(group);
   return group;
 }
