@@ -3,45 +3,131 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 const view = document.getElementById('view');
-const status = document.getElementById('status');
+const checkpoint = document.getElementById('checkpoint');
+const reward = document.getElementById('reward');
+const connection = document.getElementById('connection');
+
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(devicePixelRatio);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 view.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x070a10);
-scene.add(new THREE.HemisphereLight(0xbcd9ff, 0x151922, 2));
+scene.background = new THREE.Color(0xdcebef);
+scene.fog = new THREE.Fog(0xdcebef, 11500, 22000);
 
-const camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 10, 30000);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x698986, 2.4));
+const sun = new THREE.DirectionalLight(0xfff7df, 4.2);
+sun.position.set(-3500, -4500, 9000);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -7000;
+sun.shadow.camera.right = 7000;
+sun.shadow.camera.top = 7000;
+sun.shadow.camera.bottom = -7000;
+scene.add(sun);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 10, 30000);
 camera.up.set(0, 0, 1);
-camera.position.set(4300, -5600, 3200);
+camera.position.set(5200, -6900, 4300);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 0, 450);
+controls.target.set(0, 0, 500);
 controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.maxDistance = 18000;
+controls.minDistance = 1200;
+
+const field = new THREE.Mesh(
+  new THREE.PlaneGeometry(8192, 10240),
+  new THREE.MeshStandardMaterial({ color: 0x9fc8b6, roughness: 0.92 }),
+);
+field.position.z = -4;
+field.receiveShadow = true;
+scene.add(field);
+
+function addLine(points, color = 0xf5fbf7, opacity = 0.72) {
+  const geometry = new THREE.BufferGeometry().setFromPoints(
+    points.map(([x, y]) => new THREE.Vector3(x, y, 8)),
+  );
+  const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
+  scene.add(new THREE.Line(geometry, material));
+}
+
+addLine([[-4096, 0], [4096, 0]]);
+addLine([[-4096, -5120], [4096, -5120], [4096, 5120], [-4096, 5120], [-4096, -5120]], 0xffffff, 0.55);
+const centerCircle = [];
+for (let index = 0; index <= 64; index += 1) {
+  const angle = index / 64 * Math.PI * 2;
+  centerCircle.push([Math.cos(angle) * 920, Math.sin(angle) * 920]);
+}
+addLine(centerCircle);
+
+const grid = new THREE.GridHelper(10240, 20, 0x4a8a7d, 0x76aa9c);
+grid.rotation.x = Math.PI / 2;
+grid.position.z = 3;
+grid.material.transparent = true;
+grid.material.opacity = 0.18;
+scene.add(grid);
 
 new OBJLoader().load('/arena.obj', (arena) => {
   arena.traverse((child) => {
     if (!child.isMesh) return;
-    child.material = new THREE.MeshStandardMaterial({ color: 0x263143, transparent: true, opacity: 0.45, side: THREE.DoubleSide });
+    child.material = new THREE.MeshStandardMaterial({
+      color: 0x7897a0,
+      transparent: true,
+      opacity: 0.2,
+      roughness: 0.65,
+      side: THREE.DoubleSide,
+    });
   });
   arena.rotation.z = Math.PI / 2;
   scene.add(arena);
 });
 
 function makeCar(color, opacity = 1) {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(120, 87, 39), new THREE.MeshStandardMaterial({ color, transparent: opacity < 1, opacity }));
-  scene.add(mesh);
-  return mesh;
+  const group = new THREE.Group();
+  const material = new THREE.MeshStandardMaterial({
+    color,
+    transparent: opacity < 1,
+    opacity,
+    roughness: 0.36,
+    metalness: 0.08,
+  });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(120, 87, 39), material);
+  body.castShadow = opacity === 1;
+  body.receiveShadow = true;
+  group.add(body);
+
+  const nose = new THREE.Mesh(
+    new THREE.ConeGeometry(17, 38, 3),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: opacity < 1, opacity }),
+  );
+  nose.rotation.z = -Math.PI / 2;
+  nose.position.x = 75;
+  group.add(nose);
+  scene.add(group);
+  return group;
 }
 
-const car = makeCar(0x168cff);
-const ball = new THREE.Mesh(new THREE.SphereGeometry(91.25, 24, 16), new THREE.MeshStandardMaterial({ color: 0xe9edf2 }));
+const car = makeCar(0x145bd7);
+const ghost = makeCar(0x009b82, 0.68);
+const opponentGhost = makeCar(0xe54f42, 0.68);
+const ball = new THREE.Mesh(
+  new THREE.SphereGeometry(91.25, 28, 20),
+  new THREE.MeshStandardMaterial({ color: 0xf8fbfc, roughness: 0.3, metalness: 0.04 }),
+);
+ball.castShadow = true;
 scene.add(ball);
-const ghost = makeCar(0x74c6ff, 0.3);
-const opponentGhost = makeCar(0xff7d66, 0.3);
-const ghostBall = new THREE.Mesh(new THREE.SphereGeometry(91.25, 24, 16), new THREE.MeshStandardMaterial({ color: 0xc8ffea, transparent: true, opacity: 0.3 }));
+const ghostBall = new THREE.Mesh(
+  new THREE.SphereGeometry(94, 24, 16),
+  new THREE.MeshStandardMaterial({ color: 0x00b992, transparent: true, opacity: 0.42, wireframe: true }),
+);
 scene.add(ghostBall);
 
 const forward = new THREE.Vector3();
@@ -50,7 +136,8 @@ const up = new THREE.Vector3();
 const basis = new THREE.Matrix4();
 
 function setCar(mesh, state) {
-  mesh.visible = !state.demoed;
+  mesh.visible = Boolean(state) && !state.demoed;
+  if (!state) return;
   mesh.position.fromArray(state.pos);
   forward.fromArray(state.fwd);
   right.fromArray(state.rgt);
@@ -60,19 +147,34 @@ function setCar(mesh, state) {
 }
 
 const source = new EventSource('/api/stream');
+source.onopen = () => {
+  connection.textContent = 'Live';
+  connection.classList.add('live');
+};
 source.onmessage = ({ data }) => {
   const frame = JSON.parse(data);
-  if (frame.error) { status.textContent = frame.error; return; }
+  if (frame.error) {
+    connection.textContent = frame.error;
+    connection.classList.remove('live');
+    return;
+  }
   setCar(car, frame.cars[0]);
   setCar(ghost, frame.expert.cars[0]);
   setCar(opponentGhost, frame.expert.cars[1]);
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
-  status.textContent = `${frame.checkpoint} | reward ${frame.reward.map((value) => value.toFixed(3)).join(' / ')}`;
+  checkpoint.textContent = frame.checkpoint;
+  checkpoint.title = frame.checkpoint;
+  reward.textContent = frame.reward.map((value) => value.toFixed(3)).join(' / ');
 };
-source.onerror = () => { status.textContent = 'reconnecting'; };
+source.onerror = () => {
+  connection.textContent = 'Reconnecting';
+  connection.classList.remove('live');
+};
 
-document.getElementById('reset').addEventListener('click', () => fetch('/reset', { method: 'POST' }));
+document.getElementById('reset').addEventListener('click', () => {
+  fetch('/reset', { method: 'POST' });
+});
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
