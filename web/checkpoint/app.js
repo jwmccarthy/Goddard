@@ -12,17 +12,17 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.15;
+renderer.toneMappingExposure = 0.95;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 view.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xdcebef);
-scene.fog = new THREE.Fog(0xdcebef, 11500, 22000);
+scene.background = new THREE.Color(0xbfd1d6);
+scene.fog = new THREE.Fog(0xbfd1d6, 11500, 22000);
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0x698986, 2.4));
-const sun = new THREE.DirectionalLight(0xfff7df, 4.2);
+scene.add(new THREE.HemisphereLight(0xf5fbfc, 0x577773, 1.9));
+const sun = new THREE.DirectionalLight(0xfff4da, 3.2);
 sun.position.set(-3500, -4500, 9000);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
@@ -45,13 +45,13 @@ controls.minDistance = 1200;
 
 const field = new THREE.Mesh(
   new THREE.PlaneGeometry(8192, 10240),
-  new THREE.MeshStandardMaterial({ color: 0x9fc8b6, roughness: 0.92 }),
+  new THREE.MeshStandardMaterial({ color: 0x86ad9d, roughness: 0.92 }),
 );
 field.position.z = -4;
 field.receiveShadow = true;
 scene.add(field);
 
-function addLine(points, color = 0xf5fbf7, opacity = 0.72) {
+function addLine(points, color = 0xedf5f1, opacity = 0.62) {
   const geometry = new THREE.BufferGeometry().setFromPoints(
     points.map(([x, y]) => new THREE.Vector3(x, y, 8)),
   );
