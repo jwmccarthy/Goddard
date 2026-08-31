@@ -47,14 +47,8 @@ class ReplaySelection:
 
 
 ROOTS = (
-    Root("split-1-boston-major-5brncjgft3", "3v3", "Split 1 Boston Major"),
-    Root("split-2-paris-major-otlj36qgqw", "3v3", "Split 2 Paris Major"),
-    Root("2-playoffs-day-1-j9b7jsu3l8", "2v2", "EU Playoffs Day 1", "EU"),
-    Root("3-playoffs-day-2-e0fx30bxur", "2v2", "EU Playoffs Day 2", "EU"),
-    Root("2-playoffs-day-1-kb7fgd9l0o", "2v2", "MENA Playoffs Day 1", "MENA"),
-    Root("3-playoffs-day-2-g57x9qfz42", "2v2", "MENA Playoffs Day 2", "MENA"),
-    Root("2-playoffs-day-1-30tu03rgdn", "2v2", "NA Playoffs Day 1", "NA"),
-    Root("3-playoffs-day-2-ligywgpjcy", "2v2", "NA Playoffs Day 2", "NA"),
+    Root("1v1-events-q0z69hlqmt", "1v1", "RLCS 2026 1v1 Events"),
+    Root("2v2-events-gnz7nvaem1", "2v2", "RLCS 2026 2v2 Events"),
 )
 
 
@@ -120,11 +114,13 @@ def select_replays(
     client: BallchasingClient,
 ) -> tuple[dict[str, ReplaySelection], dict[str, int], dict[str, set[str]]]:
     occurrences: list[ReplaySelection] = []
-    discovered = {"3v3": 0, "2v2": 0}
-    unique_by_mode = {"3v3": set(), "2v2": set()}
+    discovered = {root.mode: 0 for root in ROOTS}
+    unique_by_mode = {root.mode: set() for root in ROOTS}
 
     for root in ROOTS:
         for leaf, path in descendant_leaves(client, root):
+            if not any("playoff" in component.lower() for component in path):
+                continue
             entries = client.find_replay_entries(
                 group=leaf["id"], count=200, sort_by="replay-date", sort_dir="asc"
             )
@@ -225,7 +221,7 @@ def main() -> None:
     for replay_id in new_ids:
         new_by_mode[selected[replay_id].mode] += 1
 
-    for mode in ("3v3", "2v2"):
+    for mode in ("1v1", "2v2"):
         print(
             f"{mode}: discovered={discovered[mode]} "
             f"deduped={len(unique_by_mode[mode])} new={new_by_mode[mode]}"

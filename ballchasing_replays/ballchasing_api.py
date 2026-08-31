@@ -2,11 +2,12 @@ import os
 import time
 import requests
 
-from typing import Any
+from typing import Any, Iterator
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from threading import Lock, local
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +23,7 @@ API_RETRIES = 5
 API_LIST_RATE = 16.0
 API_DOWNLOAD_RATE = 2.0
 DOWNLOAD_WORKERS = 4
+REQUEST_TIMEOUT = 30
 
 
 @dataclass(slots=True)
@@ -51,7 +53,7 @@ class BallchasingClient:
         self._download_sessions = local()
 
     @retry(
-        retry=retry_if_exception_type(requests.ConnectionError),
+        retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
         stop=stop_after_attempt(API_RETRIES),
         reraise=True,
     )
@@ -64,7 +66,11 @@ class BallchasingClient:
         }
 
         for attempt in range(API_RETRIES):
-            response = self.session.get(url, params=params)
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
             if response.status_code != 429:
                 break
             retry_after = response.headers.get("Retry-After")
@@ -96,11 +102,17 @@ class BallchasingClient:
 
         time.sleep(max(0.0, download_at - now))
 
+    @retry(
+        retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
+        stop=stop_after_attempt(API_RETRIES),
+        reraise=True,
+    )
     def _download(self, replay_id: str, output_dir: Path) -> bool:
         for attempt in range(API_RETRIES):
             self._wait_for_download_slot()
             response = self._download_session().get(
-                f"{API_URL}/replays/{replay_id}/file"
+                f"{API_URL}/replays/{replay_id}/file",
+                timeout=REQUEST_TIMEOUT,
             )
             if response.status_code != 429:
                 break
@@ -115,13 +127,24 @@ class BallchasingClient:
         path.write_bytes(response.content)
         return True
 
-    def find_replay_entries(self, **params: Any) -> list[dict[str, Any]]:
+    def iter_replay_pages(self, **params: Any) -> Iterator[list[dict[str, Any]]]:
         page = self._get(f"{API_URL}/replays", **params)
-        replays = list(page.replays)
+        while True:
+            yield page.replays
+            if not page.next_url:
+                break
+            next_params = parse_qs(urlparse(page.next_url).query)
+            missing = {
+                key: value
+                for key, value in params.items()
+                if key.replace("_", "-") not in next_params
+            }
+            page = self._get(page.next_url, **missing)
 
-        while page.next_url:
-            page = self._get(page.next_url)
-            replays.extend(page.replays)
+    def find_replay_entries(self, **params: Any) -> list[dict[str, Any]]:
+        replays = []
+        for page in self.iter_replay_pages(**params):
+            replays.extend(page)
 
         return replays
 

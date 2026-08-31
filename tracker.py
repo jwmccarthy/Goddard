@@ -118,7 +118,7 @@ class ExpertGoalStates:
 
     @staticmethod
     def _infer_n_cars(width: int) -> int:
-        remainder = width - 86
+        remainder = width - 87
         if remainder < 0 or remainder % 27:
             raise ValueError(f"invalid parsed replay width: {width}")
         n_cars = remainder // 27
@@ -159,11 +159,11 @@ class ExpertGoalStates:
     def _filter(self, demo: np.ndarray, n_cars: int | None = None) -> List[th.Tensor]:
         n_cars = n_cars or self._infer_n_cars(demo.shape[1])
         observation = self._pack(
-            demo[:, :-3].astype(np.float32, copy=False),
+            demo[:, :-4].astype(np.float32, copy=False),
             n_cars,
         )
-        ego_touch = demo[:, -3].astype(bool)
-        invalid = demo[:, -2:].astype(bool).any(axis=-1)
+        ego_touch = demo[:, -4].astype(bool)
+        invalid = demo[:, -3:].astype(bool).any(axis=-1)
         valid = np.append(~invalid, False)
 
         demos, start = [], 0

@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import hashlib
 import json
@@ -32,7 +33,7 @@ NORM_CAR_VEL_REL = 2 * NORM_CAR_VEL
 
 MAX_POSITION_RESIDUAL = 0.5
 MIN_IMPULSE_SPEED_CHANGE = 2.0
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -176,6 +177,11 @@ def _build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
             for car_id, car in state.cars.items()
             if car_id != ego_id
         ),
+        ego.bump_victim_id is not None or any(
+            car.bump_victim_id == ego_id
+            for car_id, car in state.cars.items()
+            if car_id != ego_id
+        ),
     ], dtype=np.float32)
 
     return np.concatenate([
@@ -273,11 +279,11 @@ def _resample_observations(
     discrete.extend(range(boost_start, boost_start + len(BOOST_PAD_POSITIONS)))
     resampled[:, discrete] = observations[nearest][:, discrete]
 
-    resampled[:, -2:] = 0
+    resampled[:, -3:] = 0
 
-    for source, touch in np.argwhere(observations[:, -2:] > 0.5):
+    for source, event in np.argwhere(observations[:, -3:] > 0.5):
         target = np.abs(target_ticks - ticks[source]).argmin()
-        resampled[target, -2 + touch] = 1
+        resampled[target, -3 + event] = 1
 
     return resampled.astype(np.float32, copy=False)
 
@@ -290,8 +296,8 @@ def _mark_discontinuities(
         return np.pad(observations, ((0, 0), (0, 1)))
 
     touches = (
-        observations[:-1, -2:].any(axis=-1)
-        | observations[1:, -2:].any(axis=-1)
+        observations[:-1, -3:].any(axis=-1)
+        | observations[1:, -3:].any(axis=-1)
     )
     discontinuity = np.zeros(len(observations) - 1, dtype=bool)
     physics = [(0, NORM_BALL_VEL), (9, NORM_CAR_VEL)]
@@ -458,6 +464,7 @@ def parse(
     frame_skip: int = 4,
     workers:    int | None = None,
     pov_manifest: str | None = None,
+    replay_glob: str = "*.replay",
 ) -> None:
     replay_dir = Path(replay_dir)
     output_dir = Path(output_dir)
@@ -470,7 +477,7 @@ def parse(
         else {}
     )
 
-    paths = list(replay_dir.glob("*.replay"))
+    paths = list(replay_dir.glob(replay_glob))
     paths.reverse()
     cores = workers or 1
     jobs = [
@@ -496,7 +503,19 @@ def parse(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Parse Rocket League replays.")
+    parser.add_argument("--replay-dir", default="./ballchasing_replays/replays/")
+    parser.add_argument("--output-dir", default="./ballchasing_replays/parsed_replays/")
+    parser.add_argument("--frame-skip", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--pov-manifest")
+    parser.add_argument("--replay-glob", default="*.replay")
+    args = parser.parse_args()
     parse(
-        "./ballchasing_replays/replays/",
-        "./ballchasing_replays/parsed_replays/"
+        args.replay_dir,
+        args.output_dir,
+        frame_skip=args.frame_skip,
+        workers=args.workers,
+        pov_manifest=args.pov_manifest,
+        replay_glob=args.replay_glob,
     )
