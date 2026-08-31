@@ -15,12 +15,22 @@ import carl
 import torch as th
 import torch.nn as nn
 
-from carl.gymnasium import CARLObservation, CARLTorchVectorEnv
+from carl.gymnasium import CARLTorchVectorEnv
 from jarl.modules import MLP
-from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
 
-from tracker import ExpertGoalStates, ExpertLookaheadEnv, POSITION_SCALE
+from tracker import (
+    ExpertGoalStates,
+    ExpertLookaheadEnv,
+    GOAL_STATE_SIZE,
+    MAX_OTHER_CARS,
+    OTHER_CAR_SIZE,
+    OTHER_CONTEXT_SIZE,
+    OTHER_ROLE_SIZE,
+    OTHER_TOKEN_SIZE,
+    POSITION_SCALE,
+)
+from tracker_encoder import OtherCarAttentionEncoder
 
 
 ROOT = Path(__file__).parent
@@ -53,7 +63,11 @@ def newest_checkpoint(directory: Path) -> Path:
 def load_policy(path: Path, env: ExpertLookaheadEnv):
     payload = th.load(path, map_location=env.device, weights_only=True)
     policy = MultiCategoricalPolicy(
-        foot=LinearEncoder(512, func=nn.ReLU),
+        foot=OtherCarAttentionEncoder(
+            core_size=env.single_observation_space.shape[0] - OTHER_CONTEXT_SIZE,
+            max_cars=MAX_OTHER_CARS,
+            token_size=OTHER_TOKEN_SIZE,
+        ),
         body=MLP(dims=[512, 512], func=nn.ReLU),
         head=MLP(dims=[]),
         action_codec=env.action_codec,
@@ -62,33 +76,43 @@ def load_policy(path: Path, env: ExpertLookaheadEnv):
     return policy.eval().requires_grad_(False)
 
 
-def frame_from_expert(expert: CARLObservation) -> dict:
-    ball = expert.ball
-    cars = expert.cars
+def frame_from_expert(expert: th.Tensor) -> dict:
+    ball = expert[:9]
+    ego = expert[9:GOAL_STATE_SIZE]
+    tokens = expert[
+        GOAL_STATE_SIZE:
+        GOAL_STATE_SIZE + MAX_OTHER_CARS * OTHER_TOKEN_SIZE
+    ].view(MAX_OTHER_CARS, OTHER_TOKEN_SIZE)
+    valid = expert[-MAX_OTHER_CARS:].bool()
+    cars = th.cat((ego[None], tokens[valid, :OTHER_CAR_SIZE]))
+    teams = th.cat((
+        th.zeros(1, dtype=th.long, device=expert.device),
+        tokens[valid, -OTHER_ROLE_SIZE:].argmax(-1),
+    ))
     scale = th.tensor(POSITION_SCALE, device=expert.device)
     rendered = []
 
-    for index in range(expert.n_cars):
-        forward = cars.forward[index]
-        up = cars.up[index]
+    for car, team in zip(cars, teams):
+        forward = car[9:12]
+        up = car[12:15]
         right = th.linalg.cross(up, forward, dim=-1)
         position = (
-            cars.position[index] * scale
+            car[:3] * scale
             + forward * CAR_OFFSET[0]
             + right * CAR_OFFSET[1]
             + up * CAR_OFFSET[2]
         )
         rendered.append({
-            "team":   index,
+            "team":   int(team),
             "pos":    position.cpu().tolist(),
             "fwd":    forward.cpu().tolist(),
             "rgt":    right.cpu().tolist(),
             "up":     up.cpu().tolist(),
-            "demoed": bool(cars.demoed[index]),
+            "demoed": bool(car[17]),
         })
 
     return {
-        "ball": {"pos": (ball.position * scale).cpu().tolist()},
+        "ball": {"pos": (ball[:3] * scale).cpu().tolist()},
         "cars": rendered,
     }
 
@@ -97,7 +121,7 @@ def frame_from_state(
     state:      th.Tensor,
     checkpoint: Path,
     reward:     th.Tensor,
-    expert:     CARLObservation,
+    expert:     th.Tensor,
 ) -> dict:
     cars = state[9:31].view(1, 22)
     rendered = []
@@ -139,7 +163,7 @@ def publish_frame(
 ) -> None:
     th.cuda.synchronize(base.device)
     raw = th.from_dlpack(base._env.get_state()).clone()[0]
-    expert = CARLObservation.from_tensor(replays.current(-1, n_cars=2)[0], 2)
+    expert = replays.current_tensor(-1)[0]
     viewer.publish(frame_from_state(raw, checkpoint, reward, expert))
 
 
@@ -161,6 +185,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         obs_limit=args.obs_limit,
         n_cars=1,
         device=base.device,
+        balance_modes=args.balance_modes,
     )
     env = ExpertLookaheadEnv(
         base,
@@ -300,10 +325,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    parser.add_argument("--balance-modes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--obs-limit", type=int, default=100_000)
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)
     parser.add_argument("--ball-scale", type=float, default=1.0)
-    parser.add_argument("--car-scale", type=float, default=1.0)
+    parser.add_argument("--car-scale", type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fast-forward", type=int, default=1)

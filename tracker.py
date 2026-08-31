@@ -25,7 +25,6 @@ from jarl.learn import (
 )
 from jarl.log.logger import Logger
 from jarl.modules import MLP
-from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, Trainer
@@ -35,6 +34,7 @@ from jarl.transform import GAE
 
 from physics_utils import forward_up_to_quat
 from tracker_checkpoint import PeriodicCheckpoint
+from tracker_encoder import OtherCarAttentionEncoder
 
 
 POSITION_SCALE     = (4108.0, 6000.0, 2076.0)
@@ -44,6 +44,13 @@ CAR_MAX_SPEED      = 2300.0
 CAR_MAX_ANG_SPEED  = 5.5
 BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
+MAX_OTHER_CARS     = 5
+OTHER_CAR_SIZE     = 21
+OTHER_RELATIVE_SIZE = 6
+OTHER_ROLE_SIZE    = 2
+OTHER_TOKEN_SIZE   = OTHER_CAR_SIZE + OTHER_RELATIVE_SIZE + OTHER_ROLE_SIZE
+OTHER_CONTEXT_SIZE = MAX_OTHER_CARS * OTHER_TOKEN_SIZE + MAX_OTHER_CARS
+PACKED_REPLAY_SIZE = GOAL_STATE_SIZE + OTHER_CONTEXT_SIZE
 
 
 class ExpertGoalStates:
@@ -64,19 +71,25 @@ class ExpertGoalStates:
         obs_limit:  int | None = None,
         n_cars:     int = 2,
         device:     str | th.device = "cuda:0",
+        balance_modes: bool = True,
     ) -> None:
 
         self.n_cars = n_cars
         self.device = device
+        self.balance_modes = balance_modes
 
-        replays, total = [], 0
+        replays, modes, demo_keys, total = [], [], [], 0
 
         self._min_len = 30
-        self._min_touches = 3
+        self._min_touches = 1
 
         for path in Path(replay_dir).glob("*.npy"):
-            demos = self._filter(np.load(path, mmap_mode="r"))
+            source = np.load(path, mmap_mode="r")
+            replay_cars = self._infer_n_cars(source.shape[1])
+            demos = self._filter(source, replay_cars)
             replays.extend(demos)
+            modes.extend([replay_cars // 2] * len(demos))
+            demo_keys.extend(f"{path.stem}:{index}" for index in range(len(demos)))
 
             total += sum((len(d) for d in demos))
 
@@ -86,19 +99,69 @@ class ExpertGoalStates:
         lengths = th.tensor([len(r) for r in replays], device=device)
 
         self._n_demos = len(replays)
+        self.demo_keys = tuple(demo_keys)
         self._demo_id = th.zeros(n_env, device=device).long()
         self._windows = th.tensor(windows).to(device)[None, :]
         self._replays = th.concat(replays).to(device)
+        self._modes = th.tensor(modes, device=device)
+        self._mode_demo_ids = tuple(
+            (self._modes == mode).nonzero(as_tuple=True)[0]
+            for mode in self._modes.unique(sorted=True)
+        )
         self._offsets = th.cat((th.zeros(1, device=device, dtype=th.long), lengths.cumsum(0)))
         self._cursors = th.zeros(n_env, device=device).long()
         self._times   = th.zeros_like(self._cursors)
 
     @property
     def goal_size(self) -> int:
-        return self._windows.numel() * GOAL_STATE_SIZE
+        return self._windows.numel() * GOAL_STATE_SIZE + OTHER_CONTEXT_SIZE
 
-    def _filter(self, demo: np.ndarray) -> List[th.Tensor]:
-        observation = demo[:, :-3].astype(np.float32, copy=False)
+    @staticmethod
+    def _infer_n_cars(width: int) -> int:
+        remainder = width - 86
+        if remainder < 0 or remainder % 27:
+            raise ValueError(f"invalid parsed replay width: {width}")
+        n_cars = remainder // 27
+        if n_cars not in (2, 4, 6):
+            raise ValueError(f"unsupported parsed replay car count: {n_cars}")
+        return n_cars
+
+    @staticmethod
+    def _pack(observation: np.ndarray, n_cars: int) -> np.ndarray:
+        packed = np.zeros((len(observation), PACKED_REPLAY_SIZE), dtype=np.float32)
+        packed[:, :GOAL_STATE_SIZE] = observation[:, :GOAL_STATE_SIZE]
+        tokens = packed[
+            :,
+            GOAL_STATE_SIZE:GOAL_STATE_SIZE + MAX_OTHER_CARS * OTHER_TOKEN_SIZE,
+        ].reshape(len(observation), MAX_OTHER_CARS, OTHER_TOKEN_SIZE)
+        valid = packed[:, -MAX_OTHER_CARS:]
+        relative_start = 83 + 21 * n_cars
+        teammates = n_cars // 2 - 1
+
+        for index in range(1, n_cars):
+            token = tokens[:, index - 1]
+            token[:, :OTHER_CAR_SIZE] = observation[
+                :,
+                9 + OTHER_CAR_SIZE * index:9 + OTHER_CAR_SIZE * (index + 1),
+            ]
+            token[:, OTHER_CAR_SIZE:OTHER_CAR_SIZE + OTHER_RELATIVE_SIZE] = observation[
+                :,
+                relative_start + OTHER_RELATIVE_SIZE * (index - 1):
+                relative_start + OTHER_RELATIVE_SIZE * index,
+            ]
+            token[:, -OTHER_ROLE_SIZE:] = (
+                (1.0, 0.0) if index <= teammates else (0.0, 1.0)
+            )
+            valid[:, index - 1] = 1
+
+        return packed
+
+    def _filter(self, demo: np.ndarray, n_cars: int | None = None) -> List[th.Tensor]:
+        n_cars = n_cars or self._infer_n_cars(demo.shape[1])
+        observation = self._pack(
+            demo[:, :-3].astype(np.float32, copy=False),
+            n_cars,
+        )
         ego_touch = demo[:, -3].astype(bool)
         invalid = demo[:, -2:].astype(bool).any(axis=-1)
         valid = np.append(~invalid, False)
@@ -123,7 +186,20 @@ class ExpertGoalStates:
 
     def reset(self, mask: th.Tensor) -> TensorBatch:
         n_resets = mask.sum().item()
-        demo_id = th.randint(self._n_demos, (n_resets,), device=self.device)
+        if self.balance_modes and len(self._mode_demo_ids) > 1:
+            selected_modes = th.randint(
+                len(self._mode_demo_ids),
+                (n_resets,),
+                device=self.device,
+            )
+            demo_id = th.empty(n_resets, dtype=th.long, device=self.device)
+            for mode, candidates in enumerate(self._mode_demo_ids):
+                selected = selected_modes == mode
+                demo_id[selected] = candidates[
+                    th.randint(len(candidates), (selected.sum().item(),), device=self.device)
+                ]
+        else:
+            demo_id = th.randint(self._n_demos, (n_resets,), device=self.device)
         self._demo_id[mask] = demo_id
 
         starts = self._offsets[demo_id]
@@ -140,15 +216,14 @@ class ExpertGoalStates:
             )
         })
 
-    def current(
-        self,
-        offset: int = 0,
-        n_cars: int | None = None,
-    ) -> CARLObservation:
+    def current(self, offset: int = 0) -> CARLObservation:
         return CARLObservation.from_tensor(
             self._replays[self._cursors + offset],
-            self.n_cars if n_cars is None else n_cars,
+            self.n_cars,
         )
+
+    def current_tensor(self, offset: int = 0) -> th.Tensor:
+        return self._replays[self._cursors + offset]
 
     def next_goals(
         self,
@@ -167,6 +242,7 @@ class ExpertGoalStates:
             self._replays[goal_idx, :GOAL_STATE_SIZE]
             - obs[:, None, :GOAL_STATE_SIZE]
         ).flatten(-2)
+        context = self._replays[cursors, GOAL_STATE_SIZE:]
 
         if mask is None:
             self._times += 1
@@ -179,7 +255,7 @@ class ExpertGoalStates:
 
         end = cursors >= ends
 
-        return th.cat((obs, goals), dim=-1), end
+        return th.cat((obs, goals, context), dim=-1), end
 
 class TrackingReward:
     """Scores ego state and car-relative ball motion against the replay."""
@@ -189,7 +265,7 @@ class TrackingReward:
         replays: ExpertGoalStates,
         scale:      float = 1.0,
         ball_scale: float = 1.0,
-        car_scale:  float = 1.0,
+        car_scale:  float = 2.0,
     ) -> None:
         self.replays = replays
         self.scale = scale
@@ -263,7 +339,7 @@ class ExpertLookaheadEnv:
         replays:        ExpertGoalStates,
         reward_scale:   float = 1.0,
         ball_scale:     float = 1.0,
-        car_scale:      float = 1.0,
+        car_scale:      float = 2.0,
         minimum_reward: float = 0.1,
     ) -> None:
         self.env = env
@@ -371,9 +447,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-sim",                   type=int,   default=256)
     parser.add_argument("--frameskip",               type=int,   default=4)
     parser.add_argument("--windows",                 type=int,   nargs="+", default=[1, 2, 4, 8, 16])
+    parser.add_argument("--balance-modes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--ball-scale",              type=float, default=1.0)
-    parser.add_argument("--car-scale",               type=float, default=1.0)
+    parser.add_argument("--car-scale",               type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
@@ -410,6 +487,7 @@ def main() -> None:
         windows=args.windows,
         n_cars=1,
         device=base_env.device,
+        balance_modes=args.balance_modes,
     )
     env = ExpertLookaheadEnv(
         base_env,
@@ -421,14 +499,22 @@ def main() -> None:
     )
 
     policy = MultiCategoricalPolicy(
-        foot=LinearEncoder(512, func=nn.ReLU),
+        foot=OtherCarAttentionEncoder(
+            core_size=env.single_observation_space.shape[0] - OTHER_CONTEXT_SIZE,
+            max_cars=MAX_OTHER_CARS,
+            token_size=OTHER_TOKEN_SIZE,
+        ),
         body=MLP(dims=[512, 512], func=nn.ReLU),
         head=MLP(dims=[]),
         action_codec=env.action_codec,
     ).build(env).to(env.device)
 
     critic = Critic(
-        foot=LinearEncoder(512, func=nn.ReLU),
+        foot=OtherCarAttentionEncoder(
+            core_size=env.single_observation_space.shape[0] - OTHER_CONTEXT_SIZE,
+            max_cars=MAX_OTHER_CARS,
+            token_size=OTHER_TOKEN_SIZE,
+        ),
         body=MLP(dims=[512, 512], func=nn.ReLU),
         head=MLP(dims=[]),
     ).build(env).to(env.device)

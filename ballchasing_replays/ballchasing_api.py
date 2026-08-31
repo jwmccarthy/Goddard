@@ -63,7 +63,12 @@ class BallchasingClient:
             for key, value in params.items()
         }
 
-        response = self.session.get(url, params=params)
+        for attempt in range(API_RETRIES):
+            response = self.session.get(url, params=params)
+            if response.status_code != 429:
+                break
+            retry_after = response.headers.get("Retry-After")
+            time.sleep(float(retry_after) if retry_after else 2 ** attempt)
         response.raise_for_status()
 
         content = response.json()
@@ -91,16 +96,24 @@ class BallchasingClient:
 
         time.sleep(max(0.0, download_at - now))
 
-    def _download(self, replay_id: str, output_dir: Path) -> None:
-        self._wait_for_download_slot()
+    def _download(self, replay_id: str, output_dir: Path) -> bool:
+        for attempt in range(API_RETRIES):
+            self._wait_for_download_slot()
+            response = self._download_session().get(
+                f"{API_URL}/replays/{replay_id}/file"
+            )
+            if response.status_code != 429:
+                break
+            retry_after = response.headers.get("Retry-After")
+            time.sleep(float(retry_after) if retry_after else 2 ** attempt)
 
-        response = self._download_session().get(
-            f"{API_URL}/replays/{replay_id}/file"
-        )
+        if response.status_code == 404:
+            return False
         response.raise_for_status()
 
         path = output_dir / f"{replay_id}.replay"
         path.write_bytes(response.content)
+        return True
 
     def find_replay_entries(self, **params: Any) -> list[dict[str, Any]]:
         page = self._get(f"{API_URL}/replays", **params)
@@ -134,6 +147,7 @@ class BallchasingClient:
         ]
 
         self._next_download_at = time.monotonic()
+        unavailable = 0
 
         with (
             Progress(
@@ -154,8 +168,12 @@ class BallchasingClient:
             ]
 
             for future in as_completed(futures):
-                future.result()
+                if not future.result():
+                    unavailable += 1
                 progress.advance(task)
+
+        if unavailable:
+            print(f"Unavailable replay files: {unavailable}")
 
 
 if __name__ == "__main__":

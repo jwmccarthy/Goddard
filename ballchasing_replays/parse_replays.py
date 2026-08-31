@@ -6,7 +6,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import List
 from concurrent.futures import ProcessPoolExecutor
-import os
 from rich.progress import Progress
 
 from carl.gymnasium.state import BOOST_PAD_POSITIONS as CARL_BOOST_PAD_POSITIONS
@@ -64,9 +63,9 @@ def _valid_replay(replay: ParsedReplay) -> bool:
     active = [players.get(str(player_id)) for player_id in replay.player_dfs]
     delta = replay.game_df["delta"].to_numpy()
     return (
-        len(active) == 2
+        len(active) in (2, 4, 6)
         and all(player is not None for player in active)
-        and sum(bool(player["is_orange"]) for player in active) == 1
+        and sum(bool(player["is_orange"]) for player in active) == len(active) // 2
         and np.isfinite(delta).all()
         and np.isfinite(replay.game_df["time"]).all()
         and 25 < 1 / delta.mean() < 35
@@ -122,26 +121,14 @@ def _compose_car(car: Car, physics: PhysicsObject) -> np.ndarray:
     ], axis=-1)
 
 
-def _build_observation(frame: ReplayFrame, ego_id: str) -> np.ndarray:
+def _build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
     state = frame.state
     cars = state.cars
+    ego_id = car_ids[0]
     ego = cars[ego_id]
     invert = ego.team_num
 
     ball = state.ball.inverted() if invert else state.ball
-
-    team = [
-        car_id
-        for car_id, car in cars.items()
-        if car.team_num == ego.team_num and car_id != ego_id
-    ]
-    opps = [
-        car_id
-        for car_id, car in cars.items()
-        if car.team_num != ego.team_num
-    ]
-
-    car_ids = [ego_id, *team, *opps]
 
     car_physics = [
         cars[car_id].physics.inverted() if invert else cars[car_id].physics
@@ -367,8 +354,26 @@ def _parse(
     written = 0
 
     for ego_id in ego_ids:
+        ego = first.state.cars[ego_id]
+        teammates = [
+            car_id
+            for car_id, car in first.state.cars.items()
+            if car.team_num == ego.team_num and car_id != ego_id
+        ]
+        opponents = [
+            car_id
+            for car_id, car in first.state.cars.items()
+            if car.team_num != ego.team_num
+        ]
+        car_ids = [ego_id, *teammates, *opponents]
+
         for i, frames in enumerate(active_frames):
             if not frames:
+                continue
+            if any(
+                any(car_id not in frame.state.cars for car_id in car_ids)
+                for frame in frames
+            ):
                 continue
 
             ticks = np.asarray([frame.state.tick_count for frame in frames])
@@ -376,7 +381,7 @@ def _parse(
                 continue
 
             observations = np.stack([
-                _build_observation(f, ego_id)
+                _build_observation(f, car_ids)
                 for f in frames
             ]).astype(np.float32, copy=False)
 
@@ -384,7 +389,7 @@ def _parse(
                 ticks,
                 observations,
                 frame_skip,
-                len(first.state.cars),
+                len(car_ids),
             )
 
             obs = _mark_discontinuities(
@@ -467,7 +472,7 @@ def parse(
 
     paths = list(replay_dir.glob("*.replay"))
     paths.reverse()
-    cores = workers or min(6, max(1, (os.cpu_count() or 2) - 4))
+    cores = workers or 1
     jobs = [
         (
             str(path),
