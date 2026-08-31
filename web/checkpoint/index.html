@@ -44,8 +44,6 @@
     .telemetry {
       border: 1px solid rgba(255, 255, 255, 0.8);
       background: var(--paper);
-      box-shadow: 0 16px 50px rgba(20, 54, 62, 0.15);
-      backdrop-filter: blur(16px) saturate(130%);
     }
 
     .brand {
@@ -127,18 +125,37 @@
       border: 1px solid rgba(10, 55, 66, 0.14);
       border-radius: 12px;
       background: #123f49;
-      box-shadow: 0 10px 28px rgba(18, 63, 73, 0.24);
       color: white;
       font: inherit;
       font-size: 12px;
       font-weight: 700;
       letter-spacing: 0.02em;
       cursor: pointer;
-      transition: transform 120ms ease, background 120ms ease;
+      transition: background 120ms ease;
     }
 
-    button:hover { background: #0b5963; transform: translateY(-1px); }
-    button:active { transform: translateY(1px); }
+    button:hover { background: #0b5963; }
+
+    .speed-control {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px 11px;
+      border: 1px solid rgba(10, 55, 66, 0.14);
+      border-radius: 12px;
+      background: var(--paper);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .speed-control input { width: 120px; }
+    .speed-control output {
+      min-width: 32px;
+      color: var(--ink);
+      font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-align: right;
+    }
 
     #connection {
       padding: 8px 11px;
@@ -150,7 +167,6 @@
       font-weight: 750;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-      backdrop-filter: blur(12px);
     }
 
     #connection.live::before {
@@ -194,6 +210,11 @@
   </header>
   <div class="controls">
     <button id="reset">New trajectory</button>
+    <label class="speed-control">
+      <span>Speed</span>
+      <input id="speed" type="range" min="0.1" max="4" step="0.1" value="1">
+      <output id="speed-value" for="speed">1x</output>
+    </label>
     <div id="connection">Connecting</div>
   </div>
   <script type="importmap">

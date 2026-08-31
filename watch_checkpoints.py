@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import threading
 import time
 import webbrowser
@@ -45,12 +46,21 @@ class ViewerState:
         self.reset = threading.Event()
         self.sequence = 0
         self.frame = None
+        self.speed = 1.0
 
     def publish(self, frame: dict) -> None:
         with self.condition:
             self.sequence += 1
             self.frame = frame
             self.condition.notify_all()
+
+    def set_speed(self, speed: float) -> None:
+        with self.condition:
+            self.speed = speed
+
+    def frame_time(self, frameskip: int) -> float:
+        with self.condition:
+            return frameskip / (120.0 * self.speed)
 
 
 def newest_checkpoint(directory: Path) -> Path:
@@ -201,9 +211,8 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         policy = load_policy(checkpoint, env)
         checkpoint_mtime = checkpoint.stat().st_mtime_ns
         observation = env.reset()
-        frame_time = args.frameskip / (120.0 * args.fast_forward)
         publish_frame(viewer, base, replays, checkpoint, th.zeros(1, device=env.device))
-        viewer.stop.wait(frame_time)
+        viewer.stop.wait(viewer.frame_time(args.frameskip))
         next_step = time.perf_counter()
 
         while not viewer.stop.is_set():
@@ -217,7 +226,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     checkpoint,
                     th.zeros(1, device=env.device),
                 )
-                viewer.stop.wait(frame_time)
+                viewer.stop.wait(viewer.frame_time(args.frameskip))
                 next_step = time.perf_counter()
                 continue
 
@@ -237,7 +246,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
 
             publish_frame(viewer, base, replays, checkpoint, reward)
 
-            next_step += frame_time
+            next_step += viewer.frame_time(args.frameskip)
             delay = next_step - time.perf_counter()
             if delay > 0:
                 viewer.stop.wait(delay)
@@ -254,10 +263,26 @@ def make_handler(viewer: ViewerState, frontend: Path, arena: Path):
     class Handler(BaseHTTPRequestHandler):
 
         def do_POST(self) -> None:
-            if self.path != "/reset":
+            if self.path == "/reset":
+                viewer.reset.set()
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+
+            if self.path != "/speed":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            viewer.reset.set()
+
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                speed = float(json.loads(self.rfile.read(length))["speed"])
+                if not math.isfinite(speed) or not 0 < speed <= 8:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                self.send_error(HTTPStatus.BAD_REQUEST, "invalid playback speed")
+                return
+
+            viewer.set_speed(speed)
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
 
@@ -332,7 +357,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--car-scale", type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--fast-forward", type=int, default=1)
     parser.add_argument("--sample-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)

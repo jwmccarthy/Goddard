@@ -6,6 +6,9 @@ const view = document.getElementById('view');
 const checkpoint = document.getElementById('checkpoint');
 const reward = document.getElementById('reward');
 const connection = document.getElementById('connection');
+const speed = document.getElementById('speed');
+const speedValue = document.getElementById('speed-value');
+let speedUpdate;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
@@ -201,6 +204,17 @@ source.onerror = () => {
 
 document.getElementById('reset').addEventListener('click', () => {
   fetch('/reset', { method: 'POST' });
+});
+speed.addEventListener('input', () => {
+  speedValue.value = `${Number(speed.value).toFixed(1).replace('.0', '')}x`;
+  clearTimeout(speedUpdate);
+  speedUpdate = setTimeout(() => {
+    fetch('/speed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ speed: Number(speed.value) }),
+    });
+  }, 50);
 });
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
