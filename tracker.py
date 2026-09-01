@@ -1,8 +1,9 @@
 import argparse
 
+from collections.abc import Sequence
 from pathlib import Path
 from datetime import datetime
-from typing import Any, List
+from typing import Any
 
 import numpy as np
 import torch as th
@@ -48,30 +49,33 @@ GOAL_STATE_SIZE    = 30
 
 class ExpertGoalStates:
 
-    _n_demos: int
-    _windows: th.Tensor
-    _demo_id: th.Tensor
-    _replays: th.Tensor
-    _offsets: th.Tensor
-    _cursors: th.Tensor
-    _times:   th.Tensor
+    _n_demos:      int
+    _windows:      th.Tensor
+    _demo_id:      th.Tensor
+    _replays:      th.Tensor
+    _offsets:      th.Tensor
+    _cursors:      th.Tensor
+    _modes:        th.Tensor
+    _mode_demo_ids: tuple[th.Tensor, ...]
 
     def __init__(
         self,
         replay_dir: str,
         n_env:      int,
-        windows:    List[int] = [1, 2, 4, 8],
+        windows:    Sequence[int] = (1, 2, 4, 8),
         obs_limit:  int | None = None,
         n_cars:     int = 2,
         device:     str | th.device = "cuda:0",
-        balance_modes: bool = True,
+        balance:    bool = True,
     ) -> None:
 
         self.n_cars = n_cars
         self.device = device
-        self.balance_modes = balance_modes
+        self.balance = balance
 
-        replays, modes, demo_keys, total = [], [], [], 0
+        replays: list[th.Tensor] = []
+        modes:   list[int] = []
+        total = 0
 
         self._min_len = 30
         self._min_touches = 1
@@ -79,12 +83,11 @@ class ExpertGoalStates:
         for path in Path(replay_dir).glob("*.npy"):
             source = np.load(path, mmap_mode="r")
             replay_cars = self._infer_n_cars(source.shape[1])
-            demos = self._filter(source, replay_cars)
+            demos = self._filter(source)
+
             replays.extend(demos)
             modes.extend([replay_cars // 2] * len(demos))
-            demo_keys.extend(f"{path.stem}:{index}" for index in range(len(demos)))
-
-            total += sum((len(d) for d in demos))
+            total += sum(len(demo) for demo in demos)
 
             if obs_limit is not None and total >= obs_limit:
                 break
@@ -92,7 +95,6 @@ class ExpertGoalStates:
         lengths = th.tensor([len(r) for r in replays], device=device)
 
         self._n_demos = len(replays)
-        self.demo_keys = tuple(demo_keys)
         self._demo_id = th.zeros(n_env, device=device).long()
         self._windows = th.tensor(windows).to(device)[None, :]
         self._replays = th.concat(replays).to(device)
@@ -101,9 +103,11 @@ class ExpertGoalStates:
             (self._modes == mode).nonzero(as_tuple=True)[0]
             for mode in self._modes.unique(sorted=True)
         )
-        self._offsets = th.cat((th.zeros(1, device=device, dtype=th.long), lengths.cumsum(0)))
+        self._offsets = th.cat((
+            th.zeros(1, device=device, dtype=th.long),
+            lengths.cumsum(0),
+        ))
         self._cursors = th.zeros(n_env, device=device).long()
-        self._times   = th.zeros_like(self._cursors)
 
     @property
     def goal_size(self) -> int:
@@ -119,47 +123,47 @@ class ExpertGoalStates:
             raise ValueError(f"unsupported parsed replay car count: {n_cars}")
         return n_cars
 
-    def _filter(self, demo: np.ndarray, n_cars: int | None = None) -> List[th.Tensor]:
-        n_cars = n_cars or self._infer_n_cars(demo.shape[1])
+    def _filter(self, demo: np.ndarray) -> list[th.Tensor]:
         observation = demo[:, :GOAL_STATE_SIZE].astype(np.float32, copy=False)
         ego_touch = demo[:, -4].astype(bool)
         invalid = demo[:, -3:].astype(bool).any(axis=-1)
-        valid = np.append(~invalid, False)
 
-        demos, start = [], 0
+        demos: list[th.Tensor] = []
+        start = 0
 
-        for i, valid in enumerate(valid):
-            if valid:
-                continue
+        for end in np.append(np.flatnonzero(invalid), len(demo)):
+            length = end - start
+            touch_count = np.count_nonzero(ego_touch[start:end])
 
-            touches = ego_touch[start:i]
-            touch_count = np.count_nonzero(touches)
+            if length >= self._min_len and touch_count >= self._min_touches:
+                demos.append(th.from_numpy(observation[start:end].copy()))
 
-            if i - start >= self._min_len and touch_count >= self._min_touches:
-                demos.append(
-                    th.from_numpy(observation[start:i].copy())
-                )
-
-            start = i + 1
+            start = end + 1
 
         return demos
 
+    def _sample_demo_ids(self, count: int) -> th.Tensor:
+        if not self.balance or len(self._mode_demo_ids) == 1:
+            return th.randint(self._n_demos, (count,), device=self.device)
+
+        selected_modes = th.randint(
+            len(self._mode_demo_ids),
+            (count,),
+            device=self.device,
+        )
+        demo_ids = th.empty(count, dtype=th.long, device=self.device)
+
+        for mode, candidates in enumerate(self._mode_demo_ids):
+            selected = selected_modes == mode
+            demo_ids[selected] = candidates[
+                th.randint(len(candidates), (selected.sum().item(),), device=self.device)
+            ]
+
+        return demo_ids
+
     def reset(self, mask: th.Tensor) -> TensorBatch:
         n_resets = mask.sum().item()
-        if self.balance_modes and len(self._mode_demo_ids) > 1:
-            selected_modes = th.randint(
-                len(self._mode_demo_ids),
-                (n_resets,),
-                device=self.device,
-            )
-            demo_id = th.empty(n_resets, dtype=th.long, device=self.device)
-            for mode, candidates in enumerate(self._mode_demo_ids):
-                selected = selected_modes == mode
-                demo_id[selected] = candidates[
-                    th.randint(len(candidates), (selected.sum().item(),), device=self.device)
-                ]
-        else:
-            demo_id = th.randint(self._n_demos, (n_resets,), device=self.device)
+        demo_id = self._sample_demo_ids(n_resets)
         self._demo_id[mask] = demo_id
 
         starts = self._offsets[demo_id]
@@ -167,7 +171,6 @@ class ExpertGoalStates:
         self._cursors[mask] = starts + (
             th.rand(n_resets, device=self.device) * spans
         ).long()
-        self._times[mask] = 0
 
         return TensorBatch({
             "observation": CARLObservation.from_tensor(
@@ -203,17 +206,16 @@ class ExpertGoalStates:
             - obs[:, None, :GOAL_STATE_SIZE]
         ).flatten(-2)
         if mask is None:
-            self._times += 1
             self._cursors += 1
             cursors = self._cursors
         else:
-            self._times[mask] += 1
             self._cursors[mask] += 1
             cursors = self._cursors[mask]
 
         end = cursors >= ends
 
         return th.cat((obs, goals), dim=-1), end
+
 
 class TrackingReward:
     """Scores ego state and car-relative ball motion against the replay."""
@@ -276,11 +278,17 @@ class TrackingReward:
         angular_velocity_mse = angular_velocity_error.square().sum(-1).mean(-1)
 
         ball_position_score = th.exp(-self.ball_scale * ball_position_mse)
-        reward = ball_position_score * (
-            0.5 * th.exp(-self.car_scale * car_position_mse)
-            + 0.3 * th.exp(-10.0 * rotation_mse)
-            + 0.1 * th.exp(-0.1 * velocity_mse)
-            + 0.1 * th.exp(-0.1 * angular_velocity_mse)
+        car_position_score = th.exp(-self.car_scale * car_position_mse)
+        rotation_score = th.exp(-10.0 * rotation_mse)
+        velocity_score = th.exp(-0.1 * velocity_mse)
+        angular_velocity_score = th.exp(-0.1 * angular_velocity_mse)
+
+        reward = (
+            0.50 * ball_position_score
+            + 0.25 * car_position_score
+            + 0.15 * rotation_score
+            + 0.05 * velocity_score
+            + 0.05 * angular_velocity_score
         )
 
         self.value = reward
@@ -372,11 +380,11 @@ class ExpertLookaheadEnv:
 
         end_reset = end & ~native
 
-        reward_reset = (
+        failure_reset = (
             self.reward.value < self.minimum_reward
         ) & ~native & ~end_reset
 
-        reset = end_reset | reward_reset
+        reset = end_reset | failure_reset
 
         if "final_obs" in info:
             info = dict(info)
@@ -395,7 +403,7 @@ class ExpertLookaheadEnv:
             reset_obs, _ = self.replays.next_goals(reset_obs, reset)
             obs[reset] = reset_obs
 
-        return obs, reward, term | end_reset, trunc | reward_reset, info
+        return obs, reward, term | reset, trunc, info
 
 
 def parse_args() -> argparse.Namespace:
@@ -405,7 +413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-sim",                   type=int,   default=256)
     parser.add_argument("--frameskip",               type=int,   default=4)
     parser.add_argument("--windows",                 type=int,   nargs="+", default=[1, 2, 4, 8, 16])
-    parser.add_argument("--balance-modes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--ball-scale",              type=float, default=1.0)
     parser.add_argument("--car-scale",               type=float, default=2.0)
@@ -445,7 +453,7 @@ def main() -> None:
         windows=args.windows,
         n_cars=1,
         device=base_env.device,
-        balance_modes=args.balance_modes,
+        balance=args.balance,
     )
     env = ExpertLookaheadEnv(
         base_env,
@@ -488,7 +496,15 @@ def main() -> None:
             batch_size=args.batch_size,
             epochs=args.epochs,
         ),
-        loss=PPOLoss(policy, critic, PPOConfig(clip=0.1, entropy_coef=0.001)),
+        loss=PPOLoss(
+            policy,
+            critic,
+            PPOConfig(
+                clip=0.1,
+                value_clip=None,
+                entropy_coef=0.001,
+            ),
+        ),
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(
                 policy,
