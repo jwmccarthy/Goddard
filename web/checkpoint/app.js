@@ -141,7 +141,6 @@ function makeCar(color, opacity = 1) {
 
 const car = makeCar(0x145bd7);
 const ghost = makeCar(0x009b82, 0.68);
-const otherGhosts = Array.from({ length: 5 }, () => makeCar(0xe54f42, 0.68));
 const ball = new THREE.Mesh(
   new THREE.SphereGeometry(91.25, 28, 20),
   new THREE.MeshStandardMaterial({ color: 0xf8fbfc, roughness: 0.3, metalness: 0.04 }),
@@ -184,13 +183,6 @@ source.onmessage = ({ data }) => {
   }
   setCar(car, frame.cars[0]);
   setCar(ghost, frame.expert.cars[0]);
-  otherGhosts.forEach((otherGhost, index) => {
-    const state = frame.expert.cars[index + 1];
-    setCar(otherGhost, state);
-    if (state) {
-      otherGhost.userData.bodyMaterial.color.setHex(state.team ? 0xe54f42 : 0x009b82);
-    }
-  });
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;

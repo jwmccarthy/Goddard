@@ -18,20 +18,15 @@ import torch.nn as nn
 
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.modules import MLP
+from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
 
 from tracker import (
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
-    MAX_OTHER_CARS,
-    OTHER_CAR_SIZE,
-    OTHER_CONTEXT_SIZE,
-    OTHER_ROLE_SIZE,
-    OTHER_TOKEN_SIZE,
     POSITION_SCALE,
 )
-from tracker_encoder import OtherCarAttentionEncoder
 
 
 ROOT = Path(__file__).parent
@@ -73,11 +68,7 @@ def newest_checkpoint(directory: Path) -> Path:
 def load_policy(path: Path, env: ExpertLookaheadEnv):
     payload = th.load(path, map_location=env.device, weights_only=True)
     policy = MultiCategoricalPolicy(
-        foot=OtherCarAttentionEncoder(
-            core_size=env.single_observation_space.shape[0] - OTHER_CONTEXT_SIZE,
-            max_cars=MAX_OTHER_CARS,
-            token_size=OTHER_TOKEN_SIZE,
-        ),
+        foot=LinearEncoder(512, func=nn.ReLU),
         body=MLP(dims=[512, 512], func=nn.ReLU),
         head=MLP(dims=[]),
         action_codec=env.action_codec,
@@ -89,41 +80,27 @@ def load_policy(path: Path, env: ExpertLookaheadEnv):
 def frame_from_expert(expert: th.Tensor) -> dict:
     ball = expert[:9]
     ego = expert[9:GOAL_STATE_SIZE]
-    tokens = expert[
-        GOAL_STATE_SIZE:
-        GOAL_STATE_SIZE + MAX_OTHER_CARS * OTHER_TOKEN_SIZE
-    ].view(MAX_OTHER_CARS, OTHER_TOKEN_SIZE)
-    valid = expert[-MAX_OTHER_CARS:].bool()
-    cars = th.cat((ego[None], tokens[valid, :OTHER_CAR_SIZE]))
-    teams = th.cat((
-        th.zeros(1, dtype=th.long, device=expert.device),
-        tokens[valid, -OTHER_ROLE_SIZE:].argmax(-1),
-    ))
     scale = th.tensor(POSITION_SCALE, device=expert.device)
-    rendered = []
+    forward = ego[9:12]
+    up = ego[12:15]
+    right = th.linalg.cross(up, forward, dim=-1)
+    position = (
+        ego[:3] * scale
+        + forward * CAR_OFFSET[0]
+        + right * CAR_OFFSET[1]
+        + up * CAR_OFFSET[2]
+    )
 
-    for car, team in zip(cars, teams):
-        forward = car[9:12]
-        up = car[12:15]
-        right = th.linalg.cross(up, forward, dim=-1)
-        position = (
-            car[:3] * scale
-            + forward * CAR_OFFSET[0]
-            + right * CAR_OFFSET[1]
-            + up * CAR_OFFSET[2]
-        )
-        rendered.append({
-            "team":   int(team),
+    return {
+        "ball": {"pos": (ball[:3] * scale).cpu().tolist()},
+        "cars": [{
+            "team":   0,
             "pos":    position.cpu().tolist(),
             "fwd":    forward.cpu().tolist(),
             "rgt":    right.cpu().tolist(),
             "up":     up.cpu().tolist(),
-            "demoed": bool(car[17]),
-        })
-
-    return {
-        "ball": {"pos": (ball[:3] * scale).cpu().tolist()},
-        "cars": rendered,
+            "demoed": bool(ego[17]),
+        }],
     }
 
 

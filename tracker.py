@@ -25,6 +25,7 @@ from jarl.learn import (
 )
 from jarl.log.logger import Logger
 from jarl.modules import MLP
+from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, Trainer
@@ -34,7 +35,6 @@ from jarl.transform import GAE
 
 from physics_utils import forward_up_to_quat
 from tracker_checkpoint import PeriodicCheckpoint
-from tracker_encoder import OtherCarAttentionEncoder
 
 
 POSITION_SCALE     = (4108.0, 6000.0, 2076.0)
@@ -44,13 +44,6 @@ CAR_MAX_SPEED      = 2300.0
 CAR_MAX_ANG_SPEED  = 5.5
 BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
-MAX_OTHER_CARS     = 5
-OTHER_CAR_SIZE     = 21
-OTHER_RELATIVE_SIZE = 6
-OTHER_ROLE_SIZE    = 2
-OTHER_TOKEN_SIZE   = OTHER_CAR_SIZE + OTHER_RELATIVE_SIZE + OTHER_ROLE_SIZE
-OTHER_CONTEXT_SIZE = MAX_OTHER_CARS * OTHER_TOKEN_SIZE + MAX_OTHER_CARS
-PACKED_REPLAY_SIZE = GOAL_STATE_SIZE + OTHER_CONTEXT_SIZE
 
 
 class ExpertGoalStates:
@@ -114,7 +107,7 @@ class ExpertGoalStates:
 
     @property
     def goal_size(self) -> int:
-        return self._windows.numel() * GOAL_STATE_SIZE + OTHER_CONTEXT_SIZE
+        return self._windows.numel() * GOAL_STATE_SIZE
 
     @staticmethod
     def _infer_n_cars(width: int) -> int:
@@ -126,42 +119,9 @@ class ExpertGoalStates:
             raise ValueError(f"unsupported parsed replay car count: {n_cars}")
         return n_cars
 
-    @staticmethod
-    def _pack(observation: np.ndarray, n_cars: int) -> np.ndarray:
-        packed = np.zeros((len(observation), PACKED_REPLAY_SIZE), dtype=np.float32)
-        packed[:, :GOAL_STATE_SIZE] = observation[:, :GOAL_STATE_SIZE]
-        tokens = packed[
-            :,
-            GOAL_STATE_SIZE:GOAL_STATE_SIZE + MAX_OTHER_CARS * OTHER_TOKEN_SIZE,
-        ].reshape(len(observation), MAX_OTHER_CARS, OTHER_TOKEN_SIZE)
-        valid = packed[:, -MAX_OTHER_CARS:]
-        relative_start = 83 + 21 * n_cars
-        teammates = n_cars // 2 - 1
-
-        for index in range(1, n_cars):
-            token = tokens[:, index - 1]
-            token[:, :OTHER_CAR_SIZE] = observation[
-                :,
-                9 + OTHER_CAR_SIZE * index:9 + OTHER_CAR_SIZE * (index + 1),
-            ]
-            token[:, OTHER_CAR_SIZE:OTHER_CAR_SIZE + OTHER_RELATIVE_SIZE] = observation[
-                :,
-                relative_start + OTHER_RELATIVE_SIZE * (index - 1):
-                relative_start + OTHER_RELATIVE_SIZE * index,
-            ]
-            token[:, -OTHER_ROLE_SIZE:] = (
-                (1.0, 0.0) if index <= teammates else (0.0, 1.0)
-            )
-            valid[:, index - 1] = 1
-
-        return packed
-
     def _filter(self, demo: np.ndarray, n_cars: int | None = None) -> List[th.Tensor]:
         n_cars = n_cars or self._infer_n_cars(demo.shape[1])
-        observation = self._pack(
-            demo[:, :-4].astype(np.float32, copy=False),
-            n_cars,
-        )
+        observation = demo[:, :GOAL_STATE_SIZE].astype(np.float32, copy=False)
         ego_touch = demo[:, -4].astype(bool)
         invalid = demo[:, -3:].astype(bool).any(axis=-1)
         valid = np.append(~invalid, False)
@@ -242,8 +202,6 @@ class ExpertGoalStates:
             self._replays[goal_idx, :GOAL_STATE_SIZE]
             - obs[:, None, :GOAL_STATE_SIZE]
         ).flatten(-2)
-        context = self._replays[cursors, GOAL_STATE_SIZE:]
-
         if mask is None:
             self._times += 1
             self._cursors += 1
@@ -255,7 +213,7 @@ class ExpertGoalStates:
 
         end = cursors >= ends
 
-        return th.cat((obs, goals, context), dim=-1), end
+        return th.cat((obs, goals), dim=-1), end
 
 class TrackingReward:
     """Scores ego state and car-relative ball motion against the replay."""
@@ -499,22 +457,14 @@ def main() -> None:
     )
 
     policy = MultiCategoricalPolicy(
-        foot=OtherCarAttentionEncoder(
-            core_size=env.single_observation_space.shape[0] - OTHER_CONTEXT_SIZE,
-            max_cars=MAX_OTHER_CARS,
-            token_size=OTHER_TOKEN_SIZE,
-        ),
+        foot=LinearEncoder(512, func=nn.ReLU),
         body=MLP(dims=[512, 512], func=nn.ReLU),
         head=MLP(dims=[]),
         action_codec=env.action_codec,
     ).build(env).to(env.device)
 
     critic = Critic(
-        foot=OtherCarAttentionEncoder(
-            core_size=env.single_observation_space.shape[0] - OTHER_CONTEXT_SIZE,
-            max_cars=MAX_OTHER_CARS,
-            token_size=OTHER_TOKEN_SIZE,
-        ),
+        foot=LinearEncoder(512, func=nn.ReLU),
         body=MLP(dims=[512, 512], func=nn.ReLU),
         head=MLP(dims=[]),
     ).build(env).to(env.device)
