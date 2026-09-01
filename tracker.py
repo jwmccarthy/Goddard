@@ -284,9 +284,9 @@ class TrackingReward:
         angular_velocity_score = th.exp(-0.1 * angular_velocity_mse)
 
         reward = ball_position_score * (
-            0.50 * car_position_score
-            + 0.30 * rotation_score
-            + 0.10 * velocity_score
+            0.60 * car_position_score
+            + 0.10 * rotation_score
+            + 0.20 * velocity_score
             + 0.10 * angular_velocity_score
         )
 
