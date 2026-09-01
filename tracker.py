@@ -412,8 +412,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
-    parser.add_argument("--epochs",                  type=int,   default=4)
-    parser.add_argument("--lr",                      type=float, default=1e-4)
+    parser.add_argument("--epochs",                  type=int,   default=2)
+    parser.add_argument("--lr",                      type=float, default=3e-5)
     parser.add_argument("--max-grad-norm",           type=float, default=0.5)
     parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
     parser.add_argument("--seed",                    type=int,   default=0)
@@ -488,7 +488,7 @@ def main() -> None:
             batch_size=args.batch_size,
             epochs=args.epochs,
         ),
-        loss=PPOLoss(policy, critic, PPOConfig(clip=0.2, entropy_coef=0.01)),
+        loss=PPOLoss(policy, critic, PPOConfig(clip=0.1, entropy_coef=0.001)),
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(
                 policy,
