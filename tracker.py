@@ -448,7 +448,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ball-scale",              type=float, default=1.25)
     parser.add_argument("--car-scale",               type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
-    parser.add_argument("--minimum-tracking-frames", type=int, default=1)
+    parser.add_argument("--minimum-tracking-frames", type=int,   default=1)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
     parser.add_argument("--epochs",                  type=int,   default=2)
