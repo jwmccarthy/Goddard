@@ -33,7 +33,13 @@ NORM_CAR_VEL_REL = 2 * NORM_CAR_VEL
 
 MAX_POSITION_RESIDUAL = 0.5
 MIN_IMPULSE_SPEED_CHANGE = 2.0
-SCHEMA_VERSION = 3
+MAX_REPLAY_POSITION_ERROR = 150.0
+MAX_REPLAY_LINEAR_VELOCITY_ERROR = 400.0
+MAX_REPLAY_ANGULAR_VELOCITY_ERROR = 4.0
+MAX_REPLAY_QUATERNION_ERROR = 0.05
+INTERNAL_STATE_SIZE = 19
+EVENT_FEATURES = 4
+SCHEMA_VERSION = 4
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -73,7 +79,9 @@ def _valid_replay(replay: ParsedReplay) -> bool:
     )
 
 
-def _get_active_frames(replay: ParsedReplay) -> List[list[ReplayFrame]]:
+def _get_active_frames(
+    replay: ParsedReplay,
+) -> List[list[tuple[ReplayFrame, dict]]]:
     times = replay.game_df["time"].to_numpy() * 120.0
     periods = replay.analyzer["gameplay_periods"]
     bounds = [
@@ -85,12 +93,12 @@ def _get_active_frames(replay: ParsedReplay) -> List[list[ReplayFrame]]:
     ]
     segments = [[] for _ in bounds]
 
-    for frame in replay_to_rlgym(replay):
+    for frame, errors in replay_to_rlgym(replay, calculate_error=True):
         tick = frame.state.tick_count
 
         for index, (start, end) in enumerate(bounds):
             if start <= tick < end:
-                segments[index].append(frame)
+                segments[index].append((frame, errors))
                 break
 
     return segments
@@ -120,6 +128,40 @@ def _compose_car(car: Car, physics: PhysicsObject) -> np.ndarray:
             car.is_boosting,
         ]
     ], axis=-1)
+
+
+def _compose_internal_state(car: Car) -> np.ndarray:
+    return np.asarray([
+        car.on_ground,
+        car.air_time_since_jump,
+        car.handbrake,
+        car.has_jumped,
+        car.is_jumping,
+        car.is_holding_jump,
+        car.jump_time,
+        car.has_double_jumped,
+        car.has_flipped,
+        car.is_flipping,
+        car.flip_time,
+        car.is_autoflipping,
+        car.autoflip_timer,
+        car.autoflip_direction,
+        *car.flip_torque,
+        car.is_boosting,
+        car.boost_active_time,
+    ], dtype=np.float32)
+
+
+def _large_replay_correction(error: dict | None) -> bool:
+    if not error:
+        return False
+
+    return (
+        error.get("position", 0.0) > MAX_REPLAY_POSITION_ERROR
+        or error.get("linear_velocity", 0.0) > MAX_REPLAY_LINEAR_VELOCITY_ERROR
+        or error.get("angular_velocity", 0.0) > MAX_REPLAY_ANGULAR_VELOCITY_ERROR
+        or error.get("quaternion", 0.0) > MAX_REPLAY_QUATERNION_ERROR
+    )
 
 
 def _build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
@@ -191,6 +233,7 @@ def _build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
         *ball_relative_features,
         *car_relative_features,
         *goal_features,
+        _compose_internal_state(ego),
         touch_features,
     ])
 
@@ -277,13 +320,18 @@ def _resample_observations(
 
     boost_start = 9 + 21 * n_cars
     discrete.extend(range(boost_start, boost_start + len(BOOST_PAD_POSITIONS)))
+
+    internal_start = 83 + 27 * n_cars
+    internal_discrete = (0, 3, 4, 5, 7, 8, 9, 11, 17)
+    discrete.extend(internal_start + field for field in internal_discrete)
+
     resampled[:, discrete] = observations[nearest][:, discrete]
 
-    resampled[:, -3:] = 0
+    resampled[:, -EVENT_FEATURES:] = 0
 
-    for source, event in np.argwhere(observations[:, -3:] > 0.5):
+    for source, event in np.argwhere(observations[:, -EVENT_FEATURES:] > 0.5):
         target = np.abs(target_ticks - ticks[source]).argmin()
-        resampled[target, -3 + event] = 1
+        resampled[target, -EVENT_FEATURES + event] = 1
 
     return resampled.astype(np.float32, copy=False)
 
@@ -296,8 +344,8 @@ def _mark_discontinuities(
         return np.pad(observations, ((0, 0), (0, 1)))
 
     touches = (
-        observations[:-1, -3:].any(axis=-1)
-        | observations[1:, -3:].any(axis=-1)
+        observations[:-1, -EVENT_FEATURES:].any(axis=-1)
+        | observations[1:, -EVENT_FEATURES:].any(axis=-1)
     )
     discontinuity = np.zeros(len(observations) - 1, dtype=bool)
     physics = [(0, NORM_BALL_VEL), (9, NORM_CAR_VEL)]
@@ -344,7 +392,7 @@ def _parse(
     if not active_frames or not any(active_frames):
         return 0
 
-    first = next(frames[0] for frames in active_frames if frames)
+    first = next(frames[0][0] for frames in active_frames if frames)
     ego_ids = list(first.state.cars.keys())
 
     if pov_players is not None:
@@ -373,23 +421,31 @@ def _parse(
         ]
         car_ids = [ego_id, *teammates, *opponents]
 
-        for i, frames in enumerate(active_frames):
-            if not frames:
+        for i, samples in enumerate(active_frames):
+            if not samples:
                 continue
             if any(
                 any(car_id not in frame.state.cars for car_id in car_ids)
-                for frame in frames
+                for frame, _ in samples
             ):
                 continue
 
-            ticks = np.asarray([frame.state.tick_count for frame in frames])
+            ticks = np.asarray([frame.state.tick_count for frame, _ in samples])
             if not np.isfinite(ticks).all() or np.any(np.diff(ticks) <= 0):
                 continue
 
             observations = np.stack([
                 _build_observation(f, car_ids)
-                for f in frames
+                for f, _ in samples
             ]).astype(np.float32, copy=False)
+            corrections = np.asarray([
+                _large_replay_correction(errors.get(ego_id))
+                for _, errors in samples
+            ], dtype=np.float32)
+            observations = np.concatenate((
+                observations,
+                corrections[:, None],
+            ), axis=-1)
 
             observations = _resample_observations(
                 ticks,

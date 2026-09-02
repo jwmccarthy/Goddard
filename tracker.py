@@ -45,6 +45,8 @@ CAR_MAX_SPEED      = 2300.0
 CAR_MAX_ANG_SPEED  = 5.5
 BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
+INTERNAL_STATE_SIZE = 19
+STORED_REPLAY_SIZE = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
 
 
 class ExpertGoalStates:
@@ -68,6 +70,8 @@ class ExpertGoalStates:
         device:     str | th.device = "cuda:0",
         balance:    bool = True,
     ) -> None:
+        if n_cars != 1:
+            raise ValueError("ExpertGoalStates supports one simulated ego car")
 
         self.n_cars = n_cars
         self.device = device
@@ -115,7 +119,7 @@ class ExpertGoalStates:
 
     @staticmethod
     def _infer_n_cars(width: int) -> int:
-        remainder = width - 87
+        remainder = width - 107
         if remainder < 0 or remainder % 27:
             raise ValueError(f"invalid parsed replay width: {width}")
         n_cars = remainder // 27
@@ -124,9 +128,14 @@ class ExpertGoalStates:
         return n_cars
 
     def _filter(self, demo: np.ndarray) -> list[th.Tensor]:
-        observation = demo[:, :GOAL_STATE_SIZE].astype(np.float32, copy=False)
-        ego_touch = demo[:, -4].astype(bool)
-        invalid = demo[:, -3:].astype(bool).any(axis=-1)
+        n_cars = self._infer_n_cars(demo.shape[1])
+        internal_start = 83 + 27 * n_cars
+        observation = np.concatenate((
+            demo[:, :GOAL_STATE_SIZE],
+            demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
+        ), axis=-1).astype(np.float32, copy=False)
+        ego_touch = demo[:, -5].astype(bool)
+        invalid = demo[:, -4:].astype(bool).any(axis=-1)
 
         demos: list[th.Tensor] = []
         start = 0
@@ -174,19 +183,26 @@ class ExpertGoalStates:
 
         return TensorBatch({
             "observation": CARLObservation.from_tensor(
-                self._replays[self._cursors[mask]],
+                self._replays[self._cursors[mask], :GOAL_STATE_SIZE],
                 self.n_cars
-            )
+            ),
+            "internal_state": self._replays[
+                self._cursors[mask],
+                GOAL_STATE_SIZE:STORED_REPLAY_SIZE,
+            ],
         })
 
     def current(self, offset: int = 0) -> CARLObservation:
         return CARLObservation.from_tensor(
-            self._replays[self._cursors + offset],
+            self._replays[self._cursors + offset, :GOAL_STATE_SIZE],
             self.n_cars,
         )
 
     def current_tensor(self, offset: int = 0) -> th.Tensor:
-        return self._replays[self._cursors + offset]
+        return self._replays[
+            self._cursors + offset,
+            :GOAL_STATE_SIZE,
+        ]
 
     def next_goals(
         self,
@@ -214,7 +230,7 @@ class ExpertGoalStates:
 
         end = cursors >= ends
 
-        return th.cat((obs, goals), dim=-1), end
+        return th.cat((obs[:, :GOAL_STATE_SIZE], goals), dim=-1), end
 
 
 class TrackingReward:
@@ -224,7 +240,7 @@ class TrackingReward:
         self,
         replays: ExpertGoalStates,
         scale:      float = 1.0,
-        ball_scale: float = 1.0,
+        ball_scale: float = 1.25,
         car_scale:  float = 2.0,
     ) -> None:
         self.replays = replays
@@ -240,7 +256,7 @@ class TrackingReward:
         actual_ego = actual.cars.ego
         target_ego = target.cars.ego
 
-        ball_position_error = (
+        ball_relative_position_error = (
             actual.ball.position - actual_ego.position
             - target.ball.position + target_ego.position
         ) * self.position_scale
@@ -271,13 +287,13 @@ class TrackingReward:
             actual_ego.up - target_ego.up,
         ), dim=-1)
 
-        ball_position_mse = ball_position_error.square().sum(-1)
+        ball_relative_position_mse = ball_relative_position_error.square().sum(-1)
         car_position_mse = car_position_error.square().sum(-1)
         rotation_mse = rotation_error.square().sum(-1)
         velocity_mse = velocity_error.square().sum(-1).mean(-1)
         angular_velocity_mse = angular_velocity_error.square().sum(-1).mean(-1)
 
-        ball_position_score = th.exp(-self.ball_scale * ball_position_mse)
+        ball_position_score = th.exp(-self.ball_scale * ball_relative_position_mse)
         car_position_score = th.exp(-self.car_scale * car_position_mse)
         rotation_score = th.exp(-10.0 * rotation_mse)
         velocity_score = th.exp(-0.1 * velocity_mse)
@@ -303,7 +319,7 @@ class ExpertLookaheadEnv:
         env:            CARLTorchVectorEnv,
         replays:        ExpertGoalStates,
         reward_scale:   float = 1.0,
-        ball_scale:     float = 1.0,
+        ball_scale:     float = 1.25,
         car_scale:      float = 2.0,
         minimum_reward: float = 0.1,
     ) -> None:
@@ -313,8 +329,7 @@ class ExpertLookaheadEnv:
         self.minimum_reward = minimum_reward
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
 
-        size = env.single_observation_space.shape[0]
-        size += replays.goal_size
+        size = GOAL_STATE_SIZE + replays.goal_size
 
         self.single_observation_space = gym.spaces.Box(
             -np.inf,
@@ -341,7 +356,9 @@ class ExpertLookaheadEnv:
         if not len(idx):
             return None
 
-        expert = self.replays.reset(mask)["observation"]
+        replay_state = self.replays.reset(mask)
+        expert = replay_state["observation"]
+        internal_state = replay_state["internal_state"]
         ball = expert.ball
         cars = expert.cars
 
@@ -356,14 +373,15 @@ class ExpertLookaheadEnv:
             "car_angular_velocity":  cars.angular_velocity * CAR_MAX_ANG_SPEED,
             "car_demoed":            cars.demoed,
             "car_boost":             cars.boost * BOOST_MAX,
+            "car_internal_state":    internal_state[:, None, :],
             "blue_score":            th.zeros(len(idx), dtype=th.int32, device=self.device),
             "orange_score":          th.zeros(len(idx), dtype=th.int32, device=self.device),
             "episode_ticks":         th.zeros(len(idx), dtype=th.int32, device=self.device),
         })
 
     def _pad_goals(self, obs: th.Tensor) -> th.Tensor:
-        goal_size = self.single_observation_space.shape[0] - obs.shape[-1]
-        return th.nn.functional.pad(obs, (0, goal_size))
+        current = obs[..., :GOAL_STATE_SIZE]
+        return th.nn.functional.pad(current, (0, self.replays.goal_size))
 
     def reset(self, **kwargs: Any) -> th.Tensor:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
@@ -414,7 +432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows",                 type=int,   nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
-    parser.add_argument("--ball-scale",              type=float, default=1.0)
+    parser.add_argument("--ball-scale",              type=float, default=1.25)
     parser.add_argument("--car-scale",               type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--rollout",                 type=int,   default=128)
