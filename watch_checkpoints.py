@@ -181,6 +181,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         ball_scale=args.ball_scale,
         car_scale=args.car_scale,
         minimum_reward=args.minimum_tracking_reward,
+        minimum_tracking_frames=args.minimum_tracking_frames,
     )
 
     try:
@@ -333,6 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ball-scale", type=float, default=1.25)
     parser.add_argument("--car-scale", type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
+    parser.add_argument("--minimum-tracking-frames", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--host", default="127.0.0.1")

@@ -322,11 +322,17 @@ class ExpertLookaheadEnv:
         ball_scale:     float = 1.25,
         car_scale:      float = 2.0,
         minimum_reward: float = 0.1,
+        minimum_tracking_frames: int = 1,
     ) -> None:
+        if minimum_tracking_frames < 1:
+            raise ValueError("minimum_tracking_frames must be at least one")
+
         self.env = env
         self.replays = replays
         self.device = env.device
         self.minimum_reward = minimum_reward
+        self.minimum_tracking_frames = minimum_tracking_frames
+        self._low_reward_frames = th.zeros(env.n_envs, dtype=th.long, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
 
         size = GOAL_STATE_SIZE + replays.goal_size
@@ -397,11 +403,18 @@ class ExpertLookaheadEnv:
 
         end_reset = end & ~native
 
+        low_reward = self.reward.value < self.minimum_reward
+        self._low_reward_frames = th.where(
+            low_reward,
+            self._low_reward_frames + 1,
+            th.zeros_like(self._low_reward_frames),
+        )
         failure_reset = (
-            self.reward.value < self.minimum_reward
+            self._low_reward_frames >= self.minimum_tracking_frames
         ) & ~native & ~end_reset
 
         reset = end_reset | failure_reset
+        self._low_reward_frames[reset | native] = 0
 
         if "final_obs" in info:
             info = dict(info)
@@ -435,6 +448,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ball-scale",              type=float, default=1.25)
     parser.add_argument("--car-scale",               type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
+    parser.add_argument("--minimum-tracking-frames", type=int, default=1)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
     parser.add_argument("--epochs",                  type=int,   default=2)
@@ -479,6 +493,7 @@ def main() -> None:
         ball_scale=args.ball_scale,
         car_scale=args.car_scale,
         minimum_reward=args.minimum_tracking_reward,
+        minimum_tracking_frames=args.minimum_tracking_frames,
     )
 
     policy = MultiCategoricalPolicy(

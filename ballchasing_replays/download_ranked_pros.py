@@ -1,9 +1,9 @@
 import argparse
 import json
 import os
-import random
 import re
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -18,8 +18,7 @@ PLAYLISTS = (
 )
 REPLAY_DATE_AFTER = "2025-08-31T00:00:00Z"
 REPLAY_DATE_BEFORE = "2026-09-01T00:00:00Z"
-RANKED_DOUBLES_LIMIT = 65
-SAMPLE_SEED = 20260831
+RANKED_DOUBLES_LIMIT = 1_000
 REPLAY_ID = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
     re.IGNORECASE,
@@ -31,9 +30,14 @@ def replay_id(path: Path) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def replay_date(replay: dict) -> datetime:
+    value = replay["date"].replace("Z", "+00:00")
+    return datetime.fromisoformat(value).astimezone(timezone.utc)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download last-year SSL ranked games containing only pros."
+        description="Download last-year ranked games containing only pros."
     )
     parser.add_argument(
         "--playlist",
@@ -69,13 +73,15 @@ def main() -> None:
         if playlist not in selected_playlists:
             continue
         candidates = 0
-        selected: set[str] = set()
+        selected: dict[str, datetime] = {}
         pages = client.iter_replay_pages(
             playlist=playlist,
             pro="true",
             replay_date_after=REPLAY_DATE_AFTER,
             replay_date_before=REPLAY_DATE_BEFORE,
             count=200,
+            sort_by="replay-date",
+            sort_dir="desc",
         )
         for page_number, page in enumerate(pages, 1):
             candidates += len(page)
@@ -88,7 +94,7 @@ def main() -> None:
                     and len(orange) == team_size
                     and all(player.get("pro") is True for player in players)
                 ):
-                    selected.add(replay["id"].lower())
+                    selected[replay["id"].lower()] = replay_date(replay)
             if page_number % 25 == 0:
                 print(
                     f"{playlist}: pages={page_number} candidates={candidates} "
@@ -96,27 +102,32 @@ def main() -> None:
                     flush=True,
                 )
 
-        eligible = len(selected)
-        if playlist == "ranked-doubles" and len(selected) > args.ranked_doubles_limit:
-            selected = set(
-                random.Random(SAMPLE_SEED).sample(
-                    sorted(selected),
-                    args.ranked_doubles_limit,
-                )
+            if playlist == "ranked-doubles" and len(selected) >= args.ranked_doubles_limit:
+                break
+
+        if playlist == "ranked-doubles":
+            selected = dict(
+                sorted(
+                    selected.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:args.ranked_doubles_limit]
             )
-        manifest[playlist] = sorted(selected)
+
+        selected_ids = set(selected)
+        manifest[playlist] = sorted(selected_ids)
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
-        new_ids = sorted(selected - existing)
+        new_ids = sorted(selected_ids - existing)
         print(
-            f"{playlist}: candidates={candidates} all-pro={eligible} "
-            f"selected={len(selected)} "
+            f"{playlist}: candidates={candidates} "
+            f"selected={len(selected_ids)} "
             f"downloading={len(new_ids)}",
             flush=True,
         )
         client.download_replays(new_ids, replay_dir)
         existing.update(new_ids)
-        found.update(selected)
+        found.update(selected_ids)
 
     print(f"Found {len(found)} unique ranked games", flush=True)
 
