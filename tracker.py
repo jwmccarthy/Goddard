@@ -191,6 +191,9 @@ class ExpertGoalStates:
     def reset(self, mask: th.Tensor) -> TensorBatch:
         n_resets = mask.sum().item()
         demo_id = self._sample_demo_ids(n_resets)
+        if self.start_at_beginning and self._selected_demo is None:
+            self._selected_demo = demo_id[0].item()
+            demo_id.fill_(self._selected_demo)
         self._demo_id[mask] = demo_id
 
         starts = self._offsets[demo_id]
