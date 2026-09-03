@@ -4,6 +4,7 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 const view = document.getElementById('view');
 const checkpoint = document.getElementById('checkpoint');
+const demo = document.getElementById('demo');
 const reward = document.getElementById('reward');
 const connection = document.getElementById('connection');
 const speed = document.getElementById('speed');
@@ -187,6 +188,8 @@ source.onmessage = ({ data }) => {
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;
   checkpoint.title = frame.checkpoint;
+  demo.textContent = frame.demo;
+  demo.title = frame.demo;
   reward.textContent = frame.reward.map((value) => value.toFixed(3)).join(' / ');
 };
 source.onerror = () => {

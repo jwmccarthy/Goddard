@@ -121,6 +121,7 @@ def frame_from_state(
     checkpoint: Path,
     reward:     th.Tensor,
     expert:     th.Tensor,
+    demo_name:  str,
 ) -> dict:
     cars = state[9:31].view(1, 22)
     rendered = []
@@ -146,6 +147,7 @@ def frame_from_state(
 
     return {
         "checkpoint": checkpoint.name,
+        "demo":       demo_name,
         "reward":     reward.cpu().tolist(),
         "ball":       {"pos": state[:3].cpu().tolist()},
         "cars":       rendered,
@@ -163,7 +165,13 @@ def publish_frame(
     th.cuda.synchronize(base.device)
     raw = th.from_dlpack(base._env.get_state()).clone()[0]
     expert = replays.current_tensor(-1)[0]
-    viewer.publish(frame_from_state(raw, checkpoint, reward, expert))
+    viewer.publish(frame_from_state(
+        raw,
+        checkpoint,
+        reward,
+        expert,
+        replays.current_demo_name(),
+    ))
 
 
 def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:

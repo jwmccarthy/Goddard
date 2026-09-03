@@ -59,6 +59,7 @@ class ExpertGoalStates:
     _cursors:      th.Tensor
     _modes:        th.Tensor
     _mode_demo_ids: tuple[th.Tensor, ...]
+    _demo_names:    tuple[str, ...]
 
     def __init__(
         self,
@@ -82,6 +83,7 @@ class ExpertGoalStates:
 
         replays: list[th.Tensor] = []
         modes:   list[int] = []
+        names:   list[str] = []
         total = 0
 
         self._min_len = 30
@@ -94,6 +96,7 @@ class ExpertGoalStates:
 
             replays.extend(demos)
             modes.extend([replay_cars // 2] * len(demos))
+            names.extend([path.stem] * len(demos))
             total += sum(len(demo) for demo in demos)
 
             if obs_limit is not None and total >= obs_limit:
@@ -110,6 +113,7 @@ class ExpertGoalStates:
             (self._modes == mode).nonzero(as_tuple=True)[0]
             for mode in self._modes.unique(sorted=True)
         )
+        self._demo_names = tuple(names)
         self._offsets = th.cat((
             th.zeros(1, device=device, dtype=th.long),
             lengths.cumsum(0),
@@ -226,6 +230,9 @@ class ExpertGoalStates:
             self._cursors + offset,
             :GOAL_STATE_SIZE,
         ]
+
+    def current_demo_name(self) -> str:
+        return self._demo_names[self._demo_id[0].item()]
 
     def next_goals(
         self,
