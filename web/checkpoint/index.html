@@ -46,6 +46,8 @@
       background: var(--paper);
     }
 
+    .telemetry { pointer-events: auto; }
+
     .brand {
       padding: 13px 16px 14px;
       border-radius: 4px 18px 18px 18px;
@@ -80,12 +82,10 @@
     }
 
     .checkpoint {
-      max-width: 280px;
-      overflow: hidden;
       color: var(--muted);
       font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
+      user-select: text;
     }
 
     .reward {

@@ -188,8 +188,10 @@ source.onmessage = ({ data }) => {
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;
   checkpoint.title = frame.checkpoint;
-  demo.textContent = frame.demo;
-  demo.title = frame.demo;
+  if (demo.textContent !== frame.demo) {
+    demo.textContent = frame.demo;
+    demo.title = frame.demo;
+  }
   reward.textContent = frame.reward.map((value) => value.toFixed(3)).join(' / ');
 };
 source.onerror = () => {
