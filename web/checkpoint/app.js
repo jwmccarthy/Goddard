@@ -197,6 +197,12 @@ source.onerror = () => {
 document.getElementById('reset').addEventListener('click', () => {
   fetch('/reset', { method: 'POST' });
 });
+document.getElementById('previous').addEventListener('click', () => {
+  fetch('/previous', { method: 'POST' });
+});
+document.getElementById('next').addEventListener('click', () => {
+  fetch('/next', { method: 'POST' });
+});
 speed.addEventListener('input', () => {
   speedValue.value = `${Number(speed.value).toFixed(1).replace('.0', '')}x`;
   clearTimeout(speedUpdate);

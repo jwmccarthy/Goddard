@@ -69,6 +69,7 @@ class ExpertGoalStates:
         n_cars:     int = 2,
         device:     str | th.device = "cuda:0",
         balance:    bool = True,
+        start_at_beginning: bool = False,
     ) -> None:
         if n_cars != 1:
             raise ValueError("ExpertGoalStates supports one simulated ego car")
@@ -76,6 +77,8 @@ class ExpertGoalStates:
         self.n_cars = n_cars
         self.device = device
         self.balance = balance
+        self.start_at_beginning = start_at_beginning
+        self._selected_demo: int | None = None
 
         replays: list[th.Tensor] = []
         modes:   list[int] = []
@@ -152,6 +155,14 @@ class ExpertGoalStates:
         return demos
 
     def _sample_demo_ids(self, count: int) -> th.Tensor:
+        if self._selected_demo is not None:
+            return th.full(
+                (count,),
+                self._selected_demo,
+                dtype=th.long,
+                device=self.device,
+            )
+
         if not self.balance or len(self._mode_demo_ids) == 1:
             return th.randint(self._n_demos, (count,), device=self.device)
 
@@ -170,6 +181,13 @@ class ExpertGoalStates:
 
         return demo_ids
 
+    def cycle_demo(self, offset: int) -> None:
+        current = 0 if self._selected_demo is None else self._selected_demo
+        self._selected_demo = (current + offset) % self._n_demos
+
+    def random_demo(self) -> None:
+        self._selected_demo = None
+
     def reset(self, mask: th.Tensor) -> TensorBatch:
         n_resets = mask.sum().item()
         demo_id = self._sample_demo_ids(n_resets)
@@ -177,9 +195,11 @@ class ExpertGoalStates:
 
         starts = self._offsets[demo_id]
         spans = self._offsets[demo_id + 1] - starts - 1
-        self._cursors[mask] = starts + (
-            th.rand(n_resets, device=self.device) * spans
-        ).long()
+        self._cursors[mask] = starts
+        if not self.start_at_beginning:
+            self._cursors[mask] += (
+                th.rand(n_resets, device=self.device) * spans
+            ).long()
 
         return TensorBatch({
             "observation": CARLObservation.from_tensor(

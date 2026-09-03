@@ -39,6 +39,7 @@ class ViewerState:
         self.condition = threading.Condition()
         self.stop = threading.Event()
         self.reset = threading.Event()
+        self.demo_offset = None
         self.sequence = 0
         self.frame = None
         self.speed = 1.0
@@ -56,6 +57,17 @@ class ViewerState:
     def frame_time(self, frameskip: int) -> float:
         with self.condition:
             return frameskip / (120.0 * self.speed)
+
+    def request_demo(self, offset: int | None) -> None:
+        with self.condition:
+            self.demo_offset = offset
+        self.reset.set()
+
+    def take_demo_request(self) -> int | None:
+        with self.condition:
+            offset = self.demo_offset
+            self.demo_offset = None
+            return offset
 
 
 def newest_checkpoint(directory: Path) -> Path:
@@ -173,6 +185,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         n_cars=1,
         device=base.device,
         balance=args.balance,
+        start_at_beginning=True,
     )
     env = ExpertLookaheadEnv(
         base,
@@ -196,6 +209,11 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         while not viewer.stop.is_set():
             if viewer.reset.is_set():
                 viewer.reset.clear()
+                offset = viewer.take_demo_request()
+                if offset is None:
+                    replays.random_demo()
+                else:
+                    replays.cycle_demo(offset)
                 observation = env.reset()
                 publish_frame(
                     viewer,
@@ -242,7 +260,19 @@ def make_handler(viewer: ViewerState, frontend: Path, arena: Path):
 
         def do_POST(self) -> None:
             if self.path == "/reset":
-                viewer.reset.set()
+                viewer.request_demo(None)
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+
+            if self.path == "/previous":
+                viewer.request_demo(-1)
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+
+            if self.path == "/next":
+                viewer.request_demo(1)
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.end_headers()
                 return
