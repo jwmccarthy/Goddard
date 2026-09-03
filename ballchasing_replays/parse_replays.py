@@ -12,7 +12,7 @@ from rich.progress import Progress
 from carl.gymnasium.state import BOOST_PAD_POSITIONS as CARL_BOOST_PAD_POSITIONS
 from rlgym.rocket_league.api import Car, PhysicsObject
 from rlgym_tools.rocket_league.replays.convert import replay_to_rlgym
-from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay
+from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay, process_replay
 from rlgym_tools.rocket_league.replays.replay_frame import ReplayFrame
 
 
@@ -39,7 +39,7 @@ MAX_REPLAY_ANGULAR_VELOCITY_ERROR = 4.0
 MAX_REPLAY_QUATERNION_ERROR = 0.05
 INTERNAL_STATE_SIZE = 19
 EVENT_FEATURES = 4
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -57,6 +57,14 @@ INVERTED_PAD = np.asarray([
 
 def _safe_load(path: Path) -> ParsedReplay:
     try:
+        if path.is_file() and path.suffix == ".replay":
+            with TemporaryDirectory() as temporary:
+                result = process_replay(
+                    str(path), temporary, skip_existing=False
+                )
+                if result.returncode:
+                    return
+                return ParsedReplay.load(Path(temporary) / path.stem)
         return ParsedReplay.load(path)
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         return
@@ -336,6 +344,38 @@ def _resample_observations(
     return resampled.astype(np.float32, copy=False)
 
 
+def _resample_actions(
+    ticks: np.ndarray,
+    actions: np.ndarray,
+    tick_skip: int,
+) -> np.ndarray:
+    ticks, unique = np.unique(ticks, return_index=True)
+    actions = actions[unique]
+    target_ticks = ticks[0] + np.arange(
+        int((ticks[-1] - ticks[0]) // tick_skip) + 1
+    ) * tick_skip
+    source = np.searchsorted(ticks, target_ticks, side="right") - 1
+    return actions[source.clip(0)].astype(np.float32, copy=False)
+
+
+def _project_carl_actions(actions: np.ndarray) -> np.ndarray:
+    axes = np.asarray([-1.0, 0.0, 1.0], dtype=np.float32)
+    horizontal_error = (
+        (axes[:, None] - actions[:, 1]) ** 2
+        + (axes[:, None] - actions[:, 3]) ** 2
+    )
+
+    projected = np.empty((len(actions), 7), dtype=np.int32)
+    projected[:, 0] = horizontal_error.argmin(axis=0)
+    projected[:, 1] = np.abs(axes[:, None] - actions[:, 2]).argmin(axis=0)
+    projected[:, 2] = np.abs(axes[:, None] - actions[:, 0]).argmin(axis=0)
+    projected[:, 3] = actions[:, 7] >= 0.5
+    projected[:, 4] = actions[:, 6] >= 0.5
+    projected[:, 5] = np.abs(axes[:, None] - actions[:, 4]).argmin(axis=0)
+    projected[:, 6] = actions[:, 5] >= 0.5
+    return projected
+
+
 def _mark_discontinuities(
     observations: np.ndarray,
     tick_skip:    int,
@@ -438,6 +478,12 @@ def _parse(
                 _build_observation(f, car_ids)
                 for f, _ in samples
             ]).astype(np.float32, copy=False)
+            actions = np.stack([
+                np.asarray(f.actions[ego_id], dtype=np.float32)
+                for f, _ in samples
+            ])
+            if actions.ndim != 2 or actions.shape[1] != 8:
+                continue
             corrections = np.asarray([
                 _large_replay_correction(errors.get(ego_id))
                 for _, errors in samples
@@ -453,6 +499,7 @@ def _parse(
                 frame_skip,
                 len(car_ids),
             )
+            actions = _resample_actions(ticks, actions, frame_skip)
 
             obs = _mark_discontinuities(
                 observations,
@@ -461,7 +508,13 @@ def _parse(
             if not np.isfinite(obs).all():
                 continue
 
-            np.save(output_dir / f"{ego_id}-{i}-{name}.npy", obs)
+            output = output_dir / f"{ego_id}-{i}-{name}"
+            np.save(output.with_suffix(".npy"), obs)
+            np.savez_compressed(
+                output.with_suffix(".actions.npz"),
+                raw=actions,
+                carl=_project_carl_actions(actions),
+            )
             written += 1
 
     return written
@@ -505,7 +558,9 @@ def _parse_path(
 
             for existing in output_dir.glob(f"*{path.stem}.npy"):
                 existing.unlink()
-            for output in temporary.glob("*.npy"):
+            for existing in output_dir.glob(f"*{path.stem}.actions.npz"):
+                existing.unlink()
+            for output in temporary.glob("*"):
                 output.replace(output_dir / output.name)
             complete.touch()
     except Exception as error:
