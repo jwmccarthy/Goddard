@@ -1,7 +1,7 @@
 [project]
 name = "goddard"
 version = "0.1.0"
-description = "Wall-to-air Rocket League PPO curriculum"
+description = ""
 requires-python = ">=3.11"
 dependencies = [
     "carl[gymnasium]==0.1.0",
@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-carl = { path = ".." }
+carl = { path = "../CARL" }
 jarl = { path = "../JARL" }
 torch = { index = "pytorch-cu128" }
 
