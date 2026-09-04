@@ -205,6 +205,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         device=base.device,
         balance=args.balance,
         start_at_beginning=True,
+        frame_skip=args.frameskip,
     )
     env = ExpertLookaheadEnv(
         base,
