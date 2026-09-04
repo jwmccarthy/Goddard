@@ -8,6 +8,7 @@ const demo = document.getElementById('demo');
 const reward = document.getElementById('reward');
 const agentBoost = document.getElementById('agent-boost');
 const expertBoost = document.getElementById('expert-boost');
+const action = document.getElementById('action');
 const demoSearch = document.getElementById('demo-search');
 const demoQuery = document.getElementById('demo-query');
 const connection = document.getElementById('connection');
@@ -190,6 +191,8 @@ source.onmessage = ({ data }) => {
   setCar(ghost, frame.expert.cars[0]);
   agentBoost.textContent = frame.cars[0].boost.toFixed(0);
   expertBoost.textContent = frame.expert.cars[0].boost.toFixed(0);
+  const axis = ['0', '-1', '+1'];
+  action.textContent = `Action: H ${axis[frame.action[0]]} V ${axis[frame.action[1]]} T ${axis[frame.action[2]]} Slide ${frame.action[3]} Boost ${frame.action[4]} Roll ${axis[frame.action[5]]} Jump ${frame.action[6]}`;
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;

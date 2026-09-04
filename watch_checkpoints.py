@@ -128,6 +128,7 @@ def frame_from_state(
     reward:     th.Tensor,
     expert:     th.Tensor,
     demo_name:  str,
+    action:     th.Tensor,
 ) -> dict:
     cars = state[9:31].view(1, 22)
     rendered = []
@@ -156,6 +157,7 @@ def frame_from_state(
         "checkpoint": checkpoint.name,
         "demo":       demo_name,
         "reward":     reward.cpu().tolist(),
+        "action":     action.cpu().tolist(),
         "ball":       {"pos": state[:3].cpu().tolist()},
         "cars":       rendered,
         "expert":     frame_from_expert(expert),
@@ -168,6 +170,7 @@ def publish_frame(
     replays:    ExpertGoalStates,
     checkpoint: Path,
     reward:     th.Tensor,
+    action:     th.Tensor,
 ) -> None:
     th.cuda.synchronize(base.device)
     raw = th.from_dlpack(base._env.get_state()).clone()[0]
@@ -178,6 +181,7 @@ def publish_frame(
         reward,
         expert,
         replays.current_demo_name(),
+        action,
     ))
 
 
@@ -217,7 +221,14 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         policy = load_policy(checkpoint, env)
         checkpoint_mtime = checkpoint.stat().st_mtime_ns
         observation = env.reset()
-        publish_frame(viewer, base, replays, checkpoint, th.zeros(1, device=env.device))
+        publish_frame(
+            viewer,
+            base,
+            replays,
+            checkpoint,
+            th.zeros(1, device=env.device),
+            th.zeros((1, 7), dtype=th.long, device=env.device),
+        )
         viewer.stop.wait(viewer.frame_time(args.frameskip))
         next_step = time.perf_counter()
 
@@ -238,6 +249,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     replays,
                     checkpoint,
                     th.zeros(1, device=env.device),
+                    th.zeros((1, 7), dtype=th.long, device=env.device),
                 )
                 viewer.stop.wait(viewer.frame_time(args.frameskip))
                 next_step = time.perf_counter()
@@ -257,7 +269,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                 ).action
                 observation, reward, _, _, _ = env.step(action)
 
-            publish_frame(viewer, base, replays, checkpoint, reward)
+            publish_frame(viewer, base, replays, checkpoint, reward, action)
 
             next_step += viewer.frame_time(args.frameskip)
             delay = next_step - time.perf_counter()
