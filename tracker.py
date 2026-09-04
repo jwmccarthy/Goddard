@@ -240,6 +240,23 @@ class ExpertGoalStates:
     def random_demo(self) -> None:
         self._selected_demo = None
 
+    def search_demo(self, query: str) -> bool:
+        query = query.lower()
+        matches = [
+            index
+            for index, name in enumerate(self._demo_names)
+            if query in name.lower()
+        ]
+        if not matches:
+            return False
+
+        current = 0 if self._selected_demo is None else self._selected_demo
+        self._selected_demo = next(
+            (index for index in matches if index > current),
+            matches[0],
+        )
+        return True
+
     def reset(self, mask: th.Tensor) -> TensorBatch:
         n_resets = mask.sum().item()
         demo_id = self._sample_demo_ids(n_resets)

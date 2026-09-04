@@ -39,7 +39,7 @@ class ViewerState:
         self.condition = threading.Condition()
         self.stop = threading.Event()
         self.reset = threading.Event()
-        self.demo_offset = None
+        self.demo_request: int | str | None = None
         self.sequence = 0
         self.frame = None
         self.speed = 1.0
@@ -60,14 +60,19 @@ class ViewerState:
 
     def request_demo(self, offset: int | None) -> None:
         with self.condition:
-            self.demo_offset = offset
+            self.demo_request = offset
         self.reset.set()
 
-    def take_demo_request(self) -> int | None:
+    def request_search(self, query: str) -> None:
         with self.condition:
-            offset = self.demo_offset
-            self.demo_offset = None
-            return offset
+            self.demo_request = query
+        self.reset.set()
+
+    def take_demo_request(self) -> int | str | None:
+        with self.condition:
+            request = self.demo_request
+            self.demo_request = None
+            return request
 
 
 def newest_checkpoint(directory: Path) -> Path:
@@ -219,11 +224,13 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         while not viewer.stop.is_set():
             if viewer.reset.is_set():
                 viewer.reset.clear()
-                offset = viewer.take_demo_request()
-                if offset is None:
+                request = viewer.take_demo_request()
+                if request is None:
                     replays.random_demo()
+                elif isinstance(request, str):
+                    replays.search_demo(request)
                 else:
-                    replays.cycle_demo(offset)
+                    replays.cycle_demo(request)
                 observation = env.reset()
                 publish_frame(
                     viewer,
@@ -283,6 +290,21 @@ def make_handler(viewer: ViewerState, frontend: Path, arena: Path):
 
             if self.path == "/next":
                 viewer.request_demo(1)
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+
+            if self.path == "/search":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    query = str(json.loads(self.rfile.read(length))["query"]).strip()
+                    if not query:
+                        raise ValueError
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    self.send_error(HTTPStatus.BAD_REQUEST, "invalid demo search")
+                    return
+
+                viewer.request_search(query)
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.end_headers()
                 return

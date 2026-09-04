@@ -157,6 +157,17 @@
       text-align: right;
     }
 
+    .demo-search { display: flex; gap: 6px; }
+    .demo-search input {
+      width: min(280px, 38vw);
+      padding: 10px 12px;
+      border: 1px solid rgba(10, 55, 66, 0.14);
+      border-radius: 12px;
+      background: var(--paper);
+      color: var(--ink);
+      font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
     #connection {
       padding: 8px 11px;
       border: 1px solid rgba(255, 255, 255, 0.8);
@@ -215,6 +226,10 @@
     <button id="previous">Previous demo</button>
     <button id="reset">Random demo</button>
     <button id="next">Next demo</button>
+    <form id="demo-search" class="demo-search">
+      <input id="demo-query" placeholder="Find demo" aria-label="Find demo">
+      <button>Find</button>
+    </form>
     <label class="speed-control">
       <span>Speed</span>
       <input id="speed" type="range" min="0.1" max="4" step="0.1" value="1">

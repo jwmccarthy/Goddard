@@ -8,6 +8,8 @@ const demo = document.getElementById('demo');
 const reward = document.getElementById('reward');
 const agentBoost = document.getElementById('agent-boost');
 const expertBoost = document.getElementById('expert-boost');
+const demoSearch = document.getElementById('demo-search');
+const demoQuery = document.getElementById('demo-query');
 const connection = document.getElementById('connection');
 const speed = document.getElementById('speed');
 const speedValue = document.getElementById('speed-value');
@@ -211,6 +213,14 @@ document.getElementById('previous').addEventListener('click', () => {
 });
 document.getElementById('next').addEventListener('click', () => {
   fetch('/next', { method: 'POST' });
+});
+demoSearch.addEventListener('submit', (event) => {
+  event.preventDefault();
+  fetch('/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: demoQuery.value }),
+  });
 });
 speed.addEventListener('input', () => {
   speedValue.value = `${Number(speed.value).toFixed(1).replace('.0', '')}x`;
