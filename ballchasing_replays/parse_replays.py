@@ -14,6 +14,7 @@ from rlgym.rocket_league.api import Car, PhysicsObject
 from rlgym_tools.rocket_league.replays.convert import replay_to_rlgym
 from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay, process_replay
 from rlgym_tools.rocket_league.replays.replay_frame import ReplayFrame
+from replay_safety import source_unsafe_start_mask
 
 
 NORM_POS = np.array([4108, 6000, 2076])
@@ -39,7 +40,7 @@ MAX_REPLAY_ANGULAR_VELOCITY_ERROR = 4.0
 MAX_REPLAY_QUATERNION_ERROR = 0.05
 INTERNAL_STATE_SIZE = 19
 EVENT_FEATURES = 4
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -493,6 +494,12 @@ def _parse(
                 corrections[:, None],
             ), axis=-1)
 
+            unsafe_starts = source_unsafe_start_mask(
+                ticks,
+                observations[:, 3:6] * NORM_BALL_VEL,
+                frame_skip,
+            )
+
             observations = _resample_observations(
                 ticks,
                 observations,
@@ -514,6 +521,11 @@ def _parse(
                 output.with_suffix(".actions.npz"),
                 raw=actions,
                 carl=_project_carl_actions(actions),
+            )
+            np.savez_compressed(
+                output.with_suffix(".unsafe-starts.npz"),
+                unsafe=unsafe_starts,
+                frame_skip=frame_skip,
             )
             written += 1
 
@@ -559,6 +571,8 @@ def _parse_path(
             for existing in output_dir.glob(f"*{path.stem}.npy"):
                 existing.unlink()
             for existing in output_dir.glob(f"*{path.stem}.actions.npz"):
+                existing.unlink()
+            for existing in output_dir.glob(f"*{path.stem}.unsafe-starts.npz"):
                 existing.unlink()
             for output in temporary.glob("*"):
                 output.replace(output_dir / output.name)

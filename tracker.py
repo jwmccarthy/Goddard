@@ -10,6 +10,8 @@ import torch as th
 import torch.nn as nn
 import gymnasium as gym
 
+from replay_safety import infer_unsafe_start_mask, nearest_safe_start_map
+
 from torch.optim import Adam
 from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium import CARLObservation
@@ -71,6 +73,7 @@ class ExpertGoalStates:
         device:     str | th.device = "cuda:0",
         balance:    bool = True,
         start_at_beginning: bool = False,
+        frame_skip: int = 4,
     ) -> None:
         if n_cars != 1:
             raise ValueError("ExpertGoalStates supports one simulated ego car")
@@ -79,25 +82,48 @@ class ExpertGoalStates:
         self.device = device
         self.balance = balance
         self.start_at_beginning = start_at_beginning
+        self.frame_skip = frame_skip
         self._selected_demo: int | None = None
 
         replays: list[th.Tensor] = []
         modes:   list[int] = []
         names:   list[str] = []
+        start_maps: list[th.Tensor] = []
         total = 0
 
         self._min_len = 30
         self._min_touches = 1
 
-        for path in Path(replay_dir).glob("*.npy"):
+        for path in sorted(Path(replay_dir).glob("*.npy")):
             source = np.load(path, mmap_mode="r")
             replay_cars = self._infer_n_cars(source.shape[1])
-            demos = self._filter(source)
+            unsafe_path = path.with_suffix(".unsafe-starts.npz")
+            if unsafe_path.exists():
+                with np.load(unsafe_path) as stored:
+                    unsafe = np.asarray(stored["unsafe"], dtype=bool)
+                    stored_frame_skip = int(stored.get("frame_skip", frame_skip))
+                if stored_frame_skip != frame_skip:
+                    raise ValueError(
+                        f"unsafe-start mask for {path.name} uses frame skip "
+                        f"{stored_frame_skip}, expected {frame_skip}"
+                    )
+                if unsafe.shape != (len(source),):
+                    raise ValueError(
+                        f"unsafe-start mask for {path.name} has shape {unsafe.shape}, "
+                        f"expected {(len(source),)}"
+                    )
+            else:
+                unsafe = infer_unsafe_start_mask(
+                    source[:, 3:6] * BALL_MAX_SPEED,
+                    frame_skip,
+                )
+            demos = self._filter(source, unsafe)
 
-            replays.extend(demos)
+            replays.extend(demo for demo, _ in demos)
+            start_maps.extend(start_map for _, start_map in demos)
             modes.extend([replay_cars // 2] * len(demos))
             names.extend([path.stem] * len(demos))
-            total += sum(len(demo) for demo in demos)
+            total += sum(len(demo) for demo, _ in demos)
 
             if obs_limit is not None and total >= obs_limit:
                 break
@@ -118,6 +144,10 @@ class ExpertGoalStates:
             th.zeros(1, device=device, dtype=th.long),
             lengths.cumsum(0),
         ))
+        self._safe_cursors = th.cat([
+            start_map.to(device) + self._offsets[index]
+            for index, start_map in enumerate(start_maps)
+        ])
         self._cursors = th.zeros(n_env, device=device).long()
 
     @property
@@ -134,7 +164,11 @@ class ExpertGoalStates:
             raise ValueError(f"unsupported parsed replay car count: {n_cars}")
         return n_cars
 
-    def _filter(self, demo: np.ndarray) -> list[th.Tensor]:
+    def _filter(
+        self,
+        demo: np.ndarray,
+        unsafe: np.ndarray,
+    ) -> list[tuple[th.Tensor, th.Tensor]]:
         n_cars = self._infer_n_cars(demo.shape[1])
         internal_start = 83 + 27 * n_cars
         observation = np.concatenate((
@@ -144,7 +178,7 @@ class ExpertGoalStates:
         ego_touch = demo[:, -5].astype(bool)
         invalid = demo[:, -4:].astype(bool).any(axis=-1)
 
-        demos: list[th.Tensor] = []
+        demos: list[tuple[th.Tensor, th.Tensor]] = []
         start = 0
 
         for end in np.append(np.flatnonzero(invalid), len(demo)):
@@ -152,7 +186,16 @@ class ExpertGoalStates:
             touch_count = np.count_nonzero(ego_touch[start:end])
 
             if length >= self._min_len and touch_count >= self._min_touches:
-                demos.append(th.from_numpy(observation[start:end].copy()))
+                segment_unsafe = unsafe[start:end]
+                try:
+                    start_map = nearest_safe_start_map(segment_unsafe)
+                except ValueError:
+                    start = end + 1
+                    continue
+                demos.append((
+                    th.from_numpy(observation[start:end].copy()),
+                    th.from_numpy(start_map),
+                ))
 
             start = end + 1
 
@@ -207,6 +250,7 @@ class ExpertGoalStates:
             self._cursors[mask] += (
                 th.rand(n_resets, device=self.device) * spans
             ).long()
+            self._cursors[mask] = self._safe_cursors[self._cursors[mask]]
 
         return TensorBatch({
             "observation": CARLObservation.from_tensor(
@@ -515,6 +559,7 @@ def main() -> None:
         n_cars=1,
         device=base_env.device,
         balance=args.balance,
+        frame_skip=args.frameskip,
     )
     env = ExpertLookaheadEnv(
         base_env,
