@@ -6,6 +6,8 @@ const view = document.getElementById('view');
 const checkpoint = document.getElementById('checkpoint');
 const demo = document.getElementById('demo');
 const reward = document.getElementById('reward');
+const agentBoost = document.getElementById('agent-boost');
+const expertBoost = document.getElementById('expert-boost');
 const connection = document.getElementById('connection');
 const speed = document.getElementById('speed');
 const speedValue = document.getElementById('speed-value');
@@ -184,6 +186,8 @@ source.onmessage = ({ data }) => {
   }
   setCar(car, frame.cars[0]);
   setCar(ghost, frame.expert.cars[0]);
+  agentBoost.textContent = frame.cars[0].boost.toFixed(0);
+  expertBoost.textContent = frame.expert.cars[0].boost.toFixed(0);
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;

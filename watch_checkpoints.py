@@ -112,6 +112,7 @@ def frame_from_expert(expert: th.Tensor) -> dict:
             "rgt":    right.cpu().tolist(),
             "up":     up.cpu().tolist(),
             "demoed": bool(ego[17]),
+            "boost":  float(ego[15] * 100),
         }],
     }
 
@@ -143,6 +144,7 @@ def frame_from_state(
             "rgt":     right.cpu().tolist(),
             "up":      up.cpu().tolist(),
             "demoed":  bool(car[17]),
+            "boost":   float(car[15]),
         })
 
     return {
