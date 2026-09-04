@@ -53,27 +53,27 @@ STORED_REPLAY_SIZE = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
 
 class ExpertGoalStates:
 
-    _n_demos:      int
-    _windows:      th.Tensor
-    _demo_id:      th.Tensor
-    _replays:      th.Tensor
-    _offsets:      th.Tensor
-    _cursors:      th.Tensor
-    _modes:        th.Tensor
-    _mode_demo_ids: tuple[th.Tensor, ...]
-    _demo_names:    tuple[str, ...]
+    _n_demos:        int
+    _windows:        th.Tensor
+    _demo_id:        th.Tensor
+    _replays:        th.Tensor
+    _offsets:        th.Tensor
+    _cursors:        th.Tensor
+    _modes:          th.Tensor
+    _mode_demo_ids:  tuple[th.Tensor, ...]
+    _demo_names:     tuple[str, ...]
 
     def __init__(
         self,
-        replay_dir: str,
-        n_env:      int,
-        windows:    Sequence[int] = (1, 2, 4, 8),
-        obs_limit:  int | None = None,
-        n_cars:     int = 2,
-        device:     str | th.device = "cuda:0",
-        balance:    bool = True,
+        replay_dir:         str,
+        n_env:              int,
+        windows:            Sequence[int] = (1, 2, 4, 8),
+        obs_limit:          int | None = None,
+        n_cars:             int = 2,
+        device:             str | th.device = "cuda:0",
+        balance:            bool = True,
         start_at_beginning: bool = False,
-        frame_skip: int = 4,
+        frame_skip:         int = 4,
     ) -> None:
         if n_cars != 1:
             raise ValueError("ExpertGoalStates supports one simulated ego car")
@@ -85,9 +85,9 @@ class ExpertGoalStates:
         self.frame_skip = frame_skip
         self._selected_demo: int | None = None
 
-        replays: list[th.Tensor] = []
-        modes:   list[int] = []
-        names:   list[str] = []
+        replays:    list[th.Tensor] = []
+        modes:      list[int] = []
+        names:      list[str] = []
         start_maps: list[th.Tensor] = []
         total = 0
 
@@ -97,27 +97,7 @@ class ExpertGoalStates:
         for path in sorted(Path(replay_dir).glob("*.npy")):
             source = np.load(path, mmap_mode="r")
             replay_cars = self._infer_n_cars(source.shape[1])
-            unsafe_path = path.with_suffix(".unsafe-starts.npz")
-            if unsafe_path.exists():
-                with np.load(unsafe_path) as stored:
-                    unsafe = np.asarray(stored["unsafe"], dtype=bool)
-                    stored_frame_skip = int(stored.get("frame_skip", frame_skip))
-                if stored_frame_skip != frame_skip:
-                    raise ValueError(
-                        f"unsafe-start mask for {path.name} uses frame skip "
-                        f"{stored_frame_skip}, expected {frame_skip}"
-                    )
-                if unsafe.shape != (len(source),):
-                    raise ValueError(
-                        f"unsafe-start mask for {path.name} has shape {unsafe.shape}, "
-                        f"expected {(len(source),)}"
-                    )
-            else:
-                unsafe = infer_unsafe_start_mask(
-                    source[:, 3:6] * BALL_MAX_SPEED,
-                    frame_skip,
-                )
-            demos = self._filter(source, unsafe)
+            demos = self._filter(source, self._unsafe_mask(path, source))
 
             replays.extend(demo for demo, _ in demos)
             start_maps.extend(start_map for _, start_map in demos)
@@ -150,6 +130,31 @@ class ExpertGoalStates:
         ])
         self._cursors = th.zeros(n_env, device=device).long()
 
+    def _unsafe_mask(self, path: Path, source: np.ndarray) -> np.ndarray:
+        unsafe_path = path.with_suffix(".unsafe-starts.npz")
+        if not unsafe_path.exists():
+            return infer_unsafe_start_mask(
+                source[:, 3:6] * BALL_MAX_SPEED,
+                self.frame_skip,
+            )
+
+        with np.load(unsafe_path) as stored:
+            unsafe = np.asarray(stored["unsafe"], dtype=bool)
+            stored_frame_skip = int(stored.get("frame_skip", self.frame_skip))
+
+        if stored_frame_skip != self.frame_skip:
+            raise ValueError(
+                f"unsafe-start mask for {path.name} uses frame skip "
+                f"{stored_frame_skip}, expected {self.frame_skip}"
+            )
+        if unsafe.shape != (len(source),):
+            raise ValueError(
+                f"unsafe-start mask for {path.name} has shape {unsafe.shape}, "
+                f"expected {(len(source),)}"
+            )
+
+        return unsafe
+
     @property
     def goal_size(self) -> int:
         return self._windows.numel() * GOAL_STATE_SIZE
@@ -166,7 +171,7 @@ class ExpertGoalStates:
 
     def _filter(
         self,
-        demo: np.ndarray,
+        demo:   np.ndarray,
         unsafe: np.ndarray,
     ) -> list[tuple[th.Tensor, th.Tensor]]:
         n_cars = self._infer_n_cars(demo.shape[1])
@@ -312,7 +317,7 @@ class TrackingReward:
 
     def __init__(
         self,
-        replays: ExpertGoalStates,
+        replays:    ExpertGoalStates,
         scale:      float = 1.0,
         ball_scale: float = 1.25,
         car_scale:  float = 2.0,
@@ -390,12 +395,12 @@ class ExpertLookaheadEnv:
 
     def __init__(
         self,
-        env:            CARLTorchVectorEnv,
-        replays:        ExpertGoalStates,
-        reward_scale:   float = 1.0,
-        ball_scale:     float = 1.25,
-        car_scale:      float = 2.0,
-        minimum_reward: float = 0.1,
+        env:                     CARLTorchVectorEnv,
+        replays:                 ExpertGoalStates,
+        reward_scale:            float = 1.0,
+        ball_scale:              float = 1.25,
+        car_scale:               float = 2.0,
+        minimum_reward:          float = 0.1,
         minimum_tracking_frames: int = 1,
     ) -> None:
         if minimum_tracking_frames < 1:
