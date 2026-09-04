@@ -4,17 +4,28 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 const view = document.getElementById('view');
 const checkpoint = document.getElementById('checkpoint');
-const demo = document.getElementById('demo');
 const reward = document.getElementById('reward');
 const agentBoost = document.getElementById('agent-boost');
 const expertBoost = document.getElementById('expert-boost');
-const action = document.getElementById('action');
+const agentBoostFill = document.getElementById('agent-boost-fill');
+const expertBoostFill = document.getElementById('expert-boost-fill');
+const copyDemo = document.getElementById('copy-demo');
+const actionFields = [
+  document.getElementById('action-horizontal'),
+  document.getElementById('action-vertical'),
+  document.getElementById('action-throttle'),
+  document.getElementById('action-slide'),
+  document.getElementById('action-boost'),
+  document.getElementById('action-roll'),
+  document.getElementById('action-jump'),
+];
 const demoSearch = document.getElementById('demo-search');
 const demoQuery = document.getElementById('demo-query');
 const connection = document.getElementById('connection');
 const speed = document.getElementById('speed');
 const speedValue = document.getElementById('speed-value');
 let speedUpdate;
+let demoName = '';
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
@@ -191,22 +202,43 @@ source.onmessage = ({ data }) => {
   setCar(ghost, frame.expert.cars[0]);
   agentBoost.textContent = frame.cars[0].boost.toFixed(0);
   expertBoost.textContent = frame.expert.cars[0].boost.toFixed(0);
+  agentBoostFill.style.width = `${frame.cars[0].boost}%`;
+  expertBoostFill.style.width = `${frame.expert.cars[0].boost}%`;
   const axis = ['0', '-1', '+1'];
-  action.textContent = `Action: H ${axis[frame.action[0]]} V ${axis[frame.action[1]]} T ${axis[frame.action[2]]} Slide ${frame.action[3]} Boost ${frame.action[4]} Roll ${axis[frame.action[5]]} Jump ${frame.action[6]}`;
+  const actions = Array.isArray(frame.action[0]) ? frame.action[0] : frame.action;
+  actionFields[0].textContent = axis[actions[0]];
+  actionFields[1].textContent = axis[actions[1]];
+  actionFields[2].textContent = axis[actions[2]];
+  actionFields[3].textContent = actions[3];
+  actionFields[4].textContent = actions[4];
+  actionFields[5].textContent = axis[actions[5]];
+  actionFields[6].textContent = actions[6];
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;
   checkpoint.title = frame.checkpoint;
-  if (demo.textContent !== frame.demo) {
-    demo.textContent = frame.demo;
-    demo.title = frame.demo;
-  }
+  demoName = frame.demo;
   reward.textContent = frame.reward.map((value) => value.toFixed(3)).join(' / ');
 };
 source.onerror = () => {
   connection.textContent = 'Reconnecting';
   connection.classList.remove('live');
 };
+
+copyDemo.addEventListener('click', async () => {
+  if (navigator.clipboard) {
+    await navigator.clipboard.writeText(demoName);
+  } else {
+    const text = document.createElement('textarea');
+    text.value = demoName;
+    document.body.appendChild(text);
+    text.select();
+    document.execCommand('copy');
+    text.remove();
+  }
+  copyDemo.textContent = 'Copied';
+  setTimeout(() => { copyDemo.textContent = 'Copy demo name'; }, 1200);
+});
 
 document.getElementById('reset').addEventListener('click', () => {
   fetch('/reset', { method: 'POST' });

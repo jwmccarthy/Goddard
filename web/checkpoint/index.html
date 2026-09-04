@@ -88,6 +88,43 @@
       user-select: text;
     }
 
+    .copy-demo {
+      padding: 6px 9px;
+      border-radius: 8px;
+      font-size: 10px;
+    }
+
+    .boost-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 11px;
+    }
+
+    .boost-meter { color: var(--muted); font-size: 10px; font-weight: 750; }
+    .boost-meter header { display: flex; justify-content: space-between; margin-bottom: 5px; }
+    .boost-meter output { color: var(--ink); font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .boost-meter i { display: block; height: 5px; background: rgba(16, 37, 45, 0.12); }
+    .boost-meter b { display: block; width: 0; height: 100%; background: var(--agent); transition: width 80ms linear; }
+    .boost-meter.expert b { background: var(--expert); }
+
+    .action-readout {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px;
+      margin-top: 11px;
+    }
+
+    .action-readout span {
+      padding: 5px 2px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font: 700 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-align: center;
+    }
+
+    .action-readout b { display: block; color: var(--ink); font-size: 11px; }
+
     .reward {
       font: 800 24px ui-monospace, SFMono-Regular, Menlo, monospace;
       letter-spacing: -0.06em;
@@ -212,12 +249,26 @@
         <div id="checkpoint" class="checkpoint">waiting for stream</div>
         <div id="reward" class="reward">0.000</div>
       </div>
-      <div class="checkpoint">
-        Agent boost: <span id="agent-boost">0</span>
-        Expert boost: <span id="expert-boost">0</span>
+      <button id="copy-demo" class="copy-demo" type="button">Copy demo name</button>
+      <div class="boost-grid">
+        <div class="boost-meter">
+          <header><span>Agent boost</span><output id="agent-boost">0</output></header>
+          <i><b id="agent-boost-fill"></b></i>
+        </div>
+        <div class="boost-meter expert">
+          <header><span>Expert boost</span><output id="expert-boost">0</output></header>
+          <i><b id="expert-boost-fill"></b></i>
+        </div>
       </div>
-      <div id="action" class="checkpoint">Action: 0 0 0 0 0 0 0</div>
-      <div id="demo" class="checkpoint">waiting for demo</div>
+      <div class="action-readout" aria-label="Agent action">
+        <span>H<b id="action-horizontal">0</b></span>
+        <span>V<b id="action-vertical">0</b></span>
+        <span>T<b id="action-throttle">0</b></span>
+        <span>S<b id="action-slide">0</b></span>
+        <span>B<b id="action-boost">0</b></span>
+        <span>R<b id="action-roll">0</b></span>
+        <span>J<b id="action-jump">0</b></span>
+      </div>
       <div class="legend">
         <span><i class="swatch agent"></i>Agent</span>
         <span><i class="swatch expert"></i>Expert POV</span>

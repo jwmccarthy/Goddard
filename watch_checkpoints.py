@@ -157,7 +157,7 @@ def frame_from_state(
         "checkpoint": checkpoint.name,
         "demo":       demo_name,
         "reward":     reward.cpu().tolist(),
-        "action":     action.cpu().tolist(),
+        "action":     action[0].cpu().tolist(),
         "ball":       {"pos": state[:3].cpu().tolist()},
         "cars":       rendered,
         "expert":     frame_from_expert(expert),
