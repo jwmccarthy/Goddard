@@ -223,6 +223,51 @@ def infer_actions(
     )
 
 
+def simulate_actions(
+    rows: th.Tensor,
+    actions: th.Tensor,
+    internal_start: int,
+    frameskip: int,
+    simulation_batch_size: int,
+) -> th.Tensor:
+    count = len(rows) - 1
+    n_sim = min(count, simulation_batch_size)
+    reset = ReplayReset(rows[:1].expand(n_sim, -1), internal_start)
+    env = CARLTorchVectorEnv(
+        n_sim=n_sim,
+        n_blue=1,
+        n_orange=0,
+        frameskip=frameskip,
+        max_ticks=1_000_000,
+        normalize=True,
+        reset_state_provider=reset,
+    )
+    states = []
+
+    try:
+        for start in range(0, count, n_sim):
+            batch_count = min(n_sim, count - start)
+            source = rows[start:start + batch_count]
+            batch_actions = actions[start:start + batch_count]
+            if batch_count < n_sim:
+                source = th.cat((source, source[:1].expand(n_sim - batch_count, -1)))
+                batch_actions = th.cat((
+                    batch_actions,
+                    batch_actions[:1].expand(n_sim - batch_count, -1),
+                ))
+
+            reset.rows = source
+            env.reset()
+            obs, _, terminated, truncated, info = env.step(batch_actions)
+            states.append(
+                transition_observation(env, obs, terminated, truncated, info)[:batch_count]
+            )
+    finally:
+        env.close()
+
+    return th.cat(states)
+
+
 def rollout(
     rows: th.Tensor,
     actions: th.Tensor,
@@ -559,6 +604,16 @@ def main() -> None:
             rows, internal_start, args.frameskip, args.simulation_batch_size
         )
         action_source = "inferred"
+
+    if oracle_states is None:
+        oracle_states = simulate_actions(
+            rows,
+            actions,
+            internal_start,
+            args.frameskip,
+            args.simulation_batch_size,
+        )
+        oracle_costs = tracking_cost(oracle_states, rows[1:, :30])
 
     rollout_states, ended_at = rollout(rows, actions, internal_start, args.frameskip)
     summary = write_results(
