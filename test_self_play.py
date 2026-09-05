@@ -11,7 +11,7 @@ from gymnasium.vector.utils import batch_space
 
 from carl.gymnasium.state import CarlEvents, CarlState, RewardContext
 from distill import ActionDecoder, ConditionalPrior, GOAL_STATE_SIZE
-from jarl.modules import MLP
+from jarl.modules import GRU, MLP
 from jarl.modules.encoder import LinearEncoder
 from rewards import AnnealedNextoReward, nexto_shaping_scale
 
@@ -126,6 +126,28 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(evaluation.entropy.shape, (2,))
         th.testing.assert_close(policy.log_std.exp(), th.full((3,), 0.22))
         self.assertFalse(policy.log_std.requires_grad)
+
+    def test_fixed_gaussian_policy_carries_state_across_32_step_sequences(self):
+        env = PulseLatentEnv(FakeEnv(), make_controller())
+        policy = FixedGaussianPolicy(
+            LinearEncoder(8), GRU(hidden_size=4), MLP(dims=[]), std=0.22
+        ).build(env)
+        state = policy.initial_state(2)
+
+        output = policy.act(th.ones((2, GOAL_STATE_SIZE)), state)
+        observations = th.ones((32, 2, GOAL_STATE_SIZE))
+        actions = th.zeros((32, 2, 3))
+        evaluation = policy.evaluate_actions(
+            observations,
+            actions,
+            state,
+            reset=th.zeros((32, 2), dtype=th.bool),
+        )
+
+        self.assertEqual(state.shape, (2, 1, 4))
+        self.assertEqual(output.next_state.shape, state.shape)
+        self.assertEqual(evaluation.log_prob.shape, (32, 2))
+        self.assertEqual(evaluation.entropy.shape, (32, 2))
 
     def test_controller_is_frozen_and_decodes_latent_residuals(self):
         controller = make_controller()

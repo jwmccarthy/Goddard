@@ -128,7 +128,11 @@ class SpectatorState:
 def load_checkpoint(path: Path, env: PulseLatentEnv):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload["config"]
-    policy = build_policy(env, float(config["exploration_std"]))
+    policy = build_policy(
+        env,
+        float(config["exploration_std"]),
+        config.get("gru_hidden_size"),
+    )
     policy.load_state_dict(payload["policy"])
     metadata = {
         "distill_sha256": payload["distill_sha256"],
@@ -270,6 +274,8 @@ def simulate(
         blue, _ = load_checkpoint(blue_path, env)
         orange, _ = load_checkpoint(orange_path, env)
         observation = env.reset()
+        blue_state = blue.initial_state(1)
+        orange_state = orange.initial_state(1)
         blue_score = orange_score = 0
         round_number = 1
         tick = 0
@@ -299,15 +305,22 @@ def simulate(
             if state.reset.is_set():
                 state.reset.clear()
                 observation = env.reset()
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
                 blue_score = orange_score = 0
                 round_number = 1
                 tick = 0
 
             with th.inference_mode():
-                residual = th.cat((
-                    blue.act(observation[:1], deterministic=True).action,
-                    orange.act(observation[1:], deterministic=True).action,
-                ))
+                blue_output = blue.act(
+                    observation[:1], blue_state, deterministic=True
+                )
+                orange_output = orange.act(
+                    observation[1:], orange_state, deterministic=True
+                )
+                residual = th.cat((blue_output.action, orange_output.action))
+                blue_state = blue_output.next_state
+                orange_state = orange_output.next_state
             observation, reward, terminated, truncated, _ = env.step(residual)
             tick += args.frameskip
 
@@ -315,6 +328,8 @@ def simulate(
             blue_score += max(goal, 0)
             orange_score += max(-goal, 0)
             if (terminated | truncated).any():
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
                 round_number += 1
                 tick = 0
 

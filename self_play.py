@@ -16,23 +16,24 @@ from torch.distributions import Normal
 
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
-    CriticCapture,
     LogProbCapture,
+    RecurrentCriticCapture,
+    RecurrentStateCapture,
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
 )
+from jarl.data.records import Evaluation, PolicyOutput
 from jarl.learn import Algorithm, OptimizerStep, PPOConfig, PPOLoss, Update
 from jarl.log.logger import Logger
 from jarl.data import TensorBatch, TensorDataset
 from jarl.envs import DatasetResetSampler
-from jarl.modules import MLP, orthogonal_init
-from jarl.modules.base import CompositeNet
+from jarl.modules import GRU, MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import DiagonalGaussianPolicy
 from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
-from jarl.sample import RolloutMinibatches
+from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
@@ -237,12 +238,60 @@ class FixedGaussianPolicy(DiagonalGaussianPolicy):
         self.log_std.requires_grad_(False)
         return self
 
-    def dist(self, observation: th.Tensor) -> Normal:
-        mean = CompositeNet.forward(self, observation)
+    def _distribution(self, features: th.Tensor) -> Normal:
+        mean = self.head(features)
         return Normal(mean, self.log_std.expand_as(mean).exp())
 
+    def body_features(
+        self,
+        observation: th.Tensor,
+        state: th.Tensor | None = None,
+        reset: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor | None]:
+        features = self.foot(observation)
+        if hasattr(self.body, "initial_state"):
+            return self.body(features, state, reset)
+        if state is not None or reset is not None:
+            raise ValueError("stateless policy body does not accept state")
+        return self.body(features), None
+
+    def dist(self, observation: th.Tensor) -> Normal:
+        features, _ = self.body_features(observation)
+        return self._distribution(features)
+
     def action(self, observation: th.Tensor) -> th.Tensor:
-        return CompositeNet.forward(self, observation)
+        return self.dist(observation).mean
+
+    def act(
+        self,
+        observation: th.Tensor,
+        state: th.Tensor | None = None,
+        *,
+        deterministic: bool = False,
+    ) -> PolicyOutput:
+        features, next_state = self.body_features(observation, state)
+        distribution = self._distribution(features)
+        action = distribution.mean if deterministic else distribution.sample()
+        return PolicyOutput(
+            action=action,
+            next_state=next_state,
+            log_prob=None if deterministic else self._logprob(distribution, action),
+        )
+
+    def evaluate_actions(
+        self,
+        observation: th.Tensor,
+        action: th.Tensor,
+        state: th.Tensor | None = None,
+        *,
+        reset: th.Tensor | None = None,
+    ) -> Evaluation:
+        features, _ = self.body_features(observation, state, reset)
+        distribution = self._distribution(features)
+        return Evaluation(
+            log_prob=self._logprob(distribution, action),
+            entropy=self._entropy(distribution),
+        )
 
 
 class SelfPlayCheckpoints:
@@ -340,6 +389,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--sequence-length", type=int, default=32)
+    parser.add_argument("--gru-hidden-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--exploration-std", type=float, default=0.22)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
@@ -371,6 +422,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "rollout",
         "batch_size",
         "epochs",
+        "sequence_length",
+        "gru_hidden_size",
         "lr",
         "exploration_std",
         "max_grad_norm",
@@ -387,6 +440,10 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.snapshot_pool_size < 3:
         raise ValueError("--snapshot-pool-size must be at least three")
+    if args.rollout % args.sequence_length:
+        raise ValueError("--rollout must be divisible by --sequence-length")
+    if args.batch_size % args.sequence_length:
+        raise ValueError("--batch-size must be divisible by --sequence-length")
     if not 0.0 <= args.current_fraction <= 1.0:
         raise ValueError("--current-fraction must be between zero and one")
     if not 0.0 <= args.demonstration_reset_fraction <= 1.0:
@@ -405,21 +462,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(args.replay_dir)
 
 
-def build_policy(env, exploration_std: float) -> FixedGaussianPolicy:
+def build_policy(
+    env,
+    exploration_std: float,
+    gru_hidden_size: int | None = None,
+) -> FixedGaussianPolicy:
     return FixedGaussianPolicy(
         foot=LinearEncoder(2048, func=nn.ReLU),
-        body=MLP(dims=[1024, 512], func=nn.ReLU),
+        body=(
+            GRU(hidden_size=gru_hidden_size)
+            if gru_hidden_size is not None
+            else MLP(dims=[1024, 512], func=nn.ReLU)
+        ),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=0.01)),
         std=exploration_std,
     ).build(env).to(env.device)
 
 
-def build_policy_and_critic(env, exploration_std: float):
-    policy = build_policy(env, exploration_std)
+def build_policy_and_critic(env, exploration_std: float, gru_hidden_size: int):
+    policy = build_policy(env, exploration_std, gru_hidden_size)
 
     critic = Critic(
         foot=LinearEncoder(2048, func=nn.ReLU),
-        body=MLP(dims=[1024, 512], func=nn.ReLU),
+        body=GRU(hidden_size=gru_hidden_size),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
     ).build(env).to(env.device)
     return policy, critic
@@ -462,7 +527,9 @@ def main() -> None:
         frame_skip=args.frameskip,
     )
     env = PulseLatentEnv(base_env, controller)
-    policy, critic = build_policy_and_critic(env, args.exploration_std)
+    policy, critic = build_policy_and_critic(
+        env, args.exploration_std, args.gru_hidden_size
+    )
 
     run_id = datetime.now().strftime("self-play-%Y%m%d-%H%M%S-%f")
     pool = SnapshotPool(
@@ -494,13 +561,29 @@ def main() -> None:
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
-        captures=(LogProbCapture(), CriticCapture(critic)),
+        captures=(
+            LogProbCapture(),
+            RecurrentStateCapture(),
+            RecurrentCriticCapture(critic),
+        ),
     )
 
     optimizer = Adam((*policy.parameters(), *critic.parameters()), lr=args.lr)
     update = Update(
         transforms=(GAE(gamma=0.99, lambda_=0.95),),
-        sampler=RolloutMinibatches(args.batch_size, args.epochs),
+        sampler=RecurrentRolloutMinibatches(
+            sequence_length=args.sequence_length,
+            sequences_per_batch=args.batch_size // args.sequence_length,
+            epochs=args.epochs,
+            fields=(
+                "observation",
+                "action",
+                "advantage",
+                "old_log_prob",
+                "baseline_value",
+                "returns",
+            ),
+        ),
         loss=PPOLoss(
             policy,
             critic,
