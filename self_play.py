@@ -393,6 +393,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gru-hidden-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--exploration-std", type=float, default=0.22)
+    parser.add_argument("--entropy-coef", type=float, default=0.001)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--current-fraction", type=float, default=0.5)
     parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
@@ -444,6 +445,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rollout must be divisible by --sequence-length")
     if args.batch_size % args.sequence_length:
         raise ValueError("--batch-size must be divisible by --sequence-length")
+    if not math.isfinite(args.entropy_coef) or args.entropy_coef < 0:
+        raise ValueError("--entropy-coef must be finite and nonnegative")
     if not 0.0 <= args.current_fraction <= 1.0:
         raise ValueError("--current-fraction must be between zero and one")
     if not 0.0 <= args.demonstration_reset_fraction <= 1.0:
@@ -587,7 +590,7 @@ def main() -> None:
         loss=PPOLoss(
             policy,
             critic,
-            PPOConfig(clip=0.2, value_clip=0.2, entropy_coef=0.0),
+            PPOConfig(clip=0.2, value_clip=0.2, entropy_coef=args.entropy_coef),
         ),
         optimizer_step=OptimizerStep(
             (policy, critic),
