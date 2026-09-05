@@ -9,9 +9,11 @@ import torch as th
 
 from gymnasium.vector.utils import batch_space
 
+from carl.gymnasium.state import CarlEvents, CarlState, RewardContext
 from distill import ActionDecoder, ConditionalPrior, GOAL_STATE_SIZE
 from jarl.modules import MLP
 from jarl.modules.encoder import LinearEncoder
+from rewards import AnnealedNextoReward, nexto_shaping_scale
 
 from self_play import (
     FixedGaussianPolicy,
@@ -61,7 +63,54 @@ def make_controller(latent_size: int = 3) -> FrozenPulseController:
     )
 
 
+def make_reward_context(score_delta: int = 0) -> RewardContext:
+    raw = th.zeros((1, 53))
+    raw[:, 2] = 100.0
+    raw[:, 9 + 9] = 1.0
+    raw[:, 31 + 9] = 1.0
+    state = CarlState(raw, 2, th.empty((0, 3)), th.tensor([1.0, -1.0]))
+    events = CarlEvents(
+        score_delta=th.tensor([score_delta]),
+        done=th.tensor([False]),
+        terminated=th.tensor([False]),
+        truncated=th.tensor([False]),
+    )
+    return RewardContext(
+        state,
+        state,
+        None,
+        None,
+        events,
+        None,
+        th.tensor([score_delta]),
+        th.tensor([0]),
+        th.tensor([False]),
+    )
+
+
 class SelfPlayTest(unittest.TestCase):
+    def test_nexto_reward_keeps_unit_zero_sum_goals_without_shaping(self):
+        reward = AnnealedNextoReward(1, 1, shaping_scale=0.0)
+
+        th.testing.assert_close(
+            reward(make_reward_context(score_delta=1)), th.tensor([[1.0, -1.0]])
+        )
+        th.testing.assert_close(
+            reward(make_reward_context(score_delta=0)), th.zeros((1, 2))
+        )
+
+    def test_nexto_shaping_is_zero_sum(self):
+        value = AnnealedNextoReward(1, 1)(make_reward_context())
+
+        th.testing.assert_close(value.sum(dim=-1), th.zeros(1))
+
+    def test_nexto_shaping_schedule_has_a_plateau_and_reaches_zero(self):
+        args = (1.0, 100, 1100)
+
+        self.assertEqual(nexto_shaping_scale(100, *args), 1.0)
+        self.assertEqual(nexto_shaping_scale(600, *args), 0.5)
+        self.assertEqual(nexto_shaping_scale(1100, *args), 0.0)
+
     def test_fixed_gaussian_policy_uses_requested_standard_deviation(self):
         env = PulseLatentEnv(FakeEnv(), make_controller())
         policy = FixedGaussianPolicy(

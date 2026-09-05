@@ -31,7 +31,7 @@ from jarl.modules.base import CompositeNet
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import DiagonalGaussianPolicy
-from jarl.runtime import OnPolicySchedule, Trainer
+from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
 from jarl.sample import RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
@@ -45,6 +45,7 @@ from distill import (
 )
 from physics_utils import forward_up_to_quat
 from replay_safety import infer_unsafe_start_mask
+from rewards import AnnealedNextoReward, nexto_shaping_scale
 from tracker import (
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
@@ -348,6 +349,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--historical-policies", type=int, default=4)
     parser.add_argument("--demonstration-reset-fraction", type=float, default=0.8)
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
+    parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
+    parser.add_argument("--nexto-anneal-start", type=int, default=250_000_000)
+    parser.add_argument("--nexto-anneal-end", type=int, default=1_750_000_000)
     parser.add_argument("--timesteps", type=int, default=2_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
@@ -387,6 +391,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--current-fraction must be between zero and one")
     if not 0.0 <= args.demonstration_reset_fraction <= 1.0:
         raise ValueError("--demonstration-reset-fraction must be between zero and one")
+    if not 0.0 <= args.nexto_shaping_scale <= 1.0:
+        raise ValueError("--nexto-shaping-scale must be between zero and one")
+    if args.nexto_anneal_start < 0:
+        raise ValueError("--nexto-anneal-start cannot be negative")
+    if args.nexto_anneal_end <= args.nexto_anneal_start:
+        raise ValueError("--nexto-anneal-end must be greater than --nexto-anneal-start")
     if args.historical_policies >= args.snapshot_pool_size:
         raise ValueError("--historical-policies must be smaller than the snapshot pool")
     if not args.distill_checkpoint.is_file():
@@ -432,6 +442,7 @@ def main() -> None:
         probability=args.demonstration_reset_fraction,
         seed=args.seed,
     )
+    reward = AnnealedNextoReward(1, 1, args.nexto_shaping_scale)
     base_env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=1,
@@ -442,6 +453,7 @@ def main() -> None:
         no_touch_timeout_seconds=args.no_touch_timeout_seconds,
         normalize=True,
         reset_state_provider=reset_sampler,
+        reward_funcs=(reward,),
     )
     controller = FrozenPulseController.load(
         args.distill_checkpoint,
@@ -501,6 +513,20 @@ def main() -> None:
         ),
         section="PPO",
     )
+    value_scheduler = ValueScheduler(
+        ScheduledValue.attribute(
+            "nexto_shaping_scale",
+            reward,
+            "shaping_scale",
+            lambda progress: nexto_shaping_scale(
+                round(progress * args.timesteps),
+                args.nexto_shaping_scale,
+                args.nexto_anneal_start,
+                args.nexto_anneal_end,
+            ),
+        ),
+        section="Reward",
+    )
     checkpoints = SelfPlayCheckpoints(
         args.checkpoint_dir / run_id,
         args.checkpoint_interval,
@@ -519,6 +545,7 @@ def main() -> None:
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "approx_kl", "approx KL", ".4f"),
         ("episode", "historical_reward", "historical reward", ".3f"),
+        ("Reward", "nexto_shaping_scale", "reward shaping", ".3f"),
     ):
         logger.register_progress_metric(section, key, label, format_spec)
     trainer = Trainer(
@@ -528,6 +555,7 @@ def main() -> None:
         OnPolicySchedule(),
         logger=logger,
         checkpoint=checkpoints,
+        value_scheduler=value_scheduler,
     )
 
     try:
