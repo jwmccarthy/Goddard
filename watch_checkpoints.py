@@ -132,12 +132,14 @@ def load_checkpoint(path: Path, env: PulseLatentEnv):
         env,
         float(config["exploration_std"]),
         config.get("gru_hidden_size"),
+        config.get("gru_input_size"),
     )
     policy.load_state_dict(payload["policy"])
     metadata = {
         "distill_sha256": payload["distill_sha256"],
         "pulse_artifact": payload["pulse_artifact"],
         "pulse_sha256": payload["pulse_sha256"],
+        "bf16": bool(config.get("bf16", False)),
     }
     return policy.eval().requires_grad_(False), metadata
 
@@ -256,6 +258,10 @@ def simulate(
         )
         blue_payload = th.load(blue_path, map_location="cpu", weights_only=True)
         orange_payload = th.load(orange_path, map_location="cpu", weights_only=True)
+        blue_bf16 = bool(blue_payload["config"].get("bf16", False))
+        orange_bf16 = bool(orange_payload["config"].get("bf16", False))
+        if blue_bf16 != orange_bf16:
+            raise ValueError("selected policies use different decoder precision")
         artifact_path = resolve_pulse_artifact(
             args.distill_checkpoint,
             blue_path,
@@ -268,6 +274,7 @@ def simulate(
             base.action_codec,
             base.device,
             frame_skip=args.frameskip,
+            bf16=blue_bf16,
         )
         env = PulseLatentEnv(base, controller)
         del blue_payload, orange_payload
@@ -287,6 +294,10 @@ def simulate(
                 try:
                     next_blue, next_blue_payload = load_checkpoint(pending[0], env)
                     next_orange, next_orange_payload = load_checkpoint(pending[1], env)
+                    if next_blue_payload["bf16"] != next_orange_payload["bf16"]:
+                        raise ValueError(
+                            "selected policies use different decoder precision"
+                        )
                     next_artifact = str(next_blue_payload["distill_sha256"])
                     if next_artifact != artifact_id:
                         raise ValueError(
@@ -300,6 +311,7 @@ def simulate(
                 else:
                     blue_path, orange_path = pending
                     blue, orange = next_blue, next_orange
+                    controller.bf16 = next_blue_payload["bf16"]
                     state.reset.set()
 
             if state.reset.is_set():

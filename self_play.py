@@ -138,11 +138,13 @@ class FrozenPulseController(nn.Module):
         prior: ConditionalPrior,
         decoder: ActionDecoder,
         action_codec,
+        bf16: bool = False,
     ) -> None:
         super().__init__()
         self.prior = prior.eval().requires_grad_(False)
         self.decoder = decoder.eval().requires_grad_(False)
         self.action_codec = action_codec
+        self.bf16 = bf16
 
     @classmethod
     def load(
@@ -151,6 +153,7 @@ class FrozenPulseController(nn.Module):
         action_codec,
         device,
         frame_skip: int | None = None,
+        bf16: bool = False,
     ) -> "FrozenPulseController":
         payload = th.load(checkpoint, map_location=device, weights_only=True)
         config = payload["config"]
@@ -170,7 +173,7 @@ class FrozenPulseController(nn.Module):
         ).to(device)
         prior.load_state_dict(payload["prior"])
         decoder.load_state_dict(payload["decoder"])
-        return cls(prior, decoder, action_codec)
+        return cls(prior, decoder, action_codec, bf16)
 
     @property
     def latent_size(self) -> int:
@@ -179,8 +182,13 @@ class FrozenPulseController(nn.Module):
     @th.no_grad()
     def decode(self, observation: th.Tensor, residual: th.Tensor) -> th.Tensor:
         state = observation[..., :GOAL_STATE_SIZE]
-        prior_mean, _ = self.prior(state)
-        logits = self.decoder(state, prior_mean + residual)
+        with th.autocast(
+            device_type=state.device.type,
+            dtype=th.bfloat16,
+            enabled=self.bf16 and state.device.type == "cuda",
+        ):
+            prior_mean, _ = self.prior(state)
+            logits = self.decoder(state, prior_mean + residual)
         return factor_actions(masked_logits(logits, state, self.action_codec))
 
 
@@ -250,6 +258,12 @@ class FixedGaussianPolicy(DiagonalGaussianPolicy):
     ) -> tuple[th.Tensor, th.Tensor | None]:
         features = self.foot(observation)
         if hasattr(self.body, "initial_state"):
+            if (
+                state is not None
+                and state.dtype != features.dtype
+                and th.is_autocast_enabled()
+            ):
+                state = state.to(features.dtype)
             return self.body(features, state, reset)
         if state is not None or reset is not None:
             raise ValueError("stateless policy body does not accept state")
@@ -390,7 +404,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--sequence-length", type=int, default=32)
-    parser.add_argument("--gru-hidden-size", type=int, default=512)
+    parser.add_argument("--gru-input-size", type=int, default=512)
+    parser.add_argument("--gru-hidden-size", type=int, default=256)
+    parser.add_argument(
+        "--bf16", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--exploration-std", type=float, default=0.22)
     parser.add_argument("--entropy-coef", type=float, default=0.001)
@@ -425,6 +443,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "batch_size",
         "epochs",
         "sequence_length",
+        "gru_input_size",
         "gru_hidden_size",
         "lr",
         "exploration_std",
@@ -448,6 +467,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must be divisible by --sequence-length")
     if not math.isfinite(args.entropy_coef) or args.entropy_coef < 0:
         raise ValueError("--entropy-coef must be finite and nonnegative")
+    if args.bf16 and th.cuda.is_available() and not th.cuda.is_bf16_supported():
+        raise ValueError("--bf16 requires BF16 support on the CUDA device")
     if not 0.0 <= args.current_fraction <= 1.0:
         raise ValueError("--current-fraction must be between zero and one")
     if not 0.0 <= args.demonstration_reset_fraction <= 1.0:
@@ -472,9 +493,11 @@ def build_policy(
     env,
     exploration_std: float,
     gru_hidden_size: int | None = None,
+    gru_input_size: int | None = None,
 ) -> FixedGaussianPolicy:
+    feature_size = 2048 if gru_input_size is None else gru_input_size
     return FixedGaussianPolicy(
-        foot=LinearEncoder(2048, func=nn.ReLU),
+        foot=LinearEncoder(feature_size, func=nn.ReLU),
         body=(
             GRU(hidden_size=gru_hidden_size)
             if gru_hidden_size is not None
@@ -485,11 +508,18 @@ def build_policy(
     ).build(env).to(env.device)
 
 
-def build_policy_and_critic(env, exploration_std: float, gru_hidden_size: int):
-    policy = build_policy(env, exploration_std, gru_hidden_size)
+def build_policy_and_critic(
+    env,
+    exploration_std: float,
+    gru_hidden_size: int,
+    gru_input_size: int,
+):
+    policy = build_policy(
+        env, exploration_std, gru_hidden_size, gru_input_size
+    )
 
     critic = Critic(
-        foot=LinearEncoder(2048, func=nn.ReLU),
+        foot=LinearEncoder(gru_input_size, func=nn.ReLU),
         body=GRU(hidden_size=gru_hidden_size),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
     ).build(env).to(env.device)
@@ -536,10 +566,14 @@ def main() -> None:
         base_env.action_codec,
         base_env.device,
         frame_skip=args.frameskip,
+        bf16=args.bf16,
     )
     env = PulseLatentEnv(base_env, controller)
     policy, critic = build_policy_and_critic(
-        env, args.exploration_std, args.gru_hidden_size
+        env,
+        args.exploration_std,
+        args.gru_hidden_size,
+        args.gru_input_size,
     )
 
     run_id = datetime.now().strftime("self-play-%Y%m%d-%H%M%S-%f")
@@ -598,7 +632,12 @@ def main() -> None:
         loss=PPOLoss(
             policy,
             critic,
-            PPOConfig(clip=0.2, value_clip=0.2, entropy_coef=args.entropy_coef),
+            PPOConfig(
+                clip=0.2,
+                value_clip=0.2,
+                entropy_coef=args.entropy_coef,
+                bf16=args.bf16,
+            ),
         ),
         optimizer_step=OptimizerStep(
             (policy, critic),

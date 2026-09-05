@@ -19,6 +19,7 @@ from self_play import (
     FixedGaussianPolicy,
     FrozenPulseController,
     PulseLatentEnv,
+    build_policy,
     load_demonstration_reset_dataset,
 )
 
@@ -170,6 +171,19 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(evaluation.log_prob.shape, (32, 2))
         self.assertEqual(evaluation.entropy.shape, (32, 2))
 
+    def test_compact_recurrent_policy_uses_requested_dimensions(self):
+        env = PulseLatentEnv(FakeEnv(), make_controller())
+        policy = build_policy(
+            env,
+            exploration_std=0.22,
+            gru_hidden_size=7,
+            gru_input_size=11,
+        )
+
+        self.assertEqual(policy.foot.feats, 11)
+        self.assertEqual(policy.body.input_size, 11)
+        self.assertEqual(policy.body.hidden_size, 7)
+
     def test_controller_is_frozen_and_decodes_latent_residuals(self):
         controller = make_controller()
         observation = th.zeros((2, GOAL_STATE_SIZE))
@@ -231,9 +245,10 @@ class SelfPlayTest(unittest.TestCase):
             th.save(payload, checkpoint)
 
             loaded = FrozenPulseController.load(
-                checkpoint, AllValidActionCodec(), "cpu"
+                checkpoint, AllValidActionCodec(), "cpu", bf16=True
             )
 
+        self.assertTrue(loaded.bf16)
         for expected, actual in zip(source.parameters(), loaded.parameters()):
             th.testing.assert_close(expected, actual)
 
