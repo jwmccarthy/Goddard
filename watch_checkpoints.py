@@ -308,7 +308,7 @@ def simulate(
                     blue.act(observation[:1], deterministic=True).action,
                     orange.act(observation[1:], deterministic=True).action,
                 ))
-                observation, reward, terminated, truncated, _ = env.step(residual)
+            observation, reward, terminated, truncated, _ = env.step(residual)
             tick += args.frameskip
 
             goal = int(reward[0].item())
