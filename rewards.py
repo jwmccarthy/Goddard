@@ -140,7 +140,9 @@ class AnnealedNextoReward:
             * ball_goal_progress.clamp_min(0.0)
         )
         newly_demoed = current.car_demoed & ~previous.car_demoed
-        demo = self._opponent_team_mean(newly_demoed.float())
+        demo = (
+            self._opponent_team_mean(newly_demoed.float()) - newly_demoed.float()
+        )
 
         distance_player_ball = th.exp(
             -0.5 * (distance_to_ball - BALL_RADIUS).clamp_min(0.0) / CAR_MAX_SPEED
@@ -270,9 +272,7 @@ class AnnealedNextoReward:
             )
             return th.where(overtime, decided, normal)
 
-        return (
-            team_sign * (probability(score) - probability(previous_score))
-        ).clamp_min(0.0)
+        return team_sign * (probability(score) - probability(previous_score))
 
     def _ensure_state(self, n_sim: int, device: th.device) -> None:
         expected = (n_sim, self.n_cars)

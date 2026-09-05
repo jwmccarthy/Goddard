@@ -63,12 +63,20 @@ def make_controller(latent_size: int = 3) -> FrozenPulseController:
     )
 
 
-def make_reward_context(score_delta: int = 0) -> RewardContext:
+def make_reward_context(
+    score_delta: int = 0,
+    demoed_car: int | None = None,
+) -> RewardContext:
     raw = th.zeros((1, 53))
     raw[:, 2] = 100.0
     raw[:, 9 + 9] = 1.0
     raw[:, 31 + 9] = 1.0
-    state = CarlState(raw, 2, th.empty((0, 3)), th.tensor([1.0, -1.0]))
+    current_raw = raw.clone()
+    if demoed_car is not None:
+        current_raw[:, 9 + 22 * demoed_car + 17] = 1.0
+    team_sign = th.tensor([1.0, -1.0])
+    previous = CarlState(raw, 2, th.empty((0, 3)), team_sign)
+    current = CarlState(current_raw, 2, th.empty((0, 3)), team_sign)
     events = CarlEvents(
         score_delta=th.tensor([score_delta]),
         done=th.tensor([False]),
@@ -76,8 +84,8 @@ def make_reward_context(score_delta: int = 0) -> RewardContext:
         truncated=th.tensor([False]),
     )
     return RewardContext(
-        state,
-        state,
+        current,
+        previous,
         None,
         None,
         events,
@@ -103,6 +111,19 @@ class SelfPlayTest(unittest.TestCase):
         value = AnnealedNextoReward(1, 1)(make_reward_context())
 
         self.assertGreater(value.sum().item(), 0.0)
+
+    def test_competitive_shaping_components_remain_zero_sum(self):
+        baseline = AnnealedNextoReward(1, 1)(make_reward_context())
+        demo = AnnealedNextoReward(1, 1)(make_reward_context(demoed_car=1))
+        demo_delta = demo - baseline
+        reward = AnnealedNextoReward(1, 1)
+        context = make_reward_context(score_delta=1)
+        win_progress = reward._win_probability_progress(
+            context, context.current.team_sign[None, :]
+        )
+
+        th.testing.assert_close(demo_delta, th.tensor([[0.5, -0.5]]))
+        th.testing.assert_close(win_progress.sum(dim=-1), th.zeros(1))
 
     def test_nexto_shaping_schedule_has_a_plateau_and_reaches_zero(self):
         args = (1.0, 100, 1100)
