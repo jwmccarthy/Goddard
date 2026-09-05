@@ -89,11 +89,11 @@ def make_reward_context(score_delta: int = 0) -> RewardContext:
 
 
 class SelfPlayTest(unittest.TestCase):
-    def test_nexto_reward_keeps_unit_zero_sum_goals_without_shaping(self):
+    def test_nexto_reward_keeps_weighted_zero_sum_goals_without_shaping(self):
         reward = AnnealedNextoReward(1, 1, shaping_scale=0.0)
 
         th.testing.assert_close(
-            reward(make_reward_context(score_delta=1)), th.tensor([[1.0, -1.0]])
+            reward(make_reward_context(score_delta=1)), th.tensor([[10.0, -10.0]])
         )
         th.testing.assert_close(
             reward(make_reward_context(score_delta=0)), th.zeros((1, 2))

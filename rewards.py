@@ -52,13 +52,14 @@ class NextoRewardWeights:
 
 
 class AnnealedNextoReward:
-    """Permanent unit goals plus annealable shaping from the Nexto reward."""
+    """Permanent weighted goals plus annealable shaping from the Nexto reward."""
 
     def __init__(
         self,
         n_blue: int,
         n_orange: int,
         shaping_scale: float = 1.0,
+        goal_scale: float = 10.0,
         weights: NextoRewardWeights = NextoRewardWeights(),
     ) -> None:
         self.n_blue = n_blue
@@ -66,6 +67,7 @@ class AnnealedNextoReward:
         self.n_cars = n_blue + n_orange
         self.weights = weights
         self.shaping_scale = shaping_scale
+        self.goal_scale = goal_scale
         self._touch_decay = None
         self._last_touch = None
 
@@ -244,7 +246,7 @@ class AnnealedNextoReward:
         done = context.events.done
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
-        return score_for_actor + self.shaping_scale * shaping
+        return self.goal_scale * score_for_actor + self.shaping_scale * shaping
 
     def _win_probability_progress(
         self, context: RewardContext, team_sign: th.Tensor

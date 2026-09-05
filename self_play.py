@@ -402,6 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--demonstration-reset-fraction", type=float, default=0.8)
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
     parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
+    parser.add_argument("--goal-reward-scale", type=float, default=10.0)
     parser.add_argument("--nexto-anneal-start", type=int, default=250_000_000)
     parser.add_argument("--nexto-anneal-end", type=int, default=1_750_000_000)
     parser.add_argument("--timesteps", type=int, default=2_000_000_000)
@@ -453,6 +454,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--demonstration-reset-fraction must be between zero and one")
     if not 0.0 <= args.nexto_shaping_scale <= 1.0:
         raise ValueError("--nexto-shaping-scale must be between zero and one")
+    if not math.isfinite(args.goal_reward_scale) or args.goal_reward_scale <= 0:
+        raise ValueError("--goal-reward-scale must be positive and finite")
     if args.nexto_anneal_start < 0:
         raise ValueError("--nexto-anneal-start cannot be negative")
     if args.nexto_anneal_end <= args.nexto_anneal_start:
@@ -510,7 +513,12 @@ def main() -> None:
         probability=args.demonstration_reset_fraction,
         seed=args.seed,
     )
-    reward = AnnealedNextoReward(1, 1, args.nexto_shaping_scale)
+    reward = AnnealedNextoReward(
+        1,
+        1,
+        shaping_scale=args.nexto_shaping_scale,
+        goal_scale=args.goal_reward_scale,
+    )
     base_env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=1,
