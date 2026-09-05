@@ -301,14 +301,11 @@ class AnnealedNextoReward:
 def nexto_shaping_scale(
     transitions: int,
     initial: float,
-    anneal_start: int,
-    anneal_end: int,
+    total_transitions: int,
 ) -> float:
-    if transitions <= anneal_start:
-        return initial
-    if transitions >= anneal_end:
+    if transitions >= total_transitions:
         return 0.0
-    fraction = (transitions - anneal_start) / (anneal_end - anneal_start)
+    fraction = max(transitions, 0) / total_transitions
     return initial * (1.0 - fraction)
 
 

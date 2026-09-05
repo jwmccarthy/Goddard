@@ -421,8 +421,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
     parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
     parser.add_argument("--goal-reward-scale", type=float, default=10.0)
-    parser.add_argument("--nexto-anneal-start", type=int, default=250_000_000)
-    parser.add_argument("--nexto-anneal-end", type=int, default=1_750_000_000)
     parser.add_argument("--timesteps", type=int, default=2_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
@@ -477,10 +475,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--nexto-shaping-scale must be between zero and one")
     if not math.isfinite(args.goal_reward_scale) or args.goal_reward_scale <= 0:
         raise ValueError("--goal-reward-scale must be positive and finite")
-    if args.nexto_anneal_start < 0:
-        raise ValueError("--nexto-anneal-start cannot be negative")
-    if args.nexto_anneal_end <= args.nexto_anneal_start:
-        raise ValueError("--nexto-anneal-end must be greater than --nexto-anneal-start")
     if args.historical_policies >= args.snapshot_pool_size:
         raise ValueError("--historical-policies must be smaller than the snapshot pool")
     if not args.distill_checkpoint.is_file():
@@ -654,8 +648,7 @@ def main() -> None:
             lambda progress: nexto_shaping_scale(
                 round(progress * args.timesteps),
                 args.nexto_shaping_scale,
-                args.nexto_anneal_start,
-                args.nexto_anneal_end,
+                args.timesteps,
             ),
         ),
         section="Reward",

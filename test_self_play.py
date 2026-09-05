@@ -126,12 +126,10 @@ class SelfPlayTest(unittest.TestCase):
         th.testing.assert_close(demo_delta, th.tensor([[0.5, -0.5]]))
         th.testing.assert_close(win_progress.sum(dim=-1), th.zeros(1))
 
-    def test_nexto_shaping_schedule_has_a_plateau_and_reaches_zero(self):
-        args = (1.0, 100, 1100)
-
-        self.assertEqual(nexto_shaping_scale(100, *args), 1.0)
-        self.assertEqual(nexto_shaping_scale(600, *args), 0.5)
-        self.assertEqual(nexto_shaping_scale(1100, *args), 0.0)
+    def test_nexto_shaping_schedule_spans_the_full_training_run(self):
+        self.assertEqual(nexto_shaping_scale(0, 1.0, 1000), 1.0)
+        self.assertEqual(nexto_shaping_scale(500, 1.0, 1000), 0.5)
+        self.assertEqual(nexto_shaping_scale(1000, 1.0, 1000), 0.0)
 
     def test_fixed_gaussian_policy_uses_requested_standard_deviation(self):
         env = PulseLatentEnv(FakeEnv(), make_controller())
