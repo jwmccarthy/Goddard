@@ -99,10 +99,10 @@ class SelfPlayTest(unittest.TestCase):
             reward(make_reward_context(score_delta=0)), th.zeros((1, 2))
         )
 
-    def test_nexto_shaping_is_zero_sum(self):
+    def test_nexto_shaping_is_not_opponent_centered(self):
         value = AnnealedNextoReward(1, 1)(make_reward_context())
 
-        th.testing.assert_close(value.sum(dim=-1), th.zeros(1))
+        self.assertGreater(value.sum().item(), 0.0)
 
     def test_nexto_shaping_schedule_has_a_plateau_and_reaches_zero(self):
         args = (1.0, 100, 1100)

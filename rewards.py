@@ -138,9 +138,7 @@ class AnnealedNextoReward:
             * ball_goal_progress.clamp_min(0.0)
         )
         newly_demoed = current.car_demoed & ~previous.car_demoed
-        demo = 0.5 * (
-            self._opponent_team_mean(newly_demoed.float()) - newly_demoed.float()
-        )
+        demo = self._opponent_team_mean(newly_demoed.float())
 
         distance_player_ball = th.exp(
             -0.5 * (distance_to_ball - BALL_RADIUS).clamp_min(0.0) / CAR_MAX_SPEED
@@ -241,7 +239,7 @@ class AnnealedNextoReward:
             - weights.touch_grass * touch_grass
             + weights.win_probability * win_probability_progress
         )
-        shaping = self._zero_sum(shaping) / HISTORICAL_GOAL_WEIGHT
+        shaping = shaping / HISTORICAL_GOAL_WEIGHT
 
         done = context.events.done
         self._touch_decay[done] = 1.0
@@ -270,7 +268,9 @@ class AnnealedNextoReward:
             )
             return th.where(overtime, decided, normal)
 
-        return team_sign * (probability(score) - probability(previous_score))
+        return (
+            team_sign * (probability(score) - probability(previous_score))
+        ).clamp_min(0.0)
 
     def _ensure_state(self, n_sim: int, device: th.device) -> None:
         expected = (n_sim, self.n_cars)
@@ -286,9 +286,6 @@ class AnnealedNextoReward:
             orange.mean(dim=-1, keepdim=True).expand(-1, self.n_blue),
             blue.mean(dim=-1, keepdim=True).expand(-1, self.n_orange),
         ), dim=-1)
-
-    def _zero_sum(self, reward: th.Tensor) -> th.Tensor:
-        return reward - self._opponent_team_mean(reward)
 
     @staticmethod
     def _unit(value: th.Tensor) -> th.Tensor:
