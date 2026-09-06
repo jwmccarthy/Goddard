@@ -2,6 +2,7 @@ import unittest
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch as th
 
 from carl.gymnasium import CARLObservation
@@ -10,6 +11,16 @@ from tracker import ExpertGoalStates, GOAL_STATE_SIZE, TrackingReward
 
 
 class TrackerTest(unittest.TestCase):
+    def test_dataset_loading_keeps_segments_without_ball_touches(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._min_len = 30
+        demo = np.zeros((30, 161), dtype=np.float32)
+
+        loaded = replays._filter(demo, np.zeros(30, dtype=bool))
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(len(loaded[0][0]), 30)
+
     def test_goals_contain_only_relative_car_state(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._windows = th.tensor([[1, 2]])

@@ -93,7 +93,6 @@ class ExpertGoalStates:
         total = 0
 
         self._min_len = 30
-        self._min_touches = 1
 
         for path in sorted(Path(replay_dir).glob("*.npy")):
             source = np.load(path, mmap_mode="r")
@@ -181,7 +180,6 @@ class ExpertGoalStates:
             demo[:, :GOAL_STATE_SIZE],
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
         ), axis=-1).astype(np.float32, copy=False)
-        ego_touch = demo[:, -5].astype(bool)
         invalid = demo[:, -4:].astype(bool).any(axis=-1)
 
         demos: list[tuple[th.Tensor, th.Tensor]] = []
@@ -189,9 +187,8 @@ class ExpertGoalStates:
 
         for end in np.append(np.flatnonzero(invalid), len(demo)):
             length = end - start
-            touch_count = np.count_nonzero(ego_touch[start:end])
 
-            if length >= self._min_len and touch_count >= self._min_touches:
+            if length >= self._min_len:
                 segment_unsafe = unsafe[start:end]
                 try:
                     start_map = nearest_safe_start_map(segment_unsafe)
