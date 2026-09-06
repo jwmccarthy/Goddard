@@ -24,9 +24,9 @@ from tracker import (
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
     POSITION_SCALE,
+    StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
-    TrajectoryGoalEncoder,
     _expert_action_loss,
     _expert_action_labels,
     load_tracker_policy,
@@ -36,22 +36,6 @@ from tracker import (
 class TrackerTest(unittest.TestCase):
     def test_default_tracker_lookahead_extends_to_two_seconds(self):
         self.assertEqual(DEFAULT_TRACKER_WINDOWS, (1, 2, 4, 8, 16, 32, 64))
-
-    def test_trajectory_goal_encoder_handles_batches_and_sequences(self):
-        encoder = TrajectoryGoalEncoder((1, 2, 4), feature_size=32)
-        width = GOAL_STATE_SIZE + 3 * 21
-
-        batch = encoder(th.randn(5, width))
-        sequence = encoder(th.randn(7, 5, width))
-
-        self.assertEqual(batch.shape, (5, 32))
-        self.assertEqual(sequence.shape, (7, 5, 32))
-
-    def test_trajectory_goal_encoder_rejects_wrong_width(self):
-        encoder = TrajectoryGoalEncoder((1, 2), feature_size=32)
-
-        with self.assertRaisesRegex(ValueError, "expected"):
-            encoder(th.randn(3, GOAL_STATE_SIZE + 21))
 
     def test_legacy_tracker_checkpoint_has_explicit_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -365,6 +349,18 @@ class TrackerTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(loss.item(), np.log(3), places=6)
+
+    def test_stateless_critic_capture_records_current_and_next_values(self):
+        critic = SimpleNamespace(value=lambda observation: observation.sum(-1))
+        context = SimpleNamespace(
+            observation=th.tensor([[1.0, 2.0]]),
+            env_step=SimpleNamespace(next_obs=th.tensor([[3.0, 4.0]])),
+        )
+
+        captured = StatelessCriticCapture(critic)(context)
+
+        th.testing.assert_close(captured["baseline_value"], th.tensor([3.0]))
+        th.testing.assert_close(captured["baseline_next_value"], th.tensor([7.0]))
 
     def test_demonstration_frame_includes_expert_actions_and_confidence(self):
         expert_action = th.tensor([[1, 2, 0, 1, 0, 2, 1]])

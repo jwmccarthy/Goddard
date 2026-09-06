@@ -18,7 +18,6 @@ from carl.gymnasium import CARLObservation
 from carl.gymnasium.state import RewardContext
 from jarl.collect import (
     LogProbCapture,
-    RecurrentCriticCapture,
     RecurrentStateCapture,
     Runner,
 )
@@ -35,6 +34,7 @@ from jarl.learn import (
 )
 from jarl.log.logger import Logger
 from jarl.modules import GRU, MLP
+from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, Trainer
@@ -64,98 +64,7 @@ SUPERVISED_ACTION_FACTORS = (2, 3, 4, 6)
 CARL_AXES = np.asarray([0.0, -1.0, 1.0], dtype=np.float32)
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-TRACKER_GOAL_EMBED_SIZE = 128
-TRACKER_TRANSFORMER_HEADS = 4
-TRACKER_TRANSFORMER_LAYERS = 2
-TRACKER_ARCHITECTURE = "trajectory-transformer-gru-v1"
-
-
-class TrajectoryGoalEncoder(nn.Module):
-    def __init__(
-        self,
-        windows: Sequence[int],
-        feature_size: int = TRACKER_FEATURE_SIZE,
-        goal_embed_size: int = TRACKER_GOAL_EMBED_SIZE,
-        transformer_heads: int = TRACKER_TRANSFORMER_HEADS,
-        transformer_layers: int = TRACKER_TRANSFORMER_LAYERS,
-    ) -> None:
-        super().__init__()
-        self.windows = tuple(int(window) for window in windows)
-        if not self.windows or any(window < 1 for window in self.windows):
-            raise ValueError("tracker windows must be nonempty and positive")
-        if any(left >= right for left, right in zip(self.windows, self.windows[1:])):
-            raise ValueError("tracker windows must be strictly increasing")
-        if goal_embed_size % transformer_heads:
-            raise ValueError("goal embedding size must be divisible by transformer heads")
-
-        self.expected_size = GOAL_STATE_SIZE + len(self.windows) * CAR_STATE_SIZE
-        self.state_encoder = nn.Sequential(
-            nn.Linear(GOAL_STATE_SIZE, 256),
-            nn.SiLU(),
-            nn.LayerNorm(256),
-        )
-        self.goal_encoder = nn.Sequential(
-            nn.Linear(CAR_STATE_SIZE, goal_embed_size),
-            nn.SiLU(),
-            nn.LayerNorm(goal_embed_size),
-        )
-        self.time_encoder = nn.Linear(1, goal_embed_size)
-        self.summary_token = nn.Parameter(th.zeros(1, 1, goal_embed_size))
-        layer = nn.TransformerEncoderLayer(
-            d_model=goal_embed_size,
-            nhead=transformer_heads,
-            dim_feedforward=4 * goal_embed_size,
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(
-            layer,
-            num_layers=transformer_layers,
-            norm=nn.LayerNorm(goal_embed_size),
-            enable_nested_tensor=False,
-        )
-        self.output = nn.Sequential(
-            nn.Linear(256 + goal_embed_size, feature_size),
-            nn.SiLU(),
-            nn.LayerNorm(feature_size),
-        )
-        normalized_time = np.log1p(self.windows) / np.log1p(self.windows[-1])
-        self.register_buffer(
-            "normalized_time",
-            th.tensor(normalized_time, dtype=th.float32).view(1, -1, 1),
-        )
-        self.feats = feature_size
-        self.built = False
-
-    def build(self, env) -> "TrajectoryGoalEncoder":
-        actual = int(np.prod(env.single_observation_space.shape))
-        if actual != self.expected_size:
-            raise ValueError(
-                f"tracker observation has {actual} features, expected {self.expected_size}"
-            )
-        self.built = True
-        return self
-
-    def forward(self, observation: th.Tensor) -> th.Tensor:
-        if observation.shape[-1] != self.expected_size:
-            raise ValueError(
-                f"tracker observation has {observation.shape[-1]} features, "
-                f"expected {self.expected_size}"
-            )
-        leading = observation.shape[:-1]
-        flat = observation.reshape(-1, self.expected_size)
-        state = self.state_encoder(flat[:, :GOAL_STATE_SIZE])
-        goals = flat[:, GOAL_STATE_SIZE:].reshape(-1, len(self.windows), CAR_STATE_SIZE)
-        goal_tokens = self.goal_encoder(goals) + self.time_encoder(
-            self.normalized_time.to(dtype=flat.dtype)
-        )
-        summary = self.summary_token.expand(len(flat), -1, -1)
-        trajectory = self.transformer(th.cat((summary, goal_tokens), dim=1))[:, 0]
-        return self.output(th.cat((state, trajectory), dim=-1)).reshape(
-            *leading, self.feats
-        )
+TRACKER_ARCHITECTURE = "flat-gru-v1"
 
 
 def build_tracker_policy(
@@ -163,7 +72,7 @@ def build_tracker_policy(
     windows: Sequence[int],
 ) -> MultiCategoricalPolicy:
     return MultiCategoricalPolicy(
-        foot=TrajectoryGoalEncoder(windows),
+        foot=LinearEncoder(TRACKER_FEATURE_SIZE, func=nn.SiLU),
         body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
         head=MLP(dims=[]),
         action_codec=env.action_codec,
@@ -175,8 +84,8 @@ def build_tracker_critic(
     windows: Sequence[int],
 ) -> Critic:
     return Critic(
-        foot=TrajectoryGoalEncoder(windows),
-        body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
+        foot=LinearEncoder(TRACKER_FEATURE_SIZE, func=nn.ReLU),
+        body=MLP(dims=[TRACKER_FEATURE_SIZE, TRACKER_FEATURE_SIZE], func=nn.ReLU),
         head=MLP(dims=[]),
     ).build(env).to(env.device)
 
@@ -192,7 +101,7 @@ def load_tracker_policy(
     if not isinstance(config, dict) or config.get("architecture") != TRACKER_ARCHITECTURE:
         raise RuntimeError(
             "legacy tracker checkpoint is incompatible with the recurrent "
-            "trajectory architecture; retrain the tracker"
+            "tracker architecture; retrain the tracker"
         )
     if tuple(config.get("windows", ())) != tuple(windows):
         raise ValueError("tracker checkpoint windows do not match configured replay windows")
@@ -847,6 +756,22 @@ class ExpertActionCapture(CaptureBase):
         }
 
 
+class StatelessCriticCapture(CaptureBase):
+    def __init__(self, critic: Critic) -> None:
+        self.critic = critic
+
+    @th.no_grad()
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        next_observation = th.as_tensor(
+            context.env_step.next_obs,
+            device=context.observation.device,
+        )
+        return {
+            "baseline_value": self.critic.value(context.observation),
+            "baseline_next_value": self.critic.value(next_observation),
+        }
+
+
 def _expert_action_loss(
     logits: th.Tensor,
     action_mask: th.Tensor,
@@ -1058,7 +983,7 @@ def main() -> None:
         captures=(
             LogProbCapture(),
             RecurrentStateCapture(),
-            RecurrentCriticCapture(critic),
+            StatelessCriticCapture(critic),
             ExpertActionCapture(env),
         ),
     )
