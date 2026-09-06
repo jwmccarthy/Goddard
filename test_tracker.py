@@ -10,11 +10,11 @@ from carl.gymnasium import CARLObservation
 from tracker import (
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
-    EXPERT_TOUCH_INDEX,
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
     POSITION_SCALE,
+    STORED_REPLAY_SIZE,
     TrackingReward,
 )
 
@@ -29,18 +29,7 @@ class TrackerTest(unittest.TestCase):
 
         self.assertEqual(len(loaded), 1)
         self.assertEqual(len(loaded[0][0]), 30)
-        self.assertEqual(loaded[0][0].shape[1], EXPERT_TOUCH_INDEX + 1)
-
-    def test_dataset_loading_preserves_expert_ego_touch_timing(self):
-        replays = ExpertGoalStates.__new__(ExpertGoalStates)
-        replays._min_len = 30
-        demo = np.zeros((30, 161), dtype=np.float32)
-        demo[7, -5] = 1.0
-        loaded, _ = replays._filter(demo, np.zeros(30, dtype=bool))[0]
-        replays._replays = loaded
-        replays._cursors = th.tensor([7])
-
-        self.assertTrue(replays.current_ego_touch().item())
+        self.assertEqual(loaded[0][0].shape[1], STORED_REPLAY_SIZE)
 
     def test_goals_contain_only_relative_car_state(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
@@ -102,24 +91,12 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(environment.calls, [])
         self.assertIs(returned, observation)
 
-    def test_expert_touch_anchors_post_touch_ball_then_releases(self):
-        wrapper, environment, observation = self._anchor_fixture(expert_touch=True)
-
-        wrapper._anchor_ball(observation, th.tensor([False]))
-
-        self.assertFalse(wrapper._ball_anchored.item())
-        self.assertEqual(len(environment.calls), 1)
-
     def test_step_anchors_before_advancing_replay_cursor(self):
         wrapper, environment, observation = self._anchor_fixture()
         events = []
 
         class Replays:
             cursor = 1
-
-            def current_ego_touch(self):
-                events.append(("touch", self.cursor))
-                return th.tensor([False])
 
             def current(self):
                 events.append(("current", self.cursor))
@@ -147,11 +124,11 @@ class TrackerTest(unittest.TestCase):
 
         wrapper.step(th.zeros((1, 7), dtype=th.long))
 
-        self.assertEqual(events, [("touch", 1), ("current", 1), ("next", 1)])
+        self.assertEqual(events, [("current", 1), ("next", 1)])
         self.assertEqual(wrapper.replays.cursor, 2)
 
     @staticmethod
-    def _anchor_fixture(expert_touch: bool = False):
+    def _anchor_fixture():
         expert_tensor = th.zeros((1, GOAL_STATE_SIZE))
         expert_tensor[:, :9] = th.tensor(
             [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -183,7 +160,6 @@ class TrackerTest(unittest.TestCase):
         wrapper.env = environment
         wrapper.replays = SimpleNamespace(
             current=lambda: expert,
-            current_ego_touch=lambda: th.tensor([expert_touch]),
         )
         wrapper.reward = SimpleNamespace(touched=th.tensor([False]))
         wrapper._ball_anchored = th.tensor([True])
