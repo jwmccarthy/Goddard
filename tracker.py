@@ -49,7 +49,8 @@ BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
 CAR_STATE_SIZE     = 21
 INTERNAL_STATE_SIZE = 19
-STORED_REPLAY_SIZE = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
+EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
+STORED_REPLAY_SIZE = EXPERT_TOUCH_INDEX + 1
 
 
 class ExpertGoalStates:
@@ -179,6 +180,7 @@ class ExpertGoalStates:
         observation = np.concatenate((
             demo[:, :GOAL_STATE_SIZE],
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
+            demo[:, -5, None],
         ), axis=-1).astype(np.float32, copy=False)
         invalid = demo[:, -4:].astype(bool).any(axis=-1)
 
@@ -279,7 +281,7 @@ class ExpertGoalStates:
             ),
             "internal_state": self._replays[
                 self._cursors[mask],
-                GOAL_STATE_SIZE:STORED_REPLAY_SIZE,
+                GOAL_STATE_SIZE:EXPERT_TOUCH_INDEX,
             ],
         })
 
@@ -294,6 +296,9 @@ class ExpertGoalStates:
             self._cursors + offset,
             :GOAL_STATE_SIZE,
         ]
+
+    def current_ego_touch(self) -> th.Tensor:
+        return self._replays[self._cursors, EXPERT_TOUCH_INDEX].bool()
 
     def current_demo_name(self) -> str:
         return self._demo_names[self._demo_id[0].item()]
@@ -341,12 +346,14 @@ class TrackingReward:
         self.car_scale = car_scale
         self.position_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
         self.value: th.Tensor | None = None
+        self.touched: th.Tensor | None = None
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         actual = context.current_observation
         target = self.replays.current()
         actual_ego = actual.cars.ego
         target_ego = target.cars.ego
+        self.touched = context.current.car_ball_touches[:, 0]
 
         car_position_error = (
             actual_ego.position - target_ego.position
@@ -400,6 +407,8 @@ class ExpertLookaheadEnv:
     ) -> None:
         if minimum_tracking_frames < 1:
             raise ValueError("minimum_tracking_frames must be at least one")
+        if env.n_cars != 1:
+            raise ValueError("ExpertLookaheadEnv requires exactly one car")
 
         self.env = env
         self.replays = replays
@@ -407,6 +416,7 @@ class ExpertLookaheadEnv:
         self.minimum_reward = minimum_reward
         self.minimum_tracking_frames = minimum_tracking_frames
         self._low_reward_frames = th.zeros(env.n_envs, dtype=th.long, device=env.device)
+        self._ball_anchored = th.ones(env.n_sim, dtype=th.bool, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
 
         size = GOAL_STATE_SIZE + replays.goal_size
@@ -437,6 +447,7 @@ class ExpertLookaheadEnv:
             return None
 
         replay_state = self.replays.reset(mask)
+        self._ball_anchored[mask] = True
         expert = replay_state["observation"]
         internal_state = replay_state["internal_state"]
         ball = expert.ball
@@ -467,9 +478,31 @@ class ExpertLookaheadEnv:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
         return obs
 
+    def _anchor_ball(self, obs: th.Tensor, native: th.Tensor) -> th.Tensor:
+        if self.reward.touched is None:
+            raise RuntimeError("tracking reward did not capture ball touches")
+
+        simulated_touch = self.reward.touched & ~native
+        expert_touch = self.replays.current_ego_touch() & ~native
+        anchor = self._ball_anchored & ~native & ~simulated_touch
+        self._ball_anchored[simulated_touch | expert_touch] = False
+        if not anchor.any():
+            return obs
+
+        expert = self.replays.current()
+        ball = expert.ball
+        indices = anchor.nonzero(as_tuple=True)[0]
+        return self.env.set_ball(
+            ball.position[anchor] * self._pos_scale,
+            ball.velocity[anchor] * BALL_MAX_SPEED,
+            ball.angular_velocity[anchor] * BALL_MAX_ANG_SPEED,
+            simulation_indices=indices,
+        )
+
     def step(self, action: th.Tensor | np.ndarray):
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
+        obs = self._anchor_ball(obs, native)
         obs, end = self.replays.next_goals(obs)
 
         if self.reward.value is None:
