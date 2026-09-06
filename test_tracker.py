@@ -23,6 +23,7 @@ class TrackerTest(unittest.TestCase):
     def test_dataset_loading_keeps_segments_without_ball_touches(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._min_len = 30
+        replays.minimum_remaining_frames = 1
         demo = np.zeros((30, 161), dtype=np.float32)
 
         loaded = replays._filter(demo, np.zeros(30, dtype=bool))
@@ -30,6 +31,40 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(len(loaded), 1)
         self.assertEqual(len(loaded[0][0]), 30)
         self.assertEqual(loaded[0][0].shape[1], STORED_REPLAY_SIZE)
+
+    def test_random_starts_leave_the_configured_number_of_frames(self):
+        count = 512
+        length = 200
+        minimum = 128
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays.n_cars = 1
+        replays.device = th.device("cpu")
+        replays.balance = False
+        replays.start_at_beginning = False
+        replays.minimum_remaining_frames = minimum
+        replays._selected_demo = 0
+        replays._n_demos = 1
+        replays._demo_id = th.zeros(count, dtype=th.long)
+        replays._offsets = th.tensor([0, length])
+        replays._safe_cursors = th.arange(length)
+        replays._cursors = th.zeros(count, dtype=th.long)
+        replays._replays = th.zeros((length, STORED_REPLAY_SIZE))
+
+        replays.reset(th.ones(count, dtype=th.bool))
+
+        remaining = length - replays._cursors - 1
+        self.assertTrue((remaining >= minimum).all())
+        self.assertTrue((replays._cursors <= length - minimum - 1).all())
+
+    def test_filter_rejects_segments_with_no_safe_early_start(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._min_len = 129
+        replays.minimum_remaining_frames = 128
+        demo = np.zeros((150, 161), dtype=np.float32)
+        unsafe = np.ones(150, dtype=bool)
+        unsafe[50] = False
+
+        self.assertEqual(replays._filter(demo, unsafe), [])
 
     def test_goals_contain_only_relative_car_state(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)

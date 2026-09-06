@@ -75,15 +75,19 @@ class ExpertGoalStates:
         balance:            bool = True,
         start_at_beginning: bool = False,
         frame_skip:         int = 4,
+        minimum_remaining_frames: int = 128,
     ) -> None:
         if n_cars != 1:
             raise ValueError("ExpertGoalStates supports one simulated ego car")
+        if minimum_remaining_frames < 1:
+            raise ValueError("minimum remaining frames must be positive")
 
         self.n_cars = n_cars
         self.device = device
         self.balance = balance
         self.start_at_beginning = start_at_beginning
         self.frame_skip = frame_skip
+        self.minimum_remaining_frames = minimum_remaining_frames
         self._selected_demo: int | None = None
 
         replays:    list[th.Tensor] = []
@@ -92,7 +96,7 @@ class ExpertGoalStates:
         start_maps: list[th.Tensor] = []
         total = 0
 
-        self._min_len = 30
+        self._min_len = max(30, minimum_remaining_frames + 1)
 
         for path in sorted(Path(replay_dir).glob("*.npy")):
             source = np.load(path, mmap_mode="r")
@@ -107,6 +111,11 @@ class ExpertGoalStates:
 
             if obs_limit is not None and total >= obs_limit:
                 break
+
+        if not replays:
+            raise ValueError(
+                "no replay segments satisfy the minimum remaining frame requirement"
+            )
 
         lengths = th.tensor([len(r) for r in replays], device=device)
 
@@ -189,7 +198,9 @@ class ExpertGoalStates:
             length = end - start
 
             if length >= self._min_len:
-                segment_unsafe = unsafe[start:end]
+                segment_unsafe = unsafe[start:end].copy()
+                latest_start = length - self.minimum_remaining_frames - 1
+                segment_unsafe[latest_start + 1:] = True
                 try:
                     start_map = nearest_safe_start_map(segment_unsafe)
                 except ValueError:
@@ -264,11 +275,15 @@ class ExpertGoalStates:
         self._demo_id[mask] = demo_id
 
         starts = self._offsets[demo_id]
-        spans = self._offsets[demo_id + 1] - starts - 1
+        choices = (
+            self._offsets[demo_id + 1]
+            - starts
+            - self.minimum_remaining_frames
+        )
         self._cursors[mask] = starts
         if not self.start_at_beginning:
             self._cursors[mask] += (
-                th.rand(n_resets, device=self.device) * spans
+                th.rand(n_resets, device=self.device) * choices
             ).long()
             self._cursors[mask] = self._safe_cursors[self._cursors[mask]]
 
@@ -549,6 +564,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--car-scale",               type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int,   default=1)
+    parser.add_argument("--minimum-remaining-frames", type=int, default=128)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
     parser.add_argument("--epochs",                  type=int,   default=2)
@@ -586,6 +602,7 @@ def main() -> None:
         device=base_env.device,
         balance=args.balance,
         frame_skip=args.frameskip,
+        minimum_remaining_frames=args.minimum_remaining_frames,
     )
     env = ExpertLookaheadEnv(
         base_env,

@@ -206,6 +206,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         balance=args.balance,
         start_at_beginning=True,
         frame_skip=args.frameskip,
+        minimum_remaining_frames=args.minimum_remaining_frames,
     )
     env = ExpertLookaheadEnv(
         base,
@@ -408,6 +409,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--car-scale", type=float, default=2.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int, default=1)
+    parser.add_argument("--minimum-remaining-frames", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--host", default="127.0.0.1")

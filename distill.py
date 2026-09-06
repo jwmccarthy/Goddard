@@ -451,6 +451,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int, default=1)
+    parser.add_argument("--minimum-remaining-frames", type=int, default=128)
     parser.add_argument("--latent-size", type=int, default=32)
     parser.add_argument("--encoder-hidden", type=int, nargs="+", default=[1536, 1024, 512])
     parser.add_argument("--decoder-hidden", type=int, nargs="+", default=[3096, 2048, 1024])
@@ -478,6 +479,7 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     positive = (
         "n_sim", "frameskip", "latent_size", "rollout", "batch_size", "epochs",
+        "minimum_remaining_frames",
         "timesteps", "checkpoint_interval", "checkpoint_keep", "skill_horizon",
     )
     for name in positive:
@@ -517,6 +519,7 @@ def validate_resume_config(
         "balance",
         "minimum_tracking_reward",
         "minimum_tracking_frames",
+        "minimum_remaining_frames",
         "latent_size",
         "encoder_hidden",
         "decoder_hidden",
@@ -559,6 +562,7 @@ def main() -> None:
         device=base_env.device,
         balance=args.balance,
         frame_skip=args.frameskip,
+        minimum_remaining_frames=args.minimum_remaining_frames,
     )
     env = ExpertLookaheadEnv(
         base_env,
