@@ -49,7 +49,8 @@ BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
 CAR_STATE_SIZE     = 21
 INTERNAL_STATE_SIZE = 19
-STORED_REPLAY_SIZE = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
+EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
+STORED_REPLAY_SIZE = EXPERT_TOUCH_INDEX + 1
 
 
 class ExpertGoalStates:
@@ -188,6 +189,7 @@ class ExpertGoalStates:
         observation = np.concatenate((
             demo[:, :GOAL_STATE_SIZE],
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
+            demo[:, -5, None],
         ), axis=-1).astype(np.float32, copy=False)
         invalid = demo[:, -4:].astype(bool).any(axis=-1)
 
@@ -294,7 +296,7 @@ class ExpertGoalStates:
             ),
             "internal_state": self._replays[
                 self._cursors[mask],
-                GOAL_STATE_SIZE:STORED_REPLAY_SIZE,
+                GOAL_STATE_SIZE:EXPERT_TOUCH_INDEX,
             ],
         })
 
@@ -309,6 +311,9 @@ class ExpertGoalStates:
             self._cursors + offset,
             :GOAL_STATE_SIZE,
         ]
+
+    def current_ego_touch(self) -> th.Tensor:
+        return self._replays[self._cursors, EXPERT_TOUCH_INDEX].bool()
 
     def current_demo_name(self) -> str:
         return self._demo_names[self._demo_id[0].item()]
@@ -541,8 +546,10 @@ class ExpertLookaheadEnv:
             raise RuntimeError("tracking reward did not capture ball touches")
 
         simulated_touch = self.reward.touched & ~native
-        anchor = self._ball_anchored & ~native & ~simulated_touch
-        self._ball_anchored[simulated_touch] = False
+        expert_touch = self.replays.current_ego_touch() & ~native
+        release = simulated_touch | expert_touch
+        anchor = self._ball_anchored & ~native & ~release
+        self._ball_anchored[release] = False
         if not anchor.any():
             return obs
 
