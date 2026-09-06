@@ -17,6 +17,7 @@ from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium import CARLObservation
 from carl.gymnasium.state import RewardContext
 from jarl.collect import CriticCapture, LogProbCapture, Runner
+from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.data.batch import TensorBatch
 from jarl.learn import (
     Algorithm,
@@ -24,6 +25,7 @@ from jarl.learn import (
     OptimizerStep,
     PPOConfig,
     PPOLoss,
+    LossOutput,
     Update,
 )
 from jarl.log.logger import Logger
@@ -50,7 +52,29 @@ GOAL_STATE_SIZE    = 30
 CAR_STATE_SIZE     = 21
 INTERNAL_STATE_SIZE = 19
 EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
-STORED_REPLAY_SIZE = EXPERT_TOUCH_INDEX + 1
+EXPERT_ACTION_INDEX = EXPERT_TOUCH_INDEX + 1
+ACTION_FACTORS = 7
+EXPERT_ACTION_MASK_INDEX = EXPERT_ACTION_INDEX + ACTION_FACTORS
+STORED_REPLAY_SIZE = EXPERT_ACTION_MASK_INDEX + ACTION_FACTORS
+SUPERVISED_ACTION_FACTORS = (2, 3, 4, 6)
+CARL_AXES = np.asarray([0.0, -1.0, 1.0], dtype=np.float32)
+
+
+def _expert_action_labels(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if raw.ndim != 2 or raw.shape[1] != 8:
+        raise ValueError(f"raw replay actions have shape {raw.shape}, expected [N, 8]")
+    if not np.isfinite(raw).all():
+        raise ValueError("raw replay actions contain non-finite values")
+
+    labels = np.zeros((len(raw), ACTION_FACTORS), dtype=np.int64)
+    labels[:, 2] = np.abs(CARL_AXES[:, None] - raw[:, 0]).argmin(axis=0)
+    labels[:, 3] = raw[:, 7] >= 0.5
+    labels[:, 4] = raw[:, 6] >= 0.5
+    labels[:, 6] = raw[:, 5] >= 0.5
+
+    valid = np.zeros_like(labels, dtype=bool)
+    valid[:, SUPERVISED_ACTION_FACTORS] = True
+    return labels, valid
 
 
 class ExpertGoalStates:
@@ -102,7 +126,25 @@ class ExpertGoalStates:
         for path in sorted(Path(replay_dir).glob("*.npy")):
             source = np.load(path, mmap_mode="r")
             replay_cars = self._infer_n_cars(source.shape[1])
-            demos = self._filter(source, self._unsafe_mask(path, source))
+            action_path = path.with_suffix(".actions.npz")
+            if not action_path.exists():
+                raise ValueError(f"missing expert actions for {path.name}")
+            with np.load(action_path) as stored_actions:
+                if "raw" not in stored_actions:
+                    raise ValueError(f"expert actions for {path.name} have no raw array")
+                raw_actions = np.asarray(stored_actions["raw"], dtype=np.float32)
+            if len(raw_actions) != len(source):
+                raise ValueError(
+                    f"expert actions for {path.name} have {len(raw_actions)} rows, "
+                    f"expected {len(source)}"
+                )
+            labels, valid = _expert_action_labels(raw_actions)
+            demos = self._filter(
+                source,
+                self._unsafe_mask(path, source),
+                labels,
+                valid,
+            )
 
             replays.extend(demo for demo, _ in demos)
             start_maps.extend(start_map for _, start_map in demos)
@@ -183,13 +225,24 @@ class ExpertGoalStates:
         self,
         demo:   np.ndarray,
         unsafe: np.ndarray,
+        expert_actions: np.ndarray | None = None,
+        expert_action_valid: np.ndarray | None = None,
     ) -> list[tuple[th.Tensor, th.Tensor]]:
         n_cars = self._infer_n_cars(demo.shape[1])
         internal_start = 83 + 27 * n_cars
+        if expert_actions is None:
+            expert_actions = np.zeros((len(demo), ACTION_FACTORS), dtype=np.int64)
+        if expert_action_valid is None:
+            expert_action_valid = np.zeros((len(demo), ACTION_FACTORS), dtype=bool)
+        expected = (len(demo), ACTION_FACTORS)
+        if expert_actions.shape != expected or expert_action_valid.shape != expected:
+            raise ValueError("expert action labels and masks must have shape [N, 7]")
         observation = np.concatenate((
             demo[:, :GOAL_STATE_SIZE],
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
             demo[:, -5, None],
+            expert_actions,
+            expert_action_valid,
         ), axis=-1).astype(np.float32, copy=False)
         invalid = demo[:, -4:].astype(bool).any(axis=-1)
 
@@ -314,6 +367,16 @@ class ExpertGoalStates:
 
     def current_ego_touch(self) -> th.Tensor:
         return self._replays[self._cursors, EXPERT_TOUCH_INDEX].bool()
+
+    def current_expert_action(
+        self,
+        offset: int = 0,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        rows = self._replays[self._cursors + offset]
+        return (
+            rows[:, EXPERT_ACTION_INDEX:EXPERT_ACTION_MASK_INDEX].long(),
+            rows[:, EXPERT_ACTION_MASK_INDEX:STORED_REPLAY_SIZE].bool(),
+        )
 
     def current_demo_name(self) -> str:
         return self._demo_names[self._demo_id[0].item()]
@@ -475,6 +538,8 @@ class ExpertLookaheadEnv:
         self._low_reward_frames = th.zeros(env.n_envs, dtype=th.long, device=env.device)
         self._ball_anchored = th.ones(env.n_sim, dtype=th.bool, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
+        self.last_expert_action: th.Tensor | None = None
+        self.last_expert_action_valid: th.Tensor | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size
 
@@ -564,6 +629,10 @@ class ExpertLookaheadEnv:
         )
 
     def step(self, action: th.Tensor | np.ndarray):
+        (
+            self.last_expert_action,
+            self.last_expert_action_valid,
+        ) = self.replays.current_expert_action(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
         obs = self._anchor_ball(obs, native)
@@ -607,6 +676,87 @@ class ExpertLookaheadEnv:
         return obs, reward, term | reset, trunc, info
 
 
+class ExpertActionCapture(CaptureBase):
+    def __init__(self, env: ExpertLookaheadEnv) -> None:
+        self.env = env
+
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        action = self.env.last_expert_action
+        valid = self.env.last_expert_action_valid
+        if action is None or valid is None:
+            raise RuntimeError("environment did not expose expert actions for the step")
+        return {
+            "expert_action": action,
+            "expert_action_valid": valid,
+        }
+
+
+class ExpertActionPPOLoss:
+    def __init__(
+        self,
+        ppo: PPOLoss,
+        policy: MultiCategoricalPolicy,
+        weight: float,
+    ) -> None:
+        if not np.isfinite(weight) or weight < 0:
+            raise ValueError("expert action weight must be finite and nonnegative")
+        self.ppo = ppo
+        self.policy = policy
+        self.weight = weight
+
+    def after_update(self) -> None:
+        self.ppo.after_update()
+
+    def __call__(self, batch: TensorBatch) -> LossOutput:
+        output = self.ppo(batch)
+        features, _ = self.policy.body_features(batch["observation"])
+        logits = self.policy.head(features)
+        action_mask = self.policy.action_codec.mask(batch["observation"])
+        expert_action = batch["expert_action"].long()
+        expert_valid = batch["expert_action_valid"].bool()
+
+        losses = []
+        accuracies = []
+        valid_rates = []
+        for index, (factor_logits, factor_mask) in enumerate(zip(
+            logits.split(self.policy.sizes, dim=-1),
+            action_mask.split(self.policy.sizes, dim=-1),
+        )):
+            target = expert_action[:, index]
+            target_legal = factor_mask.gather(-1, target[:, None]).squeeze(-1)
+            valid = expert_valid[:, index] & target_legal
+            if not valid.any():
+                continue
+
+            masked_logits = factor_logits.masked_fill(
+                ~factor_mask,
+                th.finfo(factor_logits.dtype).min,
+            )
+            losses.append(nn.functional.cross_entropy(masked_logits[valid], target[valid]))
+            accuracies.append(
+                (masked_logits[valid].argmax(-1) == target[valid]).float().mean()
+            )
+            valid_rates.append(valid.float().mean())
+
+        if losses:
+            expert_loss = th.stack(losses).mean()
+            expert_accuracy = th.stack(accuracies).mean()
+            expert_valid_rate = th.stack(valid_rates).mean()
+        else:
+            expert_loss = logits.sum() * 0
+            expert_accuracy = logits.new_zeros(())
+            expert_valid_rate = logits.new_zeros(())
+
+        return LossOutput(
+            output.loss + self.weight * expert_loss,
+            output.metrics | {
+                "expert_action_loss": expert_loss,
+                "expert_action_accuracy": expert_accuracy,
+                "expert_action_valid_rate": expert_valid_rate,
+            },
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO trajectory trackers.")
 
@@ -625,6 +775,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size",              type=int,   default=16_384)
     parser.add_argument("--epochs",                  type=int,   default=2)
     parser.add_argument("--lr",                      type=float, default=3e-5)
+    parser.add_argument("--expert-action-weight",    type=float, default=0.1)
     parser.add_argument("--max-grad-norm",           type=float, default=0.5)
     parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
     parser.add_argument("--seed",                    type=int,   default=0)
@@ -693,7 +844,11 @@ def main() -> None:
         env=env,
         policy=policy,
         buffer=buffer,
-        captures=(LogProbCapture(), CriticCapture(critic)),
+        captures=(
+            LogProbCapture(),
+            CriticCapture(critic),
+            ExpertActionCapture(env),
+        ),
     )
 
     update = Update(
@@ -702,14 +857,18 @@ def main() -> None:
             batch_size=args.batch_size,
             epochs=args.epochs,
         ),
-        loss=PPOLoss(
-            policy,
-            critic,
-            PPOConfig(
-                clip=0.1,
-                value_clip=None,
-                entropy_coef=0.001,
+        loss=ExpertActionPPOLoss(
+            PPOLoss(
+                policy,
+                critic,
+                PPOConfig(
+                    clip=0.1,
+                    value_clip=None,
+                    entropy_coef=0.001,
+                ),
             ),
+            policy,
+            args.expert_action_weight,
         ),
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(

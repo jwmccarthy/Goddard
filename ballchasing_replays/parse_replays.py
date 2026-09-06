@@ -40,7 +40,7 @@ MAX_REPLAY_ANGULAR_VELOCITY_ERROR = 4.0
 MAX_REPLAY_QUATERNION_ERROR = 0.05
 INTERNAL_STATE_SIZE = 19
 EVENT_FEATURES = 4
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -360,7 +360,7 @@ def _resample_actions(
 
 
 def _project_carl_actions(actions: np.ndarray) -> np.ndarray:
-    axes = np.asarray([-1.0, 0.0, 1.0], dtype=np.float32)
+    axes = np.asarray([0.0, -1.0, 1.0], dtype=np.float32)
     horizontal_error = (
         (axes[:, None] - actions[:, 1]) ** 2
         + (axes[:, None] - actions[:, 3]) ** 2

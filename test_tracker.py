@@ -4,23 +4,58 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch as th
+import torch.nn as nn
 
 from carl.gymnasium import CARLObservation
+from jarl.data.batch import TensorBatch
+from jarl.learn import LossOutput
+
+from ballchasing_replays.parse_replays import _project_carl_actions
 
 from tracker import (
+    ACTION_FACTORS,
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
     EXPERT_TOUCH_INDEX,
+    ExpertActionPPOLoss,
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
     POSITION_SCALE,
     STORED_REPLAY_SIZE,
     TrackingReward,
+    _expert_action_labels,
 )
 
 
 class TrackerTest(unittest.TestCase):
+    def test_expert_action_labels_only_supervise_direct_controls(self):
+        raw = np.zeros((3, 8), dtype=np.float32)
+        raw[:, 0] = [-1.0, 0.0, 1.0]
+        raw[1, 5:] = [1.0, 1.0, 1.0]
+
+        labels, valid = _expert_action_labels(raw)
+
+        np.testing.assert_array_equal(labels[:, 2], [1, 0, 2])
+        np.testing.assert_array_equal(labels[1, [3, 4, 6]], [1, 1, 1])
+        self.assertFalse(valid[:, [0, 1, 5]].any())
+        self.assertTrue(valid[:, [2, 3, 4, 6]].all())
+
+    def test_parser_projection_uses_carl_axis_class_order(self):
+        raw = np.zeros((3, 8), dtype=np.float32)
+        raw[:, 0] = raw[:, 1] = raw[:, 2] = raw[:, 3] = raw[:, 4] = [
+            -1.0,
+            0.0,
+            1.0,
+        ]
+
+        projected = _project_carl_actions(raw)
+
+        np.testing.assert_array_equal(projected[:, 0], [1, 0, 2])
+        np.testing.assert_array_equal(projected[:, 1], [1, 0, 2])
+        np.testing.assert_array_equal(projected[:, 2], [1, 0, 2])
+        np.testing.assert_array_equal(projected[:, 5], [1, 0, 2])
+
     def test_dataset_loading_keeps_segments_without_ball_touches(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._min_len = 30
@@ -44,7 +79,7 @@ class TrackerTest(unittest.TestCase):
         replays._cursors = th.tensor([7])
 
         self.assertTrue(replays.current_ego_touch().item())
-        self.assertEqual(loaded.shape[1], EXPERT_TOUCH_INDEX + 1)
+        self.assertEqual(loaded.shape[1], STORED_REPLAY_SIZE)
 
     def test_random_starts_leave_the_configured_number_of_frames(self):
         count = 512
@@ -192,6 +227,13 @@ class TrackerTest(unittest.TestCase):
         class Replays:
             cursor = 1
 
+            def current_expert_action(self, offset=0):
+                events.append(("action", self.cursor + offset))
+                return (
+                    th.full((1, ACTION_FACTORS), self.cursor + offset),
+                    th.ones((1, ACTION_FACTORS), dtype=th.bool),
+                )
+
             def current_ego_touch(self):
                 events.append(("touch", self.cursor))
                 return th.tensor([False])
@@ -222,8 +264,64 @@ class TrackerTest(unittest.TestCase):
 
         wrapper.step(th.zeros((1, 7), dtype=th.long))
 
-        self.assertEqual(events, [("touch", 1), ("current", 1), ("next", 1)])
+        self.assertEqual(
+            events,
+            [("action", 0), ("touch", 1), ("current", 1), ("next", 1)],
+        )
         self.assertEqual(wrapper.replays.cursor, 2)
+        th.testing.assert_close(
+            wrapper.last_expert_action,
+            th.zeros((1, ACTION_FACTORS), dtype=th.long),
+        )
+
+    def test_expert_action_loss_uses_only_valid_legal_targets(self):
+        class Codec:
+            @staticmethod
+            def mask(observation):
+                mask = th.ones((len(observation), 18), dtype=th.bool)
+                mask[1, 12] = False
+                return mask
+
+        class Policy:
+            sizes = (3, 3, 3, 2, 2, 3, 2)
+            action_codec = Codec()
+            head = nn.Linear(GOAL_STATE_SIZE, 18, bias=False)
+
+            @staticmethod
+            def body_features(observation):
+                return observation, None
+
+        class ZeroPPO:
+            @staticmethod
+            def __call__(batch):
+                return LossOutput(batch["observation"].sum() * 0, {"ppo": 0.0})
+
+            @staticmethod
+            def after_update():
+                return
+
+        nn.init.zeros_(Policy.head.weight)
+        expert_action = th.zeros((2, ACTION_FACTORS), dtype=th.long)
+        expert_action[:, 2] = th.tensor([1, 2])
+        expert_action[:, 4] = 1
+        valid = th.zeros((2, ACTION_FACTORS), dtype=th.bool)
+        valid[:, 2] = True
+        valid[:, 4] = True
+        batch = TensorBatch({
+            "observation": th.zeros((2, GOAL_STATE_SIZE)),
+            "expert_action": expert_action,
+            "expert_action_valid": valid,
+        })
+
+        output = ExpertActionPPOLoss(ZeroPPO(), Policy(), 0.5)(batch)
+
+        expected_expert_loss = (np.log(3) + np.log(2)) / 2
+        self.assertAlmostEqual(
+            output.metrics["expert_action_loss"].item(),
+            expected_expert_loss,
+            places=6,
+        )
+        self.assertAlmostEqual(output.loss.item(), 0.5 * expected_expert_loss, places=6)
 
     @staticmethod
     def _anchor_fixture(expert_touch: bool = False):
