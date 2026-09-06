@@ -25,6 +25,7 @@ from self_play import (
     build_policy,
     file_sha256,
     load_demonstration_reset_dataset,
+    policy_observation,
 )
 
 
@@ -140,8 +141,27 @@ def load_checkpoint(path: Path, env: PulseLatentEnv):
         "pulse_artifact": payload["pulse_artifact"],
         "pulse_sha256": payload["pulse_sha256"],
         "bf16": bool(config.get("bf16", False)),
+        "skill_horizon": config.get("skill_horizon"),
+        "skill_horizon_jitter": config.get("skill_horizon_jitter"),
     }
     return policy.eval().requires_grad_(False), metadata
+
+
+def skill_semantics(metadata: dict) -> tuple[int, int] | None:
+    horizon = metadata.get("skill_horizon")
+    jitter = metadata.get("skill_horizon_jitter")
+    if horizon is None and jitter is None:
+        return None
+    if horizon is None or jitter is None:
+        raise ValueError("checkpoint has incomplete skill duration configuration")
+    return int(horizon), int(jitter)
+
+
+def require_compatible_policies(blue: dict, orange: dict) -> None:
+    if blue["bf16"] != orange["bf16"]:
+        raise ValueError("selected policies use different decoder precision")
+    if skill_semantics(blue) != skill_semantics(orange):
+        raise ValueError("selected policies use different skill durations")
 
 
 def resolve_pulse_artifact(
@@ -278,11 +298,15 @@ def simulate(
         )
         env = PulseLatentEnv(base, controller)
         del blue_payload, orange_payload
-        blue, _ = load_checkpoint(blue_path, env)
-        orange, _ = load_checkpoint(orange_path, env)
+        blue, blue_metadata = load_checkpoint(blue_path, env)
+        orange, orange_metadata = load_checkpoint(orange_path, env)
+        require_compatible_policies(blue_metadata, orange_metadata)
         observation = env.reset()
         blue_state = blue.initial_state(1)
         orange_state = orange.initial_state(1)
+        blue_latent = orange_latent = None
+        blue_remaining = orange_remaining = 0
+        duration_generator = th.Generator(device=base.device).manual_seed(args.seed)
         blue_score = orange_score = 0
         round_number = 1
         tick = 0
@@ -294,9 +318,14 @@ def simulate(
                 try:
                     next_blue, next_blue_payload = load_checkpoint(pending[0], env)
                     next_orange, next_orange_payload = load_checkpoint(pending[1], env)
-                    if next_blue_payload["bf16"] != next_orange_payload["bf16"]:
+                    require_compatible_policies(
+                        next_blue_payload, next_orange_payload
+                    )
+                    if skill_semantics(next_blue_payload) != skill_semantics(
+                        blue_metadata
+                    ):
                         raise ValueError(
-                            "selected policies use different decoder precision"
+                            "selected policies use different skill duration semantics"
                         )
                     next_artifact = str(next_blue_payload["distill_sha256"])
                     if next_artifact != artifact_id:
@@ -311,6 +340,8 @@ def simulate(
                 else:
                     blue_path, orange_path = pending
                     blue, orange = next_blue, next_orange
+                    blue_metadata = next_blue_payload
+                    orange_metadata = next_orange_payload
                     controller.bf16 = next_blue_payload["bf16"]
                     state.reset.set()
 
@@ -319,21 +350,73 @@ def simulate(
                 observation = env.reset()
                 blue_state = blue.initial_state(1)
                 orange_state = orange.initial_state(1)
+                blue_latent = orange_latent = None
+                blue_remaining = orange_remaining = 0
+                duration_generator.manual_seed(args.seed)
                 blue_score = orange_score = 0
                 round_number = 1
                 tick = 0
 
             with th.inference_mode():
-                blue_output = blue.act(
-                    observation[:1], blue_state, deterministic=True
-                )
-                orange_output = orange.act(
-                    observation[1:], orange_state, deterministic=True
-                )
-                residual = th.cat((blue_output.action, orange_output.action))
-                blue_state = blue_output.next_state
-                orange_state = orange_output.next_state
-            observation, reward, terminated, truncated, _ = env.step(residual)
+                semantics = skill_semantics(blue_metadata)
+                if semantics is None:
+                    blue_duration = orange_duration = 1
+                else:
+                    horizon, jitter = semantics
+                    if blue_remaining == 0:
+                        blue_duration = int(th.randint(
+                            horizon - jitter,
+                            horizon + jitter + 1,
+                            (1,),
+                            generator=duration_generator,
+                            device=base.device,
+                        ).item())
+                    if orange_remaining == 0:
+                        orange_duration = int(th.randint(
+                            horizon - jitter,
+                            horizon + jitter + 1,
+                            (1,),
+                            generator=duration_generator,
+                            device=base.device,
+                        ).item())
+
+                if blue_remaining == 0:
+                    blue_input = policy_observation(
+                        observation[:1], blue_duration, controller.max_duration
+                    )
+                    blue_output = blue.act(
+                        blue_input, blue_state, deterministic=True
+                    )
+                    blue_state = blue_output.next_state
+                    blue_latent = (
+                        blue_output.action
+                        if semantics is None
+                        else controller.select_latent(
+                            observation[:1], blue_output.action, blue_duration
+                        )
+                    )
+                    blue_remaining = blue_duration
+                if orange_remaining == 0:
+                    orange_input = policy_observation(
+                        observation[1:], orange_duration, controller.max_duration
+                    )
+                    orange_output = orange.act(
+                        orange_input, orange_state, deterministic=True
+                    )
+                    orange_state = orange_output.next_state
+                    orange_latent = (
+                        orange_output.action
+                        if semantics is None
+                        else controller.select_latent(
+                            observation[1:], orange_output.action, orange_duration
+                        )
+                    )
+                    orange_remaining = orange_duration
+
+                latent = th.cat((blue_latent, orange_latent))
+            observation, reward, terminated, truncated, _ = env.step(latent)
+            blue_remaining -= 1
+            orange_remaining -= 1
             tick += args.frameskip
 
             goal = int(reward[0].item())
@@ -342,6 +425,8 @@ def simulate(
             if (terminated | truncated).any():
                 blue_state = blue.initial_state(1)
                 orange_state = orange.initial_state(1)
+                blue_latent = orange_latent = None
+                blue_remaining = orange_remaining = 0
                 round_number += 1
                 tick = 0
 

@@ -25,8 +25,16 @@ from jarl.runtime import (
     Trainer,
     ValueScheduler,
 )
-from jarl.sample.rollout import RolloutMinibatches
 from jarl.store.rollout import RolloutBuffer
+
+# JARL exports this sampler with constructor (horizon, jitter, batch_size, epochs).
+# ``batch_size`` is the number of valid steps per minibatch (not the number of
+# chunks).  Each yielded batch is a ChunkBatch with fields
+#   data     -> TensorBatch with rollout fields (observation, teacher_action, ...)
+#   valid    -> [batch, max_duration] bool mask
+#   duration -> [batch] long tensor of actual chunk lengths
+#   planned_duration -> [batch] long tensor used to condition the prior
+from jarl.sample import ChunkBatch, TrajectoryChunkMinibatches
 
 from tracker import ExpertGoalStates, ExpertLookaheadEnv, GOAL_STATE_SIZE
 
@@ -49,6 +57,7 @@ class GaussianEncoder(nn.Module):
         super().__init__()
         feature_dim = 5 * latent_dim
         self.trunk = mlp(input_dim, hidden, feature_dim)
+        self.segment_gru = nn.GRU(feature_dim, feature_dim, batch_first=True)
         self.mean = nn.Linear(feature_dim, latent_dim)
         self.log_variance = nn.Linear(feature_dim, latent_dim)
 
@@ -56,18 +65,63 @@ class GaussianEncoder(nn.Module):
         features = self.trunk(observation)
         return self.mean(features), self.log_variance(features).clamp(-5.0, 2.0)
 
+    def segment(
+        self,
+        observations: th.Tensor,
+        valid: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Encode valid trajectory prefixes into one posterior per segment.
+
+        observations: [B, T, D]
+        valid:        [B, T]
+        returns:      posterior mean and log variance of shape [B, latent_dim]
+        """
+        batch, time, dim = observations.shape
+        features = self.trunk(observations.reshape(batch * time, dim)).reshape(
+            batch, time, -1
+        )
+        duration = valid.sum(dim=1)
+        if (duration < 1).any():
+            raise ValueError("segments must contain at least one valid frame")
+        encoded, _ = self.segment_gru(features)
+        rows = th.arange(batch, device=observations.device)
+        pooled = encoded[rows, duration - 1]
+        return self.mean(pooled), self.log_variance(pooled).clamp(-5.0, 2.0)
+
 
 class ConditionalPrior(nn.Module):
-    def __init__(self, state_dim: int, latent_dim: int, hidden: list[int]) -> None:
+    def __init__(
+        self,
+        state_dim: int,
+        latent_dim: int,
+        hidden: list[int],
+        max_duration: int | None = None,
+    ) -> None:
         super().__init__()
         if not hidden:
             raise ValueError("prior hidden dimensions cannot be empty")
-        self.trunk = mlp(state_dim, hidden[:-1], hidden[-1])
+        self.max_duration = max_duration
+        input_dim = state_dim + (max_duration is not None)
+        self.trunk = mlp(input_dim, hidden[:-1], hidden[-1])
         self.trunk.append(nn.SiLU())
         self.mean = nn.Linear(hidden[-1], latent_dim)
         self.log_variance = nn.Linear(hidden[-1], latent_dim)
+        if max_duration is not None:
+            if max_duration < 1:
+                raise ValueError("max_duration must be positive when provided")
 
-    def forward(self, state: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+    def forward(
+        self,
+        state: th.Tensor,
+        duration: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        if self.max_duration is not None:
+            if duration is None:
+                raise ValueError("duration required for duration-conditioned prior")
+            duration = th.as_tensor(duration, device=state.device)
+            duration = th.broadcast_to(duration, state.shape[:-1])
+            normalized = duration.to(state.dtype).unsqueeze(-1) / self.max_duration
+            state = th.cat((state, normalized), dim=-1)
         features = self.trunk(state)
         return self.mean(features), self.log_variance(features).clamp(-5.0, 2.0)
 
@@ -168,15 +222,33 @@ def factor_actions(logits: th.Tensor) -> th.Tensor:
 def categorical_distillation_loss(
     logits: th.Tensor,
     target: th.Tensor,
+    valid: th.Tensor | None = None,
 ) -> tuple[th.Tensor, th.Tensor]:
+    """Factorised cross-entropy and hard accuracy, optionally masked over frames.
+
+    When ``valid`` is provided, only the ``valid`` rows contribute to the loss
+    and accuracy; the averages are per factor and then across factors.
+    """
     losses = []
     correct = []
     for index, factor in enumerate(logits.split(ACTION_SIZES, dim=-1)):
-        losses.append(
-            nn.functional.cross_entropy(factor, target[:, index], reduction="none")
-        )
-        correct.append(factor.argmax(dim=-1) == target[:, index])
-    return th.stack(losses, dim=-1).mean(), th.stack(correct, dim=-1).float().mean()
+        target_factor = target[:, index]
+        if valid is None:
+            losses.append(
+                nn.functional.cross_entropy(factor, target_factor, reduction="mean")
+            )
+            correct.append(
+                (factor.argmax(dim=-1) == target_factor).float().mean()
+            )
+        else:
+            cross_entropy = nn.functional.cross_entropy(
+                factor, target_factor, reduction="none"
+            )
+            count = valid.sum().clamp(min=1)
+            losses.append((cross_entropy * valid).sum() / count)
+            accuracy = (factor.argmax(dim=-1) == target_factor).float()
+            correct.append((accuracy * valid).sum() / count)
+    return th.stack(losses, dim=-1).mean(), th.stack(correct, dim=-1).mean()
 
 
 def load_teacher(path: Path, env: ExpertLookaheadEnv) -> MultiCategoricalPolicy:
@@ -191,7 +263,8 @@ def load_teacher(path: Path, env: ExpertLookaheadEnv) -> MultiCategoricalPolicy:
         teacher.load_state_dict(payload["policy"])
     except RuntimeError as error:
         raise RuntimeError(
-            "tracker checkpoint does not match the configured replay windows"
+            "tracker checkpoint does not match the car-only goal observation "
+            "shape and configured replay windows"
         ) from error
     return teacher.eval().requires_grad_(False)
 
@@ -202,23 +275,16 @@ class TeacherActionCapture(CaptureBase):
 
     @th.no_grad()
     def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
-        action = self.teacher.act(context.observation, deterministic=True).action
-        return {"teacher_action": action}
+        return {"teacher_action": context.policy_output.action}
 
 
 class DistillRolloutTransform:
     def __call__(self, batch: TensorBatch, context) -> TensorBatch:
-        observation = batch["observation"]
         done = batch["terminated"] | batch["truncated"]
-        previous = th.cat((observation[:1], observation[:-1]), dim=0)
-        smooth_pair = th.zeros_like(done, dtype=th.bool)
-        smooth_pair[1:] = ~done[:-1]
         action_agreement = (
             batch["action"] == batch["teacher_action"]
         ).float().mean(dim=-1)
         return batch.with_fields(
-            previous_observation=previous,
-            smooth_pair=smooth_pair,
             action_agreement=action_agreement,
             reset_fraction=done.float(),
         )
@@ -231,56 +297,85 @@ class PulseLoss:
         prior: ConditionalPrior,
         action_codec,
         kl_weight: float,
-        ar_weight: float,
-        ar_decay: float,
+        prior_action_weight: float,
     ) -> None:
         self.policy = policy
         self.prior = prior
         self.action_codec = action_codec
         self.kl_weight = kl_weight
-        self.ar_weight = ar_weight
-        self.ar_decay = ar_decay
+        self.prior_action_weight = prior_action_weight
 
-    def __call__(self, batch: TensorBatch) -> LossOutput:
-        observation = batch["observation"]
-        state = observation[:, :GOAL_STATE_SIZE]
-        posterior_mean, posterior_log_variance = self.policy.encoder(observation)
-        prior_mean, prior_log_variance = self.prior(state)
+    def __call__(self, batch: TensorBatch | ChunkBatch) -> LossOutput:
+        if isinstance(batch, ChunkBatch):
+            data = batch.data
+            valid = batch.valid
+            duration = batch.duration
+            planned_duration = batch.planned_duration
+        else:
+            data = batch
+            valid = batch["valid"]
+            duration = batch["duration"]
+            planned_duration = batch.get("planned_duration", duration)
+
+        observation = data["observation"]
+        teacher_action = data["teacher_action"]
+        state = observation[..., :GOAL_STATE_SIZE]
+        start_state = state[:, 0]
+
+        posterior_mean, posterior_log_variance = self.policy.encoder.segment(
+            observation, valid
+        )
+        prior_mean, prior_log_variance = self.prior(
+            start_state, planned_duration
+        )
         latent = reparameterize(posterior_mean, posterior_log_variance)
-        logits = masked_logits(
-            self.policy.decoder(state, latent), state, self.action_codec
-        )
-        action_loss, action_accuracy = categorical_distillation_loss(
-            logits, batch["teacher_action"]
-        )
-        latent_kl = diagonal_gaussian_kl(
+
+        kl = diagonal_gaussian_kl(
             posterior_mean,
             posterior_log_variance,
             prior_mean,
             prior_log_variance,
         )
 
-        smooth = batch["smooth_pair"].bool()
-        if smooth.any():
-            previous_mean, _ = self.policy.encoder(
-                batch["previous_observation"][smooth]
-            )
-            ar_loss = th.linalg.vector_norm(
-                posterior_mean[smooth] - self.ar_decay * previous_mean,
-                dim=-1,
-            ).mean()
-        else:
-            ar_loss = posterior_mean.sum() * 0.0
+        flat_state = state[valid]
+        flat_teacher_action = teacher_action[valid]
 
-        total = action_loss + self.kl_weight * latent_kl + self.ar_weight * ar_loss
+        flat_latent = latent.unsqueeze(1).expand(-1, observation.shape[1], -1)[valid]
+        posterior_logits = masked_logits(
+            self.policy.decoder(flat_state, flat_latent),
+            flat_state,
+            self.action_codec,
+        )
+        posterior_loss, posterior_accuracy = categorical_distillation_loss(
+            posterior_logits, flat_teacher_action
+        )
+
+        flat_prior_mean = (
+            prior_mean.unsqueeze(1).expand(-1, observation.shape[1], -1)[valid]
+        )
+        prior_logits = masked_logits(
+            self.policy.decoder(flat_state, flat_prior_mean),
+            flat_state,
+            self.action_codec,
+        )
+        prior_loss, prior_accuracy = categorical_distillation_loss(
+            prior_logits, flat_teacher_action
+        )
+
+        total = (
+            posterior_loss
+            + self.kl_weight * kl
+            + self.prior_action_weight * prior_loss
+        )
         return LossOutput(
             loss=total,
             metrics={
-                "action_loss": action_loss,
-                "kl": latent_kl,
-                "ar": ar_loss,
+                "action_loss": posterior_loss,
+                "action_accuracy": posterior_accuracy,
+                "prior_action_loss": prior_loss,
+                "prior_action_accuracy": prior_accuracy,
+                "kl": kl,
                 "total_loss": total,
-                "action_accuracy": action_accuracy,
                 "posterior_std": th.exp(0.5 * posterior_log_variance).mean(),
                 "prior_std": th.exp(0.5 * prior_log_variance).mean(),
             },
@@ -364,8 +459,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--max-grad-norm", type=float, default=50.0)
-    parser.add_argument("--ar-weight", type=float, default=0.005)
-    parser.add_argument("--ar-decay", type=float, default=0.99)
+    parser.add_argument("--prior-action-weight", type=float, default=1.0)
+    parser.add_argument("--skill-horizon", type=int, default=16)
+    parser.add_argument("--skill-horizon-jitter", type=int, default=4)
     parser.add_argument("--kl-initial", type=float, default=0.01)
     parser.add_argument("--kl-final", type=float, default=0.001)
     parser.add_argument("--kl-anneal-start", type=int, default=2_500_000_000)
@@ -382,11 +478,19 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     positive = (
         "n_sim", "frameskip", "latent_size", "rollout", "batch_size", "epochs",
-        "timesteps", "checkpoint_interval", "checkpoint_keep",
+        "timesteps", "checkpoint_interval", "checkpoint_keep", "skill_horizon",
     )
     for name in positive:
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.skill_horizon_jitter < 0:
+        raise ValueError("--skill-horizon-jitter must be non-negative")
+    if args.skill_horizon - args.skill_horizon_jitter < 1:
+        raise ValueError(
+            "--skill-horizon minus --skill-horizon-jitter must be at least one"
+        )
+    if args.prior_action_weight < 0:
+        raise ValueError("--prior-action-weight must be non-negative")
     if args.kl_anneal_end <= args.kl_anneal_start:
         raise ValueError("--kl-anneal-end must be greater than --kl-anneal-start")
     if not args.tracker_checkpoint.is_file():
@@ -417,6 +521,9 @@ def validate_resume_config(
         "encoder_hidden",
         "decoder_hidden",
         "lr",
+        "skill_horizon",
+        "skill_horizon_jitter",
+        "prior_action_weight",
     )
     current = serialized_config(args)
     mismatches = [
@@ -467,7 +574,10 @@ def main() -> None:
         env.action_codec,
     ).to(env.device)
     prior = ConditionalPrior(
-        GOAL_STATE_SIZE, args.latent_size, args.encoder_hidden
+        GOAL_STATE_SIZE,
+        args.latent_size,
+        args.encoder_hidden,
+        max_duration=args.skill_horizon + args.skill_horizon_jitter,
     ).to(env.device)
     optimizer = Adam((*policy.parameters(), *prior.parameters()), lr=args.lr)
     step = 0
@@ -488,14 +598,15 @@ def main() -> None:
         prior,
         env.action_codec,
         args.kl_initial,
-        args.ar_weight,
-        args.ar_decay,
+        args.prior_action_weight,
     )
     buffer = RolloutBuffer(args.rollout, args.n_sim, env.device)
-    runner = Runner(env, policy, buffer, captures=(TeacherActionCapture(teacher),))
+    runner = Runner(env, teacher, buffer, captures=(TeacherActionCapture(teacher),))
     update = Update(
         transforms=(),
-        sampler=RolloutMinibatches(args.batch_size, args.epochs),
+        sampler=TrajectoryChunkMinibatches(
+            args.skill_horizon, args.skill_horizon_jitter, args.batch_size, args.epochs
+        ),
         loss=loss,
         optimizer_step=OptimizerStep(
             (policy, prior), optimizer, max_grad_norm=args.max_grad_norm
@@ -540,8 +651,9 @@ def main() -> None:
     for section, key, label, format_spec in (
         ("Distill", "action_loss", "action loss", ".4f"),
         ("Distill", "action_accuracy", "accuracy", ".3f"),
+        ("Distill", "prior_action_loss", "prior action loss", ".4f"),
+        ("Distill", "prior_action_accuracy", "prior accuracy", ".3f"),
         ("Distill", "kl", "KL", ".3f"),
-        ("Distill", "ar", "AR", ".3f"),
         ("Rollout", "reward", "reward", ".3f"),
     ):
         logger.register_progress_metric(section, key, label, format_spec)
