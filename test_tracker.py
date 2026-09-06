@@ -1,42 +1,98 @@
+import tempfile
 import unittest
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch as th
-import torch.nn as nn
 
 from carl.gymnasium import CARLObservation
 from jarl.data.batch import TensorBatch
-from jarl.learn import LossOutput
 
 from ballchasing_replays.parse_replays import _project_carl_actions
+from watch_demonstrations import frame_from_state
+from tracker_checkpoint import PeriodicCheckpoint
 
 from tracker import (
     ACTION_FACTORS,
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
+    DEFAULT_TRACKER_WINDOWS,
     EXPERT_TOUCH_INDEX,
-    ExpertActionPPOLoss,
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
     POSITION_SCALE,
     STORED_REPLAY_SIZE,
     TrackingReward,
+    TrajectoryGoalEncoder,
+    _expert_action_loss,
     _expert_action_labels,
+    load_tracker_policy,
 )
 
 
 class TrackerTest(unittest.TestCase):
+    def test_default_tracker_lookahead_extends_to_two_seconds(self):
+        self.assertEqual(DEFAULT_TRACKER_WINDOWS, (1, 2, 4, 8, 16, 32, 64))
+
+    def test_trajectory_goal_encoder_handles_batches_and_sequences(self):
+        encoder = TrajectoryGoalEncoder((1, 2, 4), feature_size=32)
+        width = GOAL_STATE_SIZE + 3 * 21
+
+        batch = encoder(th.randn(5, width))
+        sequence = encoder(th.randn(7, 5, width))
+
+        self.assertEqual(batch.shape, (5, 32))
+        self.assertEqual(sequence.shape, (7, 5, 32))
+
+    def test_trajectory_goal_encoder_rejects_wrong_width(self):
+        encoder = TrajectoryGoalEncoder((1, 2), feature_size=32)
+
+        with self.assertRaisesRegex(ValueError, "expected"):
+            encoder(th.randn(3, GOAL_STATE_SIZE + 21))
+
+    def test_legacy_tracker_checkpoint_has_explicit_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tracker.pt"
+            th.save({"policy": {}}, path)
+
+            with self.assertRaisesRegex(RuntimeError, "legacy tracker checkpoint"):
+                load_tracker_policy(path, SimpleNamespace(device="cpu"), (1, 2), 4)
+
+    def test_checkpoint_retention_does_not_delete_legacy_high_step_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            legacy = directory / "tracker_999999999999.pt"
+            th.save({"policy": {}}, legacy)
+            checkpoint = PeriodicCheckpoint(
+                {"policy": th.nn.Linear(1, 1)},
+                directory,
+                interval=1,
+                keep=1,
+            )
+
+            checkpoint.run()
+            checkpoint.step = 1
+            checkpoint.run()
+
+            self.assertTrue(legacy.exists())
+            self.assertFalse((directory / "tracker_000000000000.pt").exists())
+            self.assertTrue((directory / "tracker_000000000001.pt").exists())
+
     def test_expert_action_labels_only_supervise_direct_controls(self):
         raw = np.zeros((3, 8), dtype=np.float32)
         raw[:, 0] = [-1.0, 0.0, 1.0]
+        raw[:, 1:5] = np.asarray([-1.0, 0.0, 1.0])[:, None]
         raw[1, 5:] = [1.0, 1.0, 1.0]
 
         labels, valid = _expert_action_labels(raw)
 
         np.testing.assert_array_equal(labels[:, 2], [1, 0, 2])
+        np.testing.assert_array_equal(labels[:, 0], [1, 0, 2])
+        np.testing.assert_array_equal(labels[:, 1], [1, 0, 2])
+        np.testing.assert_array_equal(labels[:, 5], [1, 0, 2])
         np.testing.assert_array_equal(labels[1, [3, 4, 6]], [1, 1, 1])
         self.assertFalse(valid[:, [0, 1, 5]].any())
         self.assertTrue(valid[:, [2, 3, 4, 6]].all())
@@ -275,53 +331,58 @@ class TrackerTest(unittest.TestCase):
         )
 
     def test_expert_action_loss_uses_only_valid_legal_targets(self):
-        class Codec:
-            @staticmethod
-            def mask(observation):
-                mask = th.ones((len(observation), 18), dtype=th.bool)
-                mask[1, 12] = False
-                return mask
-
-        class Policy:
-            sizes = (3, 3, 3, 2, 2, 3, 2)
-            action_codec = Codec()
-            head = nn.Linear(GOAL_STATE_SIZE, 18, bias=False)
-
-            @staticmethod
-            def body_features(observation):
-                return observation, None
-
-        class ZeroPPO:
-            @staticmethod
-            def __call__(batch):
-                return LossOutput(batch["observation"].sum() * 0, {"ppo": 0.0})
-
-            @staticmethod
-            def after_update():
-                return
-
-        nn.init.zeros_(Policy.head.weight)
+        logits = th.zeros((2, 18), requires_grad=True)
+        action_mask = th.ones((2, 18), dtype=th.bool)
+        action_mask[1, 12] = False
         expert_action = th.zeros((2, ACTION_FACTORS), dtype=th.long)
         expert_action[:, 2] = th.tensor([1, 2])
         expert_action[:, 4] = 1
         valid = th.zeros((2, ACTION_FACTORS), dtype=th.bool)
         valid[:, 2] = True
         valid[:, 4] = True
-        batch = TensorBatch({
-            "observation": th.zeros((2, GOAL_STATE_SIZE)),
-            "expert_action": expert_action,
-            "expert_action_valid": valid,
-        })
-
-        output = ExpertActionPPOLoss(ZeroPPO(), Policy(), 0.5)(batch)
+        loss, _, _ = _expert_action_loss(
+            logits,
+            action_mask,
+            expert_action,
+            valid,
+            th.ones(2, dtype=th.bool),
+            (3, 3, 3, 2, 2, 3, 2),
+            inferred_weight=0,
+        )
 
         expected_expert_loss = (np.log(3) + np.log(2)) / 2
-        self.assertAlmostEqual(
-            output.metrics["expert_action_loss"].item(),
-            expected_expert_loss,
-            places=6,
+        self.assertAlmostEqual(loss.item(), expected_expert_loss, places=6)
+
+    def test_expert_action_loss_trains_inferred_factors_on_valid_sequence_steps(self):
+        loss, _, _ = _expert_action_loss(
+            th.zeros((2, 1, 18), requires_grad=True),
+            th.ones((2, 1, 18), dtype=th.bool),
+            th.zeros((2, 1, ACTION_FACTORS), dtype=th.long),
+            th.zeros((2, 1, ACTION_FACTORS), dtype=th.bool),
+            th.tensor([[True], [False]]),
+            (3, 3, 3, 2, 2, 3, 2),
+            inferred_weight=0.1,
         )
-        self.assertAlmostEqual(output.loss.item(), 0.5 * expected_expert_loss, places=6)
+
+        self.assertAlmostEqual(loss.item(), np.log(3), places=6)
+
+    def test_demonstration_frame_includes_expert_actions_and_confidence(self):
+        expert_action = th.tensor([[1, 2, 0, 1, 0, 2, 1]])
+        expert_valid = th.tensor([[False, False, True, True, True, False, True]])
+
+        frame = frame_from_state(
+            th.zeros(31),
+            Path("tracker.pt"),
+            th.tensor([1.0]),
+            th.zeros(GOAL_STATE_SIZE),
+            "demo",
+            th.zeros((1, ACTION_FACTORS), dtype=th.long),
+            expert_action,
+            expert_valid,
+        )
+
+        self.assertEqual(frame["expert_action"], expert_action[0].tolist())
+        self.assertEqual(frame["expert_action_valid"], expert_valid[0].tolist())
 
     @staticmethod
     def _anchor_fixture(expert_touch: bool = False):

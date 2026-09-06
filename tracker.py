@@ -16,7 +16,12 @@ from torch.optim import Adam
 from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium import CARLObservation
 from carl.gymnasium.state import RewardContext
-from jarl.collect import CriticCapture, LogProbCapture, Runner
+from jarl.collect import (
+    LogProbCapture,
+    RecurrentCriticCapture,
+    RecurrentStateCapture,
+    Runner,
+)
 from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.data.batch import TensorBatch
 from jarl.learn import (
@@ -29,12 +34,11 @@ from jarl.learn import (
     Update,
 )
 from jarl.log.logger import Logger
-from jarl.modules import MLP
-from jarl.modules.encoder import LinearEncoder
+from jarl.modules import GRU, MLP
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, Trainer
-from jarl.sample import RolloutMinibatches
+from jarl.sample import RecurrentRolloutMinibatches, SequenceBatch
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
@@ -58,6 +62,146 @@ EXPERT_ACTION_MASK_INDEX = EXPERT_ACTION_INDEX + ACTION_FACTORS
 STORED_REPLAY_SIZE = EXPERT_ACTION_MASK_INDEX + ACTION_FACTORS
 SUPERVISED_ACTION_FACTORS = (2, 3, 4, 6)
 CARL_AXES = np.asarray([0.0, -1.0, 1.0], dtype=np.float32)
+DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
+TRACKER_FEATURE_SIZE = 512
+TRACKER_GOAL_EMBED_SIZE = 128
+TRACKER_TRANSFORMER_HEADS = 4
+TRACKER_TRANSFORMER_LAYERS = 2
+TRACKER_ARCHITECTURE = "trajectory-transformer-gru-v1"
+
+
+class TrajectoryGoalEncoder(nn.Module):
+    def __init__(
+        self,
+        windows: Sequence[int],
+        feature_size: int = TRACKER_FEATURE_SIZE,
+        goal_embed_size: int = TRACKER_GOAL_EMBED_SIZE,
+        transformer_heads: int = TRACKER_TRANSFORMER_HEADS,
+        transformer_layers: int = TRACKER_TRANSFORMER_LAYERS,
+    ) -> None:
+        super().__init__()
+        self.windows = tuple(int(window) for window in windows)
+        if not self.windows or any(window < 1 for window in self.windows):
+            raise ValueError("tracker windows must be nonempty and positive")
+        if any(left >= right for left, right in zip(self.windows, self.windows[1:])):
+            raise ValueError("tracker windows must be strictly increasing")
+        if goal_embed_size % transformer_heads:
+            raise ValueError("goal embedding size must be divisible by transformer heads")
+
+        self.expected_size = GOAL_STATE_SIZE + len(self.windows) * CAR_STATE_SIZE
+        self.state_encoder = nn.Sequential(
+            nn.Linear(GOAL_STATE_SIZE, 256),
+            nn.SiLU(),
+            nn.LayerNorm(256),
+        )
+        self.goal_encoder = nn.Sequential(
+            nn.Linear(CAR_STATE_SIZE, goal_embed_size),
+            nn.SiLU(),
+            nn.LayerNorm(goal_embed_size),
+        )
+        self.time_encoder = nn.Linear(1, goal_embed_size)
+        self.summary_token = nn.Parameter(th.zeros(1, 1, goal_embed_size))
+        layer = nn.TransformerEncoderLayer(
+            d_model=goal_embed_size,
+            nhead=transformer_heads,
+            dim_feedforward=4 * goal_embed_size,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            layer,
+            num_layers=transformer_layers,
+            norm=nn.LayerNorm(goal_embed_size),
+            enable_nested_tensor=False,
+        )
+        self.output = nn.Sequential(
+            nn.Linear(256 + goal_embed_size, feature_size),
+            nn.SiLU(),
+            nn.LayerNorm(feature_size),
+        )
+        normalized_time = np.log1p(self.windows) / np.log1p(self.windows[-1])
+        self.register_buffer(
+            "normalized_time",
+            th.tensor(normalized_time, dtype=th.float32).view(1, -1, 1),
+        )
+        self.feats = feature_size
+        self.built = False
+
+    def build(self, env) -> "TrajectoryGoalEncoder":
+        actual = int(np.prod(env.single_observation_space.shape))
+        if actual != self.expected_size:
+            raise ValueError(
+                f"tracker observation has {actual} features, expected {self.expected_size}"
+            )
+        self.built = True
+        return self
+
+    def forward(self, observation: th.Tensor) -> th.Tensor:
+        if observation.shape[-1] != self.expected_size:
+            raise ValueError(
+                f"tracker observation has {observation.shape[-1]} features, "
+                f"expected {self.expected_size}"
+            )
+        leading = observation.shape[:-1]
+        flat = observation.reshape(-1, self.expected_size)
+        state = self.state_encoder(flat[:, :GOAL_STATE_SIZE])
+        goals = flat[:, GOAL_STATE_SIZE:].reshape(-1, len(self.windows), CAR_STATE_SIZE)
+        goal_tokens = self.goal_encoder(goals) + self.time_encoder(
+            self.normalized_time.to(dtype=flat.dtype)
+        )
+        summary = self.summary_token.expand(len(flat), -1, -1)
+        trajectory = self.transformer(th.cat((summary, goal_tokens), dim=1))[:, 0]
+        return self.output(th.cat((state, trajectory), dim=-1)).reshape(
+            *leading, self.feats
+        )
+
+
+def build_tracker_policy(
+    env: "ExpertLookaheadEnv",
+    windows: Sequence[int],
+) -> MultiCategoricalPolicy:
+    return MultiCategoricalPolicy(
+        foot=TrajectoryGoalEncoder(windows),
+        body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
+        head=MLP(dims=[]),
+        action_codec=env.action_codec,
+    ).build(env).to(env.device)
+
+
+def build_tracker_critic(
+    env: "ExpertLookaheadEnv",
+    windows: Sequence[int],
+) -> Critic:
+    return Critic(
+        foot=TrajectoryGoalEncoder(windows),
+        body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
+        head=MLP(dims=[]),
+    ).build(env).to(env.device)
+
+
+def load_tracker_policy(
+    path: Path,
+    env: "ExpertLookaheadEnv",
+    windows: Sequence[int],
+    frame_skip: int,
+) -> MultiCategoricalPolicy:
+    payload = th.load(path, map_location=env.device, weights_only=True)
+    config = payload.get("config")
+    if not isinstance(config, dict) or config.get("architecture") != TRACKER_ARCHITECTURE:
+        raise RuntimeError(
+            "legacy tracker checkpoint is incompatible with the recurrent "
+            "trajectory architecture; retrain the tracker"
+        )
+    if tuple(config.get("windows", ())) != tuple(windows):
+        raise ValueError("tracker checkpoint windows do not match configured replay windows")
+    if int(config.get("frameskip", -1)) != frame_skip:
+        raise ValueError("tracker checkpoint frameskip does not match the environment")
+
+    policy = build_tracker_policy(env, windows)
+    policy.load_state_dict(payload["policy"])
+    return policy
 
 
 def _expert_action_labels(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -67,9 +211,16 @@ def _expert_action_labels(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError("raw replay actions contain non-finite values")
 
     labels = np.zeros((len(raw), ACTION_FACTORS), dtype=np.int64)
+    horizontal_error = (
+        (CARL_AXES[:, None] - raw[:, 1]) ** 2
+        + (CARL_AXES[:, None] - raw[:, 3]) ** 2
+    )
+    labels[:, 0] = horizontal_error.argmin(axis=0)
+    labels[:, 1] = np.abs(CARL_AXES[:, None] - raw[:, 2]).argmin(axis=0)
     labels[:, 2] = np.abs(CARL_AXES[:, None] - raw[:, 0]).argmin(axis=0)
     labels[:, 3] = raw[:, 7] >= 0.5
     labels[:, 4] = raw[:, 6] >= 0.5
+    labels[:, 5] = np.abs(CARL_AXES[:, None] - raw[:, 4]).argmin(axis=0)
     labels[:, 6] = raw[:, 5] >= 0.5
 
     valid = np.zeros_like(labels, dtype=bool)
@@ -93,7 +244,7 @@ class ExpertGoalStates:
         self,
         replay_dir:         str,
         n_env:              int,
-        windows:            Sequence[int] = (1, 2, 4, 8),
+        windows:            Sequence[int] = DEFAULT_TRACKER_WINDOWS,
         obs_limit:          int | None = None,
         n_cars:             int = 2,
         device:             str | th.device = "cuda:0",
@@ -106,6 +257,11 @@ class ExpertGoalStates:
             raise ValueError("ExpertGoalStates supports one simulated ego car")
         if minimum_remaining_frames < 1:
             raise ValueError("minimum remaining frames must be positive")
+        windows = tuple(int(window) for window in windows)
+        if not windows or any(window < 1 for window in windows):
+            raise ValueError("tracker windows must be nonempty and positive")
+        if any(left >= right for left, right in zip(windows, windows[1:])):
+            raise ValueError("tracker windows must be strictly increasing")
 
         self.n_cars = n_cars
         self.device = device
@@ -691,61 +847,122 @@ class ExpertActionCapture(CaptureBase):
         }
 
 
-class ExpertActionPPOLoss:
+def _expert_action_loss(
+    logits: th.Tensor,
+    action_mask: th.Tensor,
+    expert_action: th.Tensor,
+    expert_valid: th.Tensor,
+    sequence_valid: th.Tensor,
+    sizes: Sequence[int],
+    inferred_weight: float,
+) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    weighted_losses = []
+    weighted_accuracies = []
+    weights = []
+    valid_rates = []
+    for index, (factor_logits, factor_mask) in enumerate(zip(
+        logits.split(tuple(sizes), dim=-1),
+        action_mask.split(tuple(sizes), dim=-1),
+    )):
+        target = expert_action[..., index]
+        target_legal = factor_mask.gather(-1, target[..., None]).squeeze(-1)
+        trusted = expert_valid[..., index]
+        valid = sequence_valid & target_legal
+        if index in SUPERVISED_ACTION_FACTORS:
+            factor_weight = 1.0
+            valid &= trusted
+        else:
+            factor_weight = inferred_weight
+            if factor_weight == 0:
+                continue
+        if not valid.any():
+            continue
+
+        masked_logits = factor_logits.masked_fill(
+            ~factor_mask,
+            th.finfo(factor_logits.dtype).min,
+        ).float()
+        factor_loss = nn.functional.cross_entropy(masked_logits[valid], target[valid])
+        factor_accuracy = (
+            masked_logits[valid].argmax(-1) == target[valid]
+        ).float().mean()
+        weighted_losses.append(factor_weight * factor_loss)
+        weighted_accuracies.append(factor_weight * factor_accuracy)
+        weights.append(factor_weight)
+        valid_rates.append(valid.float().mean())
+
+    if not weighted_losses:
+        zero = logits.sum() * 0
+        return zero, logits.new_zeros(()), logits.new_zeros(())
+
+    total_weight = sum(weights)
+    return (
+        th.stack(weighted_losses).sum() / total_weight,
+        th.stack(weighted_accuracies).sum() / total_weight,
+        th.stack(valid_rates).mean(),
+    )
+
+
+class ExpertActionPPOLoss(PPOLoss):
     def __init__(
         self,
-        ppo: PPOLoss,
         policy: MultiCategoricalPolicy,
+        critic: Critic,
+        config: PPOConfig,
         weight: float,
+        inferred_weight: float = 0.1,
     ) -> None:
         if not np.isfinite(weight) or weight < 0:
             raise ValueError("expert action weight must be finite and nonnegative")
-        self.ppo = ppo
-        self.policy = policy
+        if not np.isfinite(inferred_weight) or inferred_weight < 0:
+            raise ValueError("inferred action weight must be finite and nonnegative")
+        super().__init__(policy, critic, config)
         self.weight = weight
+        self.inferred_weight = inferred_weight
+        self._expert_logits: th.Tensor | None = None
 
-    def after_update(self) -> None:
-        self.ppo.after_update()
+    def _evaluate(self, batch, state, critic_state, reset):
+        observation = batch["observation"]
+        features, _ = self.policy.body_features(observation, state, reset)
+        evaluation = self.policy.evaluate_from_features(
+            features,
+            observation,
+            batch["action"],
+        )
+        self._expert_logits = self.policy.head(features)
 
-    def __call__(self, batch: TensorBatch) -> LossOutput:
-        output = self.ppo(batch)
-        features, _ = self.policy.body_features(batch["observation"])
-        logits = self.policy.head(features)
+        value = evaluation.value
+        if value is None:
+            if self.critic_recurrent:
+                if critic_state is None:
+                    raise ValueError("recurrent critic requires an initial state")
+                value = self.critic.evaluate_values(
+                    observation,
+                    critic_state,
+                    reset=reset,
+                )
+            else:
+                value = self.critic.evaluate_values(observation)
+        return evaluation, value
+
+    def __call__(self, sample: TensorBatch | SequenceBatch) -> LossOutput:
+        output = super().__call__(sample)
+        batch, _, _, _, sequence_valid = self._unpack_sample(sample)
+        logits = self._expert_logits
+        if logits is None:
+            raise RuntimeError("PPO evaluation did not expose tracker logits")
         action_mask = self.policy.action_codec.mask(batch["observation"])
         expert_action = batch["expert_action"].long()
         expert_valid = batch["expert_action_valid"].bool()
-
-        losses = []
-        accuracies = []
-        valid_rates = []
-        for index, (factor_logits, factor_mask) in enumerate(zip(
-            logits.split(self.policy.sizes, dim=-1),
-            action_mask.split(self.policy.sizes, dim=-1),
-        )):
-            target = expert_action[:, index]
-            target_legal = factor_mask.gather(-1, target[:, None]).squeeze(-1)
-            valid = expert_valid[:, index] & target_legal
-            if not valid.any():
-                continue
-
-            masked_logits = factor_logits.masked_fill(
-                ~factor_mask,
-                th.finfo(factor_logits.dtype).min,
-            )
-            losses.append(nn.functional.cross_entropy(masked_logits[valid], target[valid]))
-            accuracies.append(
-                (masked_logits[valid].argmax(-1) == target[valid]).float().mean()
-            )
-            valid_rates.append(valid.float().mean())
-
-        if losses:
-            expert_loss = th.stack(losses).mean()
-            expert_accuracy = th.stack(accuracies).mean()
-            expert_valid_rate = th.stack(valid_rates).mean()
-        else:
-            expert_loss = logits.sum() * 0
-            expert_accuracy = logits.new_zeros(())
-            expert_valid_rate = logits.new_zeros(())
+        expert_loss, expert_accuracy, expert_valid_rate = _expert_action_loss(
+            logits,
+            action_mask,
+            expert_action,
+            expert_valid,
+            sequence_valid,
+            self.policy.sizes,
+            self.inferred_weight,
+        )
 
         return LossOutput(
             output.loss + self.weight * expert_loss,
@@ -763,7 +980,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-dir",              type=str,   required=True)
     parser.add_argument("--n-sim",                   type=int,   default=256)
     parser.add_argument("--frameskip",               type=int,   default=4)
-    parser.add_argument("--windows",                 type=int,   nargs="+", default=[1, 2, 4, 8, 16])
+    parser.add_argument("--windows",                 type=int,   nargs="+", default=list(DEFAULT_TRACKER_WINDOWS))
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--car-scale",               type=float, default=2.0)
@@ -774,8 +991,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
     parser.add_argument("--epochs",                  type=int,   default=2)
+    parser.add_argument("--sequence-length",         type=int,   default=32)
     parser.add_argument("--lr",                      type=float, default=3e-5)
     parser.add_argument("--expert-action-weight",    type=float, default=0.1)
+    parser.add_argument("--inferred-action-weight",  type=float, default=0.1)
     parser.add_argument("--max-grad-norm",           type=float, default=0.5)
     parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
     parser.add_argument("--seed",                    type=int,   default=0)
@@ -789,6 +1008,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.sequence_length < 1:
+        raise ValueError("--sequence-length must be positive")
     th.manual_seed(args.seed)
 
     base_env = CARLTorchVectorEnv(
@@ -821,18 +1042,8 @@ def main() -> None:
         minimum_tracking_frames=args.minimum_tracking_frames,
     )
 
-    policy = MultiCategoricalPolicy(
-        foot=LinearEncoder(512, func=nn.ReLU),
-        body=MLP(dims=[512, 512], func=nn.ReLU),
-        head=MLP(dims=[]),
-        action_codec=env.action_codec,
-    ).build(env).to(env.device)
-
-    critic = Critic(
-        foot=LinearEncoder(512, func=nn.ReLU),
-        body=MLP(dims=[512, 512], func=nn.ReLU),
-        head=MLP(dims=[]),
-    ).build(env).to(env.device)
+    policy = build_tracker_policy(env, args.windows)
+    critic = build_tracker_critic(env, args.windows)
 
     buffer = RolloutBuffer(
         horizon=args.rollout,
@@ -846,29 +1057,39 @@ def main() -> None:
         buffer=buffer,
         captures=(
             LogProbCapture(),
-            CriticCapture(critic),
+            RecurrentStateCapture(),
+            RecurrentCriticCapture(critic),
             ExpertActionCapture(env),
         ),
     )
 
     update = Update(
         transforms=(GAE(gamma=0.99, lambda_=0.95),),
-        sampler=RolloutMinibatches(
-            batch_size=args.batch_size,
+        sampler=RecurrentRolloutMinibatches(
+            sequence_length=args.sequence_length,
+            sequences_per_batch=max(1, args.batch_size // args.sequence_length),
             epochs=args.epochs,
+            fields=(
+                "observation",
+                "action",
+                "advantage",
+                "old_log_prob",
+                "baseline_value",
+                "returns",
+                "expert_action",
+                "expert_action_valid",
+            ),
         ),
         loss=ExpertActionPPOLoss(
-            PPOLoss(
-                policy,
-                critic,
-                PPOConfig(
-                    clip=0.1,
-                    value_clip=None,
-                    entropy_coef=0.001,
-                ),
-            ),
             policy,
+            critic,
+            PPOConfig(
+                clip=0.1,
+                value_clip=None,
+                entropy_coef=0.001,
+            ),
             args.expert_action_weight,
+            args.inferred_action_weight,
         ),
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(
@@ -892,6 +1113,11 @@ def main() -> None:
         directory=args.checkpoint_dir,
         interval=args.checkpoint_interval,
         keep=args.checkpoint_keep,
+        config={
+            "architecture": TRACKER_ARCHITECTURE,
+            "windows": list(args.windows),
+            "frameskip": args.frameskip,
+        },
     )
     checkpoint.run()
 

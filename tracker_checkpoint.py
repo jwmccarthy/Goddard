@@ -11,13 +11,16 @@ class PeriodicCheckpoint:
         directory: Path,
         interval: int,
         keep:     int,
+        config:   dict[str, object] | None = None,
     ) -> None:
         self.modules = modules
         self.directory = directory
         self.interval = interval
         self.keep = keep
+        self.config = {} if config is None else dict(config)
         self.step = 0
         self.next_step = interval
+        self._written_paths: list[Path] = []
         self.directory.mkdir(parents=True, exist_ok=True)
         for path in self.directory.glob("tracker_*.pt.tmp"):
             path.unlink()
@@ -29,15 +32,18 @@ class PeriodicCheckpoint:
     def run(self) -> None:
         payload = {
             "step": self.step,
+            "config": self.config,
             **{name: module.state_dict() for name, module in self.modules.items()},
         }
         path = self.directory / f"tracker_{self.step:012d}.pt"
         temporary = path.with_suffix(".pt.tmp")
         th.save(payload, temporary)
         temporary.replace(path)
+        if path not in self._written_paths:
+            self._written_paths.append(path)
 
-        paths = sorted(self.directory.glob("tracker_*.pt"))
-        for old_path in paths[:-self.keep]:
+        for old_path in self._written_paths[:-self.keep]:
             old_path.unlink()
+        self._written_paths = self._written_paths[-self.keep:]
 
         self.next_step = self.step + self.interval

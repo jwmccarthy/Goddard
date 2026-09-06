@@ -17,7 +17,6 @@ from jarl.data.records import PolicyOutput
 from jarl.learn import Algorithm, LossOutput, OptimizerStep, TransformRollout, Update
 from jarl.log.logger import Logger
 from jarl.modules import MLP
-from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import (
     OnPolicySchedule,
@@ -36,7 +35,13 @@ from jarl.store.rollout import RolloutBuffer
 #   planned_duration -> [batch] long tensor used to condition the prior
 from jarl.sample import ChunkBatch, TrajectoryChunkMinibatches
 
-from tracker import ExpertGoalStates, ExpertLookaheadEnv, GOAL_STATE_SIZE
+from tracker import (
+    DEFAULT_TRACKER_WINDOWS,
+    ExpertGoalStates,
+    ExpertLookaheadEnv,
+    GOAL_STATE_SIZE,
+    load_tracker_policy,
+)
 
 
 ACTION_SIZES = (3, 3, 3, 2, 2, 3, 2)
@@ -251,20 +256,18 @@ def categorical_distillation_loss(
     return th.stack(losses, dim=-1).mean(), th.stack(correct, dim=-1).mean()
 
 
-def load_teacher(path: Path, env: ExpertLookaheadEnv) -> MultiCategoricalPolicy:
-    payload = th.load(path, map_location=env.device, weights_only=True)
-    teacher = MultiCategoricalPolicy(
-        foot=LinearEncoder(512, func=nn.ReLU),
-        body=MLP(dims=[512, 512], func=nn.ReLU),
-        head=MLP(dims=[]),
-        action_codec=env.action_codec,
-    ).build(env).to(env.device)
+def load_teacher(
+    path: Path,
+    env: ExpertLookaheadEnv,
+    windows,
+    frame_skip: int,
+) -> MultiCategoricalPolicy:
     try:
-        teacher.load_state_dict(payload["policy"])
-    except RuntimeError as error:
+        teacher = load_tracker_policy(path, env, windows, frame_skip)
+    except (RuntimeError, ValueError) as error:
         raise RuntimeError(
-            "tracker checkpoint does not match the car-only goal observation "
-            "shape and configured replay windows"
+            "tracker checkpoint does not match the recurrent tracker architecture, "
+            "frameskip, or configured replay windows"
         ) from error
     return teacher.eval().requires_grad_(False)
 
@@ -447,7 +450,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--n-sim", type=int, default=256)
     parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    parser.add_argument("--windows", type=int, nargs="+", default=list(DEFAULT_TRACKER_WINDOWS))
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int, default=1)
@@ -574,7 +577,12 @@ def main() -> None:
         minimum_reward=args.minimum_tracking_reward,
         minimum_tracking_frames=args.minimum_tracking_frames,
     )
-    teacher = load_teacher(args.tracker_checkpoint, env)
+    teacher = load_teacher(
+        args.tracker_checkpoint,
+        env,
+        args.windows,
+        args.frameskip,
+    )
     observation_dim = env.single_observation_space.shape[0]
     policy = PulsePolicy(
         GaussianEncoder(observation_dim, args.latent_size, args.encoder_hidden),

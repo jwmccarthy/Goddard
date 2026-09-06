@@ -112,7 +112,18 @@
       display: grid;
       grid-template-columns: repeat(7, 1fr);
       gap: 4px;
-      margin-top: 11px;
+    }
+
+    .action-set { margin-top: 11px; }
+    .action-title {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
     }
 
     .action-readout span {
@@ -124,6 +135,12 @@
     }
 
     .action-readout b { display: block; color: var(--ink); font-size: 11px; }
+    .action-readout.agent span { border-color: color-mix(in srgb, var(--agent) 30%, transparent); }
+    .action-readout.expert span { border-color: color-mix(in srgb, var(--expert) 38%, transparent); }
+    .action-readout.expert span.inferred {
+      border-style: dashed;
+      opacity: 0.5;
+    }
 
     .reward {
       font: 800 24px ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -260,14 +277,29 @@
           <i><b id="expert-boost-fill"></b></i>
         </div>
       </div>
-      <div class="action-readout" aria-label="Agent action">
-        <span>H<b id="action-horizontal">0</b></span>
-        <span>V<b id="action-vertical">0</b></span>
-        <span>T<b id="action-throttle">0</b></span>
-        <span>S<b id="action-slide">0</b></span>
-        <span>B<b id="action-boost">0</b></span>
-        <span>R<b id="action-roll">0</b></span>
-        <span>J<b id="action-jump">0</b></span>
+      <div class="action-set">
+        <div class="action-title"><span>Agent controls</span></div>
+        <div class="action-readout agent" aria-label="Agent action">
+          <span>H<b id="action-horizontal">0</b></span>
+          <span>V<b id="action-vertical">0</b></span>
+          <span>T<b id="action-throttle">0</b></span>
+          <span>S<b id="action-slide">0</b></span>
+          <span>B<b id="action-boost">0</b></span>
+          <span>R<b id="action-roll">0</b></span>
+          <span>J<b id="action-jump">0</b></span>
+        </div>
+      </div>
+      <div class="action-set">
+        <div class="action-title"><span>Expert controls</span><span>Dashed = inferred</span></div>
+        <div class="action-readout expert" aria-label="Replay-derived expert action">
+          <span>H<b id="expert-action-horizontal">0</b></span>
+          <span>V<b id="expert-action-vertical">0</b></span>
+          <span>T<b id="expert-action-throttle">0</b></span>
+          <span>S<b id="expert-action-slide">0</b></span>
+          <span>B<b id="expert-action-boost">0</b></span>
+          <span>R<b id="expert-action-roll">0</b></span>
+          <span>J<b id="expert-action-jump">0</b></span>
+        </div>
       </div>
       <div class="legend">
         <span><i class="swatch agent"></i>Agent</span>

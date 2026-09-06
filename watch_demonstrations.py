@@ -14,18 +14,16 @@ from pathlib import Path
 
 import carl
 import torch as th
-import torch.nn as nn
 
 from carl.gymnasium import CARLTorchVectorEnv
-from jarl.modules import MLP
-from jarl.modules.encoder import LinearEncoder
-from jarl.modules.policy import MultiCategoricalPolicy
 
 from tracker import (
+    DEFAULT_TRACKER_WINDOWS,
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
     POSITION_SCALE,
+    load_tracker_policy,
 )
 
 
@@ -82,15 +80,8 @@ def newest_checkpoint(directory: Path) -> Path:
     return max(paths, key=lambda path: path.stat().st_mtime_ns)
 
 
-def load_policy(path: Path, env: ExpertLookaheadEnv):
-    payload = th.load(path, map_location=env.device, weights_only=True)
-    policy = MultiCategoricalPolicy(
-        foot=LinearEncoder(512, func=nn.ReLU),
-        body=MLP(dims=[512, 512], func=nn.ReLU),
-        head=MLP(dims=[]),
-        action_codec=env.action_codec,
-    ).build(env).to(env.device)
-    policy.load_state_dict(payload["policy"])
+def load_policy(path: Path, env: ExpertLookaheadEnv, windows, frame_skip: int):
+    policy = load_tracker_policy(path, env, windows, frame_skip)
     return policy.eval().requires_grad_(False)
 
 
@@ -129,6 +120,8 @@ def frame_from_state(
     expert:     th.Tensor,
     demo_name:  str,
     action:     th.Tensor,
+    expert_action: th.Tensor,
+    expert_action_valid: th.Tensor,
 ) -> dict:
     cars = state[9:31].view(1, 22)
     rendered = []
@@ -158,6 +151,8 @@ def frame_from_state(
         "demo":       demo_name,
         "reward":     reward.cpu().tolist(),
         "action":     action[0].cpu().tolist(),
+        "expert_action": expert_action[0].cpu().tolist(),
+        "expert_action_valid": expert_action_valid[0].cpu().tolist(),
         "ball":       {"pos": state[:3].cpu().tolist()},
         "cars":       rendered,
         "expert":     frame_from_expert(expert),
@@ -171,6 +166,8 @@ def publish_frame(
     checkpoint: Path,
     reward:     th.Tensor,
     action:     th.Tensor,
+    expert_action: th.Tensor,
+    expert_action_valid: th.Tensor,
 ) -> None:
     th.cuda.synchronize(base.device)
     raw = th.from_dlpack(base._env.get_state()).clone()[0]
@@ -182,6 +179,8 @@ def publish_frame(
         expert,
         replays.current_demo_name(),
         action,
+        expert_action,
+        expert_action_valid,
     ))
 
 
@@ -220,9 +219,12 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
 
     try:
         checkpoint = newest_checkpoint(args.checkpoint_dir)
-        policy = load_policy(checkpoint, env)
+        policy = load_policy(checkpoint, env, args.windows, args.frameskip)
+        policy_state = policy.initial_state(1)
         checkpoint_mtime = checkpoint.stat().st_mtime_ns
         observation = env.reset()
+        empty_expert_action = th.zeros((1, 7), dtype=th.long, device=env.device)
+        empty_expert_valid = th.zeros((1, 7), dtype=th.bool, device=env.device)
         publish_frame(
             viewer,
             base,
@@ -230,6 +232,8 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
             checkpoint,
             th.zeros(1, device=env.device),
             th.zeros((1, 7), dtype=th.long, device=env.device),
+            empty_expert_action,
+            empty_expert_valid,
         )
         viewer.stop.wait(viewer.frame_time(args.frameskip))
         next_step = time.perf_counter()
@@ -245,6 +249,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                 else:
                     replays.cycle_demo(request)
                 observation = env.reset()
+                policy_state = policy.initial_state(1)
                 publish_frame(
                     viewer,
                     base,
@@ -252,6 +257,8 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     checkpoint,
                     th.zeros(1, device=env.device),
                     th.zeros((1, 7), dtype=th.long, device=env.device),
+                    empty_expert_action,
+                    empty_expert_valid,
                 )
                 viewer.stop.wait(viewer.frame_time(args.frameskip))
                 next_step = time.perf_counter()
@@ -260,18 +267,59 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
             latest = newest_checkpoint(args.checkpoint_dir)
             latest_mtime = latest.stat().st_mtime_ns
             if latest != checkpoint or latest_mtime != checkpoint_mtime:
-                policy = load_policy(latest, env)
+                policy = load_policy(latest, env, args.windows, args.frameskip)
+                policy_state = policy.initial_state(1)
                 checkpoint = latest
                 checkpoint_mtime = latest_mtime
+                observation = env.reset()
+                publish_frame(
+                    viewer,
+                    base,
+                    replays,
+                    checkpoint,
+                    th.zeros(1, device=env.device),
+                    th.zeros((1, 7), dtype=th.long, device=env.device),
+                    empty_expert_action,
+                    empty_expert_valid,
+                )
+                viewer.stop.wait(viewer.frame_time(args.frameskip))
+                next_step = time.perf_counter()
+                continue
 
             with th.no_grad():
-                action = policy.act(
+                policy_output = policy.act(
                     observation,
+                    policy_state,
                     deterministic=not args.sample_actions,
-                ).action
-                observation, reward, _, _, _ = env.step(action)
+                )
+                action = policy_output.action
+                policy_state = policy_output.next_state
+                observation, reward, term, trunc, _ = env.step(action)
+                done = term | trunc
+                if done.any():
+                    policy_state = policy_state.clone()
+                    policy_state[done] = 0
 
-            publish_frame(viewer, base, replays, checkpoint, reward, action)
+            if env.last_expert_action is None or env.last_expert_action_valid is None:
+                raise RuntimeError("tracker environment did not expose expert actions")
+            if done.any():
+                reward = th.zeros_like(reward)
+                action = th.zeros_like(action)
+                expert_action = empty_expert_action
+                expert_valid = empty_expert_valid
+            else:
+                expert_action = env.last_expert_action
+                expert_valid = env.last_expert_action_valid
+            publish_frame(
+                viewer,
+                base,
+                replays,
+                checkpoint,
+                reward,
+                action,
+                expert_action,
+                expert_valid,
+            )
 
             next_step += viewer.frame_time(args.frameskip)
             delay = next_step - time.perf_counter()
@@ -403,7 +451,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/tracker"))
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument("--windows", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    parser.add_argument("--windows", type=int, nargs="+", default=list(DEFAULT_TRACKER_WINDOWS))
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--obs-limit", type=int, default=100_000)
     parser.add_argument("--tracking-reward-scale", type=float, default=1.0)

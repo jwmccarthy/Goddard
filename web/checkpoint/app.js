@@ -19,6 +19,15 @@ const actionFields = [
   document.getElementById('action-roll'),
   document.getElementById('action-jump'),
 ];
+const expertActionFields = [
+  document.getElementById('expert-action-horizontal'),
+  document.getElementById('expert-action-vertical'),
+  document.getElementById('expert-action-throttle'),
+  document.getElementById('expert-action-slide'),
+  document.getElementById('expert-action-boost'),
+  document.getElementById('expert-action-roll'),
+  document.getElementById('expert-action-jump'),
+];
 const demoSearch = document.getElementById('demo-search');
 const demoQuery = document.getElementById('demo-query');
 const connection = document.getElementById('connection');
@@ -187,6 +196,17 @@ function setCar(mesh, state) {
 }
 
 const source = new EventSource('/api/stream');
+const axis = ['0', '-1', '+1'];
+function setAction(fields, actions) {
+  fields[0].textContent = axis[actions[0]];
+  fields[1].textContent = axis[actions[1]];
+  fields[2].textContent = axis[actions[2]];
+  fields[3].textContent = actions[3];
+  fields[4].textContent = actions[4];
+  fields[5].textContent = axis[actions[5]];
+  fields[6].textContent = actions[6];
+}
+
 source.onopen = () => {
   connection.textContent = 'Live';
   connection.classList.add('live');
@@ -204,15 +224,12 @@ source.onmessage = ({ data }) => {
   expertBoost.textContent = frame.expert.cars[0].boost.toFixed(0);
   agentBoostFill.style.width = `${frame.cars[0].boost}%`;
   expertBoostFill.style.width = `${frame.expert.cars[0].boost}%`;
-  const axis = ['0', '-1', '+1'];
   const actions = Array.isArray(frame.action[0]) ? frame.action[0] : frame.action;
-  actionFields[0].textContent = axis[actions[0]];
-  actionFields[1].textContent = axis[actions[1]];
-  actionFields[2].textContent = axis[actions[2]];
-  actionFields[3].textContent = actions[3];
-  actionFields[4].textContent = actions[4];
-  actionFields[5].textContent = axis[actions[5]];
-  actionFields[6].textContent = actions[6];
+  setAction(actionFields, actions);
+  setAction(expertActionFields, frame.expert_action);
+  expertActionFields.forEach((field, index) => {
+    field.parentElement.classList.toggle('inferred', !frame.expert_action_valid[index]);
+  });
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;
