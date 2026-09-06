@@ -452,6 +452,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int, default=1)
     parser.add_argument("--minimum-remaining-frames", type=int, default=128)
+    parser.add_argument("--ball-outcome-weight", type=float, default=0.1)
     parser.add_argument("--latent-size", type=int, default=32)
     parser.add_argument("--encoder-hidden", type=int, nargs="+", default=[1536, 1024, 512])
     parser.add_argument("--decoder-hidden", type=int, nargs="+", default=[3096, 2048, 1024])
@@ -493,6 +494,8 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.prior_action_weight < 0:
         raise ValueError("--prior-action-weight must be non-negative")
+    if not np.isfinite(args.ball_outcome_weight) or args.ball_outcome_weight < 0:
+        raise ValueError("--ball-outcome-weight must be finite and non-negative")
     if args.kl_anneal_end <= args.kl_anneal_start:
         raise ValueError("--kl-anneal-end must be greater than --kl-anneal-start")
     if not args.tracker_checkpoint.is_file():
@@ -567,6 +570,7 @@ def main() -> None:
     env = ExpertLookaheadEnv(
         base_env,
         replays,
+        ball_outcome_weight=args.ball_outcome_weight,
         minimum_reward=args.minimum_tracking_reward,
         minimum_tracking_frames=args.minimum_tracking_frames,
     )

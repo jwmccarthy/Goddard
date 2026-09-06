@@ -87,7 +87,7 @@ class TrackerTest(unittest.TestCase):
         th.testing.assert_close(goal_observation[:, 30 + 21:], th.full((1, 21), 2.0))
         self.assertFalse(end.item())
 
-    def test_tracking_reward_ignores_ball_state(self):
+    def test_tracking_reward_ignores_ball_state_before_touch(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         actual_tensor = target_tensor.clone()
         actual_tensor[:, :9] = 100.0
@@ -96,12 +96,46 @@ class TrackerTest(unittest.TestCase):
         replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
         reward = TrackingReward(replays)
 
-        value = reward(SimpleNamespace(
-            current_observation=actual,
-            current=SimpleNamespace(car_ball_touches=th.zeros((1, 1), dtype=th.bool)),
-        ))
+        value = reward(self._tracking_context(actual))
 
         th.testing.assert_close(value, th.ones((1, 1)))
+
+    def test_ball_outcome_reward_activates_on_touch_and_latches(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        reward = TrackingReward(replays, ball_outcome_weight=0.1)
+
+        contact = reward(self._tracking_context(target, touched=True))
+        follow_up = reward(self._tracking_context(target))
+
+        th.testing.assert_close(contact, th.tensor([[1.1]]))
+        th.testing.assert_close(follow_up, th.tensor([[1.1]]))
+        th.testing.assert_close(reward.value, th.ones(1))
+
+    def test_ball_outcome_latch_resets_with_replay_segment(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        reward = TrackingReward(replays, ball_outcome_weight=0.1)
+        reward(self._tracking_context(target, touched=True))
+
+        reward.reset(th.tensor([True]))
+        after_reset = reward(self._tracking_context(target))
+
+        th.testing.assert_close(after_reset, th.ones((1, 1)))
+
+    def test_ball_outcome_latch_clears_after_native_done(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        reward = TrackingReward(replays, ball_outcome_weight=0.1)
+
+        terminal = reward(self._tracking_context(target, touched=True, done=True))
+        next_episode = reward(self._tracking_context(target))
+
+        th.testing.assert_close(terminal, th.tensor([[1.1]]))
+        th.testing.assert_close(next_episode, th.ones((1, 1)))
 
     def test_ball_is_anchored_to_expert_before_touch(self):
         wrapper, environment, observation = self._anchor_fixture()
@@ -201,6 +235,16 @@ class TrackerTest(unittest.TestCase):
         wrapper._pos_scale = th.tensor(POSITION_SCALE)
         observation = th.zeros((1, GOAL_STATE_SIZE))
         return wrapper, environment, observation
+
+    @staticmethod
+    def _tracking_context(observation, *, touched=False, done=False):
+        return SimpleNamespace(
+            current_observation=observation,
+            current=SimpleNamespace(
+                car_ball_touches=th.tensor([[touched]], dtype=th.bool)
+            ),
+            events=SimpleNamespace(done=th.tensor([done], dtype=th.bool)),
+        )
 
 
 if __name__ == "__main__":

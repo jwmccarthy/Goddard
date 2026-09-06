@@ -350,13 +350,26 @@ class TrackingReward:
         replays:    ExpertGoalStates,
         scale:      float = 1.0,
         car_scale:  float = 2.0,
+        ball_outcome_weight: float = 0.1,
     ) -> None:
+        if not np.isfinite(ball_outcome_weight) or ball_outcome_weight < 0:
+            raise ValueError("ball outcome weight must be finite and nonnegative")
         self.replays = replays
         self.scale = scale
         self.car_scale = car_scale
+        self.ball_outcome_weight = ball_outcome_weight
         self.position_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
         self.value: th.Tensor | None = None
         self.touched: th.Tensor | None = None
+        self._ball_tracking_active: th.Tensor | None = None
+
+    def reset(self, mask: th.Tensor | None = None) -> None:
+        if self._ball_tracking_active is None:
+            return
+        if mask is None:
+            self._ball_tracking_active.zero_()
+        else:
+            self._ball_tracking_active[mask] = False
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         actual = context.current_observation
@@ -364,6 +377,12 @@ class TrackingReward:
         actual_ego = actual.cars.ego
         target_ego = target.cars.ego
         self.touched = context.current.car_ball_touches[:, 0]
+        if (
+            self._ball_tracking_active is None
+            or self._ball_tracking_active.shape != self.touched.shape
+        ):
+            self._ball_tracking_active = th.zeros_like(self.touched)
+        self._ball_tracking_active |= self.touched
 
         car_position_error = (
             actual_ego.position - target_ego.position
@@ -391,14 +410,36 @@ class TrackingReward:
         velocity_score = th.exp(-0.1 * velocity_mse)
         angular_velocity_score = th.exp(-0.1 * angular_velocity_mse)
 
-        reward = (
+        car_reward = (
             0.60 * car_position_score
             + 0.10 * rotation_score
             + 0.20 * velocity_score
             + 0.10 * angular_velocity_score
         )
 
-        self.value = reward
+        ball_position_error = (
+            actual.ball.position - target.ball.position
+        ) * self.position_scale
+        ball_velocity_error = (
+            actual.ball.velocity - target.ball.velocity
+        ) * (BALL_MAX_SPEED / 100)
+        ball_angular_velocity_error = (
+            actual.ball.angular_velocity - target.ball.angular_velocity
+        ) * BALL_MAX_ANG_SPEED
+        ball_score = (
+            0.20 * th.exp(-1.25 * ball_position_error.square().sum(-1))
+            + 0.70 * th.exp(-0.1 * ball_velocity_error.square().sum(-1))
+            + 0.10
+            * th.exp(-0.1 * ball_angular_velocity_error.square().sum(-1))
+        )
+        reward = car_reward + (
+            self.ball_outcome_weight
+            * self._ball_tracking_active
+            * ball_score
+        )
+
+        self.value = car_reward
+        self._ball_tracking_active[context.events.done] = False
 
         return self.scale * reward[:, None]
 
@@ -412,6 +453,7 @@ class ExpertLookaheadEnv:
         replays:                 ExpertGoalStates,
         reward_scale:            float = 1.0,
         car_scale:               float = 2.0,
+        ball_outcome_weight:     float = 0.1,
         minimum_reward:          float = 0.1,
         minimum_tracking_frames: int = 1,
     ) -> None:
@@ -445,7 +487,12 @@ class ExpertLookaheadEnv:
         self.single_action_space = env.single_action_space
 
         self.env.reset_state_provider = self._reset_state
-        self.reward = TrackingReward(replays, reward_scale, car_scale)
+        self.reward = TrackingReward(
+            replays,
+            reward_scale,
+            car_scale,
+            ball_outcome_weight,
+        )
         self.env.register_reward(self.reward)
 
     def __getattr__(self, name: str) -> Any:
@@ -458,6 +505,7 @@ class ExpertLookaheadEnv:
 
         replay_state = self.replays.reset(mask)
         self._ball_anchored[mask] = True
+        self.reward.reset(mask)
         expert = replay_state["observation"]
         internal_state = replay_state["internal_state"]
         ball = expert.ball
@@ -562,6 +610,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--car-scale",               type=float, default=2.0)
+    parser.add_argument("--ball-outcome-weight", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int,   default=1)
     parser.add_argument("--minimum-remaining-frames", type=int, default=128)
@@ -609,6 +658,7 @@ def main() -> None:
         replays,
         reward_scale=args.tracking_reward_scale,
         car_scale=args.car_scale,
+        ball_outcome_weight=args.ball_outcome_weight,
         minimum_reward=args.minimum_tracking_reward,
         minimum_tracking_frames=args.minimum_tracking_frames,
     )
