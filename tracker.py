@@ -1,6 +1,8 @@
 import argparse
+import math
 
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -36,7 +38,7 @@ from jarl.modules import GRU, MLP
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
-from jarl.runtime import OnPolicySchedule, Trainer
+from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
 from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
@@ -727,13 +729,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--car-scale",               type=float, default=2.0)
     parser.add_argument("--ball-outcome-weight", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
-    parser.add_argument("--minimum-tracking-frames", type=int,   default=1)
+    parser.add_argument("--minimum-tracking-frames", type=int,   default=16)
     parser.add_argument("--minimum-remaining-frames", type=int, default=128)
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
-    parser.add_argument("--epochs",                  type=int,   default=2)
-    parser.add_argument("--sequence-length",         type=int,   default=32)
-    parser.add_argument("--lr",                      type=float, default=3e-5)
+    parser.add_argument("--epochs",                  type=int,   default=4)
+    parser.add_argument("--sequence-length",         type=int,   default=64)
+    parser.add_argument("--lr",                      type=float, default=1e-4)
+    parser.add_argument("--lr-final",                type=float, default=1e-5)
+    parser.add_argument("--entropy-coef",            type=float, default=1e-3)
+    parser.add_argument("--entropy-coef-final",      type=float, default=1e-4)
+    parser.add_argument("--clip",                    type=float, default=0.2)
+    parser.add_argument("--clip-final",              type=float, default=0.1)
+    parser.add_argument("--gamma",                   type=float, default=0.997)
+    parser.add_argument("--gae-lambda",              type=float, default=0.98)
+    parser.add_argument("--schedule-timesteps",      type=int, default=1_000_000_000)
     parser.add_argument("--max-grad-norm",           type=float, default=0.5)
     parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
     parser.add_argument("--seed",                    type=int,   default=0)
@@ -745,10 +755,61 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def annealed_value(
+    progress: float,
+    start: float,
+    end: float,
+    total_timesteps: int,
+    schedule_timesteps: int,
+) -> float:
+    fraction = min(progress * total_timesteps / schedule_timesteps, 1.0)
+    return start + fraction * (end - start)
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    for name in (
+        "n_sim",
+        "frameskip",
+        "rollout",
+        "batch_size",
+        "epochs",
+        "sequence_length",
+        "timesteps",
+    ):
+        if getattr(args, name) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.sequence_length > args.rollout:
+        raise ValueError("--sequence-length cannot exceed --rollout")
+    if args.batch_size < args.sequence_length:
+        raise ValueError("--batch-size must fit at least one sequence")
+    if args.schedule_timesteps < 1:
+        raise ValueError("--schedule-timesteps must be positive")
+    if not 0 < args.gamma <= 1:
+        raise ValueError("--gamma must be in (0, 1]")
+    if not 0 < args.gae_lambda <= 1:
+        raise ValueError("--gae-lambda must be in (0, 1]")
+    for name in ("lr", "lr_final"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
+    for name in ("entropy_coef", "entropy_coef_final"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    for name in ("clip", "clip_final"):
+        if not math.isfinite(getattr(args, name)) or not 0 < getattr(args, name) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be in (0, 1)")
+    if not math.isfinite(args.max_grad_norm) or args.max_grad_norm <= 0:
+        raise ValueError("--max-grad-norm must be finite and positive")
+
+
+def set_learning_rate(optimizers: Sequence[th.optim.Optimizer], value: float) -> None:
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group["lr"] = value
+
+
 def main() -> None:
     args = parse_args()
-    if args.sequence_length < 1:
-        raise ValueError("--sequence-length must be positive")
+    validate_args(args)
     th.manual_seed(args.seed)
 
     base_env = CARLTorchVectorEnv(
@@ -802,8 +863,19 @@ def main() -> None:
         ),
     )
 
+    actor_optimizer = Adam(policy.parameters(), lr=args.lr)
+    critic_optimizer = Adam(critic.parameters(), lr=args.lr)
+    ppo_loss = PPOLoss(
+        policy,
+        critic,
+        PPOConfig(
+            clip=args.clip,
+            value_clip=None,
+            entropy_coef=args.entropy_coef,
+        ),
+    )
     update = Update(
-        transforms=(GAE(gamma=0.99, lambda_=0.95),),
+        transforms=(GAE(gamma=args.gamma, lambda_=args.gae_lambda),),
         sampler=RecurrentRolloutMinibatches(
             sequence_length=args.sequence_length,
             sequences_per_batch=max(1, args.batch_size // args.sequence_length),
@@ -817,28 +889,58 @@ def main() -> None:
                 "returns",
             ),
         ),
-        loss=PPOLoss(
-            policy,
-            critic,
-            PPOConfig(
-                clip=0.1,
-                value_clip=None,
-                entropy_coef=0.001,
-            ),
-        ),
+        loss=ppo_loss,
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(
                 policy,
-                Adam(policy.parameters(), lr=args.lr),
+                actor_optimizer,
                 max_grad_norm=args.max_grad_norm,
             ),
             OptimizerStep(
                 critic,
-                Adam(critic.parameters(), lr=args.lr),
+                critic_optimizer,
                 max_grad_norm=args.max_grad_norm,
             ),
         ),
         section="PPO",
+    )
+
+    def schedule(start: float, end: float):
+        return lambda progress: annealed_value(
+            progress,
+            start,
+            end,
+            args.timesteps,
+            args.schedule_timesteps,
+        )
+
+    value_scheduler = ValueScheduler(
+        ScheduledValue(
+            "learning_rate",
+            schedule(args.lr, args.lr_final),
+            lambda value: set_learning_rate(
+                (actor_optimizer, critic_optimizer), value
+            ),
+        ),
+        ScheduledValue(
+            "entropy_coef",
+            schedule(args.entropy_coef, args.entropy_coef_final),
+            lambda value: setattr(
+                ppo_loss,
+                "config",
+                replace(ppo_loss.config, entropy_coef=value),
+            ),
+        ),
+        ScheduledValue(
+            "clip",
+            schedule(args.clip, args.clip_final),
+            lambda value: setattr(
+                ppo_loss,
+                "config",
+                replace(ppo_loss.config, clip=value),
+            ),
+        ),
+        section="Schedule",
     )
 
     run_id = datetime.now().strftime("tracker-%Y%m%d-%H%M%S")
@@ -852,6 +954,18 @@ def main() -> None:
             "architecture": TRACKER_ARCHITECTURE,
             "windows": list(args.windows),
             "frameskip": args.frameskip,
+            "gamma": args.gamma,
+            "gae_lambda": args.gae_lambda,
+            "learning_rate": [args.lr, args.lr_final],
+            "entropy_coef": [args.entropy_coef, args.entropy_coef_final],
+            "clip": [args.clip, args.clip_final],
+            "schedule_timesteps": args.schedule_timesteps,
+            "rollout": args.rollout,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "sequence_length": args.sequence_length,
+            "minimum_tracking_frames": args.minimum_tracking_frames,
+            "max_grad_norm": args.max_grad_norm,
         },
     )
     checkpoint.run()
@@ -863,6 +977,7 @@ def main() -> None:
         OnPolicySchedule(),
         logger=Logger(log_dir=str(args.log_dir / run_id)),
         checkpoint=checkpoint,
+        value_scheduler=value_scheduler,
     )
 
     trainer.run(args.timesteps)

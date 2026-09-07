@@ -29,12 +29,63 @@ from tracker import (
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
+    annealed_value,
     build_tracker_policy,
     load_tracker_policy,
+    set_learning_rate,
+    validate_args,
 )
 
 
 class TrackerTest(unittest.TestCase):
+    def test_hyperparameter_schedule_caps_at_configured_steps(self):
+        self.assertEqual(annealed_value(0.0, 1.0, 0.1, 10_000, 1_000), 1.0)
+        self.assertAlmostEqual(
+            annealed_value(0.05, 1.0, 0.1, 10_000, 1_000), 0.55
+        )
+        self.assertAlmostEqual(
+            annealed_value(0.5, 1.0, 0.1, 10_000, 1_000), 0.1
+        )
+
+    def test_tracker_hyperparameter_validation(self):
+        args = SimpleNamespace(
+            n_sim=256,
+            frameskip=2,
+            rollout=64,
+            batch_size=16_384,
+            epochs=4,
+            sequence_length=64,
+            timesteps=1_000_000,
+            schedule_timesteps=1_000,
+            gamma=0.997,
+            gae_lambda=0.98,
+            lr=1e-4,
+            lr_final=1e-5,
+            entropy_coef=1e-3,
+            entropy_coef_final=1e-4,
+            clip=0.2,
+            clip_final=0.1,
+            max_grad_norm=0.5,
+        )
+        validate_args(args)
+
+        args.gae_lambda = 0
+        with self.assertRaisesRegex(ValueError, "gae-lambda"):
+            validate_args(args)
+
+    def test_learning_rate_schedule_updates_all_optimizers(self):
+        actor = th.nn.Linear(2, 2)
+        critic = th.nn.Linear(2, 1)
+        optimizers = (th.optim.Adam(actor.parameters()), th.optim.Adam(critic.parameters()))
+
+        set_learning_rate(optimizers, 2.5e-5)
+
+        self.assertTrue(all(
+            group["lr"] == 2.5e-5
+            for optimizer in optimizers
+            for group in optimizer.param_groups
+        ))
+
     def test_default_tracker_lookahead_extends_to_two_seconds(self):
         self.assertEqual(DEFAULT_TRACKER_WINDOWS, (1, 2, 4, 8, 16, 32, 64))
 
