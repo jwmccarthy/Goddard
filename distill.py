@@ -450,7 +450,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int, default=1)
     parser.add_argument("--minimum-remaining-frames", type=int, default=128)
-    parser.add_argument("--ball-outcome-weight", type=float, default=0.1)
+    parser.add_argument("--ball-outcome-weight", type=float, default=0.5)
     parser.add_argument("--latent-size", type=int, default=32)
     parser.add_argument("--encoder-hidden", type=int, nargs="+", default=[1536, 1024, 512])
     parser.add_argument("--decoder-hidden", type=int, nargs="+", default=[3096, 2048, 1024])

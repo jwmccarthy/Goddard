@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import math
 
 from collections.abc import Sequence
@@ -25,6 +26,7 @@ from jarl.collect import (
 )
 from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.data.batch import TensorBatch
+from jarl.data.records import PolicyOutput
 from jarl.learn import (
     Algorithm,
     IndependentOptimizerSteps,
@@ -44,7 +46,7 @@ from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
 from physics_utils import forward_up_to_quat
-from tracker_checkpoint import PeriodicCheckpoint
+from tracker_checkpoint import PHCCheckpoint
 
 
 POSITION_SCALE     = (4108.0, 6000.0, 2076.0)
@@ -64,6 +66,48 @@ STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
 TRACKER_ARCHITECTURE = "categorical-all-gru-v1"
+PHC_TRACKER_ARCHITECTURE = "categorical-phc-gru-v1"
+
+
+class SegmentStats:
+    def __init__(self, n_demos: int, device: str | th.device) -> None:
+        self.attempts = th.zeros(n_demos, dtype=th.long, device=device)
+        self.failures = th.zeros(n_demos, dtype=th.long, device=device)
+
+    def record(self, demo_ids: th.Tensor, completed: th.Tensor, success: th.Tensor) -> None:
+        if completed.any():
+            self.attempts += th.bincount(
+                demo_ids[completed], minlength=len(self.attempts)
+            )
+        failed = completed & ~success
+        if failed.any():
+            self.failures += th.bincount(
+                demo_ids[failed], minlength=len(self.failures)
+            )
+
+    def hardness(self) -> th.Tensor:
+        return (self.failures.float() + 1.0) / (self.attempts.float() + 1.0)
+
+    def state_dict(self) -> dict[str, th.Tensor]:
+        return {
+            "attempts": self.attempts.cpu(),
+            "failures": self.failures.cpu(),
+        }
+
+
+def specialist_assignments(stats: Sequence[SegmentStats]) -> th.Tensor:
+    if not stats:
+        raise ValueError("at least one specialist's segment statistics are required")
+
+    rates = []
+    for stage in stats:
+        rate = stage.failures.float() / stage.attempts.clamp_min(1)
+        rates.append(th.where(stage.attempts > 0, rate, th.full_like(rate, th.inf)))
+    stacked = th.stack(rates)
+    assignments = stacked.argmin(dim=0)
+    never_attempted = th.isinf(stacked).all(dim=0)
+    assignments[never_attempted] = len(stats) - 1
+    return assignments
 
 
 def build_tracker_policy(
@@ -89,15 +133,76 @@ def build_tracker_critic(
     ).build(env).to(env.device)
 
 
+class RoutedTrackerPolicy(nn.Module):
+    def __init__(
+        self,
+        specialists: Sequence[MultiCategoricalPolicy],
+        assignments: th.Tensor,
+        replays: "ExpertGoalStates",
+    ) -> None:
+        super().__init__()
+        if not specialists:
+            raise ValueError("routed tracker requires at least one specialist")
+        if assignments.shape != (replays.n_demos,):
+            raise ValueError("specialist assignments do not match replay segments")
+        if assignments.min() < 0 or assignments.max() >= len(specialists):
+            raise ValueError("specialist assignments contain an invalid policy index")
+        self.specialists = nn.ModuleList(specialists)
+        self.register_buffer("assignments", assignments.long())
+        self.replays = replays
+
+    @property
+    def device(self) -> th.device:
+        return self.specialists[0].device
+
+    def initial_state(self, batch_size: int) -> th.Tensor | None:
+        return self.specialists[0].initial_state(batch_size)
+
+    def act(
+        self,
+        observation: th.Tensor,
+        state: th.Tensor | None = None,
+        *,
+        deterministic: bool = False,
+    ) -> PolicyOutput:
+        demo_ids = self.replays.current_demo_ids()
+        if len(demo_ids) != len(observation):
+            raise ValueError("replay routing batch does not match observations")
+        routes = self.assignments[demo_ids]
+        action = th.empty(
+            (len(observation), ACTION_FACTORS), dtype=th.long, device=observation.device
+        )
+        log_prob = th.empty(len(observation), device=observation.device)
+        next_state = self.initial_state(len(observation))
+
+        for index, specialist in enumerate(self.specialists):
+            selected = routes == index
+            if not selected.any():
+                continue
+            output = specialist.act(
+                observation[selected],
+                None if state is None else state[selected],
+                deterministic=deterministic,
+            )
+            action[selected] = output.action
+            if output.log_prob is not None:
+                log_prob[selected] = output.log_prob
+            if next_state is not None and output.next_state is not None:
+                next_state[selected] = output.next_state
+
+        return PolicyOutput(action=action, next_state=next_state, log_prob=log_prob)
+
+
 def load_tracker_policy(
     path: Path,
     env: "ExpertLookaheadEnv",
     windows: Sequence[int],
     frame_skip: int,
-) -> MultiCategoricalPolicy:
+) -> MultiCategoricalPolicy | RoutedTrackerPolicy:
     payload = th.load(path, map_location=env.device, weights_only=True)
     config = payload.get("config")
-    if not isinstance(config, dict) or config.get("architecture") != TRACKER_ARCHITECTURE:
+    architecture = config.get("architecture") if isinstance(config, dict) else None
+    if architecture not in (TRACKER_ARCHITECTURE, PHC_TRACKER_ARCHITECTURE):
         raise RuntimeError(
             "legacy tracker checkpoint is incompatible with the recurrent "
             "tracker architecture; retrain the tracker"
@@ -107,9 +212,27 @@ def load_tracker_policy(
     if int(config.get("frameskip", -1)) != frame_skip:
         raise ValueError("tracker checkpoint frameskip does not match the environment")
 
-    policy = build_tracker_policy(env, windows)
-    policy.load_state_dict(payload["policy"])
-    return policy
+    if architecture == TRACKER_ARCHITECTURE:
+        policy = build_tracker_policy(env, windows)
+        policy.load_state_dict(payload["policy"])
+        return policy
+
+    assignments = payload.get("assignments")
+    states = payload.get("specialists")
+    if not isinstance(assignments, th.Tensor) or not isinstance(states, list):
+        raise ValueError("PHC tracker checkpoint is missing routing data")
+    if tuple(config.get("replay_manifest", ())) != env.replays.demo_manifest:
+        raise ValueError("PHC tracker checkpoint replay segments do not match")
+    specialists = []
+    for state in states:
+        policy = build_tracker_policy(env, windows)
+        policy.load_state_dict(state)
+        specialists.append(policy)
+    return RoutedTrackerPolicy(
+        specialists,
+        assignments.to(env.device),
+        env.replays,
+    )
 
 
 class ExpertGoalStates:
@@ -209,7 +332,17 @@ class ExpertGoalStates:
             (self._modes == mode).nonzero(as_tuple=True)[0]
             for mode in self._modes.unique(sorted=True)
         )
+        base_probabilities = th.ones(self._n_demos, device=device)
+        if self.balance and len(self._mode_demo_ids) > 1:
+            for candidates in self._mode_demo_ids:
+                base_probabilities[candidates] = 1.0 / len(candidates)
+        self._base_sampling_probabilities = base_probabilities / base_probabilities.sum()
+        self._sampling_probabilities = self._base_sampling_probabilities.clone()
         self._demo_names = tuple(names)
+        self._demo_manifest = tuple(
+            f"{name}:{len(demo)}:{hashlib.sha256(demo.numpy()).hexdigest()}"
+            for name, demo in zip(names, replays)
+        )
         self._offsets = th.cat((
             th.zeros(1, device=device, dtype=th.long),
             lengths.cumsum(0),
@@ -248,6 +381,33 @@ class ExpertGoalStates:
     @property
     def goal_size(self) -> int:
         return self._windows.numel() * CAR_STATE_SIZE
+
+    @property
+    def n_demos(self) -> int:
+        return self._n_demos
+
+    def current_demo_ids(self) -> th.Tensor:
+        return self._demo_id.clone()
+
+    @property
+    def demo_manifest(self) -> tuple[str, ...]:
+        return self._demo_manifest
+
+    def completes_after_step(self) -> th.Tensor:
+        return self._cursors + 1 >= self._offsets[self._demo_id + 1]
+
+    def focus_failures(self, stats: SegmentStats, fraction: float) -> None:
+        if not 0 <= fraction <= 1:
+            raise ValueError("hard-negative fraction must be in [0, 1]")
+        hardness = stats.hardness() * self._base_sampling_probabilities
+        hard_probabilities = hardness / hardness.sum()
+        self._sampling_probabilities = (
+            (1.0 - fraction) * self._base_sampling_probabilities
+            + fraction * hard_probabilities
+        )
+
+    def reset_sampling(self) -> None:
+        self._sampling_probabilities = self._base_sampling_probabilities.clone()
 
     @staticmethod
     def _infer_n_cars(width: int) -> int:
@@ -314,23 +474,7 @@ class ExpertGoalStates:
                 device=self.device,
             )
 
-        if not self.balance or len(self._mode_demo_ids) == 1:
-            return th.randint(self._n_demos, (count,), device=self.device)
-
-        selected_modes = th.randint(
-            len(self._mode_demo_ids),
-            (count,),
-            device=self.device,
-        )
-        demo_ids = th.empty(count, dtype=th.long, device=self.device)
-
-        for mode, candidates in enumerate(self._mode_demo_ids):
-            selected = selected_modes == mode
-            demo_ids[selected] = candidates[
-                th.randint(len(candidates), (selected.sum().item(),), device=self.device)
-            ]
-
-        return demo_ids
+        return th.multinomial(self._sampling_probabilities, count, replacement=True)
 
     def cycle_demo(self, offset: int) -> None:
         current = 0 if self._selected_demo is None else self._selected_demo
@@ -447,7 +591,7 @@ class TrackingReward:
         replays:    ExpertGoalStates,
         scale:      float = 1.0,
         car_scale:  float = 2.0,
-        ball_outcome_weight: float = 0.1,
+        ball_outcome_weight: float = 0.5,
     ) -> None:
         if not np.isfinite(ball_outcome_weight) or ball_outcome_weight < 0:
             raise ValueError("ball outcome weight must be finite and nonnegative")
@@ -550,7 +694,7 @@ class ExpertLookaheadEnv:
         replays:                 ExpertGoalStates,
         reward_scale:            float = 1.0,
         car_scale:               float = 2.0,
-        ball_outcome_weight:     float = 0.1,
+        ball_outcome_weight:     float = 0.5,
         minimum_reward:          float = 0.1,
         minimum_tracking_frames: int = 1,
     ) -> None:
@@ -568,6 +712,7 @@ class ExpertLookaheadEnv:
         self._ball_anchored = th.ones(env.n_sim, dtype=th.bool, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
         self.last_raw_expert_action: th.Tensor | None = None
+        self.segment_stats: SegmentStats | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size
 
@@ -657,6 +802,17 @@ class ExpertLookaheadEnv:
         )
 
     def step(self, action: th.Tensor | np.ndarray):
+        segment_stats = self.__dict__.get("segment_stats")
+        demo_ids = (
+            self.replays.current_demo_ids()
+            if segment_stats is not None
+            else None
+        )
+        completes_after_step = (
+            self.replays.completes_after_step()
+            if segment_stats is not None
+            else None
+        )
         self.last_raw_expert_action = self.replays.current_raw_action(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
@@ -679,6 +835,10 @@ class ExpertLookaheadEnv:
         ) & ~native & ~end_reset
 
         reset = end_reset | failure_reset
+        completed = native | reset
+        if segment_stats is not None:
+            assert demo_ids is not None and completes_after_step is not None
+            segment_stats.record(demo_ids, completed, completed & completes_after_step)
         self._low_reward_frames[reset | native] = 0
 
         if "final_obs" in info:
@@ -727,7 +887,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--car-scale",               type=float, default=2.0)
-    parser.add_argument("--ball-outcome-weight", type=float, default=0.1)
+    parser.add_argument("--ball-outcome-weight", type=float, default=0.5)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int,   default=16)
     parser.add_argument("--minimum-remaining-frames", type=int, default=128)
@@ -745,7 +905,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gae-lambda",              type=float, default=0.98)
     parser.add_argument("--schedule-timesteps",      type=int, default=1_000_000_000)
     parser.add_argument("--max-grad-norm",           type=float, default=0.5)
-    parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
+    parser.add_argument(
+        "--timesteps",
+        type=int,
+        default=1_000_000_000,
+        help="transition budget for each PHC specialist stage",
+    )
+    parser.add_argument("--policy-count",             type=int,   default=6)
+    parser.add_argument("--hard-negative-fraction",   type=float, default=0.8)
     parser.add_argument("--seed",                    type=int,   default=0)
     parser.add_argument("--log-dir",                 type=Path,  default=Path("runs"))
     parser.add_argument("--checkpoint-dir",          type=Path,  default=Path("checkpoints/tracker"))
@@ -775,6 +942,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "epochs",
         "sequence_length",
         "timesteps",
+        "policy_count",
     ):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
@@ -799,6 +967,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be in (0, 1)")
     if not math.isfinite(args.max_grad_norm) or args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be finite and positive")
+    if not 0 <= args.hard_negative_fraction <= 1:
+        raise ValueError("--hard-negative-fraction must be in [0, 1]")
 
 
 def set_learning_rate(optimizers: Sequence[th.optim.Optimizer], value: float) -> None:
@@ -843,117 +1013,24 @@ def main() -> None:
         minimum_tracking_frames=args.minimum_tracking_frames,
     )
 
-    policy = build_tracker_policy(env, args.windows)
-    critic = build_tracker_critic(env, args.windows)
-
-    buffer = RolloutBuffer(
-        horizon=args.rollout,
-        num_envs=env.n_envs,
-        device=env.device,
-        copy_on_finish=False,
-    )
-    runner = Runner(
-        env=env,
-        policy=policy,
-        buffer=buffer,
-        captures=(
-            LogProbCapture(),
-            RecurrentStateCapture(),
-            StatelessCriticCapture(critic),
-        ),
-    )
-
-    actor_optimizer = Adam(policy.parameters(), lr=args.lr)
-    critic_optimizer = Adam(critic.parameters(), lr=args.lr)
-    ppo_loss = PPOLoss(
-        policy,
-        critic,
-        PPOConfig(
-            clip=args.clip,
-            value_clip=None,
-            entropy_coef=args.entropy_coef,
-        ),
-    )
-    update = Update(
-        transforms=(GAE(gamma=args.gamma, lambda_=args.gae_lambda),),
-        sampler=RecurrentRolloutMinibatches(
-            sequence_length=args.sequence_length,
-            sequences_per_batch=max(1, args.batch_size // args.sequence_length),
-            epochs=args.epochs,
-            fields=(
-                "observation",
-                "action",
-                "advantage",
-                "old_log_prob",
-                "baseline_value",
-                "returns",
-            ),
-        ),
-        loss=ppo_loss,
-        optimizer_step=IndependentOptimizerSteps(
-            OptimizerStep(
-                policy,
-                actor_optimizer,
-                max_grad_norm=args.max_grad_norm,
-            ),
-            OptimizerStep(
-                critic,
-                critic_optimizer,
-                max_grad_norm=args.max_grad_norm,
-            ),
-        ),
-        section="PPO",
-    )
-
-    def schedule(start: float, end: float):
-        return lambda progress: annealed_value(
-            progress,
-            start,
-            end,
-            args.timesteps,
-            args.schedule_timesteps,
-        )
-
-    value_scheduler = ValueScheduler(
-        ScheduledValue(
-            "learning_rate",
-            schedule(args.lr, args.lr_final),
-            lambda value: set_learning_rate(
-                (actor_optimizer, critic_optimizer), value
-            ),
-        ),
-        ScheduledValue(
-            "entropy_coef",
-            schedule(args.entropy_coef, args.entropy_coef_final),
-            lambda value: setattr(
-                ppo_loss,
-                "config",
-                replace(ppo_loss.config, entropy_coef=value),
-            ),
-        ),
-        ScheduledValue(
-            "clip",
-            schedule(args.clip, args.clip_final),
-            lambda value: setattr(
-                ppo_loss,
-                "config",
-                replace(ppo_loss.config, clip=value),
-            ),
-        ),
-        section="Schedule",
-    )
-
     run_id = datetime.now().strftime("tracker-%Y%m%d-%H%M%S")
+    policies: list[MultiCategoricalPolicy] = []
+    stage_stats: list[SegmentStats] = []
+    previous_critic: Critic | None = None
 
-    checkpoint = PeriodicCheckpoint(
-        modules={"policy": policy, "critic": critic},
+    checkpoint = PHCCheckpoint(
         directory=args.checkpoint_dir,
         interval=args.checkpoint_interval,
         keep=args.checkpoint_keep,
+        assignment_fn=lambda: specialist_assignments(stage_stats),
         config={
-            "architecture": TRACKER_ARCHITECTURE,
+            "architecture": PHC_TRACKER_ARCHITECTURE,
             "windows": list(args.windows),
             "frameskip": args.frameskip,
+            "policy_count": args.policy_count,
+            "stage_timesteps": args.timesteps,
+            "hard_negative_fraction": args.hard_negative_fraction,
+            "replay_manifest": list(replays.demo_manifest),
             "gamma": args.gamma,
             "gae_lambda": args.gae_lambda,
             "learning_rate": [args.lr, args.lr_final],
@@ -965,22 +1042,144 @@ def main() -> None:
             "epochs": args.epochs,
             "sequence_length": args.sequence_length,
             "minimum_tracking_frames": args.minimum_tracking_frames,
+            "ball_outcome_weight": args.ball_outcome_weight,
             "max_grad_norm": args.max_grad_norm,
         },
     )
-    checkpoint.run()
+    completed_timesteps = 0
 
-    trainer = Trainer(
-        runner,
-        buffer,
-        Algorithm(update),
-        OnPolicySchedule(),
-        logger=Logger(log_dir=str(args.log_dir / run_id)),
-        checkpoint=checkpoint,
-        value_scheduler=value_scheduler,
-    )
+    for stage in range(args.policy_count):
+        if stage == 0:
+            replays.reset_sampling()
+        else:
+            replays.focus_failures(stage_stats[-1], args.hard_negative_fraction)
 
-    trainer.run(args.timesteps)
+        policy = build_tracker_policy(env, args.windows)
+        critic = build_tracker_critic(env, args.windows)
+        if policies:
+            policy.load_state_dict(policies[-1].state_dict())
+        if previous_critic is not None:
+            critic.load_state_dict(previous_critic.state_dict())
+
+        stats = SegmentStats(replays.n_demos, env.device)
+        stage_stats.append(stats)
+        env.segment_stats = stats
+        policies.append(policy)
+        checkpoint.set_stage(
+            stage,
+            policies,
+            critic,
+            stage_stats,
+            step_offset=completed_timesteps,
+        )
+        if stage == 0:
+            checkpoint.run()
+
+        buffer = RolloutBuffer(
+            horizon=args.rollout,
+            num_envs=env.n_envs,
+            device=env.device,
+            copy_on_finish=False,
+        )
+        runner = Runner(
+            env=env,
+            policy=policy,
+            buffer=buffer,
+            captures=(
+                LogProbCapture(),
+                RecurrentStateCapture(),
+                StatelessCriticCapture(critic),
+            ),
+        )
+
+        actor_optimizer = Adam(policy.parameters(), lr=args.lr)
+        critic_optimizer = Adam(critic.parameters(), lr=args.lr)
+        ppo_loss = PPOLoss(
+            policy,
+            critic,
+            PPOConfig(
+                clip=args.clip,
+                value_clip=None,
+                entropy_coef=args.entropy_coef,
+            ),
+        )
+        update = Update(
+            transforms=(GAE(gamma=args.gamma, lambda_=args.gae_lambda),),
+            sampler=RecurrentRolloutMinibatches(
+                sequence_length=args.sequence_length,
+                sequences_per_batch=max(1, args.batch_size // args.sequence_length),
+                epochs=args.epochs,
+                fields=(
+                    "observation",
+                    "action",
+                    "advantage",
+                    "old_log_prob",
+                    "baseline_value",
+                    "returns",
+                ),
+            ),
+            loss=ppo_loss,
+            optimizer_step=IndependentOptimizerSteps(
+                OptimizerStep(policy, actor_optimizer, max_grad_norm=args.max_grad_norm),
+                OptimizerStep(critic, critic_optimizer, max_grad_norm=args.max_grad_norm),
+            ),
+            section="PPO",
+        )
+
+        def schedule(start: float, end: float):
+            return lambda progress: annealed_value(
+                progress,
+                start,
+                end,
+                args.timesteps,
+                args.schedule_timesteps,
+            )
+
+        value_scheduler = ValueScheduler(
+            ScheduledValue(
+                "learning_rate",
+                schedule(args.lr, args.lr_final),
+                lambda value: set_learning_rate(
+                    (actor_optimizer, critic_optimizer), value
+                ),
+            ),
+            ScheduledValue(
+                "entropy_coef",
+                schedule(args.entropy_coef, args.entropy_coef_final),
+                lambda value: setattr(
+                    ppo_loss,
+                    "config",
+                    replace(ppo_loss.config, entropy_coef=value),
+                ),
+            ),
+            ScheduledValue(
+                "clip",
+                schedule(args.clip, args.clip_final),
+                lambda value: setattr(
+                    ppo_loss,
+                    "config",
+                    replace(ppo_loss.config, clip=value),
+                ),
+            ),
+            section="Schedule",
+        )
+
+        trainer = Trainer(
+            runner,
+            buffer,
+            Algorithm(update),
+            OnPolicySchedule(),
+            logger=Logger(log_dir=str(args.log_dir / run_id / f"stage-{stage}")),
+            checkpoint=checkpoint,
+            value_scheduler=value_scheduler,
+        )
+        trainer.run(args.timesteps)
+
+        completed_timesteps += trainer.clock.env_steps
+        checkpoint.step = completed_timesteps
+        checkpoint.run()
+        policy.eval().requires_grad_(False)
+        previous_critic = critic
 
 
 if __name__ == "__main__":

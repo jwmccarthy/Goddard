@@ -10,11 +10,11 @@ import gymnasium as gym
 
 from carl.gymnasium import CARLObservation
 from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
-from jarl.data.batch import TensorBatch
+from jarl.data import PolicyOutput, TensorBatch
 
 from ballchasing_replays.parse_replays import _project_carl_actions
 from watch_demonstrations import frame_from_state
-from tracker_checkpoint import PeriodicCheckpoint
+from tracker_checkpoint import PHCCheckpoint, PeriodicCheckpoint
 
 from tracker import (
     ACTION_FACTORS,
@@ -25,7 +25,10 @@ from tracker import (
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
+    PHC_TRACKER_ARCHITECTURE,
     POSITION_SCALE,
+    RoutedTrackerPolicy,
+    SegmentStats,
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
@@ -33,6 +36,7 @@ from tracker import (
     build_tracker_policy,
     load_tracker_policy,
     set_learning_rate,
+    specialist_assignments,
     validate_args,
 )
 
@@ -56,6 +60,8 @@ class TrackerTest(unittest.TestCase):
             epochs=4,
             sequence_length=64,
             timesteps=1_000_000,
+            policy_count=6,
+            hard_negative_fraction=0.8,
             schedule_timesteps=1_000,
             gamma=0.997,
             gae_lambda=0.98,
@@ -104,6 +110,27 @@ class TrackerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "legacy tracker checkpoint"):
                 load_tracker_policy(path, SimpleNamespace(device="cpu"), (1, 2), 4)
 
+    def test_phc_checkpoint_rejects_different_replay_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tracker.pt"
+            th.save({
+                "assignments": th.tensor([0]),
+                "specialists": [{}],
+                "config": {
+                    "architecture": PHC_TRACKER_ARCHITECTURE,
+                    "windows": [1, 2],
+                    "frameskip": 4,
+                    "replay_manifest": ["different"],
+                },
+            }, path)
+            env = SimpleNamespace(
+                device="cpu",
+                replays=SimpleNamespace(demo_manifest=("expected",)),
+            )
+
+            with self.assertRaisesRegex(ValueError, "replay segments"):
+                load_tracker_policy(path, env, (1, 2), 4)
+
     def test_tracker_policy_uses_all_categorical_action_factors(self):
         observation_size = GOAL_STATE_SIZE + 21 * len(DEFAULT_TRACKER_WINDOWS)
         env = SimpleNamespace(
@@ -147,6 +174,104 @@ class TrackerTest(unittest.TestCase):
             self.assertTrue(legacy.exists())
             self.assertFalse((directory / "tracker_000000000000.pt").exists())
             self.assertTrue((directory / "tracker_000000000001.pt").exists())
+
+    def test_segment_stats_drive_hard_negative_sampling(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._base_sampling_probabilities = th.full((3,), 1 / 3)
+        replays._sampling_probabilities = replays._base_sampling_probabilities.clone()
+        stats = SegmentStats(3, "cpu")
+        stats.record(
+            th.tensor([0, 1, 1, 2]),
+            th.tensor([True, True, True, True]),
+            th.tensor([True, False, False, True]),
+        )
+
+        replays.focus_failures(stats, 1.0)
+
+        self.assertGreater(
+            replays._sampling_probabilities[1],
+            replays._sampling_probabilities[0],
+        )
+        th.testing.assert_close(replays._sampling_probabilities.sum(), th.tensor(1.0))
+
+    def test_specialist_assignment_selects_lowest_observed_failure_rate(self):
+        first = SegmentStats(3, "cpu")
+        first.attempts[:] = th.tensor([10, 10, 0])
+        first.failures[:] = th.tensor([1, 8, 0])
+        second = SegmentStats(3, "cpu")
+        second.attempts[:] = th.tensor([10, 10, 0])
+        second.failures[:] = th.tensor([3, 2, 0])
+
+        assignments = specialist_assignments((first, second))
+
+        th.testing.assert_close(assignments, th.tensor([0, 1, 1]))
+
+    def test_routed_tracker_dispatches_each_replay_segment(self):
+        class Specialist(th.nn.Module):
+            def __init__(self, action: int) -> None:
+                super().__init__()
+                self.value = th.nn.Parameter(th.tensor(0.0))
+                self.action_value = action
+
+            @property
+            def device(self):
+                return self.value.device
+
+            def initial_state(self, batch_size):
+                return th.zeros((batch_size, 1))
+
+            def act(self, observation, state=None, *, deterministic=False):
+                batch = len(observation)
+                return PolicyOutput(
+                    action=th.full((batch, ACTION_FACTORS), self.action_value),
+                    next_state=th.full((batch, 1), float(self.action_value)),
+                    log_prob=th.full((batch,), float(self.action_value)),
+                )
+
+        replays = SimpleNamespace(
+            n_demos=3,
+            current_demo_ids=lambda: th.tensor([0, 1, 2]),
+        )
+        policy = RoutedTrackerPolicy(
+            (Specialist(0), Specialist(1)),
+            th.tensor([0, 1, 0]),
+            replays,
+        )
+
+        output = policy.act(th.zeros((3, 2)))
+
+        th.testing.assert_close(output.action[:, 0], th.tensor([0, 1, 0]))
+        th.testing.assert_close(output.next_state[:, 0], th.tensor([0.0, 1.0, 0.0]))
+
+    def test_phc_checkpoint_serializes_specialists_stats_and_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stats = SegmentStats(2, "cpu")
+            policies = [th.nn.Linear(1, 1), th.nn.Linear(1, 1)]
+            checkpoint = PHCCheckpoint(
+                Path(directory),
+                interval=10,
+                keep=2,
+                config={"architecture": "test"},
+                assignment_fn=lambda: th.tensor([0, 1]),
+            )
+            checkpoint.set_stage(
+                1,
+                policies,
+                th.nn.Linear(1, 1),
+                (stats, stats),
+                step_offset=100,
+            )
+            checkpoint.step = 200
+
+            checkpoint.run()
+
+            payload = th.load(
+                Path(directory) / "tracker_000000000200.pt",
+                weights_only=True,
+            )
+            self.assertEqual(len(payload["specialists"]), 2)
+            self.assertEqual(len(payload["segment_stats"]), 2)
+            th.testing.assert_close(payload["assignments"], th.tensor([0, 1]))
 
     def test_parser_projection_uses_carl_axis_class_order(self):
         raw = np.zeros((3, 8), dtype=np.float32)
@@ -211,6 +336,22 @@ class TrackerTest(unittest.TestCase):
         remaining = length - replays._cursors - 1
         self.assertTrue((remaining >= minimum).all())
         self.assertTrue((replays._cursors <= length - minimum - 1).all())
+
+    def test_segment_completion_is_computed_before_environment_reset(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._demo_id = th.tensor([0, 1])
+        replays._cursors = th.tensor([8, 14])
+        replays._offsets = th.tensor([0, 10, 20])
+
+        th.testing.assert_close(
+            replays.completes_after_step(),
+            th.tensor([False, False]),
+        )
+        replays._cursors[:] = th.tensor([9, 19])
+        th.testing.assert_close(
+            replays.completes_after_step(),
+            th.tensor([True, True]),
+        )
 
     def test_filter_rejects_segments_with_no_safe_early_start(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
