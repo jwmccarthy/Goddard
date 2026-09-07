@@ -61,17 +61,70 @@ ACTION_FACTORS = 7
 EXPERT_ACTION_MASK_INDEX = EXPERT_ACTION_INDEX + ACTION_FACTORS
 STORED_REPLAY_SIZE = EXPERT_ACTION_MASK_INDEX + ACTION_FACTORS
 SUPERVISED_ACTION_FACTORS = (2, 3, 4, 6)
+LEARNED_ACTION_FACTORS = (0, 1, 5)
+EXPERT_ACTION_HINT_SIZE = len(SUPERVISED_ACTION_FACTORS)
 CARL_AXES = np.asarray([0.0, -1.0, 1.0], dtype=np.float32)
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-TRACKER_ARCHITECTURE = "flat-gru-v1"
+TRACKER_ARCHITECTURE = "hybrid-flat-gru-v1"
+
+
+class HybridTrackerPolicy(MultiCategoricalPolicy):
+    """Samples directional controls and inserts trusted replay controls."""
+
+    def act_from_features(
+        self,
+        features: th.Tensor,
+        observation: th.Tensor,
+        *,
+        deterministic: bool = False,
+    ):
+        output = super().act_from_features(
+            features,
+            observation,
+            deterministic=deterministic,
+        )
+        action = output.action.reshape(*output.action.shape[:-1], -1).clone()
+        trusted = observation[..., -EXPERT_ACTION_HINT_SIZE:].long()
+        split_mask = self.action_codec.mask(observation).split(self.sizes, dim=-1)
+        for hint, factor in enumerate(SUPERVISED_ACTION_FACTORS):
+            target = trusted[..., hint]
+            legal = split_mask[factor].gather(-1, target[..., None]).squeeze(-1)
+            action[..., factor] = th.where(legal, target, th.zeros_like(target))
+        output.action = action.reshape(*action.shape[:-1], *self.action_shape)
+        return output
+
+    def evaluate_from_features(
+        self,
+        features: th.Tensor,
+        observation: th.Tensor,
+        action: th.Tensor,
+    ):
+        evaluation = super().evaluate_from_features(features, observation, action)
+        factor_entropy = evaluation.extras["factor_entropy"]
+        evaluation.entropy = factor_entropy[..., list(LEARNED_ACTION_FACTORS)].sum(-1)
+        return evaluation
+
+    def _grouped_logprob(self, distributions, action: th.Tensor) -> th.Tensor:
+        action = action.reshape(*action.shape[:-len(self.action_shape)], -1)
+        terms = []
+        for indices, distribution in distributions:
+            positions = [
+                position
+                for position, factor in enumerate(indices)
+                if factor in LEARNED_ACTION_FACTORS
+            ]
+            if positions:
+                factor_log_prob = distribution.log_prob(action[..., list(indices)])
+                terms.append(factor_log_prob[..., positions].sum(-1))
+        return sum(terms)
 
 
 def build_tracker_policy(
     env: "ExpertLookaheadEnv",
     windows: Sequence[int],
 ) -> MultiCategoricalPolicy:
-    return MultiCategoricalPolicy(
+    return HybridTrackerPolicy(
         foot=LinearEncoder(TRACKER_FEATURE_SIZE, func=nn.SiLU),
         body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
         head=MLP(dims=[]),
@@ -606,7 +659,7 @@ class ExpertLookaheadEnv:
         self.last_expert_action: th.Tensor | None = None
         self.last_expert_action_valid: th.Tensor | None = None
 
-        size = GOAL_STATE_SIZE + replays.goal_size
+        size = GOAL_STATE_SIZE + replays.goal_size + EXPERT_ACTION_HINT_SIZE
 
         self.single_observation_space = gym.spaces.Box(
             -np.inf,
@@ -665,11 +718,19 @@ class ExpertLookaheadEnv:
 
     def _pad_goals(self, obs: th.Tensor) -> th.Tensor:
         current = obs[..., :GOAL_STATE_SIZE]
-        return th.nn.functional.pad(current, (0, self.replays.goal_size))
+        return th.nn.functional.pad(
+            current,
+            (0, self.replays.goal_size + EXPERT_ACTION_HINT_SIZE),
+        )
+
+    def _append_expert_action(self, obs: th.Tensor) -> th.Tensor:
+        action, _ = self.replays.current_expert_action(offset=-1)
+        hints = action[:, list(SUPERVISED_ACTION_FACTORS)]
+        return th.cat((obs, hints.to(obs.dtype)), dim=-1)
 
     def reset(self, **kwargs: Any) -> th.Tensor:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
-        return obs
+        return self._append_expert_action(obs)
 
     def _anchor_ball(self, obs: th.Tensor, native: th.Tensor) -> th.Tensor:
         if self.reward.touched is None:
@@ -738,6 +799,13 @@ class ExpertLookaheadEnv:
             reset_obs, _ = self.replays.next_goals(reset_obs, reset)
             obs[reset] = reset_obs
 
+        obs = self._append_expert_action(obs)
+        if "final_obs" in info and info["final_obs"].shape[-1] != obs.shape[-1]:
+            info = dict(info)
+            info["final_obs"] = th.nn.functional.pad(
+                info["final_obs"],
+                (0, EXPERT_ACTION_HINT_SIZE),
+            )
         return obs, reward, term | reset, trunc, info
 
 
@@ -750,10 +818,7 @@ class ExpertActionCapture(CaptureBase):
         valid = self.env.last_expert_action_valid
         if action is None or valid is None:
             raise RuntimeError("environment did not expose expert actions for the step")
-        return {
-            "expert_action": action,
-            "expert_action_valid": valid,
-        }
+        return {"expert_action": action}
 
 
 class StatelessCriticCapture(CaptureBase):
@@ -776,30 +841,20 @@ def _expert_action_loss(
     logits: th.Tensor,
     action_mask: th.Tensor,
     expert_action: th.Tensor,
-    expert_valid: th.Tensor,
     sequence_valid: th.Tensor,
     sizes: Sequence[int],
-    inferred_weight: float,
 ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
-    weighted_losses = []
-    weighted_accuracies = []
-    weights = []
+    losses = []
+    accuracies = []
     valid_rates = []
-    for index, (factor_logits, factor_mask) in enumerate(zip(
-        logits.split(tuple(sizes), dim=-1),
-        action_mask.split(tuple(sizes), dim=-1),
-    )):
+    split_logits = logits.split(tuple(sizes), dim=-1)
+    split_masks = action_mask.split(tuple(sizes), dim=-1)
+    for index in LEARNED_ACTION_FACTORS:
+        factor_logits = split_logits[index]
+        factor_mask = split_masks[index]
         target = expert_action[..., index]
         target_legal = factor_mask.gather(-1, target[..., None]).squeeze(-1)
-        trusted = expert_valid[..., index]
         valid = sequence_valid & target_legal
-        if index in SUPERVISED_ACTION_FACTORS:
-            factor_weight = 1.0
-            valid &= trusted
-        else:
-            factor_weight = inferred_weight
-            if factor_weight == 0:
-                continue
         if not valid.any():
             continue
 
@@ -811,19 +866,17 @@ def _expert_action_loss(
         factor_accuracy = (
             masked_logits[valid].argmax(-1) == target[valid]
         ).float().mean()
-        weighted_losses.append(factor_weight * factor_loss)
-        weighted_accuracies.append(factor_weight * factor_accuracy)
-        weights.append(factor_weight)
+        losses.append(factor_loss)
+        accuracies.append(factor_accuracy)
         valid_rates.append(valid.float().mean())
 
-    if not weighted_losses:
+    if not losses:
         zero = logits.sum() * 0
         return zero, logits.new_zeros(()), logits.new_zeros(())
 
-    total_weight = sum(weights)
     return (
-        th.stack(weighted_losses).sum() / total_weight,
-        th.stack(weighted_accuracies).sum() / total_weight,
+        th.stack(losses).mean(),
+        th.stack(accuracies).mean(),
         th.stack(valid_rates).mean(),
     )
 
@@ -835,15 +888,11 @@ class ExpertActionPPOLoss(PPOLoss):
         critic: Critic,
         config: PPOConfig,
         weight: float,
-        inferred_weight: float = 0.1,
     ) -> None:
         if not np.isfinite(weight) or weight < 0:
-            raise ValueError("expert action weight must be finite and nonnegative")
-        if not np.isfinite(inferred_weight) or inferred_weight < 0:
             raise ValueError("inferred action weight must be finite and nonnegative")
         super().__init__(policy, critic, config)
         self.weight = weight
-        self.inferred_weight = inferred_weight
         self._expert_logits: th.Tensor | None = None
 
     def _evaluate(self, batch, state, critic_state, reset):
@@ -878,15 +927,12 @@ class ExpertActionPPOLoss(PPOLoss):
             raise RuntimeError("PPO evaluation did not expose tracker logits")
         action_mask = self.policy.action_codec.mask(batch["observation"])
         expert_action = batch["expert_action"].long()
-        expert_valid = batch["expert_action_valid"].bool()
         expert_loss, expert_accuracy, expert_valid_rate = _expert_action_loss(
             logits,
             action_mask,
             expert_action,
-            expert_valid,
             sequence_valid,
             self.policy.sizes,
-            self.inferred_weight,
         )
 
         return LossOutput(
@@ -918,8 +964,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs",                  type=int,   default=2)
     parser.add_argument("--sequence-length",         type=int,   default=32)
     parser.add_argument("--lr",                      type=float, default=3e-5)
-    parser.add_argument("--expert-action-weight",    type=float, default=0.1)
-    parser.add_argument("--inferred-action-weight",  type=float, default=0.1)
+    parser.add_argument("--inferred-action-weight",  type=float, default=0.01)
     parser.add_argument("--max-grad-norm",           type=float, default=0.5)
     parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
     parser.add_argument("--seed",                    type=int,   default=0)
@@ -1002,7 +1047,6 @@ def main() -> None:
                 "baseline_value",
                 "returns",
                 "expert_action",
-                "expert_action_valid",
             ),
         ),
         loss=ExpertActionPPOLoss(
@@ -1013,7 +1057,6 @@ def main() -> None:
                 value_clip=None,
                 entropy_coef=0.001,
             ),
-            args.expert_action_weight,
             args.inferred_action_weight,
         ),
         optimizer_step=IndependentOptimizerSteps(

@@ -23,6 +23,7 @@ from tracker import (
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
+    HybridTrackerPolicy,
     POSITION_SCALE,
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
@@ -306,7 +307,13 @@ class TrackerTest(unittest.TestCase):
 
         self.assertEqual(
             events,
-            [("action", 0), ("touch", 1), ("current", 1), ("next", 1)],
+            [
+                ("action", 0),
+                ("touch", 1),
+                ("current", 1),
+                ("next", 1),
+                ("action", 1),
+            ],
         )
         self.assertEqual(wrapper.replays.cursor, 2)
         th.testing.assert_close(
@@ -314,41 +321,72 @@ class TrackerTest(unittest.TestCase):
             th.zeros((1, ACTION_FACTORS), dtype=th.long),
         )
 
-    def test_expert_action_loss_uses_only_valid_legal_targets(self):
+    def test_expert_action_loss_uses_only_directional_targets(self):
         logits = th.zeros((2, 18), requires_grad=True)
         action_mask = th.ones((2, 18), dtype=th.bool)
-        action_mask[1, 12] = False
         expert_action = th.zeros((2, ACTION_FACTORS), dtype=th.long)
         expert_action[:, 2] = th.tensor([1, 2])
         expert_action[:, 4] = 1
-        valid = th.zeros((2, ACTION_FACTORS), dtype=th.bool)
-        valid[:, 2] = True
-        valid[:, 4] = True
         loss, _, _ = _expert_action_loss(
             logits,
             action_mask,
             expert_action,
-            valid,
             th.ones(2, dtype=th.bool),
             (3, 3, 3, 2, 2, 3, 2),
-            inferred_weight=0,
         )
 
-        expected_expert_loss = (np.log(3) + np.log(2)) / 2
-        self.assertAlmostEqual(loss.item(), expected_expert_loss, places=6)
+        self.assertAlmostEqual(loss.item(), np.log(3), places=6)
 
     def test_expert_action_loss_trains_inferred_factors_on_valid_sequence_steps(self):
         loss, _, _ = _expert_action_loss(
             th.zeros((2, 1, 18), requires_grad=True),
             th.ones((2, 1, 18), dtype=th.bool),
             th.zeros((2, 1, ACTION_FACTORS), dtype=th.long),
-            th.zeros((2, 1, ACTION_FACTORS), dtype=th.bool),
             th.tensor([[True], [False]]),
             (3, 3, 3, 2, 2, 3, 2),
-            inferred_weight=0.1,
         )
 
         self.assertAlmostEqual(loss.item(), np.log(3), places=6)
+
+    def test_hybrid_policy_inserts_trusted_controls_and_scores_directions_only(self):
+        class Codec:
+            action_shape = (7,)
+
+            @staticmethod
+            def mask(observation):
+                return th.ones((*observation.shape[:-1], 18), dtype=th.bool)
+
+        policy = HybridTrackerPolicy(
+            foot=th.nn.Identity(),
+            body=th.nn.Identity(),
+            head=th.nn.Linear(2, 18, bias=False),
+            action_codec=Codec(),
+        )
+        policy.sizes = (3, 3, 3, 2, 2, 3, 2)
+        policy.action_shape = (7,)
+        th.nn.init.zeros_(policy.head.weight)
+        observation = th.tensor([[0.0, 0.0, 2.0, 1.0, 1.0, 1.0]])
+
+        output = policy.act_from_features(
+            th.zeros((1, 2)),
+            observation,
+            deterministic=True,
+        )
+        evaluation = policy.evaluate_from_features(
+            th.zeros((1, 2)),
+            observation,
+            output.action,
+        )
+
+        th.testing.assert_close(output.action, th.tensor([[0, 0, 2, 1, 1, 0, 1]]))
+        th.testing.assert_close(
+            output.log_prob,
+            output.log_prob.new_tensor([-3 * np.log(3)]),
+        )
+        th.testing.assert_close(
+            evaluation.entropy,
+            evaluation.entropy.new_tensor([3 * np.log(3)]),
+        )
 
     def test_stateless_critic_capture_records_current_and_next_values(self):
         critic = SimpleNamespace(value=lambda observation: observation.sum(-1))
