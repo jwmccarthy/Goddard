@@ -68,7 +68,18 @@ LEARNED_ACTION_FACTORS = (0, 1, 5)
 EXPERT_ACTION_HINT_SIZE = len(TRUSTED_ACTION_FACTORS)
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-TRACKER_ARCHITECTURE = "hybrid-beta-gru-v1"
+BETA_MIN_CONCENTRATION = 0.1
+BETA_INITIAL_CONCENTRATION = 0.5
+TRACKER_ARCHITECTURE = "hybrid-edge-beta-gru-v1"
+
+
+def _initialize_beta_head(layer: nn.Linear) -> nn.Linear:
+    nn.init.zeros_(layer.weight)
+    initial_logit = math.log(math.expm1(
+        BETA_INITIAL_CONCENTRATION - BETA_MIN_CONCENTRATION
+    ))
+    nn.init.constant_(layer.bias, initial_logit)
+    return layer
 
 
 class HybridTrackerPolicy(Policy):
@@ -98,7 +109,10 @@ class HybridTrackerPolicy(Policy):
 
     def _distribution(self, features: th.Tensor) -> Beta:
         alpha, beta = self.head(features).chunk(2, dim=-1)
-        return Beta(nn.functional.softplus(alpha) + 1, nn.functional.softplus(beta) + 1)
+        return Beta(
+            nn.functional.softplus(alpha) + BETA_MIN_CONCENTRATION,
+            nn.functional.softplus(beta) + BETA_MIN_CONCENTRATION,
+        )
 
     @staticmethod
     def _log_prob(distribution: Beta, action: th.Tensor) -> th.Tensor:
@@ -165,7 +179,7 @@ def build_tracker_policy(
     return HybridTrackerPolicy(
         foot=LinearEncoder(TRACKER_FEATURE_SIZE, func=nn.SiLU),
         body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
-        head=MLP(dims=[]),
+        head=MLP(dims=[], out_init_func=_initialize_beta_head),
     ).build(env).to(env.device)
 
 

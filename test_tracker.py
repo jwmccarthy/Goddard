@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch as th
+import gymnasium as gym
 
 from carl.gymnasium import CARLObservation
 from jarl.data.batch import TensorBatch
@@ -18,6 +19,7 @@ from tracker import (
     ACTION_FACTORS,
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
+    BETA_INITIAL_CONCENTRATION,
     DEFAULT_TRACKER_WINDOWS,
     EXPERT_TOUCH_INDEX,
     ExpertGoalStates,
@@ -28,6 +30,7 @@ from tracker import (
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
+    build_tracker_policy,
     load_tracker_policy,
 )
 
@@ -39,10 +42,52 @@ class TrackerTest(unittest.TestCase):
     def test_legacy_tracker_checkpoint_has_explicit_error(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tracker.pt"
-            th.save({"policy": {}}, path)
+            th.save({
+                "policy": {},
+                "config": {
+                    "architecture": "hybrid-beta-gru-v1",
+                    "windows": [1, 2],
+                    "frameskip": 4,
+                },
+            }, path)
 
             with self.assertRaisesRegex(RuntimeError, "legacy tracker checkpoint"):
                 load_tracker_policy(path, SimpleNamespace(device="cpu"), (1, 2), 4)
+
+    def test_tracker_policy_starts_with_edge_exploration(self):
+        observation_size = GOAL_STATE_SIZE + 21 * len(DEFAULT_TRACKER_WINDOWS) + 4
+        env = SimpleNamespace(
+            device="cpu",
+            single_observation_space=gym.spaces.Box(
+                -np.inf,
+                np.inf,
+                (observation_size,),
+                np.float32,
+            ),
+        )
+        policy = build_tracker_policy(env, DEFAULT_TRACKER_WINDOWS)
+
+        observation = th.zeros((2, observation_size))
+        distribution = policy.dist(observation)
+
+        th.testing.assert_close(
+            distribution.concentration1,
+            th.full((2, 3), BETA_INITIAL_CONCENTRATION),
+        )
+        th.testing.assert_close(
+            distribution.concentration0,
+            th.full((2, 3), BETA_INITIAL_CONCENTRATION),
+        )
+        self.assertTrue((distribution.concentration1 < 1).all())
+
+        th.manual_seed(0)
+        observation = observation[:1].expand(1024, -1)
+        output = policy.act(observation)
+        evaluation = policy.evaluate_actions(observation, output.action)
+        learned = output.action[:, [0, 1, 5]]
+        th.testing.assert_close(output.log_prob, evaluation.log_prob)
+        self.assertTrue(th.isfinite(output.log_prob).all())
+        self.assertGreater(learned.abs().gt(0.8).float().mean().item(), 0.3)
 
     def test_checkpoint_retention_does_not_delete_legacy_high_step_files(self):
         with tempfile.TemporaryDirectory() as directory:
