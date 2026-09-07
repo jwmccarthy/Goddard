@@ -718,10 +718,7 @@ class ExpertLookaheadEnv:
 
     def _pad_goals(self, obs: th.Tensor) -> th.Tensor:
         current = obs[..., :GOAL_STATE_SIZE]
-        return th.nn.functional.pad(
-            current,
-            (0, self.replays.goal_size + EXPERT_ACTION_HINT_SIZE),
-        )
+        return th.nn.functional.pad(current, (0, self.replays.goal_size))
 
     def _append_expert_action(self, obs: th.Tensor) -> th.Tensor:
         action, _ = self.replays.current_expert_action(offset=-1)

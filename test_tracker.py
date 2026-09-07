@@ -321,6 +321,76 @@ class TrackerTest(unittest.TestCase):
             th.zeros((1, ACTION_FACTORS), dtype=th.long),
         )
 
+    def test_native_final_observation_padding_defers_action_hints(self):
+        wrapper = ExpertLookaheadEnv.__new__(ExpertLookaheadEnv)
+        wrapper.replays = SimpleNamespace(goal_size=7 * 21)
+
+        padded = wrapper._pad_goals(th.zeros((2, GOAL_STATE_SIZE)))
+
+        self.assertEqual(padded.shape, (2, GOAL_STATE_SIZE + 7 * 21))
+
+    def test_mixed_native_and_tracking_resets_keep_final_observation_width(self):
+        goal_size = 7 * 21
+
+        class Environment:
+            def step(self, action):
+                return (
+                    th.zeros((2, GOAL_STATE_SIZE)),
+                    th.zeros(2),
+                    th.tensor([True, False]),
+                    th.zeros(2, dtype=th.bool),
+                    {
+                        "final_obs": th.zeros((2, GOAL_STATE_SIZE)),
+                        "_final_obs": th.tensor([True, False]),
+                    },
+                )
+
+            @staticmethod
+            def _apply_reset_state(mask):
+                return
+
+            @staticmethod
+            def _clear_sim_stats(mask):
+                return
+
+            @staticmethod
+            def _observe():
+                return th.zeros((2, GOAL_STATE_SIZE))
+
+        class Replays:
+            goal_size = 7 * 21
+
+            @staticmethod
+            def current_expert_action(offset=0):
+                return (
+                    th.zeros((2, ACTION_FACTORS), dtype=th.long),
+                    th.ones((2, ACTION_FACTORS), dtype=th.bool),
+                )
+
+            @staticmethod
+            def next_goals(obs, mask=None):
+                count = len(obs)
+                return th.nn.functional.pad(obs, (0, goal_size)), th.zeros(
+                    count, dtype=th.bool
+                )
+
+        wrapper = ExpertLookaheadEnv.__new__(ExpertLookaheadEnv)
+        wrapper.env = Environment()
+        wrapper.replays = Replays()
+        wrapper.reward = SimpleNamespace(value=th.tensor([1.0, 0.0]))
+        wrapper.minimum_reward = 0.5
+        wrapper.minimum_tracking_frames = 1
+        wrapper._low_reward_frames = th.zeros(2, dtype=th.long)
+        wrapper._anchor_ball = lambda obs, native: obs
+
+        observation, _, _, _, info = wrapper.step(
+            th.zeros((2, ACTION_FACTORS), dtype=th.long)
+        )
+
+        expected_width = GOAL_STATE_SIZE + goal_size + 4
+        self.assertEqual(observation.shape, (2, expected_width))
+        self.assertEqual(info["final_obs"].shape, (2, expected_width))
+
     def test_expert_action_loss_uses_only_directional_targets(self):
         logits = th.zeros((2, 18), requires_grad=True)
         action_mask = th.ones((2, 18), dtype=th.bool)
