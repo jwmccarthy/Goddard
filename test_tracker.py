@@ -9,6 +9,7 @@ import torch as th
 import gymnasium as gym
 
 from carl.gymnasium import CARLObservation
+from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 from jarl.data.batch import TensorBatch
 
 from ballchasing_replays.parse_replays import _project_carl_actions
@@ -19,13 +20,11 @@ from tracker import (
     ACTION_FACTORS,
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
-    BETA_INITIAL_CONCENTRATION,
     DEFAULT_TRACKER_WINDOWS,
     EXPERT_TOUCH_INDEX,
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
-    HybridTrackerPolicy,
     POSITION_SCALE,
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
@@ -54,10 +53,12 @@ class TrackerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "legacy tracker checkpoint"):
                 load_tracker_policy(path, SimpleNamespace(device="cpu"), (1, 2), 4)
 
-    def test_tracker_policy_starts_with_edge_exploration(self):
-        observation_size = GOAL_STATE_SIZE + 21 * len(DEFAULT_TRACKER_WINDOWS) + 4
+    def test_tracker_policy_uses_all_categorical_action_factors(self):
+        observation_size = GOAL_STATE_SIZE + 21 * len(DEFAULT_TRACKER_WINDOWS)
         env = SimpleNamespace(
+            action_codec=CARLActionCodec(),
             device="cpu",
+            single_action_space=gym.spaces.MultiDiscrete(ACTION_NVECS),
             single_observation_space=gym.spaces.Box(
                 -np.inf,
                 np.inf,
@@ -66,28 +67,15 @@ class TrackerTest(unittest.TestCase):
             ),
         )
         policy = build_tracker_policy(env, DEFAULT_TRACKER_WINDOWS)
-
         observation = th.zeros((2, observation_size))
-        distribution = policy.dist(observation)
 
-        th.testing.assert_close(
-            distribution.concentration1,
-            th.full((2, 3), BETA_INITIAL_CONCENTRATION),
-        )
-        th.testing.assert_close(
-            distribution.concentration0,
-            th.full((2, 3), BETA_INITIAL_CONCENTRATION),
-        )
-        self.assertTrue((distribution.concentration1 < 1).all())
-
-        th.manual_seed(0)
-        observation = observation[:1].expand(1024, -1)
         output = policy.act(observation)
         evaluation = policy.evaluate_actions(observation, output.action)
-        learned = output.action[:, [0, 1, 5]]
+
+        self.assertEqual(output.action.dtype, th.int64)
+        self.assertEqual(output.action.shape, (2, ACTION_FACTORS))
+        self.assertEqual(evaluation.extras["factor_entropy"].shape, (2, ACTION_FACTORS))
         th.testing.assert_close(output.log_prob, evaluation.log_prob)
-        self.assertTrue(th.isfinite(output.log_prob).all())
-        self.assertGreater(learned.abs().gt(0.8).float().mean().item(), 0.3)
 
     def test_checkpoint_retention_does_not_delete_legacy_high_step_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -336,7 +324,6 @@ class TrackerTest(unittest.TestCase):
                 ("touch", 1),
                 ("current", 1),
                 ("next", 1),
-                ("raw_action", 1),
             ],
         )
         self.assertEqual(wrapper.replays.cursor, 2)
@@ -405,31 +392,9 @@ class TrackerTest(unittest.TestCase):
             th.zeros((2, ACTION_FACTORS), dtype=th.long)
         )
 
-        expected_width = GOAL_STATE_SIZE + goal_size + 4
+        expected_width = GOAL_STATE_SIZE + goal_size
         self.assertEqual(observation.shape, (2, expected_width))
         self.assertEqual(info["final_obs"].shape, (2, expected_width))
-
-    def test_hybrid_policy_inserts_raw_controls_and_scores_directions_only(self):
-        policy = HybridTrackerPolicy(
-            foot=th.nn.Identity(),
-            body=th.nn.Identity(),
-            head=th.nn.Linear(6, 6, bias=False),
-        )
-        th.nn.init.zeros_(policy.head.weight)
-        observation = th.tensor([[0.0, 0.0, 0.37, 1.0, 1.0, 1.0]])
-
-        output = policy.act(observation, deterministic=True)
-        evaluation = policy.evaluate_actions(observation, output.action)
-        altered = output.action.clone()
-        altered[:, [2, 3, 4, 6]] = 0
-        altered_evaluation = policy.evaluate_actions(observation, altered)
-
-        th.testing.assert_close(
-            output.action, th.tensor([[0.0, 0.0, 0.37, 1.0, 1.0, 0.0, 1.0]])
-        )
-        th.testing.assert_close(output.log_prob, evaluation.log_prob)
-        th.testing.assert_close(evaluation.log_prob, altered_evaluation.log_prob)
-        self.assertGreater(evaluation.entropy.item(), 0)
 
     def test_stateless_critic_capture_records_current_and_next_values(self):
         critic = SimpleNamespace(value=lambda observation: observation.sum(-1))

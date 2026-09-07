@@ -190,6 +190,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         max_ticks=1_000_000,
         normalize=True,
         synchronize=True,
+        discrete_actions=True,
     )
     replays = ExpertGoalStates(
         str(args.replay_dir),

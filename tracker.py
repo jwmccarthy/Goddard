@@ -1,5 +1,4 @@
 import argparse
-import math
 
 from collections.abc import Sequence
 from pathlib import Path
@@ -10,7 +9,6 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import gymnasium as gym
-from torch.distributions import Beta
 
 from replay_safety import infer_unsafe_start_mask, nearest_safe_start_map
 
@@ -25,7 +23,6 @@ from jarl.collect import (
 )
 from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.data.batch import TensorBatch
-from jarl.data.records import Evaluation, PolicyOutput
 from jarl.learn import (
     Algorithm,
     IndependentOptimizerSteps,
@@ -36,10 +33,9 @@ from jarl.learn import (
 )
 from jarl.log.logger import Logger
 from jarl.modules import GRU, MLP
-from jarl.modules.base import CompositeNet
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
-from jarl.modules.policy import Policy
+from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, Trainer
 from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
@@ -63,123 +59,20 @@ ACTION_FACTORS = 7
 RAW_ACTION_INDEX = EXPERT_TOUCH_INDEX + 1
 RAW_ACTION_SIZE = 8
 STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
-TRUSTED_ACTION_FACTORS = (2, 3, 4, 6)
-LEARNED_ACTION_FACTORS = (0, 1, 5)
-EXPERT_ACTION_HINT_SIZE = len(TRUSTED_ACTION_FACTORS)
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-BETA_MIN_CONCENTRATION = 0.1
-BETA_INITIAL_CONCENTRATION = 0.5
-TRACKER_ARCHITECTURE = "hybrid-edge-beta-gru-v1"
-
-
-def _initialize_beta_head(layer: nn.Linear) -> nn.Linear:
-    nn.init.zeros_(layer.weight)
-    initial_logit = math.log(math.expm1(
-        BETA_INITIAL_CONCENTRATION - BETA_MIN_CONCENTRATION
-    ))
-    nn.init.constant_(layer.bias, initial_logit)
-    return layer
-
-
-class HybridTrackerPolicy(Policy):
-    """Samples continuous directions and inserts trusted replay controls."""
-
-    def __init__(self, foot: nn.Module, body: nn.Module, head: nn.Module) -> None:
-        super().__init__(foot, body, head)
-        self.action_shape = (ACTION_FACTORS,)
-
-    def build(self, env: "ExpertLookaheadEnv"):
-        return CompositeNet.build(self, env, 2 * len(LEARNED_ACTION_FACTORS))
-
-    def body_features(
-        self,
-        observation: th.Tensor,
-        state: th.Tensor | None = None,
-        reset: th.Tensor | None = None,
-    ) -> tuple[th.Tensor, th.Tensor | None]:
-        features = self.foot(observation)
-        if hasattr(self.body, "initial_state"):
-            if state is not None and state.dtype != features.dtype and th.is_autocast_enabled():
-                state = state.to(features.dtype)
-            return self.body(features, state, reset)
-        if state is not None or reset is not None:
-            raise ValueError("stateless policy body does not accept state")
-        return self.body(features), None
-
-    def _distribution(self, features: th.Tensor) -> Beta:
-        alpha, beta = self.head(features).chunk(2, dim=-1)
-        return Beta(
-            nn.functional.softplus(alpha) + BETA_MIN_CONCENTRATION,
-            nn.functional.softplus(beta) + BETA_MIN_CONCENTRATION,
-        )
-
-    @staticmethod
-    def _log_prob(distribution: Beta, action: th.Tensor) -> th.Tensor:
-        unit = ((action + 1) / 2).clamp(1e-6, 1 - 1e-6)
-        return (distribution.log_prob(unit) - math.log(2)).sum(-1)
-
-    @staticmethod
-    def _full_action(observation: th.Tensor, learned: th.Tensor) -> th.Tensor:
-        action = learned.new_zeros((*learned.shape[:-1], ACTION_FACTORS))
-        action[..., list(LEARNED_ACTION_FACTORS)] = learned
-        action[..., list(TRUSTED_ACTION_FACTORS)] = observation[
-            ..., -EXPERT_ACTION_HINT_SIZE:
-        ]
-        return action
-
-    def act(
-        self,
-        observation: th.Tensor,
-        state: th.Tensor | None = None,
-        *,
-        deterministic: bool = False,
-    ) -> PolicyOutput:
-        features, next_state = self.body_features(observation, state)
-        distribution = self._distribution(features)
-        unit = distribution.mean if deterministic else distribution.sample()
-        learned = 2 * unit - 1
-        return PolicyOutput(
-            action=self._full_action(observation, learned),
-            next_state=next_state,
-            log_prob=self._log_prob(distribution, learned),
-        )
-
-    def evaluate_actions(
-        self,
-        observation: th.Tensor,
-        action: th.Tensor,
-        state: th.Tensor | None = None,
-        *,
-        reset: th.Tensor | None = None,
-    ) -> Evaluation:
-        features, _ = self.body_features(observation, state, reset)
-        distribution = self._distribution(features)
-        learned = action[..., list(LEARNED_ACTION_FACTORS)]
-        return Evaluation(
-            log_prob=self._log_prob(distribution, learned),
-            entropy=(distribution.entropy() + math.log(2)).sum(-1),
-        )
-
-    def dist(self, observation: th.Tensor) -> Beta:
-        features, _ = self.body_features(observation)
-        return self._distribution(features)
-
-    def action(self, observation: th.Tensor) -> th.Tensor:
-        return self.act(observation, deterministic=True).action
-
-    def sample(self, observation: th.Tensor) -> th.Tensor:
-        return self.act(observation).action
+TRACKER_ARCHITECTURE = "categorical-all-gru-v1"
 
 
 def build_tracker_policy(
     env: "ExpertLookaheadEnv",
     windows: Sequence[int],
-) -> HybridTrackerPolicy:
-    return HybridTrackerPolicy(
+) -> MultiCategoricalPolicy:
+    return MultiCategoricalPolicy(
         foot=LinearEncoder(TRACKER_FEATURE_SIZE, func=nn.SiLU),
         body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
-        head=MLP(dims=[], out_init_func=_initialize_beta_head),
+        head=MLP(dims=[]),
+        action_codec=env.action_codec,
     ).build(env).to(env.device)
 
 
@@ -199,7 +92,7 @@ def load_tracker_policy(
     env: "ExpertLookaheadEnv",
     windows: Sequence[int],
     frame_skip: int,
-) -> HybridTrackerPolicy:
+) -> MultiCategoricalPolicy:
     payload = th.load(path, map_location=env.device, weights_only=True)
     config = payload.get("config")
     if not isinstance(config, dict) or config.get("architecture") != TRACKER_ARCHITECTURE:
@@ -674,7 +567,7 @@ class ExpertLookaheadEnv:
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
         self.last_raw_expert_action: th.Tensor | None = None
 
-        size = GOAL_STATE_SIZE + replays.goal_size + EXPERT_ACTION_HINT_SIZE
+        size = GOAL_STATE_SIZE + replays.goal_size
 
         self.single_observation_space = gym.spaces.Box(
             -np.inf,
@@ -735,16 +628,9 @@ class ExpertLookaheadEnv:
         current = obs[..., :GOAL_STATE_SIZE]
         return th.nn.functional.pad(current, (0, self.replays.goal_size))
 
-    def _append_trusted_action(self, obs: th.Tensor) -> th.Tensor:
-        raw = self.replays.current_raw_action(offset=-1)
-        hints = raw[:, [0, 7, 6, 5]].clone()
-        hints[:, 0].clamp_(-1, 1)
-        hints[:, 1:] = hints[:, 1:].ge(0.5).to(hints.dtype)
-        return th.cat((obs, hints.to(obs.dtype)), dim=-1)
-
     def reset(self, **kwargs: Any) -> th.Tensor:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
-        return self._append_trusted_action(obs)
+        return obs
 
     def _anchor_ball(self, obs: th.Tensor, native: th.Tensor) -> th.Tensor:
         if self.reward.touched is None:
@@ -810,13 +696,6 @@ class ExpertLookaheadEnv:
             reset_obs, _ = self.replays.next_goals(reset_obs, reset)
             obs[reset] = reset_obs
 
-        obs = self._append_trusted_action(obs)
-        if "final_obs" in info and info["final_obs"].shape[-1] != obs.shape[-1]:
-            info = dict(info)
-            info["final_obs"] = th.nn.functional.pad(
-                info["final_obs"],
-                (0, EXPERT_ACTION_HINT_SIZE),
-            )
         return obs, reward, term | reset, trunc, info
 
 
@@ -880,6 +759,7 @@ def main() -> None:
         frameskip=args.frameskip,
         max_ticks=1_000_000,
         normalize=True,
+        discrete_actions=True,
     )
 
     replays = ExpertGoalStates(

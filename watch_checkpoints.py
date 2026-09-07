@@ -275,6 +275,7 @@ def simulate(
             normalize=True,
             synchronize=True,
             reset_state_provider=reset_sampler,
+            discrete_actions=True,
         )
         blue_payload = th.load(blue_path, map_location="cpu", weights_only=True)
         orange_payload = th.load(orange_path, map_location="cpu", weights_only=True)

@@ -197,12 +197,15 @@ function setCar(mesh, state) {
 }
 
 const source = new EventSource('/api/stream');
+const axis = ['0', '-1', '+1'];
 function setAction(fields, actions) {
-  fields.forEach((field, index) => {
-    field.textContent = [3, 4, 6].includes(index)
-      ? Number(actions[index] >= 0.5)
-      : actions[index].toFixed(2);
-  });
+  fields[0].textContent = axis[actions[0]];
+  fields[1].textContent = axis[actions[1]];
+  fields[2].textContent = axis[actions[2]];
+  fields[3].textContent = actions[3];
+  fields[4].textContent = actions[4];
+  fields[5].textContent = axis[actions[5]];
+  fields[6].textContent = actions[6];
 }
 
 function setRawAction(actions) {

@@ -427,6 +427,28 @@ class SelfPlayTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._assert_skill_semantics_match(loaded, args)
 
+    def test_continuous_action_artifact_is_rejected(self):
+        source = make_controller()
+        payload = {
+            "prior": source.prior.state_dict(),
+            "decoder": source.decoder.state_dict(),
+            "config": {
+                "action_format": "mixed-continuous-v1",
+                "latent_size": 3,
+                "encoder_hidden": [8],
+                "decoder_hidden": [8],
+                "frameskip": 4,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "distill.pt"
+            th.save(payload, checkpoint)
+
+            with self.assertRaisesRegex(RuntimeError, "incompatible action format"):
+                FrozenPulseController.load(
+                    checkpoint, AllValidActionCodec(), "cpu", frame_skip=4
+                )
+
     def test_distill_artifact_skill_semantics_must_match_args(self):
         source = make_controller(max_duration=12)
         payload = {

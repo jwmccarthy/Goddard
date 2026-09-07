@@ -40,7 +40,8 @@ from distill import (
     ActionDecoder,
     ConditionalPrior,
     GOAL_STATE_SIZE,
-    mixed_actions,
+    factor_actions,
+    masked_logits,
 )
 from physics_utils import forward_up_to_quat
 from replay_safety import infer_unsafe_start_mask
@@ -207,7 +208,7 @@ class FrozenPulseController(nn.Module):
         payload = th.load(checkpoint, map_location=device, weights_only=True)
         config = payload["config"]
         if config.get("action_format") != ACTION_FORMAT:
-            raise RuntimeError("distillation checkpoint uses legacy categorical actions")
+            raise RuntimeError("distillation checkpoint uses an incompatible action format")
         if frame_skip is not None and int(config["frameskip"]) != frame_skip:
             raise ValueError(
                 "self-play frame skip does not match the distillation artifact"
@@ -277,8 +278,8 @@ class FrozenPulseController(nn.Module):
                 latent = prior_mean + residual
             else:
                 latent = residual
-            output = self.decoder(state, latent)
-        return mixed_actions(output)
+            logits = self.decoder(state, latent)
+        return factor_actions(masked_logits(logits, state, self.action_codec))
 
 
 class PulseLatentEnv:
@@ -1152,6 +1153,7 @@ def main() -> None:
         normalize=True,
         reset_state_provider=reset_sampler,
         reward_funcs=(reward,),
+        discrete_actions=True,
     )
     controller = FrozenPulseController.load(
         args.distill_checkpoint,
