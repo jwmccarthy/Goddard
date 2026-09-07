@@ -122,6 +122,7 @@ def frame_from_state(
     action:     th.Tensor,
     expert_action: th.Tensor,
     expert_action_valid: th.Tensor,
+    raw_expert_action: th.Tensor,
 ) -> dict:
     cars = state[9:31].view(1, 22)
     rendered = []
@@ -153,6 +154,7 @@ def frame_from_state(
         "action":     action[0].cpu().tolist(),
         "expert_action": expert_action[0].cpu().tolist(),
         "expert_action_valid": expert_action_valid[0].cpu().tolist(),
+        "raw_expert_action": raw_expert_action[0].cpu().tolist(),
         "ball":       {"pos": state[:3].cpu().tolist()},
         "cars":       rendered,
         "expert":     frame_from_expert(expert),
@@ -168,6 +170,7 @@ def publish_frame(
     action:     th.Tensor,
     expert_action: th.Tensor,
     expert_action_valid: th.Tensor,
+    raw_expert_action: th.Tensor,
 ) -> None:
     th.cuda.synchronize(base.device)
     raw = th.from_dlpack(base._env.get_state()).clone()[0]
@@ -181,6 +184,7 @@ def publish_frame(
         action,
         expert_action,
         expert_action_valid,
+        raw_expert_action,
     ))
 
 
@@ -225,6 +229,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         observation = env.reset()
         empty_expert_action = th.zeros((1, 7), dtype=th.long, device=env.device)
         empty_expert_valid = th.zeros((1, 7), dtype=th.bool, device=env.device)
+        empty_raw_expert_action = th.zeros((1, 8), device=env.device)
         publish_frame(
             viewer,
             base,
@@ -234,6 +239,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
             th.zeros((1, 7), dtype=th.long, device=env.device),
             empty_expert_action,
             empty_expert_valid,
+            empty_raw_expert_action,
         )
         viewer.stop.wait(viewer.frame_time(args.frameskip))
         next_step = time.perf_counter()
@@ -259,6 +265,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     th.zeros((1, 7), dtype=th.long, device=env.device),
                     empty_expert_action,
                     empty_expert_valid,
+                    empty_raw_expert_action,
                 )
                 viewer.stop.wait(viewer.frame_time(args.frameskip))
                 next_step = time.perf_counter()
@@ -281,6 +288,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     th.zeros((1, 7), dtype=th.long, device=env.device),
                     empty_expert_action,
                     empty_expert_valid,
+                    empty_raw_expert_action,
                 )
                 viewer.stop.wait(viewer.frame_time(args.frameskip))
                 next_step = time.perf_counter()
@@ -300,16 +308,22 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     policy_state = policy_state.clone()
                     policy_state[done] = 0
 
-            if env.last_expert_action is None or env.last_expert_action_valid is None:
+            if (
+                env.last_expert_action is None
+                or env.last_expert_action_valid is None
+                or env.last_raw_expert_action is None
+            ):
                 raise RuntimeError("tracker environment did not expose expert actions")
             if done.any():
                 reward = th.zeros_like(reward)
                 action = th.zeros_like(action)
                 expert_action = empty_expert_action
                 expert_valid = empty_expert_valid
+                raw_expert_action = empty_raw_expert_action
             else:
                 expert_action = env.last_expert_action
                 expert_valid = env.last_expert_action_valid
+                raw_expert_action = env.last_raw_expert_action
             publish_frame(
                 viewer,
                 base,
@@ -319,6 +333,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                 action,
                 expert_action,
                 expert_valid,
+                raw_expert_action,
             )
 
             next_step += viewer.frame_time(args.frameskip)

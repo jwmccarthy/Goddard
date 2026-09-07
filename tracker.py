@@ -29,7 +29,6 @@ from jarl.learn import (
     OptimizerStep,
     PPOConfig,
     PPOLoss,
-    LossOutput,
     Update,
 )
 from jarl.log.logger import Logger
@@ -38,7 +37,7 @@ from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, Trainer
-from jarl.sample import RecurrentRolloutMinibatches, SequenceBatch
+from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
@@ -59,7 +58,9 @@ EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
 EXPERT_ACTION_INDEX = EXPERT_TOUCH_INDEX + 1
 ACTION_FACTORS = 7
 EXPERT_ACTION_MASK_INDEX = EXPERT_ACTION_INDEX + ACTION_FACTORS
-STORED_REPLAY_SIZE = EXPERT_ACTION_MASK_INDEX + ACTION_FACTORS
+RAW_ACTION_INDEX = EXPERT_ACTION_MASK_INDEX + ACTION_FACTORS
+RAW_ACTION_SIZE = 8
+STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
 SUPERVISED_ACTION_FACTORS = (2, 3, 4, 6)
 LEARNED_ACTION_FACTORS = (0, 1, 5)
 EXPERT_ACTION_HINT_SIZE = len(SUPERVISED_ACTION_FACTORS)
@@ -166,18 +167,20 @@ def load_tracker_policy(
     return policy
 
 
-def _expert_action_labels(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _expert_action_labels(
+    raw: np.ndarray,
+    on_ground: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     if raw.ndim != 2 or raw.shape[1] != 8:
         raise ValueError(f"raw replay actions have shape {raw.shape}, expected [N, 8]")
     if not np.isfinite(raw).all():
         raise ValueError("raw replay actions contain non-finite values")
+    if on_ground.shape != (len(raw),):
+        raise ValueError("on-ground mask must have shape [N]")
 
     labels = np.zeros((len(raw), ACTION_FACTORS), dtype=np.int64)
-    horizontal_error = (
-        (CARL_AXES[:, None] - raw[:, 1]) ** 2
-        + (CARL_AXES[:, None] - raw[:, 3]) ** 2
-    )
-    labels[:, 0] = horizontal_error.argmin(axis=0)
+    horizontal = np.where(on_ground, raw[:, 1], raw[:, 3])
+    labels[:, 0] = np.abs(CARL_AXES[:, None] - horizontal).argmin(axis=0)
     labels[:, 1] = np.abs(CARL_AXES[:, None] - raw[:, 2]).argmin(axis=0)
     labels[:, 2] = np.abs(CARL_AXES[:, None] - raw[:, 0]).argmin(axis=0)
     labels[:, 3] = raw[:, 7] >= 0.5
@@ -256,12 +259,15 @@ class ExpertGoalStates:
                     f"expert actions for {path.name} have {len(raw_actions)} rows, "
                     f"expected {len(source)}"
                 )
-            labels, valid = _expert_action_labels(raw_actions)
+            internal_start = 83 + 27 * replay_cars
+            on_ground = source[:, internal_start].astype(bool)
+            labels, valid = _expert_action_labels(raw_actions, on_ground)
             demos = self._filter(
                 source,
                 self._unsafe_mask(path, source),
                 labels,
                 valid,
+                raw_actions,
             )
 
             replays.extend(demo for demo, _ in demos)
@@ -345,6 +351,7 @@ class ExpertGoalStates:
         unsafe: np.ndarray,
         expert_actions: np.ndarray | None = None,
         expert_action_valid: np.ndarray | None = None,
+        raw_actions: np.ndarray | None = None,
     ) -> list[tuple[th.Tensor, th.Tensor]]:
         n_cars = self._infer_n_cars(demo.shape[1])
         internal_start = 83 + 27 * n_cars
@@ -352,15 +359,20 @@ class ExpertGoalStates:
             expert_actions = np.zeros((len(demo), ACTION_FACTORS), dtype=np.int64)
         if expert_action_valid is None:
             expert_action_valid = np.zeros((len(demo), ACTION_FACTORS), dtype=bool)
+        if raw_actions is None:
+            raw_actions = np.zeros((len(demo), RAW_ACTION_SIZE), dtype=np.float32)
         expected = (len(demo), ACTION_FACTORS)
         if expert_actions.shape != expected or expert_action_valid.shape != expected:
             raise ValueError("expert action labels and masks must have shape [N, 7]")
+        if raw_actions.shape != (len(demo), RAW_ACTION_SIZE):
+            raise ValueError("raw expert actions must have shape [N, 8]")
         observation = np.concatenate((
             demo[:, :GOAL_STATE_SIZE],
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
             demo[:, -5, None],
             expert_actions,
             expert_action_valid,
+            raw_actions,
         ), axis=-1).astype(np.float32, copy=False)
         invalid = demo[:, -4:].astype(bool).any(axis=-1)
 
@@ -493,8 +505,12 @@ class ExpertGoalStates:
         rows = self._replays[self._cursors + offset]
         return (
             rows[:, EXPERT_ACTION_INDEX:EXPERT_ACTION_MASK_INDEX].long(),
-            rows[:, EXPERT_ACTION_MASK_INDEX:STORED_REPLAY_SIZE].bool(),
+            rows[:, EXPERT_ACTION_MASK_INDEX:RAW_ACTION_INDEX].bool(),
         )
+
+    def current_raw_action(self, offset: int = 0) -> th.Tensor:
+        rows = self._replays[self._cursors + offset]
+        return rows[:, RAW_ACTION_INDEX:STORED_REPLAY_SIZE]
 
     def current_demo_name(self) -> str:
         return self._demo_names[self._demo_id[0].item()]
@@ -658,6 +674,7 @@ class ExpertLookaheadEnv:
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
         self.last_expert_action: th.Tensor | None = None
         self.last_expert_action_valid: th.Tensor | None = None
+        self.last_raw_expert_action: th.Tensor | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size + EXPERT_ACTION_HINT_SIZE
 
@@ -756,6 +773,7 @@ class ExpertLookaheadEnv:
             self.last_expert_action,
             self.last_expert_action_valid,
         ) = self.replays.current_expert_action(offset=-1)
+        self.last_raw_expert_action = self.replays.current_raw_action(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
         obs = self._anchor_ball(obs, native)
@@ -806,18 +824,6 @@ class ExpertLookaheadEnv:
         return obs, reward, term | reset, trunc, info
 
 
-class ExpertActionCapture(CaptureBase):
-    def __init__(self, env: ExpertLookaheadEnv) -> None:
-        self.env = env
-
-    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
-        action = self.env.last_expert_action
-        valid = self.env.last_expert_action_valid
-        if action is None or valid is None:
-            raise RuntimeError("environment did not expose expert actions for the step")
-        return {"expert_action": action}
-
-
 class StatelessCriticCapture(CaptureBase):
     def __init__(self, critic: Critic) -> None:
         self.critic = critic
@@ -832,114 +838,6 @@ class StatelessCriticCapture(CaptureBase):
             "baseline_value": self.critic.value(context.observation),
             "baseline_next_value": self.critic.value(next_observation),
         }
-
-
-def _expert_action_loss(
-    logits: th.Tensor,
-    action_mask: th.Tensor,
-    expert_action: th.Tensor,
-    sequence_valid: th.Tensor,
-    sizes: Sequence[int],
-) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
-    losses = []
-    accuracies = []
-    valid_rates = []
-    split_logits = logits.split(tuple(sizes), dim=-1)
-    split_masks = action_mask.split(tuple(sizes), dim=-1)
-    for index in LEARNED_ACTION_FACTORS:
-        factor_logits = split_logits[index]
-        factor_mask = split_masks[index]
-        target = expert_action[..., index]
-        target_legal = factor_mask.gather(-1, target[..., None]).squeeze(-1)
-        valid = sequence_valid & target_legal
-        if not valid.any():
-            continue
-
-        masked_logits = factor_logits.masked_fill(
-            ~factor_mask,
-            th.finfo(factor_logits.dtype).min,
-        ).float()
-        factor_loss = nn.functional.cross_entropy(masked_logits[valid], target[valid])
-        factor_accuracy = (
-            masked_logits[valid].argmax(-1) == target[valid]
-        ).float().mean()
-        losses.append(factor_loss)
-        accuracies.append(factor_accuracy)
-        valid_rates.append(valid.float().mean())
-
-    if not losses:
-        zero = logits.sum() * 0
-        return zero, logits.new_zeros(()), logits.new_zeros(())
-
-    return (
-        th.stack(losses).mean(),
-        th.stack(accuracies).mean(),
-        th.stack(valid_rates).mean(),
-    )
-
-
-class ExpertActionPPOLoss(PPOLoss):
-    def __init__(
-        self,
-        policy: MultiCategoricalPolicy,
-        critic: Critic,
-        config: PPOConfig,
-        weight: float,
-    ) -> None:
-        if not np.isfinite(weight) or weight < 0:
-            raise ValueError("inferred action weight must be finite and nonnegative")
-        super().__init__(policy, critic, config)
-        self.weight = weight
-        self._expert_logits: th.Tensor | None = None
-
-    def _evaluate(self, batch, state, critic_state, reset):
-        observation = batch["observation"]
-        features, _ = self.policy.body_features(observation, state, reset)
-        evaluation = self.policy.evaluate_from_features(
-            features,
-            observation,
-            batch["action"],
-        )
-        self._expert_logits = self.policy.head(features)
-
-        value = evaluation.value
-        if value is None:
-            if self.critic_recurrent:
-                if critic_state is None:
-                    raise ValueError("recurrent critic requires an initial state")
-                value = self.critic.evaluate_values(
-                    observation,
-                    critic_state,
-                    reset=reset,
-                )
-            else:
-                value = self.critic.evaluate_values(observation)
-        return evaluation, value
-
-    def __call__(self, sample: TensorBatch | SequenceBatch) -> LossOutput:
-        output = super().__call__(sample)
-        batch, _, _, _, sequence_valid = self._unpack_sample(sample)
-        logits = self._expert_logits
-        if logits is None:
-            raise RuntimeError("PPO evaluation did not expose tracker logits")
-        action_mask = self.policy.action_codec.mask(batch["observation"])
-        expert_action = batch["expert_action"].long()
-        expert_loss, expert_accuracy, expert_valid_rate = _expert_action_loss(
-            logits,
-            action_mask,
-            expert_action,
-            sequence_valid,
-            self.policy.sizes,
-        )
-
-        return LossOutput(
-            output.loss + self.weight * expert_loss,
-            output.metrics | {
-                "expert_action_loss": expert_loss,
-                "expert_action_accuracy": expert_accuracy,
-                "expert_action_valid_rate": expert_valid_rate,
-            },
-        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -961,7 +859,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs",                  type=int,   default=2)
     parser.add_argument("--sequence-length",         type=int,   default=32)
     parser.add_argument("--lr",                      type=float, default=3e-5)
-    parser.add_argument("--inferred-action-weight",  type=float, default=0.01)
     parser.add_argument("--max-grad-norm",           type=float, default=0.5)
     parser.add_argument("--timesteps",               type=int,   default=1_000_000_000)
     parser.add_argument("--seed",                    type=int,   default=0)
@@ -1026,7 +923,6 @@ def main() -> None:
             LogProbCapture(),
             RecurrentStateCapture(),
             StatelessCriticCapture(critic),
-            ExpertActionCapture(env),
         ),
     )
 
@@ -1043,10 +939,9 @@ def main() -> None:
                 "old_log_prob",
                 "baseline_value",
                 "returns",
-                "expert_action",
             ),
         ),
-        loss=ExpertActionPPOLoss(
+        loss=PPOLoss(
             policy,
             critic,
             PPOConfig(
@@ -1054,7 +949,6 @@ def main() -> None:
                 value_clip=None,
                 entropy_coef=0.001,
             ),
-            args.inferred_action_weight,
         ),
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(

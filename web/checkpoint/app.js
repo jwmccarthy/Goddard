@@ -28,6 +28,16 @@ const expertActionFields = [
   document.getElementById('expert-action-roll'),
   document.getElementById('expert-action-jump'),
 ];
+const rawActionFields = [
+  document.getElementById('raw-action-throttle'),
+  document.getElementById('raw-action-steer'),
+  document.getElementById('raw-action-pitch'),
+  document.getElementById('raw-action-yaw'),
+  document.getElementById('raw-action-roll'),
+  document.getElementById('raw-action-jump'),
+  document.getElementById('raw-action-boost'),
+  document.getElementById('raw-action-slide'),
+];
 const demoSearch = document.getElementById('demo-search');
 const demoQuery = document.getElementById('demo-query');
 const connection = document.getElementById('connection');
@@ -207,6 +217,12 @@ function setAction(fields, actions) {
   fields[6].textContent = actions[6];
 }
 
+function setRawAction(actions) {
+  rawActionFields.forEach((field, index) => {
+    field.textContent = actions[index].toFixed(index < 5 ? 2 : 0);
+  });
+}
+
 source.onopen = () => {
   connection.textContent = 'Live';
   connection.classList.add('live');
@@ -227,6 +243,7 @@ source.onmessage = ({ data }) => {
   const actions = Array.isArray(frame.action[0]) ? frame.action[0] : frame.action;
   setAction(actionFields, actions);
   setAction(expertActionFields, frame.expert_action);
+  setRawAction(frame.raw_expert_action);
   expertActionFields.forEach((field, index) => {
     field.parentElement.classList.toggle('inferred', !frame.expert_action_valid[index]);
   });

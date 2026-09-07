@@ -28,7 +28,6 @@ from tracker import (
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
-    _expert_action_loss,
     _expert_action_labels,
     load_tracker_policy,
 )
@@ -72,7 +71,7 @@ class TrackerTest(unittest.TestCase):
         raw[:, 1:5] = np.asarray([-1.0, 0.0, 1.0])[:, None]
         raw[1, 5:] = [1.0, 1.0, 1.0]
 
-        labels, valid = _expert_action_labels(raw)
+        labels, valid = _expert_action_labels(raw, np.ones(3, dtype=bool))
 
         np.testing.assert_array_equal(labels[:, 2], [1, 0, 2])
         np.testing.assert_array_equal(labels[:, 0], [1, 0, 2])
@@ -81,6 +80,15 @@ class TrackerTest(unittest.TestCase):
         np.testing.assert_array_equal(labels[1, [3, 4, 6]], [1, 1, 1])
         self.assertFalse(valid[:, [0, 1, 5]].any())
         self.assertTrue(valid[:, [2, 3, 4, 6]].all())
+
+    def test_expert_horizontal_uses_steer_on_ground_and_yaw_in_air(self):
+        raw = np.zeros((2, 8), dtype=np.float32)
+        raw[:, 1] = [-1.0, -1.0]
+        raw[:, 3] = [1.0, 1.0]
+
+        labels, _ = _expert_action_labels(raw, np.asarray([True, False]))
+
+        np.testing.assert_array_equal(labels[:, 0], [1, 2])
 
     def test_parser_projection_uses_carl_axis_class_order(self):
         raw = np.zeros((3, 8), dtype=np.float32)
@@ -275,6 +283,10 @@ class TrackerTest(unittest.TestCase):
                     th.ones((1, ACTION_FACTORS), dtype=th.bool),
                 )
 
+            def current_raw_action(self, offset=0):
+                events.append(("raw_action", self.cursor + offset))
+                return th.full((1, 8), float(self.cursor + offset))
+
             def current_ego_touch(self):
                 events.append(("touch", self.cursor))
                 return th.tensor([False])
@@ -309,6 +321,7 @@ class TrackerTest(unittest.TestCase):
             events,
             [
                 ("action", 0),
+                ("raw_action", 0),
                 ("touch", 1),
                 ("current", 1),
                 ("next", 1),
@@ -320,6 +333,7 @@ class TrackerTest(unittest.TestCase):
             wrapper.last_expert_action,
             th.zeros((1, ACTION_FACTORS), dtype=th.long),
         )
+        th.testing.assert_close(wrapper.last_raw_expert_action, th.zeros((1, 8)))
 
     def test_native_final_observation_padding_defers_action_hints(self):
         wrapper = ExpertLookaheadEnv.__new__(ExpertLookaheadEnv)
@@ -368,6 +382,10 @@ class TrackerTest(unittest.TestCase):
                 )
 
             @staticmethod
+            def current_raw_action(offset=0):
+                return th.zeros((2, 8))
+
+            @staticmethod
             def next_goals(obs, mask=None):
                 count = len(obs)
                 return th.nn.functional.pad(obs, (0, goal_size)), th.zeros(
@@ -390,33 +408,6 @@ class TrackerTest(unittest.TestCase):
         expected_width = GOAL_STATE_SIZE + goal_size + 4
         self.assertEqual(observation.shape, (2, expected_width))
         self.assertEqual(info["final_obs"].shape, (2, expected_width))
-
-    def test_expert_action_loss_uses_only_directional_targets(self):
-        logits = th.zeros((2, 18), requires_grad=True)
-        action_mask = th.ones((2, 18), dtype=th.bool)
-        expert_action = th.zeros((2, ACTION_FACTORS), dtype=th.long)
-        expert_action[:, 2] = th.tensor([1, 2])
-        expert_action[:, 4] = 1
-        loss, _, _ = _expert_action_loss(
-            logits,
-            action_mask,
-            expert_action,
-            th.ones(2, dtype=th.bool),
-            (3, 3, 3, 2, 2, 3, 2),
-        )
-
-        self.assertAlmostEqual(loss.item(), np.log(3), places=6)
-
-    def test_expert_action_loss_trains_inferred_factors_on_valid_sequence_steps(self):
-        loss, _, _ = _expert_action_loss(
-            th.zeros((2, 1, 18), requires_grad=True),
-            th.ones((2, 1, 18), dtype=th.bool),
-            th.zeros((2, 1, ACTION_FACTORS), dtype=th.long),
-            th.tensor([[True], [False]]),
-            (3, 3, 3, 2, 2, 3, 2),
-        )
-
-        self.assertAlmostEqual(loss.item(), np.log(3), places=6)
 
     def test_hybrid_policy_inserts_trusted_controls_and_scores_directions_only(self):
         class Codec:
@@ -473,6 +464,7 @@ class TrackerTest(unittest.TestCase):
     def test_demonstration_frame_includes_expert_actions_and_confidence(self):
         expert_action = th.tensor([[1, 2, 0, 1, 0, 2, 1]])
         expert_valid = th.tensor([[False, False, True, True, True, False, True]])
+        raw_expert_action = th.tensor([[0.25, -0.5, 0.75, 1.0, 0.0, 1.0, 0.0, 1.0]])
 
         frame = frame_from_state(
             th.zeros(31),
@@ -483,10 +475,12 @@ class TrackerTest(unittest.TestCase):
             th.zeros((1, ACTION_FACTORS), dtype=th.long),
             expert_action,
             expert_valid,
+            raw_expert_action,
         )
 
         self.assertEqual(frame["expert_action"], expert_action[0].tolist())
         self.assertEqual(frame["expert_action_valid"], expert_valid[0].tolist())
+        self.assertEqual(frame["raw_expert_action"], raw_expert_action[0].tolist())
 
     @staticmethod
     def _anchor_fixture(expert_touch: bool = False):
