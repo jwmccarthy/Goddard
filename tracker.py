@@ -1,4 +1,5 @@
 import argparse
+import math
 
 from collections.abc import Sequence
 from pathlib import Path
@@ -9,6 +10,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import gymnasium as gym
+from torch.distributions import Beta
 
 from replay_safety import infer_unsafe_start_mask, nearest_safe_start_map
 
@@ -23,6 +25,7 @@ from jarl.collect import (
 )
 from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.data.batch import TensorBatch
+from jarl.data.records import Evaluation, PolicyOutput
 from jarl.learn import (
     Algorithm,
     IndependentOptimizerSteps,
@@ -33,9 +36,10 @@ from jarl.learn import (
 )
 from jarl.log.logger import Logger
 from jarl.modules import GRU, MLP
+from jarl.modules.base import CompositeNet
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
-from jarl.modules.policy import MultiCategoricalPolicy
+from jarl.modules.policy import Policy
 from jarl.runtime import OnPolicySchedule, Trainer
 from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
@@ -55,81 +59,113 @@ GOAL_STATE_SIZE    = 30
 CAR_STATE_SIZE     = 21
 INTERNAL_STATE_SIZE = 19
 EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
-EXPERT_ACTION_INDEX = EXPERT_TOUCH_INDEX + 1
 ACTION_FACTORS = 7
-EXPERT_ACTION_MASK_INDEX = EXPERT_ACTION_INDEX + ACTION_FACTORS
-RAW_ACTION_INDEX = EXPERT_ACTION_MASK_INDEX + ACTION_FACTORS
+RAW_ACTION_INDEX = EXPERT_TOUCH_INDEX + 1
 RAW_ACTION_SIZE = 8
 STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
-SUPERVISED_ACTION_FACTORS = (2, 3, 4, 6)
+TRUSTED_ACTION_FACTORS = (2, 3, 4, 6)
 LEARNED_ACTION_FACTORS = (0, 1, 5)
-EXPERT_ACTION_HINT_SIZE = len(SUPERVISED_ACTION_FACTORS)
-CARL_AXES = np.asarray([0.0, -1.0, 1.0], dtype=np.float32)
+EXPERT_ACTION_HINT_SIZE = len(TRUSTED_ACTION_FACTORS)
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-TRACKER_ARCHITECTURE = "hybrid-flat-gru-v1"
+TRACKER_ARCHITECTURE = "hybrid-beta-gru-v1"
 
 
-class HybridTrackerPolicy(MultiCategoricalPolicy):
-    """Samples directional controls and inserts trusted replay controls."""
+class HybridTrackerPolicy(Policy):
+    """Samples continuous directions and inserts trusted replay controls."""
 
-    def act_from_features(
+    def __init__(self, foot: nn.Module, body: nn.Module, head: nn.Module) -> None:
+        super().__init__(foot, body, head)
+        self.action_shape = (ACTION_FACTORS,)
+
+    def build(self, env: "ExpertLookaheadEnv"):
+        return CompositeNet.build(self, env, 2 * len(LEARNED_ACTION_FACTORS))
+
+    def body_features(
         self,
-        features: th.Tensor,
         observation: th.Tensor,
+        state: th.Tensor | None = None,
+        reset: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor | None]:
+        features = self.foot(observation)
+        if hasattr(self.body, "initial_state"):
+            if state is not None and state.dtype != features.dtype and th.is_autocast_enabled():
+                state = state.to(features.dtype)
+            return self.body(features, state, reset)
+        if state is not None or reset is not None:
+            raise ValueError("stateless policy body does not accept state")
+        return self.body(features), None
+
+    def _distribution(self, features: th.Tensor) -> Beta:
+        alpha, beta = self.head(features).chunk(2, dim=-1)
+        return Beta(nn.functional.softplus(alpha) + 1, nn.functional.softplus(beta) + 1)
+
+    @staticmethod
+    def _log_prob(distribution: Beta, action: th.Tensor) -> th.Tensor:
+        unit = ((action + 1) / 2).clamp(1e-6, 1 - 1e-6)
+        return (distribution.log_prob(unit) - math.log(2)).sum(-1)
+
+    @staticmethod
+    def _full_action(observation: th.Tensor, learned: th.Tensor) -> th.Tensor:
+        action = learned.new_zeros((*learned.shape[:-1], ACTION_FACTORS))
+        action[..., list(LEARNED_ACTION_FACTORS)] = learned
+        action[..., list(TRUSTED_ACTION_FACTORS)] = observation[
+            ..., -EXPERT_ACTION_HINT_SIZE:
+        ]
+        return action
+
+    def act(
+        self,
+        observation: th.Tensor,
+        state: th.Tensor | None = None,
         *,
         deterministic: bool = False,
-    ):
-        output = super().act_from_features(
-            features,
-            observation,
-            deterministic=deterministic,
+    ) -> PolicyOutput:
+        features, next_state = self.body_features(observation, state)
+        distribution = self._distribution(features)
+        unit = distribution.mean if deterministic else distribution.sample()
+        learned = 2 * unit - 1
+        return PolicyOutput(
+            action=self._full_action(observation, learned),
+            next_state=next_state,
+            log_prob=self._log_prob(distribution, learned),
         )
-        action = output.action.reshape(*output.action.shape[:-1], -1).clone()
-        trusted = observation[..., -EXPERT_ACTION_HINT_SIZE:].long()
-        split_mask = self.action_codec.mask(observation).split(self.sizes, dim=-1)
-        for hint, factor in enumerate(SUPERVISED_ACTION_FACTORS):
-            target = trusted[..., hint]
-            legal = split_mask[factor].gather(-1, target[..., None]).squeeze(-1)
-            action[..., factor] = th.where(legal, target, th.zeros_like(target))
-        output.action = action.reshape(*action.shape[:-1], *self.action_shape)
-        return output
 
-    def evaluate_from_features(
+    def evaluate_actions(
         self,
-        features: th.Tensor,
         observation: th.Tensor,
         action: th.Tensor,
-    ):
-        evaluation = super().evaluate_from_features(features, observation, action)
-        factor_entropy = evaluation.extras["factor_entropy"]
-        evaluation.entropy = factor_entropy[..., list(LEARNED_ACTION_FACTORS)].sum(-1)
-        return evaluation
+        state: th.Tensor | None = None,
+        *,
+        reset: th.Tensor | None = None,
+    ) -> Evaluation:
+        features, _ = self.body_features(observation, state, reset)
+        distribution = self._distribution(features)
+        learned = action[..., list(LEARNED_ACTION_FACTORS)]
+        return Evaluation(
+            log_prob=self._log_prob(distribution, learned),
+            entropy=(distribution.entropy() + math.log(2)).sum(-1),
+        )
 
-    def _grouped_logprob(self, distributions, action: th.Tensor) -> th.Tensor:
-        action = action.reshape(*action.shape[:-len(self.action_shape)], -1)
-        terms = []
-        for indices, distribution in distributions:
-            positions = [
-                position
-                for position, factor in enumerate(indices)
-                if factor in LEARNED_ACTION_FACTORS
-            ]
-            if positions:
-                factor_log_prob = distribution.log_prob(action[..., list(indices)])
-                terms.append(factor_log_prob[..., positions].sum(-1))
-        return sum(terms)
+    def dist(self, observation: th.Tensor) -> Beta:
+        features, _ = self.body_features(observation)
+        return self._distribution(features)
+
+    def action(self, observation: th.Tensor) -> th.Tensor:
+        return self.act(observation, deterministic=True).action
+
+    def sample(self, observation: th.Tensor) -> th.Tensor:
+        return self.act(observation).action
 
 
 def build_tracker_policy(
     env: "ExpertLookaheadEnv",
     windows: Sequence[int],
-) -> MultiCategoricalPolicy:
+) -> HybridTrackerPolicy:
     return HybridTrackerPolicy(
         foot=LinearEncoder(TRACKER_FEATURE_SIZE, func=nn.SiLU),
         body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
         head=MLP(dims=[]),
-        action_codec=env.action_codec,
     ).build(env).to(env.device)
 
 
@@ -149,7 +185,7 @@ def load_tracker_policy(
     env: "ExpertLookaheadEnv",
     windows: Sequence[int],
     frame_skip: int,
-) -> MultiCategoricalPolicy:
+) -> HybridTrackerPolicy:
     payload = th.load(path, map_location=env.device, weights_only=True)
     config = payload.get("config")
     if not isinstance(config, dict) or config.get("architecture") != TRACKER_ARCHITECTURE:
@@ -165,32 +201,6 @@ def load_tracker_policy(
     policy = build_tracker_policy(env, windows)
     policy.load_state_dict(payload["policy"])
     return policy
-
-
-def _expert_action_labels(
-    raw: np.ndarray,
-    on_ground: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    if raw.ndim != 2 or raw.shape[1] != 8:
-        raise ValueError(f"raw replay actions have shape {raw.shape}, expected [N, 8]")
-    if not np.isfinite(raw).all():
-        raise ValueError("raw replay actions contain non-finite values")
-    if on_ground.shape != (len(raw),):
-        raise ValueError("on-ground mask must have shape [N]")
-
-    labels = np.zeros((len(raw), ACTION_FACTORS), dtype=np.int64)
-    horizontal = np.where(on_ground, raw[:, 1], raw[:, 3])
-    labels[:, 0] = np.abs(CARL_AXES[:, None] - horizontal).argmin(axis=0)
-    labels[:, 1] = np.abs(CARL_AXES[:, None] - raw[:, 2]).argmin(axis=0)
-    labels[:, 2] = np.abs(CARL_AXES[:, None] - raw[:, 0]).argmin(axis=0)
-    labels[:, 3] = raw[:, 7] >= 0.5
-    labels[:, 4] = raw[:, 6] >= 0.5
-    labels[:, 5] = np.abs(CARL_AXES[:, None] - raw[:, 4]).argmin(axis=0)
-    labels[:, 6] = raw[:, 5] >= 0.5
-
-    valid = np.zeros_like(labels, dtype=bool)
-    valid[:, SUPERVISED_ACTION_FACTORS] = True
-    return labels, valid
 
 
 class ExpertGoalStates:
@@ -259,14 +269,9 @@ class ExpertGoalStates:
                     f"expert actions for {path.name} have {len(raw_actions)} rows, "
                     f"expected {len(source)}"
                 )
-            internal_start = 83 + 27 * replay_cars
-            on_ground = source[:, internal_start].astype(bool)
-            labels, valid = _expert_action_labels(raw_actions, on_ground)
             demos = self._filter(
                 source,
                 self._unsafe_mask(path, source),
-                labels,
-                valid,
                 raw_actions,
             )
 
@@ -349,29 +354,20 @@ class ExpertGoalStates:
         self,
         demo:   np.ndarray,
         unsafe: np.ndarray,
-        expert_actions: np.ndarray | None = None,
-        expert_action_valid: np.ndarray | None = None,
         raw_actions: np.ndarray | None = None,
     ) -> list[tuple[th.Tensor, th.Tensor]]:
         n_cars = self._infer_n_cars(demo.shape[1])
         internal_start = 83 + 27 * n_cars
-        if expert_actions is None:
-            expert_actions = np.zeros((len(demo), ACTION_FACTORS), dtype=np.int64)
-        if expert_action_valid is None:
-            expert_action_valid = np.zeros((len(demo), ACTION_FACTORS), dtype=bool)
         if raw_actions is None:
             raw_actions = np.zeros((len(demo), RAW_ACTION_SIZE), dtype=np.float32)
-        expected = (len(demo), ACTION_FACTORS)
-        if expert_actions.shape != expected or expert_action_valid.shape != expected:
-            raise ValueError("expert action labels and masks must have shape [N, 7]")
         if raw_actions.shape != (len(demo), RAW_ACTION_SIZE):
             raise ValueError("raw expert actions must have shape [N, 8]")
+        if not np.isfinite(raw_actions).all():
+            raise ValueError("raw expert actions contain non-finite values")
         observation = np.concatenate((
             demo[:, :GOAL_STATE_SIZE],
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
             demo[:, -5, None],
-            expert_actions,
-            expert_action_valid,
             raw_actions,
         ), axis=-1).astype(np.float32, copy=False)
         invalid = demo[:, -4:].astype(bool).any(axis=-1)
@@ -497,16 +493,6 @@ class ExpertGoalStates:
 
     def current_ego_touch(self) -> th.Tensor:
         return self._replays[self._cursors, EXPERT_TOUCH_INDEX].bool()
-
-    def current_expert_action(
-        self,
-        offset: int = 0,
-    ) -> tuple[th.Tensor, th.Tensor]:
-        rows = self._replays[self._cursors + offset]
-        return (
-            rows[:, EXPERT_ACTION_INDEX:EXPERT_ACTION_MASK_INDEX].long(),
-            rows[:, EXPERT_ACTION_MASK_INDEX:RAW_ACTION_INDEX].bool(),
-        )
 
     def current_raw_action(self, offset: int = 0) -> th.Tensor:
         rows = self._replays[self._cursors + offset]
@@ -672,8 +658,6 @@ class ExpertLookaheadEnv:
         self._low_reward_frames = th.zeros(env.n_envs, dtype=th.long, device=env.device)
         self._ball_anchored = th.ones(env.n_sim, dtype=th.bool, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
-        self.last_expert_action: th.Tensor | None = None
-        self.last_expert_action_valid: th.Tensor | None = None
         self.last_raw_expert_action: th.Tensor | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size + EXPERT_ACTION_HINT_SIZE
@@ -737,14 +721,16 @@ class ExpertLookaheadEnv:
         current = obs[..., :GOAL_STATE_SIZE]
         return th.nn.functional.pad(current, (0, self.replays.goal_size))
 
-    def _append_expert_action(self, obs: th.Tensor) -> th.Tensor:
-        action, _ = self.replays.current_expert_action(offset=-1)
-        hints = action[:, list(SUPERVISED_ACTION_FACTORS)]
+    def _append_trusted_action(self, obs: th.Tensor) -> th.Tensor:
+        raw = self.replays.current_raw_action(offset=-1)
+        hints = raw[:, [0, 7, 6, 5]].clone()
+        hints[:, 0].clamp_(-1, 1)
+        hints[:, 1:] = hints[:, 1:].ge(0.5).to(hints.dtype)
         return th.cat((obs, hints.to(obs.dtype)), dim=-1)
 
     def reset(self, **kwargs: Any) -> th.Tensor:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
-        return self._append_expert_action(obs)
+        return self._append_trusted_action(obs)
 
     def _anchor_ball(self, obs: th.Tensor, native: th.Tensor) -> th.Tensor:
         if self.reward.touched is None:
@@ -769,10 +755,6 @@ class ExpertLookaheadEnv:
         )
 
     def step(self, action: th.Tensor | np.ndarray):
-        (
-            self.last_expert_action,
-            self.last_expert_action_valid,
-        ) = self.replays.current_expert_action(offset=-1)
         self.last_raw_expert_action = self.replays.current_raw_action(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
@@ -814,7 +796,7 @@ class ExpertLookaheadEnv:
             reset_obs, _ = self.replays.next_goals(reset_obs, reset)
             obs[reset] = reset_obs
 
-        obs = self._append_expert_action(obs)
+        obs = self._append_trusted_action(obs)
         if "final_obs" in info and info["final_obs"].shape[-1] != obs.shape[-1]:
             info = dict(info)
             info["final_obs"] = th.nn.functional.pad(

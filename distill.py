@@ -17,7 +17,6 @@ from jarl.data.records import PolicyOutput
 from jarl.learn import Algorithm, LossOutput, OptimizerStep, TransformRollout, Update
 from jarl.log.logger import Logger
 from jarl.modules import MLP
-from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import (
     OnPolicySchedule,
     ScheduledValue,
@@ -44,8 +43,10 @@ from tracker import (
 )
 
 
-ACTION_SIZES = (3, 3, 3, 2, 2, 3, 2)
-ACTION_DIM = sum(ACTION_SIZES)
+ACTION_DIM = 7
+ANALOG_ACTION_FACTORS = (0, 1, 2, 5)
+BUTTON_ACTION_FACTORS = (3, 4, 6)
+ACTION_FORMAT = "mixed-continuous-v1"
 
 
 def mlp(in_dim: int, hidden: list[int], out_dim: int) -> nn.Sequential:
@@ -141,11 +142,10 @@ class ActionDecoder(nn.Module):
 
 
 class PulsePolicy(nn.Module):
-    def __init__(self, encoder: GaussianEncoder, decoder: ActionDecoder, action_codec) -> None:
+    def __init__(self, encoder: GaussianEncoder, decoder: ActionDecoder) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.action_codec = action_codec
 
     @property
     def device(self) -> th.device:
@@ -166,12 +166,7 @@ class PulsePolicy(nn.Module):
         environment_state = observation[..., :GOAL_STATE_SIZE]
         mean, log_variance = self.encoder(observation)
         latent = mean if deterministic else reparameterize(mean, log_variance)
-        logits = masked_logits(
-            self.decoder(environment_state, latent),
-            environment_state,
-            self.action_codec,
-        )
-        return PolicyOutput(action=factor_actions(logits))
+        return PolicyOutput(action=mixed_actions(self.decoder(environment_state, latent)))
 
 
 def reparameterize(mean: th.Tensor, log_variance: th.Tensor) -> th.Tensor:
@@ -208,52 +203,44 @@ def kl_coefficient(
     return initial + fraction * (final - initial)
 
 
-def masked_logits(logits: th.Tensor, state: th.Tensor, action_codec) -> th.Tensor:
-    mask = action_codec.mask(state)
-    if mask.shape != logits.shape:
-        raise ValueError(
-            f"action mask shape {mask.shape} does not match logits {logits.shape}"
-        )
-    return logits.masked_fill(~mask, th.finfo(logits.dtype).min)
+def mixed_actions(output: th.Tensor) -> th.Tensor:
+    action = output.clone()
+    action[..., list(ANALOG_ACTION_FACTORS)] = action[
+        ..., list(ANALOG_ACTION_FACTORS)
+    ].tanh()
+    action[..., list(BUTTON_ACTION_FACTORS)] = action[
+        ..., list(BUTTON_ACTION_FACTORS)
+    ].ge(0).to(action.dtype)
+    return action
 
 
-def factor_actions(logits: th.Tensor) -> th.Tensor:
-    return th.stack(
-        [factor.argmax(dim=-1) for factor in logits.split(ACTION_SIZES, dim=-1)],
-        dim=-1,
-    )
-
-
-def categorical_distillation_loss(
-    logits: th.Tensor,
+def mixed_distillation_loss(
+    output: th.Tensor,
     target: th.Tensor,
     valid: th.Tensor | None = None,
 ) -> tuple[th.Tensor, th.Tensor]:
-    """Factorised cross-entropy and hard accuracy, optionally masked over frames.
-
-    When ``valid`` is provided, only the ``valid`` rows contribute to the loss
-    and accuracy; the averages are per factor and then across factors.
-    """
-    losses = []
-    correct = []
-    for index, factor in enumerate(logits.split(ACTION_SIZES, dim=-1)):
-        target_factor = target[:, index]
-        if valid is None:
-            losses.append(
-                nn.functional.cross_entropy(factor, target_factor, reduction="mean")
-            )
-            correct.append(
-                (factor.argmax(dim=-1) == target_factor).float().mean()
-            )
-        else:
-            cross_entropy = nn.functional.cross_entropy(
-                factor, target_factor, reduction="none"
-            )
-            count = valid.sum().clamp(min=1)
-            losses.append((cross_entropy * valid).sum() / count)
-            accuracy = (factor.argmax(dim=-1) == target_factor).float()
-            correct.append((accuracy * valid).sum() / count)
-    return th.stack(losses, dim=-1).mean(), th.stack(correct, dim=-1).mean()
+    analog = output[..., list(ANALOG_ACTION_FACTORS)].tanh()
+    target_analog = target[..., list(ANALOG_ACTION_FACTORS)]
+    button = output[..., list(BUTTON_ACTION_FACTORS)]
+    target_button = target[..., list(BUTTON_ACTION_FACTORS)]
+    analog_loss = (analog - target_analog).square().mean(-1)
+    button_loss = nn.functional.binary_cross_entropy_with_logits(
+        button, target_button, reduction="none"
+    ).mean(-1)
+    analog_score = 1 - (analog - target_analog).abs().mean(-1) / 2
+    button_score = (button.ge(0) == target_button.ge(0.5)).float().mean(-1)
+    score = (
+        len(ANALOG_ACTION_FACTORS) * analog_score
+        + len(BUTTON_ACTION_FACTORS) * button_score
+    ) / ACTION_DIM
+    loss = (
+        len(ANALOG_ACTION_FACTORS) * analog_loss
+        + len(BUTTON_ACTION_FACTORS) * button_loss
+    ) / ACTION_DIM
+    if valid is None:
+        return loss.mean(), score.mean()
+    count = valid.sum().clamp(min=1)
+    return (loss * valid).sum() / count, (score * valid).sum() / count
 
 
 def load_teacher(
@@ -261,7 +248,7 @@ def load_teacher(
     env: ExpertLookaheadEnv,
     windows,
     frame_skip: int,
-) -> MultiCategoricalPolicy:
+):
     try:
         teacher = load_tracker_policy(path, env, windows, frame_skip)
     except (RuntimeError, ValueError) as error:
@@ -273,7 +260,7 @@ def load_teacher(
 
 
 class TeacherActionCapture(CaptureBase):
-    def __init__(self, teacher: MultiCategoricalPolicy) -> None:
+    def __init__(self, teacher) -> None:
         self.teacher = teacher
 
     @th.no_grad()
@@ -284,9 +271,18 @@ class TeacherActionCapture(CaptureBase):
 class DistillRolloutTransform:
     def __call__(self, batch: TensorBatch, context) -> TensorBatch:
         done = batch["terminated"] | batch["truncated"]
-        action_agreement = (
-            batch["action"] == batch["teacher_action"]
+        analog_error = (
+            batch["action"][..., list(ANALOG_ACTION_FACTORS)]
+            - batch["teacher_action"][..., list(ANALOG_ACTION_FACTORS)]
+        ).abs().mean(dim=-1)
+        button_agreement = (
+            batch["action"][..., list(BUTTON_ACTION_FACTORS)].ge(0.5)
+            == batch["teacher_action"][..., list(BUTTON_ACTION_FACTORS)].ge(0.5)
         ).float().mean(dim=-1)
+        action_agreement = (
+            len(ANALOG_ACTION_FACTORS) * (1 - analog_error / 2)
+            + len(BUTTON_ACTION_FACTORS) * button_agreement
+        ) / ACTION_DIM
         return batch.with_fields(
             action_agreement=action_agreement,
             reset_fraction=done.float(),
@@ -298,13 +294,11 @@ class PulseLoss:
         self,
         policy: PulsePolicy,
         prior: ConditionalPrior,
-        action_codec,
         kl_weight: float,
         prior_action_weight: float,
     ) -> None:
         self.policy = policy
         self.prior = prior
-        self.action_codec = action_codec
         self.kl_weight = kl_weight
         self.prior_action_weight = prior_action_weight
 
@@ -344,25 +338,17 @@ class PulseLoss:
         flat_teacher_action = teacher_action[valid]
 
         flat_latent = latent.unsqueeze(1).expand(-1, observation.shape[1], -1)[valid]
-        posterior_logits = masked_logits(
-            self.policy.decoder(flat_state, flat_latent),
-            flat_state,
-            self.action_codec,
-        )
-        posterior_loss, posterior_accuracy = categorical_distillation_loss(
-            posterior_logits, flat_teacher_action
+        posterior_output = self.policy.decoder(flat_state, flat_latent)
+        posterior_loss, posterior_accuracy = mixed_distillation_loss(
+            posterior_output, flat_teacher_action
         )
 
         flat_prior_mean = (
             prior_mean.unsqueeze(1).expand(-1, observation.shape[1], -1)[valid]
         )
-        prior_logits = masked_logits(
-            self.policy.decoder(flat_state, flat_prior_mean),
-            flat_state,
-            self.action_codec,
-        )
-        prior_loss, prior_accuracy = categorical_distillation_loss(
-            prior_logits, flat_teacher_action
+        prior_output = self.policy.decoder(flat_state, flat_prior_mean)
+        prior_loss, prior_accuracy = mixed_distillation_loss(
+            prior_output, flat_teacher_action
         )
 
         total = (
@@ -508,7 +494,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def serialized_config(args: argparse.Namespace) -> dict[str, object]:
-    return {
+    return {"action_format": ACTION_FORMAT} | {
         name: str(value) if isinstance(value, Path) else value
         for name, value in vars(args).items()
     }
@@ -518,6 +504,7 @@ def validate_resume_config(
     stored: dict[str, object], args: argparse.Namespace
 ) -> None:
     immutable = (
+        "action_format",
         "replay_dir",
         "tracker_checkpoint",
         "frameskip",
@@ -587,7 +574,6 @@ def main() -> None:
     policy = PulsePolicy(
         GaussianEncoder(observation_dim, args.latent_size, args.encoder_hidden),
         ActionDecoder(GOAL_STATE_SIZE, args.latent_size, args.decoder_hidden),
-        env.action_codec,
     ).to(env.device)
     prior = ConditionalPrior(
         GOAL_STATE_SIZE,
@@ -612,7 +598,6 @@ def main() -> None:
     loss = PulseLoss(
         policy,
         prior,
-        env.action_codec,
         args.kl_initial,
         args.prior_action_weight,
     )

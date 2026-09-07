@@ -28,7 +28,6 @@ from tracker import (
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
-    _expert_action_labels,
     load_tracker_policy,
 )
 
@@ -64,31 +63,6 @@ class TrackerTest(unittest.TestCase):
             self.assertTrue(legacy.exists())
             self.assertFalse((directory / "tracker_000000000000.pt").exists())
             self.assertTrue((directory / "tracker_000000000001.pt").exists())
-
-    def test_expert_action_labels_only_supervise_direct_controls(self):
-        raw = np.zeros((3, 8), dtype=np.float32)
-        raw[:, 0] = [-1.0, 0.0, 1.0]
-        raw[:, 1:5] = np.asarray([-1.0, 0.0, 1.0])[:, None]
-        raw[1, 5:] = [1.0, 1.0, 1.0]
-
-        labels, valid = _expert_action_labels(raw, np.ones(3, dtype=bool))
-
-        np.testing.assert_array_equal(labels[:, 2], [1, 0, 2])
-        np.testing.assert_array_equal(labels[:, 0], [1, 0, 2])
-        np.testing.assert_array_equal(labels[:, 1], [1, 0, 2])
-        np.testing.assert_array_equal(labels[:, 5], [1, 0, 2])
-        np.testing.assert_array_equal(labels[1, [3, 4, 6]], [1, 1, 1])
-        self.assertFalse(valid[:, [0, 1, 5]].any())
-        self.assertTrue(valid[:, [2, 3, 4, 6]].all())
-
-    def test_expert_horizontal_uses_steer_on_ground_and_yaw_in_air(self):
-        raw = np.zeros((2, 8), dtype=np.float32)
-        raw[:, 1] = [-1.0, -1.0]
-        raw[:, 3] = [1.0, 1.0]
-
-        labels, _ = _expert_action_labels(raw, np.asarray([True, False]))
-
-        np.testing.assert_array_equal(labels[:, 0], [1, 2])
 
     def test_parser_projection_uses_carl_axis_class_order(self):
         raw = np.zeros((3, 8), dtype=np.float32)
@@ -276,13 +250,6 @@ class TrackerTest(unittest.TestCase):
         class Replays:
             cursor = 1
 
-            def current_expert_action(self, offset=0):
-                events.append(("action", self.cursor + offset))
-                return (
-                    th.full((1, ACTION_FACTORS), self.cursor + offset),
-                    th.ones((1, ACTION_FACTORS), dtype=th.bool),
-                )
-
             def current_raw_action(self, offset=0):
                 events.append(("raw_action", self.cursor + offset))
                 return th.full((1, 8), float(self.cursor + offset))
@@ -320,19 +287,14 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("action", 0),
                 ("raw_action", 0),
                 ("touch", 1),
                 ("current", 1),
                 ("next", 1),
-                ("action", 1),
+                ("raw_action", 1),
             ],
         )
         self.assertEqual(wrapper.replays.cursor, 2)
-        th.testing.assert_close(
-            wrapper.last_expert_action,
-            th.zeros((1, ACTION_FACTORS), dtype=th.long),
-        )
         th.testing.assert_close(wrapper.last_raw_expert_action, th.zeros((1, 8)))
 
     def test_native_final_observation_padding_defers_action_hints(self):
@@ -375,13 +337,6 @@ class TrackerTest(unittest.TestCase):
             goal_size = 7 * 21
 
             @staticmethod
-            def current_expert_action(offset=0):
-                return (
-                    th.zeros((2, ACTION_FACTORS), dtype=th.long),
-                    th.ones((2, ACTION_FACTORS), dtype=th.bool),
-                )
-
-            @staticmethod
             def current_raw_action(offset=0):
                 return th.zeros((2, 8))
 
@@ -409,45 +364,27 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(observation.shape, (2, expected_width))
         self.assertEqual(info["final_obs"].shape, (2, expected_width))
 
-    def test_hybrid_policy_inserts_trusted_controls_and_scores_directions_only(self):
-        class Codec:
-            action_shape = (7,)
-
-            @staticmethod
-            def mask(observation):
-                return th.ones((*observation.shape[:-1], 18), dtype=th.bool)
-
+    def test_hybrid_policy_inserts_raw_controls_and_scores_directions_only(self):
         policy = HybridTrackerPolicy(
             foot=th.nn.Identity(),
             body=th.nn.Identity(),
-            head=th.nn.Linear(2, 18, bias=False),
-            action_codec=Codec(),
+            head=th.nn.Linear(6, 6, bias=False),
         )
-        policy.sizes = (3, 3, 3, 2, 2, 3, 2)
-        policy.action_shape = (7,)
         th.nn.init.zeros_(policy.head.weight)
-        observation = th.tensor([[0.0, 0.0, 2.0, 1.0, 1.0, 1.0]])
+        observation = th.tensor([[0.0, 0.0, 0.37, 1.0, 1.0, 1.0]])
 
-        output = policy.act_from_features(
-            th.zeros((1, 2)),
-            observation,
-            deterministic=True,
-        )
-        evaluation = policy.evaluate_from_features(
-            th.zeros((1, 2)),
-            observation,
-            output.action,
-        )
+        output = policy.act(observation, deterministic=True)
+        evaluation = policy.evaluate_actions(observation, output.action)
+        altered = output.action.clone()
+        altered[:, [2, 3, 4, 6]] = 0
+        altered_evaluation = policy.evaluate_actions(observation, altered)
 
-        th.testing.assert_close(output.action, th.tensor([[0, 0, 2, 1, 1, 0, 1]]))
         th.testing.assert_close(
-            output.log_prob,
-            output.log_prob.new_tensor([-3 * np.log(3)]),
+            output.action, th.tensor([[0.0, 0.0, 0.37, 1.0, 1.0, 0.0, 1.0]])
         )
-        th.testing.assert_close(
-            evaluation.entropy,
-            evaluation.entropy.new_tensor([3 * np.log(3)]),
-        )
+        th.testing.assert_close(output.log_prob, evaluation.log_prob)
+        th.testing.assert_close(evaluation.log_prob, altered_evaluation.log_prob)
+        self.assertGreater(evaluation.entropy.item(), 0)
 
     def test_stateless_critic_capture_records_current_and_next_values(self):
         critic = SimpleNamespace(value=lambda observation: observation.sum(-1))
@@ -461,9 +398,7 @@ class TrackerTest(unittest.TestCase):
         th.testing.assert_close(captured["baseline_value"], th.tensor([3.0]))
         th.testing.assert_close(captured["baseline_next_value"], th.tensor([7.0]))
 
-    def test_demonstration_frame_includes_expert_actions_and_confidence(self):
-        expert_action = th.tensor([[1, 2, 0, 1, 0, 2, 1]])
-        expert_valid = th.tensor([[False, False, True, True, True, False, True]])
+    def test_demonstration_frame_includes_raw_expert_actions(self):
         raw_expert_action = th.tensor([[0.25, -0.5, 0.75, 1.0, 0.0, 1.0, 0.0, 1.0]])
 
         frame = frame_from_state(
@@ -472,14 +407,10 @@ class TrackerTest(unittest.TestCase):
             th.tensor([1.0]),
             th.zeros(GOAL_STATE_SIZE),
             "demo",
-            th.zeros((1, ACTION_FACTORS), dtype=th.long),
-            expert_action,
-            expert_valid,
+            th.zeros((1, ACTION_FACTORS)),
             raw_expert_action,
         )
 
-        self.assertEqual(frame["expert_action"], expert_action[0].tolist())
-        self.assertEqual(frame["expert_action_valid"], expert_valid[0].tolist())
         self.assertEqual(frame["raw_expert_action"], raw_expert_action[0].tolist())
 
     @staticmethod

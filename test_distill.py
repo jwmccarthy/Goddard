@@ -7,7 +7,8 @@ import torch as th
 import torch.nn as nn
 
 from distill import (
-    ACTION_SIZES,
+    ANALOG_ACTION_FACTORS,
+    BUTTON_ACTION_FACTORS,
     ActionDecoder,
     ConditionalPrior,
     DistillCheckpoints,
@@ -16,21 +17,14 @@ from distill import (
     PulseLoss,
     PulsePolicy,
     TrajectoryChunkMinibatches,
-    categorical_distillation_loss,
     diagonal_gaussian_kl,
-    factor_actions,
     kl_coefficient,
+    mixed_actions,
+    mixed_distillation_loss,
     validate_args,
 )
 from jarl.data.batch import TensorBatch
 from tracker import GOAL_STATE_SIZE
-
-
-class AllValidActionCodec:
-    def mask(self, state: th.Tensor) -> th.Tensor:
-        return th.ones(
-            (*state.shape[:-1], 18), dtype=th.bool, device=state.device
-        )
 
 
 class RecordingDecoder(nn.Module):
@@ -41,7 +35,7 @@ class RecordingDecoder(nn.Module):
     def forward(self, state: th.Tensor, latent: th.Tensor) -> th.Tensor:
         self.calls.append((state.detach().clone(), latent.detach().clone()))
         return th.zeros(
-            state.shape[0], 18, device=state.device, dtype=state.dtype
+            state.shape[0], 7, device=state.device, dtype=state.dtype
         )
 
 
@@ -121,46 +115,41 @@ class ConditionalPriorTest(unittest.TestCase):
         self.assertFalse(th.allclose(mean_a, mean_b))
 
 
-class CategoricalDistillationLossTest(unittest.TestCase):
-    def test_factorized_action_loss_and_argmax(self):
-        target = th.tensor([[2, 1, 0, 1, 0, 2, 1]])
-        logits = th.full((1, 18), -5.0)
-        offset = 0
-        for size, value in zip((3, 3, 3, 2, 2, 3, 2), target[0]):
-            logits[0, offset + value] = 5.0
-            offset += size
+class MixedDistillationLossTest(unittest.TestCase):
+    def test_mixed_action_loss_and_decode(self):
+        target = th.tensor([[0.5, -0.25, 0.8, 1.0, 0.0, -0.75, 1.0]])
+        output = th.zeros((1, 7))
+        output[:, list(ANALOG_ACTION_FACTORS)] = th.atanh(
+            target[:, list(ANALOG_ACTION_FACTORS)]
+        )
+        output[:, list(BUTTON_ACTION_FACTORS)] = th.tensor([[10.0, -10.0, 10.0]])
 
-        loss, accuracy = categorical_distillation_loss(logits, target)
+        loss, score = mixed_distillation_loss(output, target)
 
-        th.testing.assert_close(factor_actions(logits), target)
+        th.testing.assert_close(mixed_actions(output), target)
         self.assertLess(loss.item(), 0.001)
-        self.assertEqual(accuracy.item(), 1.0)
+        self.assertGreater(score.item(), 0.999)
 
     def test_valid_mask_ignores_invalid_frames(self):
-        target = th.tensor([[2, 1, 0, 1, 0, 2, 1]])
-        logits = th.full((4, 18), -5.0)
-        for row, value in enumerate(target):
-            offset = 0
-            for size, action in zip((3, 3, 3, 2, 2, 3, 2), target[0]):
-                logits[row, offset + action] = 5.0
-                offset += size
+        target = th.zeros((4, 7))
+        output = th.zeros((4, 7))
 
-        masked_loss, masked_accuracy = categorical_distillation_loss(
-            logits, target.repeat(4, 1), valid=th.tensor([True, True, False, False])
+        masked_loss, masked_accuracy = mixed_distillation_loss(
+            output, target, valid=th.tensor([True, True, False, False])
         )
-        full_loss, full_accuracy = categorical_distillation_loss(
-            logits[:2], target.repeat(2, 1)
+        full_loss, full_accuracy = mixed_distillation_loss(
+            output[:2], target[:2]
         )
 
         th.testing.assert_close(masked_loss, full_loss)
         th.testing.assert_close(masked_accuracy, full_accuracy)
 
     def test_all_invalid_frames_return_zero(self):
-        target = th.zeros((4, 7), dtype=th.long)
-        logits = th.zeros((4, 18))
+        target = th.zeros((4, 7))
+        output = th.zeros((4, 7))
 
-        loss, accuracy = categorical_distillation_loss(
-            logits, target, valid=th.zeros(4, dtype=th.bool)
+        loss, accuracy = mixed_distillation_loss(
+            output, target, valid=th.zeros(4, dtype=th.bool)
         )
 
         self.assertEqual(loss.item(), 0.0)
@@ -173,19 +162,19 @@ class PulseLossTest(unittest.TestCase):
         latent_size = 2
         encoder = GaussianEncoder(GOAL_STATE_SIZE, latent_size, [16])
         decoder = RecordingDecoder()
-        policy = PulsePolicy(encoder, decoder, AllValidActionCodec())
+        policy = PulsePolicy(encoder, decoder)
         prior = ConditionalPrior(GOAL_STATE_SIZE, latent_size, [16], max_duration=4)
         loss = PulseLoss(
             policy,
             prior,
-            AllValidActionCodec(),
             kl_weight=0.1,
             prior_action_weight=0.5,
         )
 
-        teacher_action = th.stack(
-            [th.randint(0, size, (2, 3)) for size in ACTION_SIZES], dim=-1
-        )
+        teacher_action = th.rand((2, 3, 7)) * 2 - 1
+        teacher_action[..., list(BUTTON_ACTION_FACTORS)] = th.randint(
+            0, 2, (2, 3, len(BUTTON_ACTION_FACTORS))
+        ).float()
         batch = TensorBatch(
             {
                 "observation": th.randn(2, 3, GOAL_STATE_SIZE),
@@ -219,7 +208,7 @@ class TrajectoryChunkMinibatchesTest(unittest.TestCase):
                 "observation": th.arange(time * envs * 30, dtype=th.float32).reshape(
                     time, envs, 30
                 ),
-                "teacher_action": th.zeros(time, envs, 7, dtype=th.long),
+                "teacher_action": th.zeros(time, envs, 7),
                 "terminated": th.zeros(time, envs, dtype=th.bool),
                 "truncated": th.zeros(time, envs, dtype=th.bool),
             }
@@ -287,7 +276,7 @@ class DistillRolloutTransformTest(unittest.TestCase):
         observation = th.arange(18, dtype=th.float32).reshape(3, 2, 3)
         terminated = th.tensor([[False, False], [True, False], [False, False]])
         truncated = th.tensor([[False, True], [False, False], [False, False]])
-        action = th.zeros((3, 2, 7), dtype=th.long)
+        action = th.zeros((3, 2, 7))
         teacher_action = action.clone()
         teacher_action[2, 1, 0] = 1
         batch = TensorBatch(
@@ -305,7 +294,7 @@ class DistillRolloutTransformTest(unittest.TestCase):
         self.assertIn("action_agreement", transformed)
         self.assertIn("reset_fraction", transformed)
         self.assertAlmostEqual(
-            transformed["action_agreement"][2, 1].item(), 6 / 7
+            transformed["action_agreement"][2, 1].item(), 6.5 / 7
         )
         th.testing.assert_close(
             transformed["reset_fraction"],

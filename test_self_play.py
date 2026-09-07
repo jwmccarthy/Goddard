@@ -13,7 +13,7 @@ import torch as th
 from gymnasium.vector.utils import batch_space
 
 from carl.gymnasium.state import CarlEvents, CarlState, RewardContext
-from distill import ActionDecoder, ConditionalPrior, GOAL_STATE_SIZE
+from distill import ACTION_FORMAT, ActionDecoder, ConditionalPrior, GOAL_STATE_SIZE
 from jarl.data.records import PolicyOutput
 from jarl.modules import GRU, MLP
 from jarl.modules.encoder import LinearEncoder
@@ -247,6 +247,7 @@ class SelfPlayTest(unittest.TestCase):
             "prior": source.prior.state_dict(),
             "decoder": source.decoder.state_dict(),
             "config": {
+                "action_format": ACTION_FORMAT,
                 "latent_size": 3,
                 "encoder_hidden": [8],
                 "decoder_hidden": [8],
@@ -314,6 +315,7 @@ class SelfPlayTest(unittest.TestCase):
             "prior": source.prior.state_dict(),
             "decoder": source.decoder.state_dict(),
             "config": {
+                "action_format": ACTION_FORMAT,
                 "latent_size": 3,
                 "encoder_hidden": [8],
                 "decoder_hidden": [8],
@@ -404,6 +406,7 @@ class SelfPlayTest(unittest.TestCase):
             "prior": source.prior.state_dict(),
             "decoder": source.decoder.state_dict(),
             "config": {
+                "action_format": ACTION_FORMAT,
                 "latent_size": 3,
                 "encoder_hidden": [8],
                 "decoder_hidden": [8],
@@ -430,6 +433,7 @@ class SelfPlayTest(unittest.TestCase):
             "prior": source.prior.state_dict(),
             "decoder": source.decoder.state_dict(),
             "config": {
+                "action_format": ACTION_FORMAT,
                 "latent_size": 3,
                 "encoder_hidden": [8],
                 "decoder_hidden": [8],

@@ -36,11 +36,11 @@ from jarl.store.rollout import Rollout
 from jarl.transform import SemiMarkovGAE
 
 from distill import (
+    ACTION_FORMAT,
     ActionDecoder,
     ConditionalPrior,
     GOAL_STATE_SIZE,
-    factor_actions,
-    masked_logits,
+    mixed_actions,
 )
 from physics_utils import forward_up_to_quat
 from replay_safety import infer_unsafe_start_mask
@@ -206,6 +206,8 @@ class FrozenPulseController(nn.Module):
     ) -> "FrozenPulseController":
         payload = th.load(checkpoint, map_location=device, weights_only=True)
         config = payload["config"]
+        if config.get("action_format") != ACTION_FORMAT:
+            raise RuntimeError("distillation checkpoint uses legacy categorical actions")
         if frame_skip is not None and int(config["frameskip"]) != frame_skip:
             raise ValueError(
                 "self-play frame skip does not match the distillation artifact"
@@ -275,8 +277,8 @@ class FrozenPulseController(nn.Module):
                 latent = prior_mean + residual
             else:
                 latent = residual
-            logits = self.decoder(state, latent)
-        return factor_actions(masked_logits(logits, state, self.action_codec))
+            output = self.decoder(state, latent)
+        return mixed_actions(output)
 
 
 class PulseLatentEnv:

@@ -19,15 +19,6 @@ const actionFields = [
   document.getElementById('action-roll'),
   document.getElementById('action-jump'),
 ];
-const expertActionFields = [
-  document.getElementById('expert-action-horizontal'),
-  document.getElementById('expert-action-vertical'),
-  document.getElementById('expert-action-throttle'),
-  document.getElementById('expert-action-slide'),
-  document.getElementById('expert-action-boost'),
-  document.getElementById('expert-action-roll'),
-  document.getElementById('expert-action-jump'),
-];
 const rawActionFields = [
   document.getElementById('raw-action-throttle'),
   document.getElementById('raw-action-steer'),
@@ -206,15 +197,12 @@ function setCar(mesh, state) {
 }
 
 const source = new EventSource('/api/stream');
-const axis = ['0', '-1', '+1'];
 function setAction(fields, actions) {
-  fields[0].textContent = axis[actions[0]];
-  fields[1].textContent = axis[actions[1]];
-  fields[2].textContent = axis[actions[2]];
-  fields[3].textContent = actions[3];
-  fields[4].textContent = actions[4];
-  fields[5].textContent = axis[actions[5]];
-  fields[6].textContent = actions[6];
+  fields.forEach((field, index) => {
+    field.textContent = [3, 4, 6].includes(index)
+      ? Number(actions[index] >= 0.5)
+      : actions[index].toFixed(2);
+  });
 }
 
 function setRawAction(actions) {
@@ -242,11 +230,7 @@ source.onmessage = ({ data }) => {
   expertBoostFill.style.width = `${frame.expert.cars[0].boost}%`;
   const actions = Array.isArray(frame.action[0]) ? frame.action[0] : frame.action;
   setAction(actionFields, actions);
-  setAction(expertActionFields, frame.expert_action);
   setRawAction(frame.raw_expert_action);
-  expertActionFields.forEach((field, index) => {
-    field.parentElement.classList.toggle('inferred', !frame.expert_action_valid[index]);
-  });
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;

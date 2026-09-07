@@ -185,6 +185,7 @@ def infer_actions(
         max_ticks=1_000_000,
         normalize=True,
         reset_state_provider=reset,
+        discrete_actions=True,
     )
     selected_actions = []
     selected_states = []
@@ -241,6 +242,7 @@ def simulate_actions(
         max_ticks=1_000_000,
         normalize=True,
         reset_state_provider=reset,
+        discrete_actions=True,
     )
     states = []
 
@@ -283,6 +285,7 @@ def rollout(
         max_ticks=1_000_000,
         normalize=True,
         reset_state_provider=reset,
+        discrete_actions=True,
     )
     states = []
     ended_at = None
