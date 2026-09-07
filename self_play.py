@@ -349,7 +349,14 @@ class RaggedRolloutBuffer:
 
     @property
     def full(self) -> bool:
-        return int(self.counts.max().item()) >= self.horizon
+        return int(self.counts.min().item()) >= self.horizon
+
+    def can_finish(self, active: th.Tensor) -> bool:
+        active = th.as_tensor(active, dtype=th.bool, device=self.device)
+        if active.shape != self.counts.shape:
+            raise ValueError("active skill mask must match rollout actors")
+        projected = self.counts + active.long()
+        return int(projected.min().item()) >= self.horizon
 
     @property
     def position(self) -> int:
@@ -590,6 +597,15 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def baseline_opponent_ids(pool: SnapshotPool, count: int) -> tuple[int, ...]:
+    if count < 1:
+        raise ValueError("historical policy count must be positive")
+    recent = tuple(snapshot for snapshot in pool.select_ids(count) if snapshot != 0)
+    if count == 1:
+        return (0,)
+    return (0, *recent[-(count - 1):])
+
+
 class SemiMarkovSelfPlayRunner(SelfPlayRunner):
     """Collect semi-Markov skill transitions with planned durations and held latents.
 
@@ -616,6 +632,7 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         matchmaker: SelfPlayMatchmaker | None = None,
         snapshot_policy=None,
         historical_policies: int = 1,
+        gameplay_reward: AnnealedNextoReward | None = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -632,6 +649,7 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         self.gamma = gamma
         self.skill_horizon = skill_horizon
         self.skill_horizon_jitter = skill_horizon_jitter
+        self.gameplay_reward = gameplay_reward
         self._duration_generator = th.Generator(
             device=self.env.device
         ).manual_seed(seed)
@@ -649,6 +667,7 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         self._start_critic_state: th.Tensor | None = None
         self._start_baseline_value: th.Tensor | None = None
         self._start_learner_mask: th.Tensor | None = None
+        self._diagnostics: dict[str, th.Tensor] = {}
 
     @property
     def timestep_count(self) -> int:
@@ -808,6 +827,83 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
             (self._elapsed == self._planned_duration) | done
         ) & (self._planned_duration != -1)
 
+    def _baseline_mask(self) -> th.Tensor:
+        baseline_matches = (
+            self.matchmaker.opponent_ids.view(
+                self.matchmaker.num_matches,
+                self.matchmaker.players_per_match,
+            )
+            .eq(0)
+            .any(-1)
+        )
+        return baseline_matches.repeat_interleave(self.matchmaker.players_per_match)
+
+    def _episode_groups(self) -> dict[str, th.Tensor]:
+        groups = super()._episode_groups()
+        groups["baseline"] = self.matchmaker.learner_mask & self._baseline_mask()
+        return groups
+
+    def _record_diagnostics(self, env_step) -> None:
+        if self.gameplay_reward is None:
+            return
+        touches = self.gameplay_reward.last_touches
+        score = self.gameplay_reward.last_score_for_actor
+        if touches is None or score is None:
+            return
+
+        learner = self.matchmaker.learner_mask
+        done = th.as_tensor(env_step.done, dtype=th.bool, device=self.env.device)
+        no_touch_timeout = self.gameplay_reward.last_no_touch_timeout
+        if no_touch_timeout is None:
+            return
+        no_touch_timeout = no_touch_timeout.repeat_interleave(
+            self.matchmaker.players_per_match
+        )
+        score = score.reshape(-1)
+        touches = touches.reshape(-1)
+        baseline = learner & self._baseline_mask()
+
+        self._diagnostics["steps"] += learner.sum()
+        self._diagnostics["touches"] += (touches & learner).sum()
+        self._diagnostics["goals_for"] += ((score > 0) & learner).sum()
+        self._diagnostics["goals_against"] += ((score < 0) & learner).sum()
+        self._diagnostics["episodes"] += (done & learner).sum()
+        self._diagnostics["timeouts"] += (no_touch_timeout & learner).sum()
+        self._diagnostics["baseline_episodes"] += (done & baseline).sum()
+        self._diagnostics["baseline_wins"] += ((score > 0) & baseline).sum()
+
+    def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
+        if not self._diagnostics:
+            return {}
+        metrics = {}
+        steps = self._diagnostics["steps"]
+        if steps.item() > 0:
+            metrics |= {
+                "touches_per_1000_steps": self._diagnostics["touches"] / steps * 1000,
+                "goals_for_per_1000_steps": self._diagnostics["goals_for"] / steps * 1000,
+                "goals_against_per_1000_steps": self._diagnostics["goals_against"] / steps * 1000,
+            }
+            for name in ("steps", "touches", "goals_for", "goals_against"):
+                self._diagnostics[name].zero_()
+
+        episodes = self._diagnostics["episodes"]
+        if episodes.item() > 0:
+            metrics["timeout_fraction"] = self._diagnostics["timeouts"] / episodes
+            self._diagnostics["episodes"].zero_()
+            self._diagnostics["timeouts"].zero_()
+
+        baseline_episodes = self._diagnostics["baseline_episodes"]
+        if baseline_episodes.item() > 0:
+            metrics["baseline_win_rate"] = (
+                self._diagnostics["baseline_wins"] / baseline_episodes
+            )
+            self._diagnostics["baseline_episodes"].zero_()
+            self._diagnostics["baseline_wins"].zero_()
+
+        return {
+            "Gameplay": {name: value.item() for name, value in metrics.items()}
+        } if metrics else {}
+
     def _close_skills(self, env_step, completion_mask: th.Tensor) -> None:
         """Append completed skill transitions and prepare the next queued duration."""
         completion_indices = completion_mask.nonzero(as_tuple=True)[0]
@@ -921,6 +1017,19 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         )
 
         self.matchmaker.rematch()
+        self._diagnostics = {
+            name: th.zeros((), dtype=th.float32, device=device)
+            for name in (
+                "steps",
+                "touches",
+                "goals_for",
+                "goals_against",
+                "episodes",
+                "timeouts",
+                "baseline_episodes",
+                "baseline_wins",
+            )
+        }
         self._timestep_count = self.matchmaker.learner_count
         return self.observation
 
@@ -939,6 +1048,7 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
             self._start_skill_at_boundary(physical_observation, boundary_mask)
 
         env_step = _make_env_step(self.env.step(self._held_latent))
+        self._record_diagnostics(env_step)
 
         reward = th.as_tensor(env_step.reward, device=self.env.device)
         self._reward_sum += (self.gamma ** self._elapsed) * reward
@@ -947,8 +1057,8 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         completion_mask = self._completion_mask(env_step)
         if completion_mask.any():
             self._close_skills(env_step, completion_mask)
-        if self.buffer.full:
-            partial = self._elapsed > 0
+        partial = self._elapsed > 0
+        if self.buffer.can_finish(partial):
             if partial.any():
                 self._close_skills(env_step, partial)
 
@@ -966,9 +1076,9 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         if not self.opponent_pool.ready(timesteps):
             return
 
-        self.opponent_pool.add(self.snapshot_policy, timesteps)
+        self.opponent_pool.add(self.snapshot_policy, timesteps, protected_ids=(0,))
         self.matchmaker.set_historical_ids(
-            self.opponent_pool.select_ids(self.historical_policies)
+            baseline_opponent_ids(self.opponent_pool, self.historical_policies)
         )
         remapped = self.matchmaker.remap_stale_opponents()
         if self.state is not None:
@@ -1010,6 +1120,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
     parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
     parser.add_argument("--goal-reward-scale", type=float, default=10.0)
+    parser.add_argument("--touch-reward-scale", type=float, default=0.1)
+    parser.add_argument("--no-touch-penalty", type=float, default=1.0)
     parser.add_argument("--timesteps", type=int, default=2_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
@@ -1072,6 +1184,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--nexto-shaping-scale must be between zero and one")
     if not math.isfinite(args.goal_reward_scale) or args.goal_reward_scale <= 0:
         raise ValueError("--goal-reward-scale must be positive and finite")
+    for name in ("touch_reward_scale", "no_touch_penalty"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
     if args.historical_policies >= args.snapshot_pool_size:
         raise ValueError("--historical-policies must be smaller than the snapshot pool")
     if not args.distill_checkpoint.is_file():
@@ -1141,6 +1256,11 @@ def main() -> None:
         1,
         shaping_scale=args.nexto_shaping_scale,
         goal_scale=args.goal_reward_scale,
+        touch_scale=args.touch_reward_scale,
+        no_touch_penalty=args.no_touch_penalty,
+        no_touch_timeout_steps=math.ceil(
+            args.no_touch_timeout_seconds * 120 / args.frameskip
+        ),
     )
     base_env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
@@ -1197,7 +1317,7 @@ def main() -> None:
         num_matches=args.n_sim,
         team_sizes=(1, 1),
         current_fraction=args.current_fraction,
-        historical_ids=pool.select_ids(args.historical_policies),
+        historical_ids=baseline_opponent_ids(pool, args.historical_policies),
         device=env.device,
         seed=args.seed,
     )
@@ -1221,6 +1341,7 @@ def main() -> None:
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
+        gameplay_reward=reward,
     )
 
     optimizer = Adam((*policy.parameters(), *critic.parameters()), lr=args.lr)
@@ -1287,9 +1408,19 @@ def main() -> None:
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "approx_kl", "approx KL", ".4f"),
         ("episode", "historical_reward", "historical reward", ".3f"),
+        ("episode", "baseline_reward", "baseline reward", ".3f"),
+        ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
+        ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
+        ("Gameplay", "baseline_win_rate", "base win", ".3f"),
         ("Reward", "nexto_shaping_scale", "reward shaping", ".3f"),
     ):
         logger.register_progress_metric(section, key, label, format_spec)
+
+    def log_diagnostics(trainer: Trainer) -> None:
+        metrics = runner.diagnostic_metrics()
+        if metrics:
+            trainer.logger.update(metrics, step=trainer.clock.env_steps)
+
     trainer = Trainer(
         runner,
         buffer,
@@ -1298,6 +1429,7 @@ def main() -> None:
         logger=logger,
         checkpoint=checkpoints,
         value_scheduler=value_scheduler,
+        update_callback=log_diagnostics,
     )
 
     try:

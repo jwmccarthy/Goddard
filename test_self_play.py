@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
@@ -25,6 +26,7 @@ from self_play import (
     PulseLatentEnv,
     RaggedRolloutBuffer,
     SemiMarkovSelfPlayRunner,
+    baseline_opponent_ids,
     build_policy,
     load_demonstration_reset_dataset,
     policy_observation,
@@ -81,6 +83,8 @@ def make_controller(
 def make_reward_context(
     score_delta: int = 0,
     demoed_car: int | None = None,
+    touched_car: int | None = None,
+    truncated: bool = False,
 ) -> RewardContext:
     raw = th.zeros((1, 53))
     raw[:, 2] = 100.0
@@ -89,14 +93,16 @@ def make_reward_context(
     current_raw = raw.clone()
     if demoed_car is not None:
         current_raw[:, 9 + 22 * demoed_car + 17] = 1.0
+    if touched_car is not None:
+        current_raw[:, 9 + 22 * touched_car + 21] = 1.0
     team_sign = th.tensor([1.0, -1.0])
     previous = CarlState(raw, 2, th.empty((0, 3)), team_sign)
     current = CarlState(current_raw, 2, th.empty((0, 3)), team_sign)
     events = CarlEvents(
         score_delta=th.tensor([score_delta]),
-        done=th.tensor([False]),
+        done=th.tensor([truncated]),
         terminated=th.tensor([False]),
-        truncated=th.tensor([False]),
+        truncated=th.tensor([truncated]),
     )
     return RewardContext(
         current,
@@ -113,13 +119,29 @@ def make_reward_context(
 
 class SelfPlayTest(unittest.TestCase):
     def test_nexto_reward_keeps_weighted_zero_sum_goals_without_shaping(self):
-        reward = AnnealedNextoReward(1, 1, shaping_scale=0.0)
+        reward = AnnealedNextoReward(
+            1, 1, shaping_scale=0.0, touch_scale=0.0, no_touch_penalty=0.0
+        )
 
         th.testing.assert_close(
             reward(make_reward_context(score_delta=1)), th.tensor([[10.0, -10.0]])
         )
         th.testing.assert_close(
             reward(make_reward_context(score_delta=0)), th.zeros((1, 2))
+        )
+
+    def test_touch_reward_and_no_touch_penalty_are_explicit(self):
+        reward = AnnealedNextoReward(
+            1, 1, shaping_scale=0.0, no_touch_timeout_steps=1
+        )
+
+        th.testing.assert_close(
+            reward(make_reward_context(touched_car=0)),
+            th.tensor([[0.1, 0.0]]),
+        )
+        th.testing.assert_close(
+            reward(make_reward_context(truncated=True)),
+            th.tensor([[-1.0, -1.0]]),
         )
 
     def test_nexto_shaping_is_not_opponent_centered(self):
@@ -373,7 +395,7 @@ class SelfPlayTest(unittest.TestCase):
         self.assertTrue(steps["valid"].equal(expected_valid))
         self.assertTrue(steps["learner_mask"].equal(expected_valid))
 
-    def test_ragged_rollout_buffer_full_when_any_actor_reaches_horizon(self):
+    def test_ragged_rollout_buffer_waits_for_every_actor(self):
         buffer = RaggedRolloutBuffer(horizon=2, num_envs=2, device="cpu")
         self.assertFalse(buffer.full)
         self.assertEqual(buffer.position, 0)
@@ -382,14 +404,31 @@ class SelfPlayTest(unittest.TestCase):
         self.assertFalse(buffer.full)
 
         buffer.append([0], {"x": th.tensor([[3.0]])})
-        self.assertTrue(buffer.full)
+        self.assertFalse(buffer.full)
         self.assertEqual(buffer.position, 2)
+
+        buffer.append([1], {"x": th.tensor([[4.0]])})
+        self.assertTrue(buffer.full)
+
+    def test_ragged_rollout_can_finish_with_each_actors_partial_skill(self):
+        buffer = RaggedRolloutBuffer(horizon=2, num_envs=2, device="cpu")
+        buffer.append([0, 1], {"x": th.tensor([[1.0], [2.0]])})
+        buffer.append([0], {"x": th.tensor([[3.0]])})
+
+        self.assertTrue(buffer.can_finish(th.tensor([False, True])))
+        self.assertFalse(buffer.can_finish(th.tensor([False, False])))
+
+    def test_baseline_opponent_is_retained_with_recent_snapshots(self):
+        pool = SimpleNamespace(select_ids=lambda count: (2, 3, 4, 5))
+
+        self.assertEqual(baseline_opponent_ids(pool, 3), (0, 4, 5))
+        self.assertEqual(baseline_opponent_ids(pool, 1), (0,))
 
     def test_ragged_rollout_buffer_allows_faster_actor_to_exceed_horizon(self):
         buffer = RaggedRolloutBuffer(horizon=2, num_envs=2, device="cpu")
         buffer.append([0, 1], {"x": th.tensor([[1.0], [2.0]])})
         buffer.append([0], {"x": th.tensor([[3.0]])})
-        self.assertTrue(buffer.full)
+        self.assertFalse(buffer.full)
         buffer.append([0], {"x": th.tensor([[4.0]])})
         buffer.append([1], {"x": th.tensor([[5.0]])})
 
@@ -556,6 +595,8 @@ class SelfPlayTest(unittest.TestCase):
             demonstration_reset_fraction=0.0,
             nexto_shaping_scale=0.0,
             goal_reward_scale=1.0,
+            touch_reward_scale=0.1,
+            no_touch_penalty=1.0,
             distill_checkpoint=distill_checkpoint,
             replay_dir=replay_dir,
         )
@@ -769,6 +810,55 @@ class TestSemiMarkovSelfPlayRunner(unittest.TestCase):
         self.assertEqual(steps["duration"][0, 1].item(), 1)
         self.assertFalse(steps["terminated"][0, 1])
         self.assertFalse(steps["truncated"][0, 1])
+
+    def test_fast_actor_does_not_cut_slow_actor_before_rollout_target(self):
+        runner, env, policy, critic, controller, buffer = self._make_runner(
+            n_envs=2, horizon=2, jitter=0, gamma=0.9
+        )
+        buffer.horizon = 2
+        runner.reset()
+        runner._planned_duration[:] = th.tensor([1, 3])
+
+        runner.step()
+
+        th.testing.assert_close(buffer.counts, th.tensor([1, 0]))
+        th.testing.assert_close(runner._elapsed, th.tensor([0, 1]))
+
+    def test_gameplay_diagnostics_include_fixed_baseline_results(self):
+        runner, env, policy, critic, controller, buffer = self._make_runner(
+            n_envs=2
+        )
+        runner.reset()
+        runner.matchmaker.opponent_ids[:] = th.tensor([0, -1])
+        runner.gameplay_reward = SimpleNamespace(
+            last_touches=th.tensor([True, False]),
+            last_score_for_actor=th.tensor([1.0, 0.0]),
+            last_no_touch_timeout=th.tensor([False, True]),
+        )
+        env_step = SimpleNamespace(
+            done=th.tensor([True, True]),
+            truncated=th.tensor([False, True]),
+        )
+
+        runner._record_diagnostics(env_step)
+        metrics = runner.diagnostic_metrics()["Gameplay"]
+
+        self.assertEqual(metrics["touches_per_1000_steps"], 500.0)
+        self.assertEqual(metrics["goals_for_per_1000_steps"], 500.0)
+        self.assertEqual(metrics["timeout_fraction"], 0.5)
+        self.assertEqual(metrics["baseline_win_rate"], 1.0)
+
+    def test_undefined_baseline_rate_is_retained_until_an_episode_finishes(self):
+        runner, env, policy, critic, controller, buffer = self._make_runner()
+        runner.reset()
+        runner._diagnostics["baseline_wins"] += 1
+
+        runner.diagnostic_metrics()
+
+        self.assertEqual(runner._diagnostics["baseline_wins"].item(), 1.0)
+        runner._diagnostics["baseline_episodes"] += 1
+        metrics = runner.diagnostic_metrics()["Gameplay"]
+        self.assertEqual(metrics["baseline_win_rate"], 1.0)
 
     def test_early_done_records_realized_duration(self):
         runner, env, policy, critic, controller, buffer = self._make_runner(

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch as th
@@ -60,16 +61,32 @@ class AnnealedNextoReward:
         n_orange: int,
         shaping_scale: float = 1.0,
         goal_scale: float = 10.0,
+        touch_scale: float = 0.1,
+        no_touch_penalty: float = 1.0,
+        no_touch_timeout_steps: int | None = None,
         weights: NextoRewardWeights = NextoRewardWeights(),
     ) -> None:
+        if not math.isfinite(touch_scale) or touch_scale < 0:
+            raise ValueError("touch scale must be finite and nonnegative")
+        if not math.isfinite(no_touch_penalty) or no_touch_penalty < 0:
+            raise ValueError("no-touch penalty must be finite and nonnegative")
+        if no_touch_timeout_steps is not None and no_touch_timeout_steps < 1:
+            raise ValueError("no-touch timeout steps must be positive")
         self.n_blue = n_blue
         self.n_orange = n_orange
         self.n_cars = n_blue + n_orange
         self.weights = weights
         self.shaping_scale = shaping_scale
         self.goal_scale = goal_scale
+        self.touch_scale = touch_scale
+        self.no_touch_penalty = no_touch_penalty
+        self.no_touch_timeout_steps = no_touch_timeout_steps
         self._touch_decay = None
         self._last_touch = None
+        self._steps_since_touch = None
+        self.last_touches: th.Tensor | None = None
+        self.last_score_for_actor: th.Tensor | None = None
+        self.last_no_touch_timeout: th.Tensor | None = None
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         current = context.current
@@ -123,6 +140,17 @@ class AnnealedNextoReward:
         )
 
         touches = current.car_ball_touches
+        self.last_touches = touches
+        self.last_score_for_actor = score_for_actor
+        self._steps_since_touch += 1
+        self._steps_since_touch[touches.any(dim=-1)] = 0
+        if self.no_touch_timeout_steps is None:
+            self.last_no_touch_timeout = th.zeros_like(context.events.truncated)
+        else:
+            self.last_no_touch_timeout = (
+                context.events.truncated
+                & (self._steps_since_touch >= self.no_touch_timeout_steps)
+            )
         self._touch_decay = th.where(
             touches,
             (self._touch_decay * 0.95).clamp_min(0.1),
@@ -248,7 +276,14 @@ class AnnealedNextoReward:
         done = context.events.done
         self._touch_decay[done] = 1.0
         self._last_touch[done] = False
-        return self.goal_scale * score_for_actor + self.shaping_scale * shaping
+        self._steps_since_touch[done] = 0
+        timeout_penalty = self.last_no_touch_timeout[:, None] * self.no_touch_penalty
+        return (
+            self.goal_scale * score_for_actor
+            + self.touch_scale * touches
+            - timeout_penalty
+            + self.shaping_scale * shaping
+        )
 
     def _win_probability_progress(
         self, context: RewardContext, team_sign: th.Tensor
@@ -280,6 +315,7 @@ class AnnealedNextoReward:
             return
         self._touch_decay = th.ones(expected, device=device)
         self._last_touch = th.zeros(expected, dtype=th.bool, device=device)
+        self._steps_since_touch = th.zeros(n_sim, dtype=th.long, device=device)
 
     def _opponent_team_mean(self, value: th.Tensor) -> th.Tensor:
         blue = value[:, :self.n_blue]

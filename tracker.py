@@ -110,6 +110,20 @@ def specialist_assignments(stats: Sequence[SegmentStats]) -> th.Tensor:
     return assignments
 
 
+def validated_replay_assignments(
+    assignments: th.Tensor,
+    stored_manifest: Sequence[str],
+    loaded_manifest: Sequence[str],
+) -> th.Tensor:
+    stored_manifest = tuple(stored_manifest)
+    loaded_manifest = tuple(loaded_manifest)
+    if len(assignments) != len(stored_manifest):
+        raise ValueError("PHC tracker checkpoint routing manifest is inconsistent")
+    if stored_manifest[:len(loaded_manifest)] != loaded_manifest:
+        raise ValueError("PHC tracker checkpoint replay segments do not match")
+    return assignments[:len(loaded_manifest)]
+
+
 def build_tracker_policy(
     env: "ExpertLookaheadEnv",
     windows: Sequence[int],
@@ -221,8 +235,11 @@ def load_tracker_policy(
     states = payload.get("specialists")
     if not isinstance(assignments, th.Tensor) or not isinstance(states, list):
         raise ValueError("PHC tracker checkpoint is missing routing data")
-    if tuple(config.get("replay_manifest", ())) != env.replays.demo_manifest:
-        raise ValueError("PHC tracker checkpoint replay segments do not match")
+    assignments = validated_replay_assignments(
+        assignments,
+        config.get("replay_manifest", ()),
+        env.replays.demo_manifest,
+    )
     specialists = []
     for state in states:
         policy = build_tracker_policy(env, windows)

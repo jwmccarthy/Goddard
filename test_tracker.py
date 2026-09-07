@@ -37,6 +37,7 @@ from tracker import (
     load_tracker_policy,
     set_learning_rate,
     specialist_assignments,
+    validated_replay_assignments,
     validate_args,
 )
 
@@ -130,6 +131,15 @@ class TrackerTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "replay segments"):
                 load_tracker_policy(path, env, (1, 2), 4)
+
+    def test_phc_routes_accept_a_verified_replay_prefix(self):
+        assignments = validated_replay_assignments(
+            th.tensor([2, 1, 0]),
+            ("first", "second", "third"),
+            ("first", "second"),
+        )
+
+        th.testing.assert_close(assignments, th.tensor([2, 1]))
 
     def test_tracker_policy_uses_all_categorical_action_factors(self):
         observation_size = GOAL_STATE_SIZE + 21 * len(DEFAULT_TRACKER_WINDOWS)
