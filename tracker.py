@@ -925,10 +925,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timesteps",
         type=int,
-        default=1_000_000_000,
-        help="transition budget for each PHC specialist stage",
+        default=6_000_000_000,
+        help="total transition budget across all PHC specialist stages",
     )
-    parser.add_argument("--policy-count",             type=int,   default=6)
+    parser.add_argument(
+        "--stage-timesteps",
+        type=int,
+        default=1_000_000_000,
+        help="fixed transition budget for each PHC specialist",
+    )
     parser.add_argument("--hard-negative-fraction",   type=float, default=0.8)
     parser.add_argument("--seed",                    type=int,   default=0)
     parser.add_argument("--log-dir",                 type=Path,  default=Path("runs"))
@@ -959,7 +964,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "epochs",
         "sequence_length",
         "timesteps",
-        "policy_count",
+        "stage_timesteps",
     ):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
@@ -969,6 +974,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must fit at least one sequence")
     if args.schedule_timesteps < 1:
         raise ValueError("--schedule-timesteps must be positive")
+    if args.timesteps % args.stage_timesteps:
+        raise ValueError("--timesteps must be divisible by --stage-timesteps")
     if not 0 < args.gamma <= 1:
         raise ValueError("--gamma must be in (0, 1]")
     if not 0 < args.gae_lambda <= 1:
@@ -1034,6 +1041,7 @@ def main() -> None:
     policies: list[MultiCategoricalPolicy] = []
     stage_stats: list[SegmentStats] = []
     previous_critic: Critic | None = None
+    policy_count = args.timesteps // args.stage_timesteps
 
     checkpoint = PHCCheckpoint(
         directory=args.checkpoint_dir,
@@ -1044,8 +1052,9 @@ def main() -> None:
             "architecture": PHC_TRACKER_ARCHITECTURE,
             "windows": list(args.windows),
             "frameskip": args.frameskip,
-            "policy_count": args.policy_count,
-            "stage_timesteps": args.timesteps,
+            "total_timesteps": args.timesteps,
+            "stage_timesteps": args.stage_timesteps,
+            "policy_count": policy_count,
             "hard_negative_fraction": args.hard_negative_fraction,
             "replay_manifest": list(replays.demo_manifest),
             "gamma": args.gamma,
@@ -1065,7 +1074,7 @@ def main() -> None:
     )
     completed_timesteps = 0
 
-    for stage in range(args.policy_count):
+    for stage in range(policy_count):
         if stage == 0:
             replays.reset_sampling()
         else:
@@ -1148,7 +1157,7 @@ def main() -> None:
                 progress,
                 start,
                 end,
-                args.timesteps,
+                args.stage_timesteps,
                 args.schedule_timesteps,
             )
 
@@ -1190,7 +1199,7 @@ def main() -> None:
             checkpoint=checkpoint,
             value_scheduler=value_scheduler,
         )
-        trainer.run(args.timesteps)
+        trainer.run(args.stage_timesteps)
 
         completed_timesteps += trainer.clock.env_steps
         checkpoint.step = completed_timesteps

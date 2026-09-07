@@ -60,8 +60,8 @@ class TrackerTest(unittest.TestCase):
             batch_size=16_384,
             epochs=4,
             sequence_length=64,
-            timesteps=1_000_000,
-            policy_count=6,
+            timesteps=6_000_000,
+            stage_timesteps=1_000_000,
             hard_negative_fraction=0.8,
             schedule_timesteps=1_000,
             gamma=0.997,
@@ -78,6 +78,11 @@ class TrackerTest(unittest.TestCase):
 
         args.gae_lambda = 0
         with self.assertRaisesRegex(ValueError, "gae-lambda"):
+            validate_args(args)
+
+        args.gae_lambda = 0.98
+        args.timesteps = 6_000_001
+        with self.assertRaisesRegex(ValueError, "divisible"):
             validate_args(args)
 
     def test_learning_rate_schedule_updates_all_optimizers(self):
