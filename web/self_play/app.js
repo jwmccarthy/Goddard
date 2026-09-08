@@ -49,14 +49,16 @@ controls.dampingFactor = 0.06;
 controls.maxDistance = 18000;
 controls.minDistance = 1200;
 
-const field = new THREE.Mesh(
-  new THREE.PlaneGeometry(8192, 10240),
-  new THREE.MeshStandardMaterial({ color: 0x86ad9d, roughness: 0.92 }),
-);
-field.position.z = -4;
-field.receiveShadow = true;
-field.renderOrder = -2;
-scene.add(field);
+for (const [y, color] of [[-2560, 0x7faaa8], [2560, 0xaaa184]]) {
+  const fieldHalf = new THREE.Mesh(
+    new THREE.PlaneGeometry(8192, 5120),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.92 }),
+  );
+  fieldHalf.position.set(0, y, -4);
+  fieldHalf.receiveShadow = true;
+  fieldHalf.renderOrder = -2;
+  scene.add(fieldHalf);
+}
 
 function addLine(points, color = 0xedf5f1, opacity = 0.62) {
   const geometry = new THREE.BufferGeometry().setFromPoints(
