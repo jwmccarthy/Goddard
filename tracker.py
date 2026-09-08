@@ -65,8 +65,8 @@ RAW_ACTION_SIZE = 8
 STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-TRACKER_ARCHITECTURE = "categorical-all-gru-v1"
-PHC_TRACKER_ARCHITECTURE = "categorical-phc-gru-v1"
+TRACKER_ARCHITECTURE = "categorical-all-gru-v2"
+PHC_TRACKER_ARCHITECTURE = "categorical-phc-gru-v2"
 
 
 class SegmentStats:
@@ -397,7 +397,7 @@ class ExpertGoalStates:
 
     @property
     def goal_size(self) -> int:
-        return self._windows.numel() * CAR_STATE_SIZE
+        return INTERNAL_STATE_SIZE + self._windows.numel() * CAR_STATE_SIZE
 
     @property
     def n_demos(self) -> int:
@@ -588,6 +588,10 @@ class ExpertGoalStates:
             self._replays[goal_idx, 9:GOAL_STATE_SIZE]
             - obs[:, None, 9:GOAL_STATE_SIZE]
         ).flatten(-2)
+        internal_state = self._replays[
+            cursors,
+            GOAL_STATE_SIZE:EXPERT_TOUCH_INDEX,
+        ]
         if mask is None:
             self._cursors += 1
             cursors = self._cursors
@@ -597,7 +601,7 @@ class ExpertGoalStates:
 
         end = cursors >= ends
 
-        return th.cat((obs[:, :GOAL_STATE_SIZE], goals), dim=-1), end
+        return th.cat((obs[:, :GOAL_STATE_SIZE], internal_state, goals), dim=-1), end
 
 
 class TrackingReward:
