@@ -459,6 +459,31 @@ class TrackerTest(unittest.TestCase):
         th.testing.assert_close(follow_up, contact)
         th.testing.assert_close(reward.value[:, None], contact)
 
+    def test_ball_outcome_scores_ball_position_relative_to_car(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        aligned_tensor = target_tensor.clone()
+        aligned_tensor[:, 0] = 0.005
+        aligned_tensor[:, 9] = 0.005
+        opposed_tensor = aligned_tensor.clone()
+        opposed_tensor[:, 9] = -0.005
+        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+
+        aligned = TrackingReward(replays)(
+            self._tracking_context(
+                CARLObservation.from_tensor(aligned_tensor, 1),
+                touched=True,
+            )
+        )
+        opposed = TrackingReward(replays)(
+            self._tracking_context(
+                CARLObservation.from_tensor(opposed_tensor, 1),
+                touched=True,
+            )
+        )
+
+        self.assertGreater(aligned.item(), opposed.item())
+
     def test_ball_outcome_latch_resets_with_replay_segment(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         target = CARLObservation.from_tensor(target_tensor, 1)

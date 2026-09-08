@@ -678,6 +678,10 @@ class TrackingReward:
         ball_position_error = (
             actual.ball.position - target.ball.position
         ) * self.position_scale
+        relative_ball_position_error = (
+            (actual.ball.position - actual_ego.position)
+            - (target.ball.position - target_ego.position)
+        ) * self.position_scale
         ball_velocity_error = (
             actual.ball.velocity - target.ball.velocity
         ) * (BALL_MAX_SPEED / 100)
@@ -685,7 +689,9 @@ class TrackingReward:
             actual.ball.angular_velocity - target.ball.angular_velocity
         ) * BALL_MAX_ANG_SPEED
         ball_score = (
-            0.20 * th.exp(-1.25 * ball_position_error.square().sum(-1))
+            0.10 * th.exp(-1.25 * ball_position_error.square().sum(-1))
+            + 0.10
+            * th.exp(-1.25 * relative_ball_position_error.square().sum(-1))
             + 0.70 * th.exp(-0.1 * ball_velocity_error.square().sum(-1))
             + 0.10
             * th.exp(-0.1 * ball_angular_velocity_error.square().sum(-1))
