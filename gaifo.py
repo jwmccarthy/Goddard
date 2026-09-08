@@ -64,6 +64,53 @@ def add_scene_noise(windows: th.Tensor, std: float) -> th.Tensor:
     return windows + noise
 
 
+def resample_scene(
+    scene: np.ndarray,
+    source_frame_skip: int,
+    target_frame_skip: int,
+) -> np.ndarray:
+    """Resample normalized physical scenes onto the simulator's time cadence."""
+    if source_frame_skip < 1 or target_frame_skip < 1:
+        raise ValueError("source and target frame skips must be positive")
+    if len(scene) < 2 or source_frame_skip == target_frame_skip:
+        return np.asarray(scene, dtype=np.float32)
+
+    source_ticks = np.arange(len(scene), dtype=np.float64) * source_frame_skip
+    target_ticks = np.arange(
+        0.0,
+        source_ticks[-1] + 1.0,
+        target_frame_skip,
+    )
+    right = np.searchsorted(source_ticks, target_ticks).clip(0, len(scene) - 1)
+    left = (right - 1).clip(0, len(scene) - 1)
+    span = source_ticks[right] - source_ticks[left]
+    alpha = np.divide(
+        target_ticks - source_ticks[left],
+        span,
+        out=np.zeros_like(target_ticks),
+        where=span > 0,
+    ).astype(np.float32)
+    output = (
+        scene[left] * (1.0 - alpha[:, None])
+        + scene[right] * alpha[:, None]
+    ).astype(np.float32)
+
+    nearest = np.where(alpha < 0.5, left, right)
+    for car_start in (BLUE_START, ORANGE_START):
+        bool_slice = slice(
+            car_start + CAR_BOOL_START,
+            car_start + CAR_BOOL_END,
+        )
+        output[:, bool_slice] = scene[nearest, bool_slice]
+        forward = output[:, car_start + 9:car_start + 12]
+        up = output[:, car_start + 12:car_start + 15]
+        forward /= np.linalg.norm(forward, axis=-1, keepdims=True).clip(1e-6)
+        up -= forward * np.sum(forward * up, axis=-1, keepdims=True)
+        up /= np.linalg.norm(up, axis=-1, keepdims=True).clip(1e-6)
+
+    return output
+
+
 def extract_scene_observations(
     observation: th.Tensor,
     n_cars: int = N_CARS,
@@ -241,14 +288,11 @@ class ExpertSceneDataset:
                     raise ValueError(f"missing frame-skip metadata for {path.name}")
                 with np.load(metadata_path) as metadata:
                     stored_frame_skip = int(metadata.get("frame_skip", -1))
-                if stored_frame_skip != frame_skip:
-                    raise ValueError(
-                        f"expert replay {path.name} uses frame skip "
-                        f"{stored_frame_skip}, expected {frame_skip}"
-                    )
             source = np.array(
                 np.load(path, mmap_mode="r")[:, :SCENE_SIZE], dtype=np.float32, copy=True
             )
+            if frame_skip is not None:
+                source = resample_scene(source, stored_frame_skip, frame_skip)
             if limit is not None and total + len(source) > limit:
                 keep = max(0, limit - total)
                 if keep == 0:

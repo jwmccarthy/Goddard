@@ -27,6 +27,7 @@ from gaifo import (
     add_scene_noise,
     build_scene_windows,
     extract_scene_observations,
+    resample_scene,
     validate_args,
 )
 
@@ -235,14 +236,30 @@ class ExpertDatasetTest(unittest.TestCase):
             # Different seeds must produce different first-file choices sometimes.
             self.assertGreater(len(first_values), 1)
 
-    def test_rejects_mismatched_frame_skip_metadata(self):
+    def test_resamples_mismatched_frame_skip_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            self._save_replay(path / "blue-0-match.npy", 10)
-            np.savez(path / "blue-0-match.unsafe-starts.npz", frame_skip=8)
+            rows = np.zeros((10, 161), dtype=np.float32)
+            rows[:, 0] = np.arange(10)
+            np.save(path / "blue-0-match.npy", rows)
+            np.savez(path / "blue-0-match.unsafe-starts.npz", frame_skip=2)
 
-            with self.assertRaisesRegex(ValueError, "frame skip 8, expected 4"):
-                ExpertSceneDataset(path, trajectory_length=4, frame_skip=4)
+            dataset = ExpertSceneDataset(path, trajectory_length=4, frame_skip=4)
+
+            th.testing.assert_close(
+                dataset.frames[:, 0],
+                th.tensor([0.0, 2.0, 4.0, 6.0, 8.0]),
+            )
+
+    def test_scene_resampling_preserves_nearest_boolean_values(self):
+        scene = np.zeros((2, 51), dtype=np.float32)
+        scene[1, 25:30] = 1.0
+        scene[1, 46:51] = 1.0
+
+        resampled = resample_scene(scene, source_frame_skip=4, target_frame_skip=2)
+
+        np.testing.assert_array_equal(resampled[1, 25:30], np.ones(5))
+        np.testing.assert_array_equal(resampled[1, 46:51], np.ones(5))
 
 
 class NoiseMaskTest(unittest.TestCase):
