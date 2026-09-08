@@ -65,20 +65,20 @@ class PHCCheckpoint(PeriodicCheckpoint):
         self.step_offset = 0
         self.policies: Sequence[th.nn.Module] = ()
         self.critic: th.nn.Module | None = None
-        self.segment_stats: Sequence[object] = ()
+        self.segment_scores: Sequence[object] = ()
 
     def set_stage(
         self,
         stage: int,
         policies: Sequence[th.nn.Module],
         critic: th.nn.Module,
-        segment_stats: Sequence[object],
+        segment_scores: Sequence[object],
         step_offset: int,
     ) -> None:
         self.stage = stage
         self.policies = policies
         self.critic = critic
-        self.segment_stats = segment_stats
+        self.segment_scores = segment_scores
         self.step_offset = step_offset
 
     def ready(self, step: int) -> bool:
@@ -93,7 +93,7 @@ class PHCCheckpoint(PeriodicCheckpoint):
             "config": self.config,
             "specialists": [policy.state_dict() for policy in self.policies],
             "critic": self.critic.state_dict(),
-            "segment_stats": [stats.state_dict() for stats in self.segment_stats],
+            "segment_scores": [scores.state_dict() for scores in self.segment_scores],
             "assignments": self.assignment_fn().cpu(),
         }
         path = self.directory / f"tracker_{self.step:012d}.pt"

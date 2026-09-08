@@ -69,44 +69,35 @@ TRACKER_ARCHITECTURE = "categorical-all-gru-v3"
 PHC_TRACKER_ARCHITECTURE = "categorical-phc-gru-v3"
 
 
-class SegmentStats:
+class SegmentScores:
     def __init__(self, n_demos: int, device: str | th.device) -> None:
-        self.attempts = th.zeros(n_demos, dtype=th.long, device=device)
-        self.failures = th.zeros(n_demos, dtype=th.long, device=device)
+        self.mean_rewards = th.full((n_demos,), th.nan, device=device)
 
-    def record(self, demo_ids: th.Tensor, completed: th.Tensor, success: th.Tensor) -> None:
-        if completed.any():
-            self.attempts += th.bincount(
-                demo_ids[completed], minlength=len(self.attempts)
-            )
-        failed = completed & ~success
-        if failed.any():
-            self.failures += th.bincount(
-                demo_ids[failed], minlength=len(self.failures)
-            )
+    def set(self, mean_rewards: th.Tensor) -> None:
+        if mean_rewards.shape != self.mean_rewards.shape:
+            raise ValueError("deterministic segment rewards have the wrong shape")
+        if not th.isfinite(mean_rewards).all():
+            raise ValueError("deterministic segment rewards must be finite")
+        self.mean_rewards.copy_(mean_rewards)
 
     def hardness(self) -> th.Tensor:
-        return (self.failures.float() + 1.0) / (self.attempts.float() + 1.0)
+        if not th.isfinite(self.mean_rewards).all():
+            raise RuntimeError("segment rewards have not been evaluated")
+        return (1.0 - self.mean_rewards).clamp_min(1e-6)
 
     def state_dict(self) -> dict[str, th.Tensor]:
-        return {
-            "attempts": self.attempts.cpu(),
-            "failures": self.failures.cpu(),
-        }
+        return {"mean_rewards": self.mean_rewards.cpu()}
 
 
-def specialist_assignments(stats: Sequence[SegmentStats]) -> th.Tensor:
-    if not stats:
-        raise ValueError("at least one specialist's segment statistics are required")
+def specialist_assignments(scores: Sequence[SegmentScores]) -> th.Tensor:
+    if not scores:
+        raise ValueError("at least one specialist's segment scores are required")
 
-    rates = []
-    for stage in stats:
-        rate = stage.failures.float() / stage.attempts.clamp_min(1)
-        rates.append(th.where(stage.attempts > 0, rate, th.full_like(rate, th.inf)))
-    stacked = th.stack(rates)
-    assignments = stacked.argmin(dim=0)
-    never_attempted = th.isinf(stacked).all(dim=0)
-    assignments[never_attempted] = len(stats) - 1
+    stacked = th.stack([stage.mean_rewards for stage in scores])
+    evaluated = th.isfinite(stacked)
+    assignments = th.where(evaluated, stacked, -th.inf).argmax(dim=0)
+    never_evaluated = ~evaluated.any(dim=0)
+    assignments[never_evaluated] = len(scores) - 1
     return assignments
 
 
@@ -294,6 +285,7 @@ class ExpertGoalStates:
         self.frame_skip = frame_skip
         self.minimum_remaining_frames = minimum_remaining_frames
         self._selected_demo: int | None = None
+        self._next_demo_ids: th.Tensor | None = None
 
         replays:    list[th.Tensor] = []
         modes:      list[int] = []
@@ -410,13 +402,10 @@ class ExpertGoalStates:
     def demo_manifest(self) -> tuple[str, ...]:
         return self._demo_manifest
 
-    def completes_after_step(self) -> th.Tensor:
-        return self._cursors + 1 >= self._offsets[self._demo_id + 1]
-
-    def focus_failures(self, stats: SegmentStats, fraction: float) -> None:
+    def focus_hard_negatives(self, scores: SegmentScores, fraction: float) -> None:
         if not 0 <= fraction <= 1:
             raise ValueError("hard-negative fraction must be in [0, 1]")
-        hardness = stats.hardness() * self._base_sampling_probabilities
+        hardness = scores.hardness() * self._base_sampling_probabilities
         hard_probabilities = hardness / hardness.sum()
         self._sampling_probabilities = (
             (1.0 - fraction) * self._base_sampling_probabilities
@@ -500,6 +489,16 @@ class ExpertGoalStates:
     def random_demo(self) -> None:
         self._selected_demo = None
 
+    def queue_demo_ids(self, demo_ids: th.Tensor) -> None:
+        if demo_ids.shape != self._demo_id.shape:
+            raise ValueError("queued replay segment IDs must match the environment batch")
+        if demo_ids.min() < 0 or demo_ids.max() >= self._n_demos:
+            raise ValueError("queued replay segment ID is out of range")
+        self._next_demo_ids = demo_ids.to(self.device).long()
+
+    def clear_queued_demo_ids(self) -> None:
+        self._next_demo_ids = None
+
     def search_demo(self, query: str) -> bool:
         query = query.lower()
         matches = [
@@ -519,8 +518,13 @@ class ExpertGoalStates:
 
     def reset(self, mask: th.Tensor) -> TensorBatch:
         n_resets = mask.sum().item()
-        demo_id = self._sample_demo_ids(n_resets)
-        if self.start_at_beginning and self._selected_demo is None:
+        queued = getattr(self, "_next_demo_ids", None)
+        if queued is None:
+            demo_id = self._sample_demo_ids(n_resets)
+        else:
+            demo_id = queued[mask]
+            self._next_demo_ids = None
+        if queued is None and self.start_at_beginning and self._selected_demo is None:
             self._selected_demo = demo_id[0].item()
             demo_id.fill_(self._selected_demo)
         self._demo_id[mask] = demo_id
@@ -532,7 +536,9 @@ class ExpertGoalStates:
             - self.minimum_remaining_frames
         )
         self._cursors[mask] = starts
-        if not self.start_at_beginning:
+        if queued is not None:
+            self._cursors[mask] = self._safe_cursors[self._cursors[mask]]
+        elif not self.start_at_beginning:
             self._cursors[mask] += (
                 th.rand(n_resets, device=self.device) * choices
             ).long()
@@ -689,11 +695,11 @@ class TrackingReward:
             actual.ball.angular_velocity - target.ball.angular_velocity
         ) * BALL_MAX_ANG_SPEED
         ball_score = (
-            0.10 * th.exp(-1.25 * ball_position_error.square().sum(-1))
-            + 0.10
+            0.35 * th.exp(-1.25 * ball_position_error.square().sum(-1))
+            + 0.35
             * th.exp(-1.25 * relative_ball_position_error.square().sum(-1))
-            + 0.70 * th.exp(-0.1 * ball_velocity_error.square().sum(-1))
-            + 0.10
+            + 0.25 * th.exp(-0.1 * ball_velocity_error.square().sum(-1))
+            + 0.05
             * th.exp(-0.1 * ball_angular_velocity_error.square().sum(-1))
         )
         reward = th.where(
@@ -734,7 +740,6 @@ class ExpertLookaheadEnv:
         self._ball_anchored = th.ones(env.n_sim, dtype=th.bool, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
         self.last_raw_expert_action: th.Tensor | None = None
-        self.segment_stats: SegmentStats | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size
 
@@ -823,17 +828,6 @@ class ExpertLookaheadEnv:
         )
 
     def step(self, action: th.Tensor | np.ndarray):
-        segment_stats = self.__dict__.get("segment_stats")
-        demo_ids = (
-            self.replays.current_demo_ids()
-            if segment_stats is not None
-            else None
-        )
-        completes_after_step = (
-            self.replays.completes_after_step()
-            if segment_stats is not None
-            else None
-        )
         self.last_raw_expert_action = self.replays.current_raw_action(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
@@ -856,10 +850,6 @@ class ExpertLookaheadEnv:
         ) & ~native & ~end_reset
 
         reset = end_reset | failure_reset
-        completed = native | reset
-        if segment_stats is not None:
-            assert demo_ids is not None and completes_after_step is not None
-            segment_stats.record(demo_ids, completed, completed & completes_after_step)
         self._low_reward_frames[reset | native] = 0
 
         if "final_obs" in info:
@@ -880,6 +870,60 @@ class ExpertLookaheadEnv:
             obs[reset] = reset_obs
 
         return obs, reward, term | reset, trunc, info
+
+
+@th.no_grad()
+def evaluate_tracker_policy(
+    env: ExpertLookaheadEnv,
+    policy: MultiCategoricalPolicy,
+) -> th.Tensor:
+    """Measure deterministic mean reward from the start of every replay segment."""
+    scores = th.empty(env.replays.n_demos, device=env.device)
+    previous_minimum_reward = env.minimum_reward
+    was_training = policy.training
+    env.minimum_reward = -th.inf
+    policy.eval()
+
+    try:
+        for start in range(0, env.replays.n_demos, env.n_envs):
+            stop = min(start + env.n_envs, env.replays.n_demos)
+            valid_count = stop - start
+            demo_ids = th.arange(start, stop, device=env.device)
+            if valid_count < env.n_envs:
+                demo_ids = th.cat((
+                    demo_ids,
+                    demo_ids[-1:].expand(env.n_envs - valid_count),
+                ))
+            env.replays.queue_demo_ids(demo_ids)
+            observation = env.reset()
+            state = policy.initial_state(env.n_envs)
+            active = th.arange(env.n_envs, device=env.device) < valid_count
+            reward_sum = th.zeros(env.n_envs, device=env.device)
+            frame_count = th.zeros(env.n_envs, device=env.device)
+
+            while active.any():
+                output = policy.act(
+                    observation,
+                    state,
+                    deterministic=True,
+                )
+                observation, _, terminated, truncated, _ = env.step(output.action)
+                if env.reward.value is None:
+                    raise RuntimeError("tracking reward did not compute a value")
+                reward_sum[active] += env.reward.value[active]
+                frame_count[active] += 1
+                active &= ~(terminated | truncated)
+                state = output.next_state
+
+            scores[start:stop] = (
+                reward_sum[:valid_count] / frame_count[:valid_count]
+            )
+    finally:
+        env.replays.clear_queued_demo_ids()
+        env.minimum_reward = previous_minimum_reward
+        policy.train(was_training)
+
+    return scores
 
 
 class StatelessCriticCapture(CaptureBase):
@@ -1041,7 +1085,7 @@ def main() -> None:
 
     run_id = datetime.now().strftime("tracker-%Y%m%d-%H%M%S")
     policies: list[MultiCategoricalPolicy] = []
-    stage_stats: list[SegmentStats] = []
+    stage_scores: list[SegmentScores] = []
     previous_critic: Critic | None = None
     policy_count = args.timesteps // args.stage_timesteps
 
@@ -1049,7 +1093,7 @@ def main() -> None:
         directory=args.checkpoint_dir,
         interval=args.checkpoint_interval,
         keep=args.checkpoint_keep,
-        assignment_fn=lambda: specialist_assignments(stage_stats),
+        assignment_fn=lambda: specialist_assignments(stage_scores),
         config={
             "architecture": PHC_TRACKER_ARCHITECTURE,
             "windows": list(args.windows),
@@ -1058,6 +1102,7 @@ def main() -> None:
             "stage_timesteps": args.stage_timesteps,
             "policy_count": policy_count,
             "hard_negative_fraction": args.hard_negative_fraction,
+            "hard_negative_metric": "deterministic_mean_reward",
             "replay_manifest": list(replays.demo_manifest),
             "gamma": args.gamma,
             "gae_lambda": args.gae_lambda,
@@ -1079,7 +1124,9 @@ def main() -> None:
         if stage == 0:
             replays.reset_sampling()
         else:
-            replays.focus_failures(stage_stats[-1], args.hard_negative_fraction)
+            replays.focus_hard_negatives(
+                stage_scores[-1], args.hard_negative_fraction
+            )
 
         policy = build_tracker_policy(env, args.windows)
         critic = build_tracker_critic(env, args.windows)
@@ -1088,15 +1135,14 @@ def main() -> None:
         if previous_critic is not None:
             critic.load_state_dict(previous_critic.state_dict())
 
-        stats = SegmentStats(replays.n_demos, env.device)
-        stage_stats.append(stats)
-        env.segment_stats = stats
+        scores = SegmentScores(replays.n_demos, env.device)
+        stage_scores.append(scores)
         policies.append(policy)
         checkpoint.set_stage(
             stage,
             policies,
             critic,
-            stage_stats,
+            stage_scores,
             step_offset=completed_timesteps,
         )
         if stage == 0:
@@ -1203,6 +1249,7 @@ def main() -> None:
         trainer.run(args.stage_timesteps)
 
         completed_timesteps += trainer.clock.env_steps
+        scores.set(evaluate_tracker_policy(env, policy))
         checkpoint.step = completed_timesteps
         checkpoint.run()
         policy.eval().requires_grad_(False)

@@ -29,12 +29,13 @@ from tracker import (
     PHC_TRACKER_ARCHITECTURE,
     POSITION_SCALE,
     RoutedTrackerPolicy,
-    SegmentStats,
+    SegmentScores,
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
     annealed_value,
     build_tracker_policy,
+    evaluate_tracker_policy,
     load_tracker_policy,
     set_learning_rate,
     specialist_assignments,
@@ -191,18 +192,14 @@ class TrackerTest(unittest.TestCase):
             self.assertFalse((directory / "tracker_000000000000.pt").exists())
             self.assertTrue((directory / "tracker_000000000001.pt").exists())
 
-    def test_segment_stats_drive_hard_negative_sampling(self):
+    def test_low_deterministic_rewards_drive_hard_negative_sampling(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._base_sampling_probabilities = th.full((3,), 1 / 3)
         replays._sampling_probabilities = replays._base_sampling_probabilities.clone()
-        stats = SegmentStats(3, "cpu")
-        stats.record(
-            th.tensor([0, 1, 1, 2]),
-            th.tensor([True, True, True, True]),
-            th.tensor([True, False, False, True]),
-        )
+        scores = SegmentScores(3, "cpu")
+        scores.set(th.tensor([0.9, 0.1, 0.8]))
 
-        replays.focus_failures(stats, 1.0)
+        replays.focus_hard_negatives(scores, 1.0)
 
         self.assertGreater(
             replays._sampling_probabilities[1],
@@ -210,17 +207,78 @@ class TrackerTest(unittest.TestCase):
         )
         th.testing.assert_close(replays._sampling_probabilities.sum(), th.tensor(1.0))
 
-    def test_specialist_assignment_selects_lowest_observed_failure_rate(self):
-        first = SegmentStats(3, "cpu")
-        first.attempts[:] = th.tensor([10, 10, 0])
-        first.failures[:] = th.tensor([1, 8, 0])
-        second = SegmentStats(3, "cpu")
-        second.attempts[:] = th.tensor([10, 10, 0])
-        second.failures[:] = th.tensor([3, 2, 0])
+    def test_specialist_assignment_selects_highest_deterministic_reward(self):
+        first = SegmentScores(3, "cpu")
+        first.mean_rewards[:] = th.tensor([0.9, 0.2, th.nan])
+        second = SegmentScores(3, "cpu")
+        second.mean_rewards[:] = th.tensor([0.7, 0.8, th.nan])
 
         assignments = specialist_assignments((first, second))
 
         th.testing.assert_close(assignments, th.tensor([0, 1, 1]))
+
+    def test_segment_evaluation_uses_deterministic_mean_reward(self):
+        class Replays:
+            n_demos = 3
+
+            def queue_demo_ids(self, demo_ids):
+                self.demo_ids = demo_ids
+
+            @staticmethod
+            def clear_queued_demo_ids():
+                return
+
+        class Environment:
+            device = th.device("cpu")
+            n_envs = 2
+            minimum_reward = 0.1
+
+            def __init__(self):
+                self.replays = Replays()
+                self.reward = SimpleNamespace(value=None)
+
+            def reset(self):
+                self.demo_ids = self.replays.demo_ids
+                self.elapsed = th.zeros(self.n_envs)
+                return th.zeros((self.n_envs, 1))
+
+            def step(self, action):
+                self.elapsed += 1
+                self.reward.value = (self.demo_ids.float() + 1) / 5
+                terminated = self.elapsed >= self.demo_ids + 1
+                return (
+                    th.zeros((self.n_envs, 1)),
+                    self.reward.value[:, None],
+                    terminated,
+                    th.zeros(self.n_envs, dtype=th.bool),
+                    {},
+                )
+
+        class Policy(th.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.deterministic = []
+
+            @staticmethod
+            def initial_state(batch_size):
+                return th.zeros((batch_size, 1))
+
+            def act(self, observation, state=None, *, deterministic=False):
+                self.deterministic.append(deterministic)
+                return PolicyOutput(
+                    action=th.zeros((len(observation), ACTION_FACTORS), dtype=th.long),
+                    next_state=state,
+                )
+
+        env = Environment()
+        policy = Policy()
+
+        scores = evaluate_tracker_policy(env, policy)
+
+        th.testing.assert_close(scores, th.tensor([0.2, 0.4, 0.6]))
+        self.assertTrue(all(policy.deterministic))
+        self.assertEqual(env.minimum_reward, 0.1)
+        self.assertTrue(policy.training)
 
     def test_routed_tracker_dispatches_each_replay_segment(self):
         class Specialist(th.nn.Module):
@@ -259,9 +317,9 @@ class TrackerTest(unittest.TestCase):
         th.testing.assert_close(output.action[:, 0], th.tensor([0, 1, 0]))
         th.testing.assert_close(output.next_state[:, 0], th.tensor([0.0, 1.0, 0.0]))
 
-    def test_phc_checkpoint_serializes_specialists_stats_and_routes(self):
+    def test_phc_checkpoint_serializes_specialist_scores_and_routes(self):
         with tempfile.TemporaryDirectory() as directory:
-            stats = SegmentStats(2, "cpu")
+            scores = SegmentScores(2, "cpu")
             policies = [th.nn.Linear(1, 1), th.nn.Linear(1, 1)]
             checkpoint = PHCCheckpoint(
                 Path(directory),
@@ -274,7 +332,7 @@ class TrackerTest(unittest.TestCase):
                 1,
                 policies,
                 th.nn.Linear(1, 1),
-                (stats, stats),
+                (scores, scores),
                 step_offset=100,
             )
             checkpoint.step = 200
@@ -286,7 +344,7 @@ class TrackerTest(unittest.TestCase):
                 weights_only=True,
             )
             self.assertEqual(len(payload["specialists"]), 2)
-            self.assertEqual(len(payload["segment_stats"]), 2)
+            self.assertEqual(len(payload["segment_scores"]), 2)
             th.testing.assert_close(payload["assignments"], th.tensor([0, 1]))
 
     def test_parser_projection_uses_carl_axis_class_order(self):
@@ -353,21 +411,24 @@ class TrackerTest(unittest.TestCase):
         self.assertTrue((remaining >= minimum).all())
         self.assertTrue((replays._cursors <= length - minimum - 1).all())
 
-    def test_segment_completion_is_computed_before_environment_reset(self):
+    def test_queued_segment_evaluation_starts_at_earliest_safe_frame(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
-        replays._demo_id = th.tensor([0, 1])
-        replays._cursors = th.tensor([8, 14])
-        replays._offsets = th.tensor([0, 10, 20])
+        replays.n_cars = 1
+        replays.device = th.device("cpu")
+        replays.start_at_beginning = False
+        replays.minimum_remaining_frames = 1
+        replays._n_demos = 2
+        replays._demo_id = th.zeros(2, dtype=th.long)
+        replays._offsets = th.tensor([0, 3, 6])
+        replays._safe_cursors = th.tensor([1, 1, 2, 4, 4, 5])
+        replays._cursors = th.zeros(2, dtype=th.long)
+        replays._replays = th.zeros((6, STORED_REPLAY_SIZE))
+        replays.queue_demo_ids(th.tensor([0, 1]))
 
-        th.testing.assert_close(
-            replays.completes_after_step(),
-            th.tensor([False, False]),
-        )
-        replays._cursors[:] = th.tensor([9, 19])
-        th.testing.assert_close(
-            replays.completes_after_step(),
-            th.tensor([True, True]),
-        )
+        replays.reset(th.ones(2, dtype=th.bool))
+
+        th.testing.assert_close(replays._demo_id, th.tensor([0, 1]))
+        th.testing.assert_close(replays._cursors, th.tensor([1, 4]))
 
     def test_filter_rejects_segments_with_no_safe_early_start(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
