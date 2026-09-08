@@ -412,41 +412,54 @@ class TrackerTest(unittest.TestCase):
 
         th.testing.assert_close(value, th.ones((1, 1)))
 
-    def test_ball_outcome_reward_activates_on_touch_and_latches(self):
+    def test_ball_outcome_multiplies_car_reward_after_touch_and_latches(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         target = CARLObservation.from_tensor(target_tensor, 1)
+        missed_ball_tensor = target_tensor.clone()
+        missed_ball_tensor[:, :9] = 100.0
+        missed_ball = CARLObservation.from_tensor(missed_ball_tensor, 1)
         replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
-        reward = TrackingReward(replays, ball_outcome_weight=0.1)
+        reward = TrackingReward(replays)
 
-        contact = reward(self._tracking_context(target, touched=True))
-        follow_up = reward(self._tracking_context(target))
+        before_contact = reward(self._tracking_context(missed_ball))
+        contact = reward(self._tracking_context(missed_ball, touched=True))
+        follow_up = reward(self._tracking_context(missed_ball))
 
-        th.testing.assert_close(contact, th.tensor([[1.1]]))
-        th.testing.assert_close(follow_up, th.tensor([[1.1]]))
-        th.testing.assert_close(reward.value, th.ones(1))
+        th.testing.assert_close(before_contact, th.ones((1, 1)))
+        self.assertLess(contact.item(), 1e-3)
+        th.testing.assert_close(follow_up, contact)
+        th.testing.assert_close(reward.value[:, None], contact)
 
     def test_ball_outcome_latch_resets_with_replay_segment(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         target = CARLObservation.from_tensor(target_tensor, 1)
+        missed_ball_tensor = target_tensor.clone()
+        missed_ball_tensor[:, :9] = 100.0
+        missed_ball = CARLObservation.from_tensor(missed_ball_tensor, 1)
         replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
-        reward = TrackingReward(replays, ball_outcome_weight=0.1)
-        reward(self._tracking_context(target, touched=True))
+        reward = TrackingReward(replays)
+        reward(self._tracking_context(missed_ball, touched=True))
 
         reward.reset(th.tensor([True]))
-        after_reset = reward(self._tracking_context(target))
+        after_reset = reward(self._tracking_context(missed_ball))
 
         th.testing.assert_close(after_reset, th.ones((1, 1)))
 
     def test_ball_outcome_latch_clears_after_native_done(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         target = CARLObservation.from_tensor(target_tensor, 1)
+        missed_ball_tensor = target_tensor.clone()
+        missed_ball_tensor[:, :9] = 100.0
+        missed_ball = CARLObservation.from_tensor(missed_ball_tensor, 1)
         replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
-        reward = TrackingReward(replays, ball_outcome_weight=0.1)
+        reward = TrackingReward(replays)
 
-        terminal = reward(self._tracking_context(target, touched=True, done=True))
-        next_episode = reward(self._tracking_context(target))
+        terminal = reward(
+            self._tracking_context(missed_ball, touched=True, done=True)
+        )
+        next_episode = reward(self._tracking_context(missed_ball))
 
-        th.testing.assert_close(terminal, th.tensor([[1.1]]))
+        self.assertLess(terminal.item(), 1e-3)
         th.testing.assert_close(next_episode, th.ones((1, 1)))
 
     def test_ball_is_anchored_to_expert_before_touch(self):

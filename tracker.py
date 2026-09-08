@@ -608,14 +608,10 @@ class TrackingReward:
         replays:    ExpertGoalStates,
         scale:      float = 1.0,
         car_scale:  float = 2.0,
-        ball_outcome_weight: float = 0.5,
     ) -> None:
-        if not np.isfinite(ball_outcome_weight) or ball_outcome_weight < 0:
-            raise ValueError("ball outcome weight must be finite and nonnegative")
         self.replays = replays
         self.scale = scale
         self.car_scale = car_scale
-        self.ball_outcome_weight = ball_outcome_weight
         self.position_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
         self.value: th.Tensor | None = None
         self.touched: th.Tensor | None = None
@@ -690,13 +686,13 @@ class TrackingReward:
             + 0.10
             * th.exp(-0.1 * ball_angular_velocity_error.square().sum(-1))
         )
-        reward = car_reward + (
-            self.ball_outcome_weight
-            * self._ball_tracking_active
-            * ball_score
+        reward = th.where(
+            self._ball_tracking_active,
+            car_reward * ball_score,
+            car_reward,
         )
 
-        self.value = car_reward
+        self.value = reward
         self._ball_tracking_active[context.events.done] = False
 
         return self.scale * reward[:, None]
@@ -711,7 +707,6 @@ class ExpertLookaheadEnv:
         replays:                 ExpertGoalStates,
         reward_scale:            float = 1.0,
         car_scale:               float = 2.0,
-        ball_outcome_weight:     float = 0.5,
         minimum_reward:          float = 0.1,
         minimum_tracking_frames: int = 1,
     ) -> None:
@@ -751,7 +746,6 @@ class ExpertLookaheadEnv:
             replays,
             reward_scale,
             car_scale,
-            ball_outcome_weight,
         )
         self.env.register_reward(self.reward)
 
@@ -904,7 +898,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--car-scale",               type=float, default=2.0)
-    parser.add_argument("--ball-outcome-weight", type=float, default=0.5)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int,   default=16)
     parser.add_argument("--minimum-remaining-frames", type=int, default=128)
@@ -1032,7 +1025,6 @@ def main() -> None:
         replays,
         reward_scale=args.tracking_reward_scale,
         car_scale=args.car_scale,
-        ball_outcome_weight=args.ball_outcome_weight,
         minimum_reward=args.minimum_tracking_reward,
         minimum_tracking_frames=args.minimum_tracking_frames,
     )
@@ -1068,7 +1060,6 @@ def main() -> None:
             "epochs": args.epochs,
             "sequence_length": args.sequence_length,
             "minimum_tracking_frames": args.minimum_tracking_frames,
-            "ball_outcome_weight": args.ball_outcome_weight,
             "max_grad_norm": args.max_grad_norm,
         },
     )

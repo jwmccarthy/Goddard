@@ -338,7 +338,6 @@ class ArgumentValidationTest(unittest.TestCase):
             checkpoint_interval=10,
             checkpoint_keep=2,
             minimum_remaining_frames=128,
-            ball_outcome_weight=0.1,
             skill_horizon=16,
             skill_horizon_jitter=4,
             prior_action_weight=1.0,
