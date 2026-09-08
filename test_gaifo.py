@@ -110,6 +110,7 @@ class ArgumentValidationTest(unittest.TestCase):
             rollout=32,
             trajectory_length=8,
             expert_frame_limit=None,
+            replay_reset_fraction=0.7,
             discriminator_noise=0.01,
             discriminator_batch=8,
             discriminator_epochs=1,
@@ -183,6 +184,15 @@ class ArgumentValidationTest(unittest.TestCase):
             np.save(path / "blue-0-match.npy", np.zeros((20, 161), dtype=np.float32))
             args = self._valid_args(path)
             args.ppo_batch = 1_000
+            with self.assertRaises(ValueError):
+                validate_args(args)
+
+    def test_rejects_replay_reset_fraction_outside_unit_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            np.save(path / "blue-0-match.npy", np.zeros((20, 161), dtype=np.float32))
+            args = self._valid_args(path)
+            args.replay_reset_fraction = 1.1
             with self.assertRaises(ValueError):
                 validate_args(args)
 
@@ -260,6 +270,30 @@ class ExpertDatasetTest(unittest.TestCase):
 
         np.testing.assert_array_equal(resampled[1, 25:30], np.ones(5))
         np.testing.assert_array_equal(resampled[1, 46:51], np.ones(5))
+
+    def test_reset_dataset_contains_all_states_and_both_car_internals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            blue = np.zeros((5, 161), dtype=np.float32)
+            orange = np.zeros((5, 161), dtype=np.float32)
+            for car_start in (9, 30):
+                blue[:, car_start + 9] = 1.0
+                blue[:, car_start + 14] = 1.0
+            blue[:, 137:156] = 1.0
+            orange[:, 137:156] = 2.0
+            blue[:, -4:] = 1.0
+            np.save(path / "blue-0-match.npy", blue)
+            np.save(path / "orange-0-match.npy", orange)
+
+            reset = ExpertSceneDataset(path, trajectory_length=2).reset_dataset()
+
+            self.assertEqual(len(reset), 5)
+            th.testing.assert_close(
+                reset.data["car_internal_state"][:, 0], th.ones(5, 19)
+            )
+            th.testing.assert_close(
+                reset.data["car_internal_state"][:, 1], th.full((5, 19), 2.0)
+            )
 
 
 class NoiseMaskTest(unittest.TestCase):

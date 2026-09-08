@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import threading
 import time
 import webbrowser
@@ -17,6 +18,7 @@ import gaifo
 import torch as th
 
 from carl.gymnasium import CARLTorchVectorEnv
+from jarl.envs import DatasetResetSampler
 
 
 ROOT = Path(__file__).parent
@@ -154,6 +156,29 @@ def select_actions(
     return actions, blue_output.next_state, orange_output.next_state
 
 
+def configure_replay_resets(
+    env: CARLTorchVectorEnv,
+    replay_dir: Path,
+    frameskip: int,
+    limit: int,
+    probability: float,
+    seed: int,
+) -> None:
+    scenes = gaifo.ExpertSceneDataset(
+        replay_dir,
+        trajectory_length=2,
+        limit=limit,
+        seed=seed,
+        frame_skip=frameskip,
+        device=env.device,
+    )
+    env.reset_state_provider = DatasetResetSampler(
+        scenes.reset_dataset(),
+        probability=probability,
+        seed=seed,
+    )
+
+
 def simulate(
     state: SpectatorState,
     registry: CheckpointRegistry,
@@ -184,6 +209,14 @@ def simulate(
             normalize=True,
             synchronize=True,
             discrete_actions=True,
+        )
+        configure_replay_resets(
+            env,
+            args.replay_dir,
+            frameskip,
+            args.reset_state_limit,
+            args.replay_reset_fraction,
+            args.seed,
         )
         blue = load_policy(blue_path, env)
         orange = load_policy(orange_path, env)
@@ -278,6 +311,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-dir", type=Path, default=Path("checkpoints/gaifo")
     )
+    parser.add_argument("--replay-dir", type=Path, required=True)
+    parser.add_argument("--reset-state-limit", type=int, default=100_000)
+    parser.add_argument("--replay-reset-fraction", type=float, default=1.0)
     parser.add_argument("--blue")
     parser.add_argument("--orange")
     parser.add_argument("--frameskip", type=int)
@@ -293,6 +329,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--frameskip must be positive")
     if args.max_ticks < 1:
         parser.error("--max-ticks must be positive")
+    if args.reset_state_limit < 2:
+        parser.error("--reset-state-limit must be at least two")
+    if (
+        not math.isfinite(args.replay_reset_fraction)
+        or not 0.0 <= args.replay_reset_fraction <= 1.0
+    ):
+        parser.error("--replay-reset-fraction must be between zero and one")
+    if not args.replay_dir.is_dir():
+        parser.error("--replay-dir must be a directory")
     if args.port < 1:
         parser.error("--port must be positive")
     return args

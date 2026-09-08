@@ -11,7 +11,8 @@ import torch.nn.functional as F
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import CaptureContext, CriticCapture, LogProbCapture, Runner
 from jarl.collect.capture import CaptureBase
-from jarl.data.batch import TensorBatch
+from jarl.data import TensorBatch, TensorDataset
+from jarl.envs import DatasetResetSampler
 from jarl.learn import (
     Algorithm,
     IndependentOptimizerSteps,
@@ -31,6 +32,8 @@ from jarl.sample import RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE, PrepareContext
 
+from physics_utils import forward_up_to_quat
+
 
 SCENE_SIZE = 51
 GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v1"
@@ -41,6 +44,15 @@ BLUE_START = 9
 ORANGE_START = 30
 CAR_BOOL_START = 16
 CAR_BOOL_END = 21
+INTERNAL_STATE_START = 137
+INTERNAL_STATE_SIZE = 19
+POSITION_SCALE = (4108.0, 6000.0, 2076.0)
+BALL_MAX_SPEED = 6000.0
+BALL_MAX_ANG_SPEED = 6.0
+CAR_MAX_SPEED = 2300.0
+CAR_MAX_ANG_SPEED = 5.5
+BOOST_MAX = 100.0
+INTERNAL_BOOL_INDICES = (0, 2, 3, 4, 5, 7, 8, 9, 11, 17)
 
 
 def noise_mask(device: str | th.device = "cpu") -> th.Tensor:
@@ -64,25 +76,21 @@ def add_scene_noise(windows: th.Tensor, std: float) -> th.Tensor:
     return windows + noise
 
 
-def resample_scene(
-    scene: np.ndarray,
+def _resample_coordinates(
+    length: int,
     source_frame_skip: int,
     target_frame_skip: int,
-) -> np.ndarray:
-    """Resample normalized physical scenes onto the simulator's time cadence."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if source_frame_skip < 1 or target_frame_skip < 1:
         raise ValueError("source and target frame skips must be positive")
-    if len(scene) < 2 or source_frame_skip == target_frame_skip:
-        return np.asarray(scene, dtype=np.float32)
-
-    source_ticks = np.arange(len(scene), dtype=np.float64) * source_frame_skip
+    source_ticks = np.arange(length, dtype=np.float64) * source_frame_skip
     target_ticks = np.arange(
         0.0,
         source_ticks[-1] + 1.0,
         target_frame_skip,
     )
-    right = np.searchsorted(source_ticks, target_ticks).clip(0, len(scene) - 1)
-    left = (right - 1).clip(0, len(scene) - 1)
+    right = np.searchsorted(source_ticks, target_ticks).clip(0, length - 1)
+    left = (right - 1).clip(0, length - 1)
     span = source_ticks[right] - source_ticks[left]
     alpha = np.divide(
         target_ticks - source_ticks[left],
@@ -90,6 +98,20 @@ def resample_scene(
         out=np.zeros_like(target_ticks),
         where=span > 0,
     ).astype(np.float32)
+    return left, right, alpha
+
+
+def resample_scene(
+    scene: np.ndarray,
+    source_frame_skip: int,
+    target_frame_skip: int,
+) -> np.ndarray:
+    """Resample normalized physical scenes onto the simulator's time cadence."""
+    if len(scene) < 2 or source_frame_skip == target_frame_skip:
+        return np.asarray(scene, dtype=np.float32)
+    left, right, alpha = _resample_coordinates(
+        len(scene), source_frame_skip, target_frame_skip
+    )
     output = (
         scene[left] * (1.0 - alpha[:, None])
         + scene[right] * alpha[:, None]
@@ -108,6 +130,25 @@ def resample_scene(
         up -= forward * np.sum(forward * up, axis=-1, keepdims=True)
         up /= np.linalg.norm(up, axis=-1, keepdims=True).clip(1e-6)
 
+    return output
+
+
+def resample_internal_state(
+    state: np.ndarray,
+    source_frame_skip: int,
+    target_frame_skip: int,
+) -> np.ndarray:
+    if len(state) < 2 or source_frame_skip == target_frame_skip:
+        return np.asarray(state, dtype=np.float32)
+    left, right, alpha = _resample_coordinates(
+        len(state), source_frame_skip, target_frame_skip
+    )
+    output = (
+        state[left] * (1.0 - alpha[:, None])
+        + state[right] * alpha[:, None]
+    ).astype(np.float32)
+    nearest = np.where(alpha < 0.5, left, right)
+    output[:, INTERNAL_BOOL_INDICES] = state[nearest[:, None], INTERNAL_BOOL_INDICES]
     return output
 
 
@@ -272,7 +313,7 @@ class ExpertSceneDataset:
             key = self._dedup_key(path)
             groups.setdefault(key, []).append(path)
 
-        selected = [sorted(groups[key])[0] for key in sorted(groups)]
+        selected = [sorted(groups[key]) for key in sorted(groups)]
         if not selected:
             raise ValueError(f"no 1v1 replay files found in {replay_dir}")
 
@@ -280,26 +321,71 @@ class ExpertSceneDataset:
             rng.shuffle(selected)
 
         frames: list[th.Tensor] = []
+        internal_states: list[th.Tensor] = []
         lengths: list[int] = []
         total = 0
-        for path in selected:
+        for group in selected:
+            path = group[0]
             if frame_skip is not None:
                 metadata_path = path.with_suffix(".unsafe-starts.npz")
                 if not metadata_path.is_file():
                     raise ValueError(f"missing frame-skip metadata for {path.name}")
                 with np.load(metadata_path) as metadata:
                     stored_frame_skip = int(metadata.get("frame_skip", -1))
+            stored = np.load(path, mmap_mode="r")
             source = np.array(
-                np.load(path, mmap_mode="r")[:, :SCENE_SIZE], dtype=np.float32, copy=True
+                stored[:, :SCENE_SIZE], dtype=np.float32, copy=True
             )
+            ego_internal = np.array(
+                stored[
+                    :, INTERNAL_STATE_START:INTERNAL_STATE_START + INTERNAL_STATE_SIZE
+                ],
+                dtype=np.float32,
+                copy=True,
+            )
+            opponent_internal = np.zeros_like(ego_internal)
+            if len(group) > 1:
+                opponent_path = group[1]
+                opponent = np.load(opponent_path, mmap_mode="r")
+                if len(opponent) != len(stored):
+                    raise ValueError(f"paired POV rows differ for {path.name}")
+                opponent_internal = np.array(
+                    opponent[
+                        :,
+                        INTERNAL_STATE_START:INTERNAL_STATE_START + INTERNAL_STATE_SIZE,
+                    ],
+                    dtype=np.float32,
+                    copy=True,
+                )
+                if frame_skip is not None:
+                    opponent_metadata_path = opponent_path.with_suffix(
+                        ".unsafe-starts.npz"
+                    )
+                    if not opponent_metadata_path.is_file():
+                        raise ValueError(
+                            f"missing frame-skip metadata for {opponent_path.name}"
+                        )
+                    with np.load(opponent_metadata_path) as metadata:
+                        opponent_frame_skip = int(metadata.get("frame_skip", -1))
+                    if opponent_frame_skip != stored_frame_skip:
+                        raise ValueError(f"paired POV cadence differs for {path.name}")
             if frame_skip is not None:
                 source = resample_scene(source, stored_frame_skip, frame_skip)
+                ego_internal = resample_internal_state(
+                    ego_internal, stored_frame_skip, frame_skip
+                )
+                opponent_internal = resample_internal_state(
+                    opponent_internal, stored_frame_skip, frame_skip
+                )
+            internal = np.stack((ego_internal, opponent_internal), axis=1)
             if limit is not None and total + len(source) > limit:
                 keep = max(0, limit - total)
                 if keep == 0:
                     break
                 source = source[:keep]
+                internal = internal[:keep]
             frames.append(th.from_numpy(source))
+            internal_states.append(th.from_numpy(internal))
             lengths.append(len(source))
             total += len(source)
             if limit is not None and total >= limit:
@@ -309,6 +395,7 @@ class ExpertSceneDataset:
             raise ValueError(f"no expert frames loaded from {replay_dir}")
 
         self.frames = th.cat(frames).to(device)
+        self.internal_states = th.cat(internal_states).to(device)
         self.lengths = lengths
         window_starts = []
         offset = 0
@@ -354,6 +441,25 @@ class ExpertSceneDataset:
         )
         starts = self.window_starts[selected, None]
         return self.frames[starts + self.window_offsets]
+
+    def reset_dataset(self) -> TensorDataset:
+        ball = self.frames[:, :BALL_SIZE]
+        cars = self.frames[:, BALL_SIZE:SCENE_SIZE].view(-1, N_CARS, CAR_SIZE)
+        position_scale = th.tensor(
+            POSITION_SCALE, dtype=self.frames.dtype, device=self.frames.device
+        )
+        return TensorDataset(TensorBatch({
+            "ball_position": ball[:, :3] * position_scale,
+            "ball_velocity": ball[:, 3:6] * BALL_MAX_SPEED,
+            "ball_angular_velocity": ball[:, 6:9] * BALL_MAX_ANG_SPEED,
+            "car_position": cars[..., :3] * position_scale,
+            "car_rotation": forward_up_to_quat(cars[..., 9:12], cars[..., 12:15]),
+            "car_velocity": cars[..., 3:6] * CAR_MAX_SPEED,
+            "car_angular_velocity": cars[..., 6:9] * CAR_MAX_ANG_SPEED,
+            "car_demoed": cars[..., 17].bool(),
+            "car_boost": cars[..., 15] * BOOST_MAX,
+            "car_internal_state": self.internal_states,
+        }))
 
 
 class SceneDiscriminator(nn.Module):
@@ -633,6 +739,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout", type=int, default=32)
     parser.add_argument("--trajectory-length", type=int, default=8)
     parser.add_argument("--expert-frame-limit", type=int, default=None)
+    parser.add_argument("--replay-reset-fraction", type=float, default=0.70)
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
     parser.add_argument("--discriminator-batch", type=int, default=16_384)
     parser.add_argument("--discriminator-epochs", type=int, default=1)
@@ -710,6 +817,11 @@ def validate_args(args: argparse.Namespace) -> None:
         and args.expert_frame_limit < args.trajectory_length
     ):
         raise ValueError("--expert-frame-limit must fit one trajectory")
+    if (
+        not math.isfinite(args.replay_reset_fraction)
+        or not 0.0 <= args.replay_reset_fraction <= 1.0
+    ):
+        raise ValueError("--replay-reset-fraction must be between zero and one")
     if not math.isfinite(args.discriminator_noise) or args.discriminator_noise < 0.0:
         raise ValueError("--discriminator-noise must be non-negative")
     if (
@@ -811,6 +923,11 @@ def main() -> None:
     )
     if expert.total_windows < 1:
         raise ValueError("expert dataset contains no valid windows")
+    env.reset_state_provider = DatasetResetSampler(
+        expert.reset_dataset(),
+        probability=args.replay_reset_fraction,
+        seed=args.seed,
+    )
 
     policy_optimizer = th.optim.Adam(policy.parameters(), lr=args.ppo_lr)
     critic_optimizer = th.optim.Adam(critic.parameters(), lr=args.ppo_lr)
