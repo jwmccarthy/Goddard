@@ -416,6 +416,31 @@ class RewardTest(unittest.TestCase):
         self.assertFalse(result["learner_mask"][:2].any())
         self.assertTrue(result["learner_mask"][2:].all())
 
+    def test_reward_scores_scene_windows_in_bounded_batches(self):
+        class CountingDiscriminator(DeterministicDiscriminator):
+            def __init__(self):
+                super().__init__(trajectory_length=2)
+                self.batch_sizes = []
+
+            def forward(self, windows):
+                self.batch_sizes.append(len(windows))
+                return super().forward(windows)
+
+        batch = add_scene_window_fields(
+            make_rollout_batch(time=4, n_sim=2, obs_dim=60),
+            trajectory_length=2,
+        )
+        discriminator = CountingDiscriminator()
+
+        SceneDiscriminatorReward(
+            discriminator,
+            noise_std=0.0,
+            trajectory_length=2,
+            batch_size=3,
+        )(batch, None)
+
+        self.assertEqual(discriminator.batch_sizes, [3, 3, 2])
+
 
 class PolicyTest(unittest.TestCase):
     def test_policy_is_per_actor_not_joint(self):

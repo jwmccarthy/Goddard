@@ -505,11 +505,15 @@ class SceneDiscriminatorReward:
         discriminator: SceneDiscriminator,
         noise_std: float,
         trajectory_length: int,
+        batch_size: int = 16_384,
         output_field: str = "imitation_reward",
     ) -> None:
+        if batch_size < 1:
+            raise ValueError("discriminator reward batch size must be positive")
         self.discriminator = discriminator
         self.noise_std = noise_std
         self.trajectory_length = trajectory_length
+        self.batch_size = batch_size
         self.output_field = output_field
 
     @th.no_grad()
@@ -523,9 +527,16 @@ class SceneDiscriminatorReward:
 
         scores = th.zeros_like(valid, dtype=batch["observation"].dtype)
         if valid.any():
-            noisy = add_scene_noise(windows[valid], self.noise_std)
-            logits = self.discriminator(noisy)
-            scores[valid] = F.softplus(-logits)
+            selected = windows[valid]
+            selected_scores = th.empty(
+                len(selected), dtype=scores.dtype, device=scores.device
+            )
+            for start in range(0, len(selected), self.batch_size):
+                stop = min(start + self.batch_size, len(selected))
+                noisy = add_scene_noise(selected[start:stop], self.noise_std)
+                logits = self.discriminator(noisy)
+                selected_scores[start:stop] = F.softplus(-logits)
+            scores[valid] = selected_scores
 
         # Full team spirit: broadcast the same scene score to every actor.
         reward = scores.repeat_interleave(N_CARS, dim=1)
@@ -838,6 +849,7 @@ def main() -> None:
                 discriminator,
                 args.discriminator_noise,
                 args.trajectory_length,
+                batch_size=args.discriminator_batch,
             ),
             GAE(
                 gamma=args.gamma,
