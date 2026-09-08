@@ -253,6 +253,7 @@ class ExpertSceneDataset:
         limit: int | None = None,
         seed: int = 0,
         frame_skip: int | None = None,
+        device: str | th.device = "cpu",
     ) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
@@ -307,17 +308,23 @@ class ExpertSceneDataset:
         if not frames:
             raise ValueError(f"no expert frames loaded from {replay_dir}")
 
-        self.frames = th.cat(frames)
+        self.frames = th.cat(frames).to(device)
         self.lengths = lengths
-        self.starts = np.concatenate(([0], np.cumsum(lengths, dtype=np.int64)))
-        self._rng = np.random.default_rng(seed)
-        self.total_windows = sum(
-            max(0, length - trajectory_length + 1) for length in lengths
-        )
-        if self.total_windows <= 0:
+        window_starts = []
+        offset = 0
+        for length in lengths:
+            count = max(0, length - trajectory_length + 1)
+            if count:
+                window_starts.append(th.arange(offset, offset + count))
+            offset += length
+        if not window_starts:
             raise ValueError(
                 f"expert files are too short to build windows of length {trajectory_length}"
             )
+        self.window_starts = th.cat(window_starts).to(device)
+        self.window_offsets = th.arange(trajectory_length, device=device)
+        self._generator = th.Generator(device=device).manual_seed(seed)
+        self.total_windows = len(self.window_starts)
 
     @staticmethod
     def _dedup_key(path: Path) -> tuple[str, ...]:
@@ -334,24 +341,19 @@ class ExpertSceneDataset:
         if self.total_windows <= 0:
             raise RuntimeError("no expert windows available")
 
-        windows_per_file = np.array(
-            [max(0, length - self.trajectory_length + 1) for length in self.lengths],
-            dtype=np.float64,
+        requested_device = th.device(device)
+        if requested_device != self.frames.device:
+            raise ValueError(
+                "expert scenes and generated scenes must reside on the same device"
+            )
+        selected = th.randint(
+            self.total_windows,
+            (n,),
+            device=self.frames.device,
+            generator=self._generator,
         )
-        probabilities = windows_per_file / windows_per_file.sum()
-        file_indices = self._rng.choice(len(self.lengths), size=n, p=probabilities)
-        starts = [
-            self._rng.integers(0, int(windows_per_file[i])) for i in file_indices
-        ]
-
-        batch = th.empty(
-            n, self.trajectory_length, SCENE_SIZE, dtype=self.frames.dtype
-        )
-        for j, (file_index, start) in enumerate(zip(file_indices, starts)):
-            offset = int(self.starts[file_index]) + int(start)
-            batch[j] = self.frames[offset : offset + self.trajectory_length]
-
-        return batch.to(device)
+        starts = self.window_starts[selected, None]
+        return self.frames[starts + self.window_offsets]
 
 
 class SceneDiscriminator(nn.Module):
@@ -613,7 +615,7 @@ def parse_args() -> argparse.Namespace:
         description="GAIfO imitation learning for 1v1 Rocket League via CARL and JARL."
     )
     parser.add_argument("--replay-dir", type=Path, required=True)
-    parser.add_argument("--n-sim", type=int, default=256)
+    parser.add_argument("--n-sim", type=int, default=16_384)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
@@ -621,13 +623,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-length", type=int, default=8)
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
-    parser.add_argument("--discriminator-batch", type=int, default=64)
+    parser.add_argument("--discriminator-batch", type=int, default=16_384)
     parser.add_argument("--discriminator-epochs", type=int, default=1)
     parser.add_argument("--discriminator-lr", type=float, default=3e-4)
     parser.add_argument("--discriminator-hidden", type=int, default=128)
     parser.add_argument("--frame-embedding", type=int, default=128)
     parser.add_argument("--temporal-hidden", type=int, default=128)
-    parser.add_argument("--ppo-batch", type=int, default=64)
+    parser.add_argument("--ppo-batch", type=int, default=16_384)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
     parser.add_argument("--ppo-clip", type=float, default=0.2)
@@ -641,11 +643,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--policy-hidden", type=int, default=256)
     parser.add_argument("--critic-hidden", type=int, default=256)
-    parser.add_argument("--timesteps", type=int, default=10_000_000)
+    parser.add_argument("--timesteps", type=int, default=2_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/gaifo"))
-    parser.add_argument("--checkpoint-interval", type=int, default=1_000_000)
+    parser.add_argument("--checkpoint-interval", type=int, default=10_000_000)
     parser.add_argument("--checkpoint-keep", type=int, default=5)
     return parser.parse_args()
 
@@ -794,6 +796,7 @@ def main() -> None:
         args.expert_frame_limit,
         args.seed,
         frame_skip=args.frameskip,
+        device=env.device,
     )
     if expert.total_windows < 1:
         raise ValueError("expert dataset contains no valid windows")
