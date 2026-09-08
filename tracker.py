@@ -65,8 +65,8 @@ RAW_ACTION_SIZE = 8
 STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-TRACKER_ARCHITECTURE = "categorical-all-gru-v2"
-PHC_TRACKER_ARCHITECTURE = "categorical-phc-gru-v2"
+TRACKER_ARCHITECTURE = "categorical-all-gru-v3"
+PHC_TRACKER_ARCHITECTURE = "categorical-phc-gru-v3"
 
 
 class SegmentStats:
@@ -397,7 +397,7 @@ class ExpertGoalStates:
 
     @property
     def goal_size(self) -> int:
-        return INTERNAL_STATE_SIZE + self._windows.numel() * CAR_STATE_SIZE
+        return INTERNAL_STATE_SIZE + self._windows.numel() * GOAL_STATE_SIZE
 
     @property
     def n_demos(self) -> int:
@@ -585,8 +585,8 @@ class ExpertGoalStates:
         )
 
         goals = (
-            self._replays[goal_idx, 9:GOAL_STATE_SIZE]
-            - obs[:, None, 9:GOAL_STATE_SIZE]
+            self._replays[goal_idx, :GOAL_STATE_SIZE]
+            - obs[:, None, :GOAL_STATE_SIZE]
         ).flatten(-2)
         internal_state = self._replays[
             cursors,

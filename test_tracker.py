@@ -20,7 +20,6 @@ from tracker import (
     ACTION_FACTORS,
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
-    CAR_STATE_SIZE,
     DEFAULT_TRACKER_WINDOWS,
     EXPERT_TOUCH_INDEX,
     ExpertGoalStates,
@@ -380,7 +379,7 @@ class TrackerTest(unittest.TestCase):
 
         self.assertEqual(replays._filter(demo, unsafe), [])
 
-    def test_goals_include_internal_state_and_relative_car_state(self):
+    def test_goals_include_internal_state_and_relative_ball_and_car_state(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._windows = th.tensor([[1, 2]])
         replays._cursors = th.tensor([0])
@@ -395,13 +394,14 @@ class TrackerTest(unittest.TestCase):
         replays._replays[1, 9:GOAL_STATE_SIZE] = 1.0
         replays._replays[2, 9:GOAL_STATE_SIZE] = 2.0
         observation = th.zeros((1, GOAL_STATE_SIZE))
+        observation[:, :9] = 10.0
 
         goal_observation, end = replays.next_goals(observation)
 
         internal_end = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
         self.assertEqual(
             goal_observation.shape,
-            (1, GOAL_STATE_SIZE + INTERNAL_STATE_SIZE + 42),
+            (1, GOAL_STATE_SIZE + INTERNAL_STATE_SIZE + 2 * GOAL_STATE_SIZE),
         )
         th.testing.assert_close(goal_observation[:, :GOAL_STATE_SIZE], observation)
         th.testing.assert_close(
@@ -409,12 +409,22 @@ class TrackerTest(unittest.TestCase):
             th.arange(INTERNAL_STATE_SIZE, dtype=th.float32).expand(1, -1),
         )
         th.testing.assert_close(
-            goal_observation[:, internal_end:internal_end + CAR_STATE_SIZE],
-            th.ones(1, CAR_STATE_SIZE),
+            goal_observation[:, internal_end:internal_end + 9],
+            th.full((1, 9), 90.0),
         )
         th.testing.assert_close(
-            goal_observation[:, internal_end + CAR_STATE_SIZE:],
-            th.full((1, CAR_STATE_SIZE), 2.0),
+            goal_observation[:, internal_end + 9:internal_end + GOAL_STATE_SIZE],
+            th.ones(1, GOAL_STATE_SIZE - 9),
+        )
+        th.testing.assert_close(
+            goal_observation[
+                :, internal_end + GOAL_STATE_SIZE:internal_end + GOAL_STATE_SIZE + 9
+            ],
+            th.full((1, 9), 190.0),
+        )
+        th.testing.assert_close(
+            goal_observation[:, internal_end + GOAL_STATE_SIZE + 9:],
+            th.full((1, GOAL_STATE_SIZE - 9), 2.0),
         )
         self.assertFalse(end.item())
 
@@ -570,17 +580,19 @@ class TrackerTest(unittest.TestCase):
 
     def test_native_final_observation_padding_defers_action_hints(self):
         wrapper = ExpertLookaheadEnv.__new__(ExpertLookaheadEnv)
-        wrapper.replays = SimpleNamespace(goal_size=INTERNAL_STATE_SIZE + 7 * 21)
+        wrapper.replays = SimpleNamespace(
+            goal_size=INTERNAL_STATE_SIZE + 7 * GOAL_STATE_SIZE
+        )
 
         padded = wrapper._pad_goals(th.zeros((2, GOAL_STATE_SIZE)))
 
         self.assertEqual(
             padded.shape,
-            (2, GOAL_STATE_SIZE + INTERNAL_STATE_SIZE + 7 * 21),
+            (2, GOAL_STATE_SIZE + INTERNAL_STATE_SIZE + 7 * GOAL_STATE_SIZE),
         )
 
     def test_mixed_native_and_tracking_resets_keep_final_observation_width(self):
-        goal_size = INTERNAL_STATE_SIZE + 7 * 21
+        goal_size = INTERNAL_STATE_SIZE + 7 * GOAL_STATE_SIZE
 
         class Environment:
             def step(self, action):
@@ -608,7 +620,7 @@ class TrackerTest(unittest.TestCase):
                 return th.zeros((2, GOAL_STATE_SIZE))
 
         class Replays:
-            goal_size = INTERNAL_STATE_SIZE + 7 * 21
+            goal_size = INTERNAL_STATE_SIZE + 7 * GOAL_STATE_SIZE
 
             @staticmethod
             def current_raw_action(offset=0):
