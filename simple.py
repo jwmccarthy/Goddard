@@ -131,8 +131,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-hidden", type=int, default=512)
     parser.add_argument("--critic-hidden", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=0.997)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.9997,
+        help="reward discount factor (default: 0.9997 for long-horizon credit)",
+    )
+    parser.add_argument(
+        "--gae-lambda",
+        "--lambda",
+        dest="gae_lambda",
+        type=float,
+        default=0.999,
+        help="GAE trace factor (default: 0.999 for long-horizon credit)",
+    )
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
