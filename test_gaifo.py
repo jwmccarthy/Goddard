@@ -19,7 +19,9 @@ from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 
 from gaifo import (
     AdaptiveDiscriminatorUpdate,
+    DualTimescaleSceneDiscriminatorReward,
     ExpertSceneDataset,
+    ExpertSceneView,
     GAIFO_ARCHITECTURE,
     GAIFOCheckpoints,
     HistoricalReplayBuffer,
@@ -28,8 +30,10 @@ from gaifo import (
     SceneDiscriminatorReward,
     SceneGAIFOMinibatches,
     SceneWindowCapture,
+    SelectPPOFields,
     add_scene_noise,
     build_scene_windows,
+    compute_long_offsets,
     extract_scene_observations,
     opponent_view,
     resample_scene,
@@ -115,6 +119,30 @@ def add_scene_window_fields(batch: TensorBatch, trajectory_length: int) -> Tenso
     )
 
 
+def capture_step(
+    capture: SceneWindowCapture,
+    values: list[float],
+    next_values: list[float] | None = None,
+    done: th.Tensor | None = None,
+) -> dict[str, th.Tensor]:
+    """Push one transition through ``SceneWindowCapture`` for testing."""
+    n_envs = len(values)
+    obs = th.zeros(n_envs, 60)
+    for i, value in enumerate(values):
+        obs[i, 0] = value
+    if next_values is None:
+        next_values = values
+    next_obs = th.zeros(n_envs, 60)
+    for i, value in enumerate(next_values):
+        next_obs[i, 0] = value
+    if done is None:
+        done = th.zeros(n_envs, dtype=th.bool)
+    return capture(SimpleNamespace(
+        observation=obs,
+        env_step=SimpleNamespace(next_obs=next_obs, done=done),
+    ))
+
+
 class ArgumentValidationTest(unittest.TestCase):
     def _valid_args(self, replay_dir: Path) -> SimpleNamespace:
         return SimpleNamespace(
@@ -125,6 +153,11 @@ class ArgumentValidationTest(unittest.TestCase):
             no_touch_timeout=30.0,
             rollout=32,
             trajectory_length=8,
+            long_trajectory_seconds=5.0,
+            long_trajectory_length=16,
+            long_reward_weight=0.5,
+            long_history_capacity=65_536,
+            long_history_add_size=4_096,
             expert_frame_limit=None,
             replay_reset_fraction=0.7,
             discriminator_noise=0.01,
@@ -991,6 +1024,520 @@ class CheckpointTest(unittest.TestCase):
         self.assertFalse(checkpoint.ready(100))
         buffer.position = 0
         self.assertTrue(checkpoint.ready(100))
+
+
+class LongOffsetTest(unittest.TestCase):
+    def test_default_five_seconds_at_frameskip_two(self):
+        offsets = compute_long_offsets(5.0, 2, 16)
+        self.assertEqual(len(offsets), 16)
+        self.assertEqual(len(set(offsets.tolist())), 16)
+        self.assertEqual(offsets[0].item(), 0)
+        self.assertEqual(offsets[-1].item(), 300)
+
+    def test_offsets_include_zero_and_span(self):
+        offsets = compute_long_offsets(1.0, 4, 8)
+        self.assertEqual(offsets[0].item(), 0)
+        self.assertEqual(offsets[-1].item(), 30)
+
+    def test_rejects_nonpositive_seconds(self):
+        with self.assertRaises(ValueError):
+            compute_long_offsets(0.0, 2, 4)
+        with self.assertRaises(ValueError):
+            compute_long_offsets(float("inf"), 2, 4)
+
+    def test_rejects_too_few_samples(self):
+        with self.assertRaises(ValueError):
+            compute_long_offsets(1.0, 2, 1)
+
+    def test_rejects_span_smaller_than_required(self):
+        # 2 frames at 120Hz with frameskip 1 -> span 2, need at least 3 for 4 samples.
+        with self.assertRaises(ValueError):
+            compute_long_offsets(2.0 / 120.0, 1, 4)
+
+
+class SceneWindowCaptureLongTest(unittest.TestCase):
+    def test_long_window_uses_exact_next_endpoint_and_resets_both_actors(self):
+        capture = SceneWindowCapture(
+            trajectory_length=2,
+            long_span=4,
+            long_sample_offsets=np.array([0, 2, 4]),
+        )
+        capture.reset(2)
+        output = None
+        for step in range(4):
+            output = capture_step(
+                capture,
+                [float(step), float(step + 100)],
+                [step + 0.5, step + 100.5],
+                done=th.tensor([step == 3, False]),
+            )
+        assert output is not None
+        self.assertTrue(output["long_scene_window_valid"].all())
+        th.testing.assert_close(
+            output["long_scene_window"][0, :, 0],
+            th.tensor([0.0, 2.0, 3.5]),
+        )
+        th.testing.assert_close(
+            output["long_scene_window"][1, :, 0],
+            th.tensor([100.0, 102.0, 103.5]),
+        )
+
+        after_reset = capture_step(capture, [10.0, 110.0], [10.5, 110.5])
+        self.assertFalse(after_reset["long_scene_window_valid"].any())
+
+    def test_short_window_unchanged_with_long_enabled(self):
+        capture = SceneWindowCapture(
+            trajectory_length=4,
+            long_span=8,
+            long_sample_offsets=np.array([0, 2, 4, 8]),
+            device="cpu",
+        )
+        capture.reset(2)
+        outputs = [capture_step(capture, [float(t), float(t) + 10.0]) for t in range(3)]
+        self.assertFalse(outputs[0]["scene_window_valid"].any())
+        self.assertTrue(outputs[2]["scene_window_valid"].all())
+        th.testing.assert_close(
+            outputs[2]["scene_window"][0, :, 0],
+            th.tensor([0.0, 1.0, 2.0, 2.0]),
+        )
+
+    def test_long_window_invalid_during_warmup_and_after_done(self):
+        capture = SceneWindowCapture(
+            trajectory_length=2,
+            long_span=3,
+            long_sample_offsets=np.array([0, 1, 3]),
+            device="cpu",
+        )
+        capture.reset(2)
+        warmup = capture_step(capture, [0.0, 100.0])
+        self.assertFalse(warmup["long_scene_window_valid"].any())
+
+        capture.reset(2)
+        capture_step(capture, [0.0, 100.0])
+        after_done = capture_step(
+            capture,
+            [1.0, 101.0],
+            done=th.tensor([True, False], dtype=th.bool),
+        )
+        self.assertFalse(after_done["long_scene_window_valid"][0])
+
+    def test_long_window_ends_with_next_obs(self):
+        capture = SceneWindowCapture(
+            trajectory_length=2,
+            long_span=4,
+            long_sample_offsets=np.array([0, 1, 2, 4]),
+            device="cpu",
+        )
+        capture.reset(2)
+        outputs = []
+        for t in range(5):
+            outputs.append(capture_step(capture, [float(t), float(t) + 100.0]))
+
+        self.assertTrue(outputs[4]["long_scene_window_valid"].all())
+        # Distances are 4,3,2,0 -> chronological oldest..newest ending with next_obs.
+        # The circular capacity is 4, so the oldest retained frame is from t=1.
+        th.testing.assert_close(
+            outputs[4]["long_scene_window"][0, :, 0],
+            th.tensor([1.0, 2.0, 3.0, 4.0]),
+        )
+        th.testing.assert_close(
+            outputs[4]["long_scene_window"][1, :, 0],
+            th.tensor([101.0, 102.0, 103.0, 104.0]),
+        )
+
+    def test_circular_wrap(self):
+        capture = SceneWindowCapture(
+            trajectory_length=2,
+            long_span=3,
+            long_sample_offsets=np.array([0, 1, 3]),
+            device="cpu",
+        )
+        capture.reset(2)
+        outputs = []
+        for t in range(6):
+            outputs.append(capture_step(capture, [float(t), float(t) + 100.0]))
+        # With capacity 3 the buffer has wrapped around at least once.
+        self.assertTrue(outputs[5]["long_scene_window_valid"].all())
+        th.testing.assert_close(
+            outputs[5]["long_scene_window"][0, :, 0],
+            th.tensor([3.0, 4.0, 5.0]),
+        )
+
+    def test_actor_specific_history(self):
+        capture = SceneWindowCapture(
+            trajectory_length=3,
+            long_span=2,
+            long_sample_offsets=np.array([0, 1, 2]),
+            device="cpu",
+        )
+        capture.reset(2)
+        capture_step(capture, [0.0, 100.0])
+        output = capture_step(capture, [1.0, 200.0])
+        self.assertTrue(output["long_scene_window_valid"].all())
+        th.testing.assert_close(
+            output["long_scene_window"][0, :, 0],
+            th.tensor([0.0, 1.0, 1.0]),
+        )
+        th.testing.assert_close(
+            output["long_scene_window"][1, :, 0],
+            th.tensor([100.0, 200.0, 200.0]),
+        )
+
+
+class ExpertSceneViewTest(unittest.TestCase):
+    def _save_replay(self, path: Path, rows: int, value: float) -> None:
+        np.save(path, np.full((rows, 161), value, dtype=np.float32))
+
+    def test_reuses_base_frames_tensor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self._save_replay(path / "blue-0-a.npy", 20, 1.0)
+            self._save_replay(path / "blue-1-b.npy", 20, 2.0)
+            base = ExpertSceneDataset(path, trajectory_length=2, heldout_size=2, seed=0)
+            view = ExpertSceneView(
+                base, 4, np.array([0, 1, 2, 4]), "long_scene_window", seed=0
+            )
+            self.assertIs(view.base.frames, base.frames)
+
+    def test_sparse_windows_do_not_cross_file_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self._save_replay(path / "blue-0-a.npy", 6, 1.0)
+            self._save_replay(path / "blue-1-b.npy", 12, 2.0)
+            base = ExpertSceneDataset(path, trajectory_length=2, seed=0)
+            view = ExpertSceneView(
+                base, 3, np.array([0, 2, 4]), "long_scene_window", seed=0
+            )
+            windows = view.sample(100, th.device("cpu"))
+            for window in windows:
+                unique = set(window[:, 0].tolist())
+                self.assertEqual(len(unique), 1, "sparse window crossed replay boundary")
+
+    def test_train_heldout_partition_is_shared_with_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self._save_replay(path / "blue-0-a.npy", 12, 1.0)
+            self._save_replay(path / "blue-1-b.npy", 12, 2.0)
+            base = ExpertSceneDataset(path, trajectory_length=2, heldout_size=2, seed=0)
+            view = ExpertSceneView(
+                base, 4, np.array([0, 1, 2, 4]), "long_scene_window", seed=0
+            )
+            heldout_values = set(view.sample_heldout(50, th.device("cpu"))[:, 0, 0].tolist())
+            train_values = set(view.sample(50, th.device("cpu"))[:, 0, 0].tolist())
+            self.assertFalse(heldout_values & train_values)
+
+    def test_reset_dataset_uses_training_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self._save_replay(path / "blue-0-a.npy", 10, 1.0)
+            self._save_replay(path / "blue-1-b.npy", 10, 2.0)
+            base = ExpertSceneDataset(path, trajectory_length=2, heldout_size=2, seed=0)
+            view = ExpertSceneView(
+                base, 3, np.array([0, 1, 3]), "long_scene_window", seed=0
+            )
+            reset = view.reset_dataset()
+            self.assertEqual(len(reset), 10)
+
+    def test_single_replay_sparse_train_and_heldout_frames_are_disjoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self._save_replay(path / "blue-0-a.npy", 20, 1.0)
+            base = ExpertSceneDataset(
+                path,
+                trajectory_length=2,
+                heldout_size=4,
+                partition_span=4,
+            )
+            view = ExpertSceneView(
+                base, 3, np.array([0, 2, 4]), "long_scene_window"
+            )
+
+            train_frames = {
+                start + offset
+                for start in view.train_window_starts.tolist()
+                for offset in view.offsets.tolist()
+            }
+            heldout_frames = {
+                start + offset
+                for start in view.heldout_window_starts.tolist()
+                for offset in view.offsets.tolist()
+            }
+            self.assertTrue(train_frames)
+            self.assertTrue(heldout_frames)
+            self.assertFalse(train_frames & heldout_frames)
+
+
+class PPOFieldSelectionTest(unittest.TestCase):
+    def test_drops_large_discriminator_fields(self):
+        required = {
+            name: th.zeros(2, 2)
+            for name in SelectPPOFields.FIELDS
+        }
+        batch = TensorBatch(required | {
+            "scene_window": th.zeros(2, 2, 8, 51),
+            "long_scene_window": th.zeros(2, 2, 16, 51),
+        })
+
+        selected = SelectPPOFields()(batch, None)
+
+        self.assertEqual(set(selected), set(SelectPPOFields.FIELDS))
+
+
+class DualTimescaleAdaptiveTest(unittest.TestCase):
+    def _make_expert(self, path: Path, marker: float, heldout_size: int = 0) -> ExpertSceneDataset:
+        rows = np.full((30, 161), 0.0, dtype=np.float32)
+        rows[:, 25:30] = marker
+        rows[:, 46:51] = marker
+        np.save(path / "blue-0-match.npy", rows)
+        return ExpertSceneDataset(path, trajectory_length=2, heldout_size=heldout_size, seed=0)
+
+    def _make_long_expert(self, base: ExpertSceneDataset) -> ExpertSceneView:
+        return ExpertSceneView(
+            base,
+            trajectory_length=3,
+            offsets=np.array([0, 1, 2]),
+            window_field="long_scene_window",
+            seed=0,
+        )
+
+    def _make_rollout_batch(self) -> TensorBatch:
+        T, n_envs = 4, 4
+        obs = th.zeros(T, n_envs, 60)
+        obs[..., 50] = 1.0
+        return TensorBatch({
+            "observation": obs,
+            "next_obs": obs,
+            "terminated": th.zeros(T, n_envs, dtype=th.bool),
+            "truncated": th.zeros(T, n_envs, dtype=th.bool),
+        })
+
+    def test_long_stage_is_noop_when_no_valid_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            base = self._make_expert(path, marker=-1.0, heldout_size=2)
+            long_expert = self._make_long_expert(base)
+            batch = TensorBatch({
+                "long_scene_window": th.zeros(4, 4, 3, 51),
+                "long_scene_window_valid": th.zeros(4, 4, dtype=th.bool),
+            })
+            discriminator = TrivialSignDiscriminator()
+            stage = AdaptiveDiscriminatorUpdate(
+                expert=long_expert,
+                history=None,
+                batch_size=4,
+                epochs=1,
+                noise_std=0.0,
+                heldout_size=2,
+                accuracy_target=0.8,
+                history_add_size=4,
+                history_mix_fraction=0.5,
+                max_grad_norm=0.5,
+                discriminator=discriminator,
+                optimizer=th.optim.Adam(discriminator.parameters()),
+                loss=SceneDiscriminatorLoss(discriminator),
+                window_field="long_scene_window",
+                valid_field="long_scene_window_valid",
+                section="LongDiscriminator",
+                require_valid=False,
+            )
+            _, metrics = stage.run(Rollout(steps=batch))
+        self.assertIn("LongDiscriminator", metrics)
+        self.assertEqual(metrics["LongDiscriminator"]["minibatches"], 0.0)
+        self.assertEqual(metrics["LongDiscriminator"]["updated"], 0.0)
+
+    def test_short_and_long_stages_report_independent_sections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            base = self._make_expert(path, marker=-1.0, heldout_size=2)
+            long_expert = self._make_long_expert(base)
+
+            obs = th.zeros(4, 4, 60)
+            obs[..., 50] = 1.0
+            batch = TensorBatch({
+                "observation": obs,
+                "scene_window": th.zeros(4, 4, 2, 51),
+                "scene_window_valid": th.ones(4, 4, dtype=th.bool),
+                "long_scene_window": th.zeros(4, 4, 3, 51),
+                "long_scene_window_valid": th.ones(4, 4, dtype=th.bool),
+            })
+
+            short_disc = TrivialSignDiscriminator()
+            short_disc.bias.data[0] = 0.5
+            long_disc = TrivialSignDiscriminator()
+            long_disc.bias.data[0] = 0.5
+            short_stage = AdaptiveDiscriminatorUpdate(
+                expert=base,
+                history=None,
+                batch_size=4,
+                epochs=1,
+                noise_std=0.0,
+                heldout_size=2,
+                accuracy_target=0.8,
+                history_add_size=4,
+                history_mix_fraction=0.5,
+                max_grad_norm=0.5,
+                discriminator=short_disc,
+                optimizer=th.optim.Adam(short_disc.parameters()),
+                loss=SceneDiscriminatorLoss(short_disc),
+                section="ShortDiscriminator",
+            )
+            long_stage = AdaptiveDiscriminatorUpdate(
+                expert=long_expert,
+                history=None,
+                batch_size=4,
+                epochs=1,
+                noise_std=0.0,
+                heldout_size=2,
+                accuracy_target=0.8,
+                history_add_size=4,
+                history_mix_fraction=0.5,
+                max_grad_norm=0.5,
+                discriminator=long_disc,
+                optimizer=th.optim.Adam(long_disc.parameters()),
+                loss=SceneDiscriminatorLoss(long_disc),
+                window_field="long_scene_window",
+                valid_field="long_scene_window_valid",
+                section="LongDiscriminator",
+            )
+            _, short_metrics = short_stage.run(Rollout(steps=batch))
+            _, long_metrics = long_stage.run(Rollout(steps=batch))
+
+        self.assertIn("ShortDiscriminator", short_metrics)
+        self.assertIn("LongDiscriminator", long_metrics)
+        self.assertEqual(short_metrics["ShortDiscriminator"]["updated"], 1.0)
+        self.assertEqual(long_metrics["LongDiscriminator"]["updated"], 1.0)
+
+
+class DualRewardTest(unittest.TestCase):
+    def _make_batch(self, short_window_marker: float = 1.0) -> TensorBatch:
+        T, n_envs = 4, 4
+        obs = th.zeros(T, n_envs, 60)
+        short_windows = th.zeros(T, n_envs, 2, 51)
+        short_windows[:, :, 0, 0] = th.arange(n_envs).view(1, n_envs).float() * short_window_marker
+        return TensorBatch({
+            "observation": obs,
+            "scene_window": short_windows,
+            "scene_window_valid": th.ones(T, n_envs, dtype=th.bool),
+            "long_scene_window": th.zeros(T, n_envs, 3, 51),
+            "long_scene_window_valid": th.zeros(T, n_envs, dtype=th.bool),
+        })
+
+    def test_short_reward_still_computes_when_long_invalid(self):
+        batch = self._make_batch()
+        transform = DualTimescaleSceneDiscriminatorReward(
+            short_discriminator=DeterministicDiscriminator(trajectory_length=2),
+            long_discriminator=DeterministicDiscriminator(trajectory_length=3),
+            noise_std=0.0,
+            short_trajectory_length=2,
+            long_trajectory_length=3,
+            long_reward_weight=0.5,
+            max_magnitude=10.0,
+        )
+        result = transform(batch, None)
+        short_reward = result["short_imitation_reward"]
+        long_reward = result["long_imitation_reward"]
+        combined = result["imitation_reward"]
+        self.assertTrue((short_reward[result["learner_mask"]] != 0.0).any())
+        self.assertTrue((long_reward == 0.0).all())
+        self.assertTrue(th.allclose(combined, short_reward))
+
+    def test_long_invalid_does_not_mask_short_valid_transitions(self):
+        valid = th.zeros(4, 4, dtype=th.bool)
+        valid[0, 0] = True
+        short_windows = th.zeros(4, 4, 2, 51)
+        batch = TensorBatch({
+            "observation": th.zeros(4, 4, 60),
+            "scene_window": short_windows,
+            "scene_window_valid": valid,
+            "long_scene_window": th.zeros(4, 4, 3, 51),
+            "long_scene_window_valid": th.zeros(4, 4, dtype=th.bool),
+        })
+        transform = DualTimescaleSceneDiscriminatorReward(
+            short_discriminator=DeterministicDiscriminator(trajectory_length=2),
+            long_discriminator=DeterministicDiscriminator(trajectory_length=3),
+            noise_std=0.0,
+            short_trajectory_length=2,
+            long_trajectory_length=3,
+            long_reward_weight=0.5,
+        )
+        result = transform(batch, None)
+        self.assertTrue(result["learner_mask"][0, 0])
+        self.assertTrue((result["learner_mask"] == valid).all())
+
+    def test_combined_reward_is_clipped(self):
+        batch = TensorBatch({
+            "observation": th.zeros(4, 4, 60),
+            "scene_window": th.zeros(4, 4, 2, 51),
+            "scene_window_valid": th.ones(4, 4, dtype=th.bool),
+            "long_scene_window": th.zeros(4, 4, 3, 51),
+            "long_scene_window_valid": th.ones(4, 4, dtype=th.bool),
+        })
+
+        class FixedLogit(th.nn.Module):
+            def forward(self, windows: th.Tensor) -> th.Tensor:
+                return th.full((windows.shape[0],), 100.0, device=windows.device)
+
+        transform = DualTimescaleSceneDiscriminatorReward(
+            short_discriminator=FixedLogit(),
+            long_discriminator=FixedLogit(),
+            noise_std=0.0,
+            short_trajectory_length=2,
+            long_trajectory_length=3,
+            long_reward_weight=1.0,
+            max_magnitude=2.0,
+        )
+        result = transform(batch, None)
+        self.assertLessEqual(result["imitation_reward"].abs().max().item(), 2.0)
+
+
+class V3CheckpointTest(unittest.TestCase):
+    def test_checkpoint_saves_long_discriminator_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            np.save(path / "blue-0-match.npy", np.zeros((20, 161), dtype=np.float32))
+            args = ArgumentValidationTest()._valid_args(path)
+
+            policy = th.nn.Linear(4, 4)
+            critic = th.nn.Linear(4, 4)
+            short_disc = th.nn.Linear(4, 4)
+            long_disc = th.nn.Linear(4, 4)
+            policy_opt = th.optim.Adam(policy.parameters())
+            critic_opt = th.optim.Adam(critic.parameters())
+            short_opt = th.optim.Adam(short_disc.parameters())
+            long_opt = th.optim.Adam(long_disc.parameters())
+
+            checkpoints = GAIFOCheckpoints(
+                path / "checkpoints",
+                interval=100,
+                keep=2,
+                policy=policy,
+                critic=critic,
+                discriminator=short_disc,
+                policy_optimizer=policy_opt,
+                critic_optimizer=critic_opt,
+                discriminator_optimizer=short_opt,
+                buffer=SimpleNamespace(position=0),
+                args=args,
+                long_discriminator=long_disc,
+                long_discriminator_optimizer=long_opt,
+            )
+            checkpoints.save(0, force=True)
+            saved = list((path / "checkpoints").glob("gaifo_*.pt"))
+            self.assertEqual(len(saved), 1)
+            payload = th.load(saved[0], map_location="cpu", weights_only=True)
+            for key in (
+                "policy",
+                "critic",
+                "discriminator",
+                "long_discriminator",
+                "policy_optimizer",
+                "critic_optimizer",
+                "discriminator_optimizer",
+                "long_discriminator_optimizer",
+                "config",
+            ):
+                self.assertIn(key, payload)
+            self.assertEqual(payload["config"]["architecture"], GAIFO_ARCHITECTURE)
 
 
 if __name__ == "__main__":

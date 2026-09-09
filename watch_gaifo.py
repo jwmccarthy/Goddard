@@ -207,6 +207,7 @@ def simulate(
             seed=args.seed,
             frameskip=frameskip,
             max_ticks=args.max_ticks,
+            no_touch_timeout_seconds=args.no_touch_timeout,
             normalize=True,
             synchronize=True,
             discrete_actions=True,
@@ -319,6 +320,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orange")
     parser.add_argument("--frameskip", type=int)
     parser.add_argument("--max-ticks", type=int, default=4096)
+    parser.add_argument("--no-touch-timeout", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
@@ -330,6 +332,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--frameskip must be positive")
     if args.max_ticks < 1:
         parser.error("--max-ticks must be positive")
+    if not math.isfinite(args.no_touch_timeout) or args.no_touch_timeout <= 0.0:
+        parser.error("--no-touch-timeout must be positive")
     if args.reset_state_limit < 2:
         parser.error("--reset-state-limit must be at least two")
     if (

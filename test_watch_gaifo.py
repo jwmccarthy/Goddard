@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch as th
 
@@ -18,6 +19,7 @@ from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 from watch_gaifo import (
     CheckpointRegistry,
     load_policy,
+    parse_args,
     require_compatible_checkpoints,
     require_gaifo_config,
     resolve_frameskip,
@@ -47,6 +49,16 @@ class FakeEnv:
         )
         self.action_space = batch_space(self.single_action_space, self.n_envs)
         self.action_codec = CARLActionCodec()
+
+
+class ArgumentTest(unittest.TestCase):
+    def test_no_touch_timeout_defaults_to_training_value(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "sys.argv", ["watch_gaifo.py", "--replay-dir", directory]
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.no_touch_timeout, 30.0)
 
 
 class MockPolicy:
@@ -167,6 +179,16 @@ class ArchitectureValidationTest(unittest.TestCase):
             {"architecture": "scene-marl-gaifo-1v1-v1"}, Path("x.pt")
         )
 
+    def test_require_gaifo_config_accepts_v2_policy(self):
+        require_gaifo_config(
+            {"architecture": "scene-marl-gaifo-1v1-v2"}, Path("x.pt")
+        )
+
+    def test_require_gaifo_config_accepts_v3_policy(self):
+        require_gaifo_config(
+            {"architecture": "scene-marl-gaifo-1v1-v3"}, Path("x.pt")
+        )
+
     def test_require_gaifo_config_rejects_wrong_architecture(self):
         with self.assertRaises(ValueError):
             require_gaifo_config({"architecture": "other"}, Path("x.pt"))
@@ -194,6 +216,16 @@ class ArchitectureValidationTest(unittest.TestCase):
             None,
         )
         self.assertEqual(frameskip, 8)
+
+    def test_require_compatible_checkpoints_accepts_v3(self):
+        frameskip = require_compatible_checkpoints(
+            Path("blue.pt"),
+            {"config": {"architecture": "scene-marl-gaifo-1v1-v3", "frameskip": 4}},
+            Path("orange.pt"),
+            {"config": {"architecture": "scene-marl-gaifo-1v1-v3", "frameskip": 4}},
+            None,
+        )
+        self.assertEqual(frameskip, 4)
 
 
 class LoadPolicyTest(unittest.TestCase):

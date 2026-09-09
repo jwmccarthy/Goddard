@@ -37,9 +37,10 @@ from physics_utils import forward_up_to_quat
 
 
 SCENE_SIZE = 51
-GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v2"
+GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v3"
 GAIFO_POLICY_ARCHITECTURES = frozenset({
     "scene-marl-gaifo-1v1-v1",
+    "scene-marl-gaifo-1v1-v2",
     GAIFO_ARCHITECTURE,
 })
 BALL_SIZE = 9
@@ -185,6 +186,51 @@ def resample_internal_state(
     return output
 
 
+def compute_long_offsets(
+    seconds: float,
+    frameskip: int,
+    n_samples: int,
+) -> np.ndarray:
+    """Return unique rounded uniform sample positions from 0 to span.
+
+    ``span`` is the number of simulator steps covered by ``seconds`` at the
+    given ``frameskip`` (``round(seconds * 120 / frameskip)``). The returned
+    array has ``n_samples`` integers, starts at 0, ends at ``span``, and is
+    suitable for indexing into a circular observation history.
+    """
+    if not math.isfinite(seconds) or seconds <= 0.0:
+        raise ValueError("--long-trajectory-seconds must be finite and positive")
+    if not isinstance(frameskip, int) or frameskip < 1:
+        raise ValueError("frameskip must be a positive integer")
+    if not isinstance(n_samples, int) or n_samples < 2:
+        raise ValueError("--long-trajectory-length must be at least 2")
+
+    span = int(round(seconds * 120.0 / frameskip))
+    if span < n_samples - 1:
+        raise ValueError(
+            f"long trajectory span ({span} steps) must be at least "
+            f"{n_samples - 1} for {n_samples} unique samples"
+        )
+
+    ticks = np.linspace(0.0, float(span), n_samples)
+    offsets = np.round(ticks).astype(np.int64)
+    offsets[0] = 0
+    offsets[-1] = span
+
+    seen: set[int] = set()
+    for i, value in enumerate(offsets):
+        if value in seen:
+            for replacement in range(value + 1, span + 1):
+                if replacement not in seen:
+                    offsets[i] = replacement
+                    break
+        seen.add(int(offsets[i]))
+
+    if len(np.unique(offsets)) != n_samples:
+        raise RuntimeError("could not produce unique long trajectory offsets")
+    return offsets
+
+
 def extract_scene_observations(
     observation: th.Tensor,
     n_cars: int = N_CARS,
@@ -254,22 +300,60 @@ def build_scene_windows(
 
 
 class SceneWindowCapture(CaptureBase):
-    """Capture actor-specific scene trajectories continuously across rollout buffer boundaries."""
+    """Capture actor-specific scene trajectories continuously across rollout buffer boundaries.
 
-    def __init__(self, trajectory_length: int) -> None:
+    Maintains a circular per-actor observation history. By default it emits the
+    existing dense ``scene_window``/``scene_window_valid`` fields. When a long
+    span and sparse sample offsets are provided it additionally emits
+    ``long_scene_window``/``long_scene_window_valid`` using only ``len(offsets)``
+    frames sampled uniformly over the physical span.
+    """
+
+    def __init__(
+        self,
+        trajectory_length: int,
+        long_span: int | None = None,
+        long_sample_offsets: np.ndarray | None = None,
+        device: str | th.device = "cpu",
+    ) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
         self.trajectory_length = trajectory_length
+        self.short_distances = np.arange(trajectory_length - 1, -1, -1)
+        self.long_span = long_span
+        self.long_distances: np.ndarray | None = None
+        self.device = th.device(device)
+
+        if long_span is not None:
+            if long_sample_offsets is None:
+                raise ValueError(
+                    "long sample offsets are required when long span is set"
+                )
+            offsets = np.asarray(long_sample_offsets, dtype=np.int64)
+            if len(offsets) < 2:
+                raise ValueError(
+                    "long sample offsets must contain at least two positions"
+                )
+            if offsets[0] != 0 or offsets[-1] != long_span:
+                raise ValueError(
+                    "long sample offsets must start at 0 and end at long_span"
+                )
+            self.long_distances = (long_span - offsets).astype(np.int64)
+            if self.long_distances.min() != 0 or self.long_distances.max() != long_span:
+                raise ValueError("invalid long sample offsets")
+
         self.n_envs = 0
         self.history: th.Tensor | None = None
-        self.history_length: th.Tensor | None = None
+        self.history_age: th.Tensor | None = None
+        self.history_pos: th.Tensor | None = None
 
     def reset(self, batch_size: int) -> None:
         if batch_size % N_CARS:
             raise ValueError("1v1 collection requires two actors per simulation")
         self.n_envs = batch_size
         self.history = None
-        self.history_length = None
+        self.history_age = None
+        self.history_pos = None
 
     def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
         observation = context.observation
@@ -284,27 +368,51 @@ class SceneWindowCapture(CaptureBase):
         current_scene = extract_scene_observations(observation)
         next_scene = extract_scene_observations(next_obs)
         n_envs = len(current_scene)
-        history_size = self.trajectory_length - 1
+        short_history_size = self.trajectory_length - 1
+        capacity = short_history_size
+        if self.long_span is not None:
+            capacity = max(capacity, self.long_span)
+
         if self.history is None:
             self.history = th.zeros(
                 n_envs,
-                history_size,
+                capacity,
                 SCENE_SIZE,
                 dtype=observation.dtype,
                 device=observation.device,
             )
-            self.history_length = th.zeros(
+            self.history_age = th.zeros(
                 n_envs,
                 dtype=th.long,
                 device=observation.device,
             )
-        assert self.history_length is not None
+            self.history_pos = th.zeros(
+                n_envs,
+                dtype=th.long,
+                device=observation.device,
+            )
+        assert self.history_age is not None
+        assert self.history_pos is not None
 
-        self.history = th.roll(self.history, shifts=-1, dims=1)
-        self.history[:, -1] = current_scene
-        self.history_length += 1
-        valid = self.history_length >= history_size
-        window = th.cat((self.history, next_scene[:, None]), dim=1)
+        env_indices = th.arange(n_envs, device=observation.device)
+        self.history[env_indices, self.history_pos] = current_scene
+        self.history_pos = (self.history_pos + 1) % capacity
+        self.history_age = self.history_age + 1
+
+        short_valid = self.history_age >= short_history_size
+        result: dict[str, th.Tensor] = {
+            "scene_window": self._gather_window(
+                current_scene, next_scene, self.short_distances
+            ),
+            "scene_window_valid": short_valid,
+        }
+
+        if self.long_distances is not None:
+            long_valid = self.history_age >= self.long_span
+            result["long_scene_window"] = self._gather_window(
+                current_scene, next_scene, self.long_distances
+            )
+            result["long_scene_window_valid"] = long_valid
 
         done = th.as_tensor(
             context.env_step.done,
@@ -315,12 +423,53 @@ class SceneWindowCapture(CaptureBase):
         simulation_done = done.view(n_sim, N_CARS).any(dim=1)
         env_done = simulation_done.repeat_interleave(N_CARS)
         self.history[env_done] = 0
-        self.history_length[env_done] = 0
+        self.history_age[env_done] = 0
+        self.history_pos[env_done] = 0
 
-        return {
-            "scene_window": window,
-            "scene_window_valid": valid,
-        }
+        return result
+
+    def _gather_window(
+        self,
+        current_scene: th.Tensor,
+        next_scene: th.Tensor,
+        distances: np.ndarray,
+    ) -> th.Tensor:
+        """Build [n_envs, len(distances), SCENE_SIZE] windows from circular history.
+
+        ``distances`` are chronological offsets from ``next_scene`` (0 = newest),
+        ordered oldest-to-newest so the window ends with the scored transition's
+        next observation.
+        """
+        assert self.history is not None
+        assert self.history_pos is not None
+        n_envs = len(current_scene)
+        capacity = self.history.shape[1]
+        samples = len(distances)
+        window = th.empty(
+            n_envs,
+            samples,
+            SCENE_SIZE,
+            dtype=current_scene.dtype,
+            device=current_scene.device,
+        )
+
+        zero_mask = distances == 0
+        if zero_mask.any():
+            window[:, zero_mask] = next_scene[:, None]
+
+        non_zero = distances[~zero_mask]
+        if len(non_zero):
+            distance_tensor = th.as_tensor(
+                non_zero, dtype=th.long, device=self.history_pos.device
+            )
+            positions = (
+                self.history_pos.unsqueeze(1) - distance_tensor
+            ) % capacity
+            env_indices = th.arange(
+                n_envs, device=self.history_pos.device
+            )[:, None].expand_as(positions)
+            window[:, ~zero_mask] = self.history[env_indices, positions]
+        return window
 
 
 class ExpertSceneDataset:
@@ -335,6 +484,7 @@ class ExpertSceneDataset:
         frame_skip: int | None = None,
         device: str | th.device = "cpu",
         heldout_size: int = 0,
+        partition_span: int | None = None,
     ) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
@@ -342,9 +492,14 @@ class ExpertSceneDataset:
             raise ValueError("expert frame limit must fit one trajectory")
         if heldout_size < 0:
             raise ValueError("heldout size must be non-negative")
+        if partition_span is not None and partition_span < trajectory_length - 1:
+            raise ValueError("partition span must cover the short trajectory")
         self.trajectory_length = trajectory_length
         self.limit = limit
         self.heldout_size = heldout_size
+        self.partition_span = (
+            trajectory_length - 1 if partition_span is None else partition_span
+        )
 
         rng = np.random.default_rng(seed)
         paths = sorted(Path(replay_dir).glob("*.npy"))
@@ -467,8 +622,8 @@ class ExpertSceneDataset:
     def _split_heldout(self, device: str | th.device, seed: int) -> None:
         split_rng = th.Generator(device=device).manual_seed(seed)
         eligible = [
-            index for index, starts in enumerate(self.segment_window_starts)
-            if len(starts) > 0
+            index for index, indices in enumerate(self.segment_frame_indices)
+            if len(indices) > self.partition_span
         ]
         if self.heldout_size > 0 and len(eligible) > 1:
             order = th.tensor(eligible, device=device)[th.randperm(
@@ -485,33 +640,35 @@ class ExpertSceneDataset:
                 ).item()
             ) + 1
             count = min(count, len(order) - 1)
-            heldout_segments = set(order[:count].tolist())
+            self.heldout_segments = set(order[:count].tolist())
             self.heldout_window_starts = th.cat([
                 starts
                 for index, starts in enumerate(self.segment_window_starts)
-                if index in heldout_segments
+                if index in self.heldout_segments
             ])
             self.train_window_starts = th.cat([
                 starts
                 for index, starts in enumerate(self.segment_window_starts)
-                if index not in heldout_segments
+                if index not in self.heldout_segments
             ])
             self.reset_indices = th.cat([
                 indices
                 for index, indices in enumerate(self.segment_frame_indices)
-                if index not in heldout_segments
+                if index not in self.heldout_segments
             ])
             self._train_generator = th.Generator(device=device).manual_seed(seed)
             self._heldout_generator = th.Generator(device=device).manual_seed(seed + 1)
+            self._build_partition_masks(device)
             return
 
+        self.heldout_segments: set[int] = set()
         n_heldout = min(
             max(0, self.heldout_size),
-            max(0, self.total_windows - self.trajectory_length),
+            max(0, self.total_windows - self.partition_span - 1),
         )
         if n_heldout:
             first_heldout = self.window_starts[-n_heldout]
-            train_stop = first_heldout - (self.trajectory_length - 1)
+            train_stop = first_heldout - self.partition_span
             self.heldout_window_starts = self.window_starts[-n_heldout:]
             self.train_window_starts = self.window_starts[
                 self.window_starts < train_stop
@@ -525,6 +682,21 @@ class ExpertSceneDataset:
             self.reset_indices = th.arange(len(self.frames), device=device)
         self._train_generator = th.Generator(device=device).manual_seed(seed)
         self._heldout_generator = th.Generator(device=device).manual_seed(seed + 1)
+        self._build_partition_masks(device)
+
+    def _build_partition_masks(self, device: str | th.device) -> None:
+        self.train_frame_mask = th.zeros(
+            len(self.frames), dtype=th.bool, device=device
+        )
+        self.train_frame_mask[self.reset_indices] = True
+        self.heldout_frame_mask = th.zeros_like(self.train_frame_mask)
+        if self.heldout_segments:
+            for index in self.heldout_segments:
+                self.heldout_frame_mask[self.segment_frame_indices[index]] = True
+        elif len(self.heldout_window_starts):
+            first = int(self.heldout_window_starts.min().item())
+            last = int(self.heldout_window_starts.max().item()) + self.trajectory_length
+            self.heldout_frame_mask[first:last] = True
 
     @property
     def train_total(self) -> int:
@@ -614,6 +786,152 @@ class ExpertSceneDataset:
             "car_boost": cars[..., 15] * BOOST_MAX,
             "car_internal_state": self.internal_states[self.reset_indices],
         }))
+
+
+class ExpertSceneView:
+    """Sparse expert windows that reference an ``ExpertSceneDataset`` frames tensor.
+
+    The long discriminator needs windows sampled uniformly across a large physical
+    span, but it must share the raw expert frame corpus and the train/heldout
+    replay-level partition with the short discriminator. This view builds sparse
+    window starts from the same segment list and heldout segment indices stored
+    on ``base``, so it never duplicates frames and never leaks heldout replays.
+    """
+
+    def __init__(
+        self,
+        base: ExpertSceneDataset,
+        trajectory_length: int,
+        offsets: np.ndarray,
+        window_field: str,
+        seed: int = 0,
+    ) -> None:
+        if trajectory_length < 2:
+            raise ValueError("trajectory length must be at least 2")
+        offsets = np.asarray(offsets, dtype=np.int64)
+        if len(offsets) < 2 or offsets[0] != 0:
+            raise ValueError("offsets must start at 0 and contain at least 2 samples")
+        if len(np.unique(offsets)) != len(offsets):
+            raise ValueError("long trajectory offsets must be unique")
+
+        self.base = base
+        self.trajectory_length = trajectory_length
+        self.offsets = offsets
+        self.window_field = window_field
+        self.span = int(offsets[-1])
+        self.device = base.frames.device
+        self._seed = seed
+
+        self.window_offsets = th.from_numpy(offsets).to(self.device)
+
+        segment_starts: list[th.Tensor] = []
+        cumulative = 0
+        for length in base.lengths:
+            count = max(0, length - self.span)
+            if count:
+                segment_starts.append(
+                    th.arange(cumulative, cumulative + count, device=self.device)
+                )
+            else:
+                segment_starts.append(
+                    th.empty(0, dtype=th.long, device=self.device)
+                )
+            cumulative += length
+
+        train_starts = [
+            starts[
+                base.train_frame_mask[starts]
+                & base.train_frame_mask[starts + self.span]
+            ]
+            for starts in segment_starts
+        ]
+        heldout_starts = [
+            starts[
+                base.heldout_frame_mask[starts]
+                & base.heldout_frame_mask[starts + self.span]
+            ]
+            for starts in segment_starts
+        ]
+
+        self.train_window_starts = (
+            th.cat(train_starts)
+            if train_starts
+            else th.empty(0, dtype=th.long, device=self.device)
+        )
+        self.heldout_window_starts = (
+            th.cat(heldout_starts)
+            if heldout_starts
+            else th.empty(0, dtype=th.long, device=self.device)
+        )
+
+        if len(self.train_window_starts) == 0 and len(self.heldout_window_starts) == 0:
+            raise ValueError(
+                f"expert files are too short to build sparse windows of length "
+                f"{trajectory_length} with span {self.span}"
+            )
+
+        self._train_generator = th.Generator(device=self.device).manual_seed(seed)
+        self._heldout_generator = th.Generator(device=self.device).manual_seed(seed + 1)
+
+    @property
+    def train_total(self) -> int:
+        return len(self.train_window_starts)
+
+    @property
+    def heldout_total(self) -> int:
+        return len(self.heldout_window_starts)
+
+    def _sample_windows(
+        self,
+        starts: th.Tensor,
+        n: int,
+        device: str | th.device,
+        generator: th.Generator,
+    ) -> th.Tensor:
+        if n < 1:
+            raise ValueError("sample count must be positive")
+        if len(starts) == 0:
+            raise RuntimeError("no expert windows available")
+        requested_device = th.device(device)
+        if requested_device != self.base.frames.device:
+            raise ValueError(
+                "expert scenes and generated scenes must reside on the same device"
+            )
+        selected = th.randint(
+            len(starts),
+            (n,),
+            device=self.base.frames.device,
+            generator=generator,
+        )
+        indices = starts[selected, None] + self.window_offsets
+        return self.base.frames[indices]
+
+    def _sample_dual(
+        self,
+        starts: th.Tensor,
+        n: int,
+        device: str | th.device,
+        generator: th.Generator,
+    ) -> th.Tensor:
+        canonical = self._sample_windows(starts, (n + 1) // 2, device, generator)
+        opponent = opponent_view(canonical)
+        return th.stack((canonical, opponent), dim=1).flatten(0, 1)[:n]
+
+    def sample(self, n: int, device: str | th.device) -> th.Tensor:
+        """Sample ``n`` training sparse windows without crossing file boundaries."""
+        return self._sample_dual(
+            self.train_window_starts, n, device, self._train_generator
+        )
+
+    def sample_heldout(self, n: int, device: str | th.device) -> th.Tensor:
+        """Sample ``n`` held-out sparse expert windows for evaluation."""
+        return self._sample_dual(
+            self.heldout_window_starts, n, device, self._heldout_generator
+        )
+
+    def reset_dataset(self) -> TensorDataset:
+        """Reset states come from the shared training frame partition."""
+        return self.base.reset_dataset()
 
 
 class HistoricalReplayBuffer:
@@ -772,16 +1090,23 @@ class SceneDiscriminatorLoss:
 
 
 class SceneGAIFOMinibatches:
-    """Minibatch sampler for generated vs expert scene windows."""
+    """Minibatch sampler for generated vs expert scene windows.
+
+    Works with either a full ``ExpertSceneDataset`` or a lightweight
+    ``ExpertSceneView`` and can target any ``window_field``/``valid_field`` pair
+    so that the same class serves both the short and long discriminators.
+    """
 
     def __init__(
         self,
-        expert: ExpertSceneDataset,
+        expert: ExpertSceneDataset | ExpertSceneView,
         batch_size: int,
         epochs: int,
         noise_std: float,
         history: HistoricalReplayBuffer | None = None,
         mix_fraction: float = 0.5,
+        window_field: str = "scene_window",
+        valid_field: str = "scene_window_valid",
     ) -> None:
         if batch_size < 1 or epochs < 1:
             raise ValueError("batch size and epochs must be positive")
@@ -793,16 +1118,18 @@ class SceneGAIFOMinibatches:
         self.noise_std = noise_std
         self.history = history
         self.mix_fraction = mix_fraction if (history is not None) else 0.0
+        self.window_field = window_field
+        self.valid_field = valid_field
         self._epoch_callback = None
 
     def set_epoch_callback(self, callback) -> None:
         self._epoch_callback = callback
 
     def __call__(self, batch: TensorBatch):
-        windows = batch["scene_window"].reshape(
+        windows = batch[self.window_field].reshape(
             -1, self.expert.trajectory_length, SCENE_SIZE
         )
-        valid = batch["scene_window_valid"].bool().flatten()
+        valid = batch[self.valid_field].bool().flatten()
         if windows.shape[-2:] != (self.expert.trajectory_length, SCENE_SIZE):
             raise ValueError("captured scene windows do not match expert trajectories")
         if not valid.any():
@@ -927,18 +1254,147 @@ class SceneDiscriminatorReward:
         return result.with_fields(learner_mask=valid)
 
 
-class AdaptiveDiscriminatorUpdate:
-    """Discriminator update stage that adapts to held-out accuracy.
+class DualTimescaleSceneDiscriminatorReward:
+    """Combine independent short and long discriminator rewards into one reward.
 
-    Compatible with ``Algorithm.run`` / ``Algorithm.set_progress_callback``.
-    Returns a ``Discriminator`` metrics section containing ``heldout_accuracy``
-    and ``updated`` (0/1), along with training metrics when an update occurs.
+    Both discriminators are scored, normalized, and clamped independently with
+    the existing negative-logit logic. Invalid long entries remain zero so they
+    never mask short-valid PPO transitions. The learner mask is the short
+    validity mask.
     """
 
     def __init__(
         self,
-        expert: ExpertSceneDataset,
-        history: HistoricalReplayBuffer,
+        short_discriminator: SceneDiscriminator,
+        long_discriminator: SceneDiscriminator,
+        noise_std: float,
+        short_trajectory_length: int,
+        long_trajectory_length: int,
+        long_reward_weight: float,
+        batch_size: int = 16_384,
+        max_magnitude: float = 10.0,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("discriminator reward batch size must be positive")
+        if not math.isfinite(max_magnitude) or max_magnitude <= 0.0:
+            raise ValueError("reward max magnitude must be positive")
+        if not math.isfinite(long_reward_weight) or long_reward_weight < 0.0:
+            raise ValueError("long reward weight must be non-negative")
+        self.short_discriminator = short_discriminator
+        self.long_discriminator = long_discriminator
+        self.noise_std = noise_std
+        self.short_trajectory_length = short_trajectory_length
+        self.long_trajectory_length = long_trajectory_length
+        self.long_reward_weight = long_reward_weight
+        self.batch_size = batch_size
+        self.max_magnitude = max_magnitude
+
+    def _score_windows(
+        self,
+        windows: th.Tensor,
+        valid: th.Tensor,
+        discriminator: SceneDiscriminator,
+        trajectory_length: int,
+    ) -> th.Tensor:
+        scores = th.zeros_like(valid, dtype=windows.dtype)
+        if not valid.any():
+            return scores
+
+        flat_windows = windows.reshape(-1, trajectory_length, SCENE_SIZE)
+        flat_scores = scores.flatten()
+        indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
+        selected_scores = th.empty(
+            len(indices), dtype=scores.dtype, device=scores.device
+        )
+        for start in range(0, len(indices), self.batch_size):
+            stop = min(start + self.batch_size, len(indices))
+            noisy = add_scene_noise(
+                flat_windows[indices[start:stop]], self.noise_std
+            )
+            logits = discriminator(noisy)
+            selected_scores[start:stop] = (-logits).clamp(
+                -self.max_magnitude, self.max_magnitude
+            )
+
+        std = selected_scores.std(unbiased=False)
+        if std > 1e-8:
+            normalized = (selected_scores - selected_scores.mean()) / std
+        else:
+            normalized = th.zeros_like(selected_scores)
+        flat_scores[indices] = normalized.clamp(
+            -self.max_magnitude, self.max_magnitude
+        )
+        return scores
+
+    @th.no_grad()
+    def __call__(
+        self, batch: TensorBatch, context: PrepareContext
+    ) -> TensorBatch:
+        short_windows = batch["scene_window"]
+        short_valid = batch["scene_window_valid"].bool()
+        long_windows = batch["long_scene_window"]
+        long_valid = batch["long_scene_window_valid"].bool()
+        if short_windows.shape[-2:] != (self.short_trajectory_length, SCENE_SIZE):
+            raise ValueError("short scene windows have the wrong shape")
+        if long_windows.shape[-2:] != (self.long_trajectory_length, SCENE_SIZE):
+            raise ValueError("long scene windows have the wrong shape")
+
+        dtype = batch["observation"].dtype
+        short_scores = self._score_windows(
+            short_windows, short_valid, self.short_discriminator, self.short_trajectory_length
+        ).to(dtype)
+        long_scores = self._score_windows(
+            long_windows, long_valid, self.long_discriminator, self.long_trajectory_length
+        ).to(dtype)
+
+        combined = short_scores + self.long_reward_weight * long_scores
+        imitation_reward = combined.clamp(-self.max_magnitude, self.max_magnitude)
+
+        result = batch.with_fields(
+            short_imitation_reward=short_scores,
+            long_imitation_reward=long_scores,
+            imitation_reward=imitation_reward,
+        )
+        if "learner_mask" in result:
+            return result.replace_fields(
+                learner_mask=result["learner_mask"].bool() & short_valid
+            )
+        return result.with_fields(learner_mask=short_valid)
+
+
+class SelectPPOFields:
+    """Drop large discriminator-only tensors before PPO flattens the rollout."""
+
+    FIELDS = (
+        "observation",
+        "action",
+        "old_log_prob",
+        "baseline_value",
+        "advantage",
+        "returns",
+        "learner_mask",
+    )
+
+    def __call__(
+        self, batch: TensorBatch, context: PrepareContext
+    ) -> TensorBatch:
+        return batch.select(*self.FIELDS)
+
+
+class AdaptiveDiscriminatorUpdate:
+    """Discriminator update stage that adapts to held-out accuracy.
+
+    Works with any expert source (``ExpertSceneDataset`` or
+    ``ExpertSceneView``) and configurable window/valid fields. Returns metrics
+    under the requested ``section`` (e.g. ``ShortDiscriminator`` or
+    ``LongDiscriminator``). When ``require_valid`` is False and no generated
+    windows are valid the stage is a no-op instead of raising an error.
+    """
+
+    def __init__(
+        self,
+        expert: ExpertSceneDataset | ExpertSceneView,
+        history: HistoricalReplayBuffer | None,
         batch_size: int,
         epochs: int,
         noise_std: float,
@@ -950,6 +1406,10 @@ class AdaptiveDiscriminatorUpdate:
         discriminator: SceneDiscriminator,
         optimizer: th.optim.Optimizer,
         loss: SceneDiscriminatorLoss,
+        window_field: str = "scene_window",
+        valid_field: str = "scene_window_valid",
+        section: str = "Discriminator",
+        require_valid: bool = True,
     ) -> None:
         if heldout_size < 0:
             raise ValueError("heldout size must be non-negative")
@@ -972,11 +1432,27 @@ class AdaptiveDiscriminatorUpdate:
         self.discriminator = discriminator
         self.optimizer = optimizer
         self.loss = loss
+        self.window_field = window_field
+        self.valid_field = valid_field
+        self.section = section
+        self.require_valid = require_valid
         self._progress_callback = None
         self._heldout_sim: th.Tensor | None = None
 
     def set_progress_callback(self, callback) -> None:
         self._progress_callback = callback
+
+    def _empty_metrics(self) -> dict[str, float]:
+        return {
+            "loss": 0.0,
+            "agent_score": 0.0,
+            "expert_score": 0.0,
+            "agent_accuracy": 0.0,
+            "expert_accuracy": 0.0,
+            "heldout_accuracy": 0.0,
+            "updated": 0.0,
+            "minibatches": 0.0,
+        }
 
     def run(self, experience: Rollout | TensorBatch):
         batch = (
@@ -984,10 +1460,12 @@ class AdaptiveDiscriminatorUpdate:
             if isinstance(experience, Rollout)
             else experience
         )
-        windows = batch["scene_window"]
-        valid = batch["scene_window_valid"].bool()
+        windows = batch[self.window_field]
+        valid = batch[self.valid_field].bool()
         if not valid.any():
-            raise RuntimeError("no valid generated scene windows in rollout")
+            if self.require_valid:
+                raise RuntimeError("no valid generated scene windows in rollout")
+            return experience, {self.section: self._empty_metrics()}
 
         flat_windows = windows.reshape(
             -1, self.expert.trajectory_length, SCENE_SIZE
@@ -1009,13 +1487,15 @@ class AdaptiveDiscriminatorUpdate:
                 self.noise_std,
                 history=self.history,
                 mix_fraction=self.history_mix_fraction,
+                window_field=self.window_field,
+                valid_field=self.valid_field,
             )
             sampler.set_epoch_callback(self._epoch_finished)
             metric_totals: dict[str, float | th.Tensor] = {}
             minibatch_count = 0
             callback = self._progress_callback
             if callback is not None:
-                callback.start(self.epochs, "Discriminator")
+                callback.start(self.epochs, self.section)
             try:
                 for sample in sampler.sample_windows(flat_windows, train_indices):
                     output = self.loss(sample)
@@ -1062,7 +1542,7 @@ class AdaptiveDiscriminatorUpdate:
                 ]
                 self.history.add(flat_windows[selected], add_count)
 
-        return experience, {"Discriminator": metrics}
+        return experience, {self.section: metrics}
 
     def _split_generated(
         self, valid: th.Tensor
@@ -1175,7 +1655,7 @@ class AdaptiveDiscriminatorUpdate:
 
 
 class GAIFOCheckpoints:
-    """Periodic checkpointing for policy, critic, discriminator and optimizers."""
+    """Periodic checkpointing for policy, critic, discriminators and optimizers."""
 
     def __init__(
         self,
@@ -1190,6 +1670,8 @@ class GAIFOCheckpoints:
         discriminator_optimizer: th.optim.Optimizer,
         buffer: RolloutBuffer,
         args: argparse.Namespace,
+        long_discriminator: nn.Module | None = None,
+        long_discriminator_optimizer: th.optim.Optimizer | None = None,
     ) -> None:
         self.directory = Path(directory)
         self.interval = interval
@@ -1200,6 +1682,8 @@ class GAIFOCheckpoints:
         self.policy_optimizer = policy_optimizer
         self.critic_optimizer = critic_optimizer
         self.discriminator_optimizer = discriminator_optimizer
+        self.long_discriminator = long_discriminator
+        self.long_discriminator_optimizer = long_discriminator_optimizer
         self.buffer = buffer
         self.args = args
         self.step = 0
@@ -1234,6 +1718,12 @@ class GAIFOCheckpoints:
                 },
             },
         }
+        if self.long_discriminator is not None:
+            payload["long_discriminator"] = self.long_discriminator.state_dict()
+        if self.long_discriminator_optimizer is not None:
+            payload["long_discriminator_optimizer"] = (
+                self.long_discriminator_optimizer.state_dict()
+            )
         path = self.directory / f"gaifo_{step:012d}.pt"
         temporary = path.with_suffix(".pt.tmp")
         th.save(payload, temporary)
@@ -1257,6 +1747,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
     parser.add_argument("--rollout", type=int, default=32)
     parser.add_argument("--trajectory-length", type=int, default=8)
+    parser.add_argument("--long-trajectory-seconds", type=float, default=5.0)
+    parser.add_argument("--long-trajectory-length", type=int, default=16)
+    parser.add_argument("--long-reward-weight", type=float, default=0.5)
+    parser.add_argument("--long-history-capacity", type=int, default=65_536)
+    parser.add_argument("--long-history-add-size", type=int, default=4_096)
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--replay-reset-fraction", type=float, default=0.70)
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
@@ -1314,6 +1809,9 @@ def validate_args(args: argparse.Namespace) -> None:
         "max_ticks",
         "rollout",
         "trajectory_length",
+        "long_trajectory_length",
+        "long_history_capacity",
+        "long_history_add_size",
         "discriminator_batch",
         "discriminator_epochs",
         "discriminator_hidden",
@@ -1385,10 +1883,28 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--discriminator-accuracy-target must be between zero and one")
     if not math.isfinite(args.reward_max_magnitude) or args.reward_max_magnitude <= 0.0:
         raise ValueError("--reward-max-magnitude must be positive")
+    if not math.isfinite(args.long_trajectory_seconds) or args.long_trajectory_seconds <= 0.0:
+        raise ValueError("--long-trajectory-seconds must be finite and positive")
+    if not math.isfinite(args.long_reward_weight) or args.long_reward_weight < 0.0:
+        raise ValueError("--long-reward-weight must be finite and non-negative")
+    if args.long_history_add_size > args.long_history_capacity:
+        raise ValueError(
+            "--long-history-add-size must not exceed --long-history-capacity"
+        )
     if args.history_add_size > args.history_capacity:
         raise ValueError(
             "--history-add-size must not exceed --history-capacity"
         )
+
+    # Validate long trajectory offsets can be constructed.
+    long_offsets = compute_long_offsets(
+        args.long_trajectory_seconds, args.frameskip, args.long_trajectory_length
+    )
+    if (
+        args.expert_frame_limit is not None
+        and args.expert_frame_limit < int(long_offsets[-1]) + 1
+    ):
+        raise ValueError("--expert-frame-limit must fit one long trajectory")
 
     if args.rollout < args.trajectory_length - 1:
         raise ValueError("--rollout must be at least --trajectory-length - 1")
@@ -1455,7 +1971,11 @@ def main() -> None:
     env = build_env(args)
     policy = build_policy(env, args)
     critic = build_critic(env, args)
-    discriminator = build_discriminator(args).to(env.device)
+    short_discriminator = build_discriminator(args).to(env.device)
+    long_discriminator = build_discriminator(args).to(env.device)
+    long_offsets = compute_long_offsets(
+        args.long_trajectory_seconds, args.frameskip, args.long_trajectory_length
+    )
 
     expert = ExpertSceneDataset(
         args.replay_dir,
@@ -1465,26 +1985,49 @@ def main() -> None:
         frame_skip=args.frameskip,
         device=env.device,
         heldout_size=args.discriminator_heldout_size,
+        partition_span=int(long_offsets[-1]),
     )
     if expert.train_total < 1:
         raise ValueError("expert dataset contains no training windows")
+
+    long_expert = ExpertSceneView(
+        expert,
+        args.long_trajectory_length,
+        long_offsets,
+        window_field="long_scene_window",
+        seed=args.seed,
+    )
+    if long_expert.train_total < 1 or long_expert.heldout_total < 1:
+        raise ValueError(
+            "expert data must provide training and held-out long trajectories"
+        )
+
     env.reset_state_provider = DatasetResetSampler(
         expert.reset_dataset(),
         probability=args.replay_reset_fraction,
         seed=args.seed,
     )
 
-    history = HistoricalReplayBuffer(
+    short_history = HistoricalReplayBuffer(
         capacity=args.history_capacity,
         trajectory_length=args.trajectory_length,
+        device=env.device,
+        seed=args.seed,
+    )
+    long_history = HistoricalReplayBuffer(
+        capacity=args.long_history_capacity,
+        trajectory_length=args.long_trajectory_length,
         device=env.device,
         seed=args.seed,
     )
 
     policy_optimizer = th.optim.Adam(policy.parameters(), lr=args.ppo_lr)
     critic_optimizer = th.optim.Adam(critic.parameters(), lr=args.ppo_lr)
-    discriminator_optimizer = th.optim.Adam(
-        discriminator.parameters(), lr=args.discriminator_lr
+    short_discriminator_optimizer = th.optim.Adam(
+        short_discriminator.parameters(), lr=args.discriminator_lr
+    )
+    long_discriminator_optimizer = th.optim.Adam(
+        long_discriminator.parameters(), lr=args.discriminator_lr
     )
 
     buffer = RolloutBuffer(
@@ -1497,13 +2040,18 @@ def main() -> None:
         captures=(
             LogProbCapture(),
             CriticCapture(critic),
-            SceneWindowCapture(args.trajectory_length),
+            SceneWindowCapture(
+                args.trajectory_length,
+                long_span=int(long_offsets[-1]),
+                long_sample_offsets=long_offsets,
+                device=env.device,
+            ),
         ),
     )
 
-    discriminator_update = AdaptiveDiscriminatorUpdate(
+    short_discriminator_update = AdaptiveDiscriminatorUpdate(
         expert=expert,
-        history=history,
+        history=short_history,
         batch_size=args.discriminator_batch,
         epochs=args.discriminator_epochs,
         noise_std=args.discriminator_noise,
@@ -1512,17 +2060,44 @@ def main() -> None:
         history_add_size=args.history_add_size,
         history_mix_fraction=args.history_mix_fraction,
         max_grad_norm=args.max_grad_norm,
-        discriminator=discriminator,
-        optimizer=discriminator_optimizer,
-        loss=SceneDiscriminatorLoss(discriminator),
+        discriminator=short_discriminator,
+        optimizer=short_discriminator_optimizer,
+        loss=SceneDiscriminatorLoss(short_discriminator),
+        window_field="scene_window",
+        valid_field="scene_window_valid",
+        section="ShortDiscriminator",
+        require_valid=True,
+    )
+
+    long_discriminator_update = AdaptiveDiscriminatorUpdate(
+        expert=long_expert,
+        history=long_history,
+        batch_size=args.discriminator_batch,
+        epochs=args.discriminator_epochs,
+        noise_std=args.discriminator_noise,
+        heldout_size=args.discriminator_heldout_size,
+        accuracy_target=args.discriminator_accuracy_target,
+        history_add_size=args.long_history_add_size,
+        history_mix_fraction=args.history_mix_fraction,
+        max_grad_norm=args.max_grad_norm,
+        discriminator=long_discriminator,
+        optimizer=long_discriminator_optimizer,
+        loss=SceneDiscriminatorLoss(long_discriminator),
+        window_field="long_scene_window",
+        valid_field="long_scene_window_valid",
+        section="LongDiscriminator",
+        require_valid=False,
     )
 
     ppo_update = Update(
         transforms=(
-            SceneDiscriminatorReward(
-                discriminator,
-                args.discriminator_noise,
-                args.trajectory_length,
+            DualTimescaleSceneDiscriminatorReward(
+                short_discriminator=short_discriminator,
+                long_discriminator=long_discriminator,
+                noise_std=args.discriminator_noise,
+                short_trajectory_length=args.trajectory_length,
+                long_trajectory_length=args.long_trajectory_length,
+                long_reward_weight=args.long_reward_weight,
                 batch_size=args.discriminator_batch,
                 max_magnitude=args.reward_max_magnitude,
             ),
@@ -1531,6 +2106,7 @@ def main() -> None:
                 lambda_=args.lambda_,
                 reward_field="imitation_reward",
             ),
+            SelectPPOFields(),
         ),
         sampler=RolloutMinibatches(args.ppo_batch, args.ppo_epochs),
         loss=PPOLoss(
@@ -1551,19 +2127,27 @@ def main() -> None:
         section="PPO",
     )
 
-    learner = Algorithm(discriminator_update, ppo_update)
+    learner = Algorithm(short_discriminator_update, long_discriminator_update, ppo_update)
 
     run_id = datetime.now().strftime("gaifo-%Y%m%d-%H%M%S-%f")
     logger = Logger(args.log_dir / run_id)
     for section, key, label, fmt in (
-        ("Discriminator", "loss", "discriminator loss", ".4f"),
-        ("Discriminator", "agent_score", "agent score", ".3f"),
-        ("Discriminator", "expert_score", "expert score", ".3f"),
-        ("Discriminator", "agent_accuracy", "agent accuracy", ".3f"),
-        ("Discriminator", "expert_accuracy", "expert accuracy", ".3f"),
-        ("Discriminator", "heldout_accuracy", "heldout accuracy", ".3f"),
-        ("Discriminator", "updated", "updated", ".0f"),
-        ("Discriminator", "minibatches", "D minibatches", ".0f"),
+        ("ShortDiscriminator", "loss", "short D loss", ".4f"),
+        ("ShortDiscriminator", "agent_score", "short agent score", ".3f"),
+        ("ShortDiscriminator", "expert_score", "short expert score", ".3f"),
+        ("ShortDiscriminator", "agent_accuracy", "short agent accuracy", ".3f"),
+        ("ShortDiscriminator", "expert_accuracy", "short expert accuracy", ".3f"),
+        ("ShortDiscriminator", "heldout_accuracy", "short heldout accuracy", ".3f"),
+        ("ShortDiscriminator", "updated", "short updated", ".0f"),
+        ("ShortDiscriminator", "minibatches", "short D batches", ".0f"),
+        ("LongDiscriminator", "loss", "long D loss", ".4f"),
+        ("LongDiscriminator", "agent_score", "long agent score", ".3f"),
+        ("LongDiscriminator", "expert_score", "long expert score", ".3f"),
+        ("LongDiscriminator", "agent_accuracy", "long agent accuracy", ".3f"),
+        ("LongDiscriminator", "expert_accuracy", "long expert accuracy", ".3f"),
+        ("LongDiscriminator", "heldout_accuracy", "long heldout accuracy", ".3f"),
+        ("LongDiscriminator", "updated", "long updated", ".0f"),
+        ("LongDiscriminator", "minibatches", "long D batches", ".0f"),
         ("PPO", "policy_loss", "policy loss", ".4f"),
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "entropy", "entropy", ".3f"),
@@ -1576,12 +2160,14 @@ def main() -> None:
         args.checkpoint_keep,
         policy,
         critic,
-        discriminator,
+        short_discriminator,
         policy_optimizer,
         critic_optimizer,
-        discriminator_optimizer,
+        short_discriminator_optimizer,
         buffer,
         args,
+        long_discriminator=long_discriminator,
+        long_discriminator_optimizer=long_discriminator_optimizer,
     )
 
     trainer = Trainer(
