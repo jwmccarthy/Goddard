@@ -445,7 +445,11 @@ class ExpertGoalStates:
             demo[:, -5, None],
             raw_actions,
         ), axis=-1).astype(np.float32, copy=False)
-        invalid = demo[:, -4:].astype(bool).any(axis=-1)
+        # The parsed tail is ego touch, then non-ego touch and invalid events.
+        invalid_events = demo[:, -4:].astype(bool).any(axis=-1)
+        invalid = invalid_events.copy()
+        invalid[1:] |= invalid_events[:-1]
+        invalid[:-1] |= invalid_events[1:]
 
         demos: list[tuple[th.Tensor, th.Tensor]] = []
         start = 0

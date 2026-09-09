@@ -13,7 +13,7 @@ from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 from jarl.data import PolicyOutput, TensorBatch
 
 from ballchasing_replays.parse_replays import _project_carl_actions
-from watch_demonstrations import frame_from_state
+from watch_demonstrations import frame_from_state, publish_frame
 from tracker_checkpoint import PHCCheckpoint, PeriodicCheckpoint
 
 from tracker import (
@@ -392,6 +392,38 @@ class TrackerTest(unittest.TestCase):
 
         self.assertTrue(replays.current_ego_touch().item())
         self.assertEqual(loaded.shape[1], STORED_REPLAY_SIZE)
+
+    def test_dataset_loading_guards_non_ego_touch_transitions_in_all_modes(self):
+        for width in (161, 215, 269):
+            with self.subTest(width=width):
+                replays = ExpertGoalStates.__new__(ExpertGoalStates)
+                replays._min_len = 3
+                replays.minimum_remaining_frames = 1
+                demo = np.zeros((12, width), dtype=np.float32)
+                demo[:, 9] = np.arange(12)
+                demo[5, -4] = 1.0
+
+                loaded = replays._filter(demo, np.zeros(12, dtype=bool))
+
+                self.assertEqual(len(loaded), 2)
+                np.testing.assert_array_equal(
+                    loaded[0][0][:, 9].numpy(), np.arange(4)
+                )
+                np.testing.assert_array_equal(
+                    loaded[1][0][:, 9].numpy(), np.arange(7, 12)
+                )
+
+    def test_dataset_loading_does_not_guard_expert_ego_touches(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._min_len = 3
+        replays.minimum_remaining_frames = 1
+        demo = np.zeros((12, 215), dtype=np.float32)
+        demo[5, -5] = 1.0
+
+        loaded = replays._filter(demo, np.zeros(12, dtype=bool))
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(len(loaded[0][0]), 12)
 
     def test_random_starts_leave_the_configured_number_of_frames(self):
         count = 512
@@ -790,6 +822,35 @@ class TrackerTest(unittest.TestCase):
         )
 
         self.assertEqual(frame["raw_expert_action"], raw_expert_action[0].tolist())
+
+    def test_watcher_publishes_expert_row_matching_eager_replay_cursor(self):
+        class Replays:
+            @staticmethod
+            def current_tensor(offset=0):
+                self.assertEqual(offset, -1)
+                return th.zeros((1, GOAL_STATE_SIZE))
+
+            @staticmethod
+            def current_demo_name():
+                return "demo"
+
+        viewer = SimpleNamespace(publish=lambda frame: setattr(viewer, "frame", frame))
+        base = SimpleNamespace(
+            device=th.device("cpu"),
+            _env=SimpleNamespace(get_state=lambda: np.zeros((1, 31), dtype=np.float32)),
+        )
+        with unittest.mock.patch("torch.cuda.synchronize"):
+            publish_frame(
+                viewer,
+                base,
+                Replays(),
+                Path("tracker.pt"),
+                th.zeros(1),
+                th.zeros((1, ACTION_FACTORS)),
+                th.zeros((1, 8)),
+            )
+
+        self.assertEqual(viewer.frame["demo"], "demo")
 
     @staticmethod
     def _anchor_fixture(expert_touch: bool = False):

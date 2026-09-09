@@ -230,6 +230,17 @@ def simulate(
         orange_score = 0
         round_number = 1
         tick = 0
+        state.publish(render_frame(
+            raw_state(env),
+            registry.directory,
+            blue_path,
+            orange_path,
+            blue_score,
+            orange_score,
+            round_number,
+            tick,
+        ))
+        state.stop.wait(frameskip / 120.0)
         next_step = time.perf_counter()
 
         while not state.stop.is_set():
@@ -268,6 +279,19 @@ def simulate(
                 blue_score = orange_score = 0
                 round_number = 1
                 tick = 0
+                state.publish(render_frame(
+                    raw_state(env),
+                    registry.directory,
+                    blue_path,
+                    orange_path,
+                    blue_score,
+                    orange_score,
+                    round_number,
+                    tick,
+                ))
+                state.stop.wait(frameskip / 120.0)
+                next_step = time.perf_counter()
+                continue
 
             actions, blue_state, orange_state = select_actions(
                 blue, orange, observation, blue_state, orange_state

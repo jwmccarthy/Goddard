@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch as th
 
@@ -24,6 +24,7 @@ from watch_gaifo import (
     require_gaifo_config,
     resolve_frameskip,
     select_actions,
+    simulate,
 )
 
 
@@ -314,6 +315,60 @@ class SelectActionsTest(unittest.TestCase):
         )
         self.assertTrue(th.equal(blue_next, th.tensor([1.0])))
         self.assertTrue(th.equal(orange_next, th.tensor([1.0])))
+
+
+class WatchTimingTest(unittest.TestCase):
+    def test_initial_reset_frame_is_published_before_first_step(self):
+        class StopAfterWait:
+            def __init__(self):
+                self.stopped = False
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, timeout):
+                self.stopped = True
+
+        env = MagicMock()
+        env.reset.return_value = th.zeros((2, 60))
+        state = SimpleNamespace(
+            stop=StopAfterWait(),
+            publish=MagicMock(),
+            take_match=lambda: None,
+            reset=SimpleNamespace(is_set=lambda: False),
+        )
+        policy = MockPolicy(0)
+        args = SimpleNamespace(
+            frameskip=4,
+            seed=0,
+            max_ticks=4096,
+            no_touch_timeout=30.0,
+            replay_dir=Path("replays"),
+            reset_state_limit=100,
+            replay_reset_fraction=1.0,
+        )
+        registry = SimpleNamespace(directory=Path("checkpoints"))
+
+        with (
+            patch("watch_gaifo.th.load", return_value={}),
+            patch("watch_gaifo.require_compatible_checkpoints", return_value=4),
+            patch("watch_gaifo.CARLTorchVectorEnv", return_value=env),
+            patch("watch_gaifo.configure_replay_resets"),
+            patch("watch_gaifo.load_policy", return_value=policy),
+            patch("watch_checkpoints.raw_state", return_value="reset-state"),
+            patch("watch_checkpoints.render_frame", return_value={"tick": 0}),
+        ):
+            simulate(
+                state,
+                registry,
+                Path("blue.pt"),
+                Path("orange.pt"),
+                args,
+            )
+
+        env.reset.assert_called_once_with()
+        env.step.assert_not_called()
+        state.publish.assert_called_once_with({"tick": 0})
 
 
 if __name__ == "__main__":
