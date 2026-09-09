@@ -845,7 +845,7 @@ class AdaptiveDiscriminatorTest(unittest.TestCase):
             "truncated": th.zeros(T, n_envs, dtype=th.bool),
         })
 
-    def test_skips_update_when_heldout_accuracy_above_target(self):
+    def test_runs_one_update_when_heldout_accuracy_above_target(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             expert = self._make_expert(path, marker=-1.0, heldout_size=4)
@@ -872,10 +872,10 @@ class AdaptiveDiscriminatorTest(unittest.TestCase):
             )
             _, metrics = stage.run(rollout)
         self.assertIn("heldout_accuracy", metrics["Discriminator"])
-        self.assertEqual(metrics["Discriminator"]["updated"], 0.0)
-        self.assertEqual(metrics["Discriminator"]["minibatches"], 0.0)
+        self.assertEqual(metrics["Discriminator"]["updated"], 1.0)
+        self.assertEqual(metrics["Discriminator"]["minibatches"], 1.0)
         self.assertGreaterEqual(metrics["Discriminator"]["heldout_accuracy"], 0.8)
-        # History was still populated even though the update was skipped.
+        # History is populated while adaptive stopping limits training to one batch.
         self.assertGreater(history.size, 0)
 
     def test_runs_update_when_heldout_accuracy_below_target(self):

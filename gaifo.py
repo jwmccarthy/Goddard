@@ -995,14 +995,13 @@ class AdaptiveDiscriminatorUpdate:
         train_indices, heldout_indices = self._split_generated(valid)
         heldout_generated = flat_windows[heldout_indices]
 
-        heldout_accuracy = self._evaluate(heldout_generated)
-        metrics: dict[str, float] = {
-            "heldout_accuracy": heldout_accuracy,
+        evaluation = self._evaluate(heldout_generated)
+        metrics: dict[str, float] = evaluation | {
             "updated": 0.0,
             "minibatches": 0.0,
         }
 
-        if heldout_accuracy < self.accuracy_target and len(train_indices) > 0:
+        if len(train_indices) > 0:
             sampler = SceneGAIFOMinibatches(
                 self.expert,
                 self.batch_size,
@@ -1032,9 +1031,8 @@ class AdaptiveDiscriminatorUpdate:
                         metric_totals[key] = metric_totals.get(key, 0.0) + detached
                     minibatch_count += 1
 
-                    heldout_accuracy = self._evaluate(heldout_generated)
-                    metrics["heldout_accuracy"] = heldout_accuracy
-                    if heldout_accuracy >= self.accuracy_target:
+                    evaluation = self._evaluate(heldout_generated)
+                    if evaluation["heldout_accuracy"] >= self.accuracy_target:
                         metrics["updated"] = 1.0
                         break
                 else:
@@ -1048,11 +1046,13 @@ class AdaptiveDiscriminatorUpdate:
                 metrics["minibatches"] = float(minibatch_count)
                 for key, total in metric_totals.items():
                     averaged = total / minibatch_count
-                    metrics[key] = (
+                    metrics[f"train_{key}"] = (
                         float(averaged.item())
                         if isinstance(averaged, th.Tensor)
                         else float(averaged)
                     )
+
+        metrics.update(evaluation)
 
         if self.history is not None:
             add_count = min(self.history_add_size, len(train_indices))
@@ -1117,15 +1117,22 @@ class AdaptiveDiscriminatorUpdate:
             th.nonzero(heldout_mask, as_tuple=False).squeeze(-1),
         )
 
-    def _evaluate(self, heldout_generated: th.Tensor) -> float:
+    def _evaluate(self, heldout_generated: th.Tensor) -> dict[str, float]:
         n_gen = len(heldout_generated)
         n_exp = self.expert.heldout_total
         if n_gen == 0 or n_exp == 0:
-            return 0.0
+            return {
+                "loss": 0.0,
+                "agent_score": 0.0,
+                "expert_score": 0.0,
+                "agent_accuracy": 0.0,
+                "expert_accuracy": 0.0,
+                "heldout_accuracy": 0.0,
+            }
 
         n = min(n_gen, n_exp, self.heldout_size)
         gen_indices = th.randperm(n_gen, device=heldout_generated.device)[:n]
-        correct = th.zeros((), device=heldout_generated.device)
+        totals = th.zeros(5, device=heldout_generated.device)
 
         with th.no_grad():
             self.discriminator.eval()
@@ -1141,10 +1148,26 @@ class AdaptiveDiscriminatorUpdate:
                 expert_logits = self.discriminator(
                     add_scene_noise(expert, self.noise_std)
                 )
-                correct += (generated_logits > 0.0).sum()
-                correct += (expert_logits <= 0.0).sum()
+                totals[0] += F.softplus(-generated_logits).sum()
+                totals[0] += F.softplus(expert_logits).sum()
+                totals[1] += th.sigmoid(generated_logits).sum()
+                totals[2] += th.sigmoid(expert_logits).sum()
+                totals[3] += (generated_logits > 0.0).sum()
+                totals[4] += (expert_logits <= 0.0).sum()
         self.discriminator.train()
-        return (correct / (2 * n)).item()
+        loss, agent_score, expert_score, agent_correct, expert_correct = (
+            totals.tolist()
+        )
+        agent_accuracy = agent_correct / n
+        expert_accuracy = expert_correct / n
+        return {
+            "loss": loss / (2 * n),
+            "agent_score": agent_score / n,
+            "expert_score": expert_score / n,
+            "agent_accuracy": agent_accuracy,
+            "expert_accuracy": expert_accuracy,
+            "heldout_accuracy": (agent_accuracy + expert_accuracy) / 2,
+        }
 
     def _epoch_finished(self) -> None:
         if self._progress_callback is not None:
