@@ -6,19 +6,48 @@ from unittest.mock import patch
 
 import torch as th
 
-from simple import GoalOnlyReward, SimpleCheckpoints, parse_args, validate_args
+from simple import MinimalReward, SimpleCheckpoints, parse_args, validate_args
 
 
 def make_reward_context(score_delta: int):
+    def state():
+        return SimpleNamespace(
+            team_sign=th.tensor([1.0, -1.0]),
+            ball_position=th.zeros((1, 3)),
+            ball_velocity=th.zeros((1, 3)),
+            car_position=th.zeros((1, 2, 3)),
+            car_up=th.tensor([[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]]),
+            car_ball_touches=th.zeros((1, 2), dtype=th.bool),
+            car_has_flipped=th.zeros((1, 2), dtype=th.bool),
+            car_has_double_jumped=th.zeros((1, 2), dtype=th.bool),
+        )
+
     return SimpleNamespace(
-        events=SimpleNamespace(score_delta=th.tensor([score_delta])),
-        current=SimpleNamespace(team_sign=th.tensor([1.0, -1.0])),
+        events=SimpleNamespace(
+            score_delta=th.tensor([score_delta]),
+            done=th.tensor([False]),
+        ),
+        current=state(),
+        previous=state(),
     )
+
+
+def component_reward(**scales):
+    disabled = {
+        "touch_scale": 0.0,
+        "ball_velocity_scale": 0.0,
+        "flip_reset_scale": 0.0,
+        "ball_goal_progress_scale": 0.0,
+        "player_ball_progress_scale": 0.0,
+        "ball_height_progress_scale": 0.0,
+        "gravity_lift_scale": 0.0,
+    }
+    return MinimalReward(4, **(disabled | scales))
 
 
 class SimpleSelfPlayTest(unittest.TestCase):
     def test_goal_reward_is_zero_sum_plus_or_minus_ten(self):
-        reward = GoalOnlyReward()
+        reward = MinimalReward(4)
 
         th.testing.assert_close(
             reward(make_reward_context(score_delta=1)),
@@ -30,11 +59,74 @@ class SimpleSelfPlayTest(unittest.TestCase):
         )
 
     def test_non_goal_events_have_zero_reward(self):
-        reward = GoalOnlyReward()
+        reward = MinimalReward(4)
 
         th.testing.assert_close(
             reward(make_reward_context(score_delta=0)),
             th.zeros((1, 2)),
+        )
+
+    def test_touch_and_touch_velocity_change_rewards_are_small(self):
+        reward = component_reward(touch_scale=0.05, ball_velocity_scale=0.05)
+        context = make_reward_context(0)
+        context.current.car_ball_touches[0, 0] = True
+        context.current.ball_velocity[0, 0] = 6000.0
+
+        th.testing.assert_close(reward(context), th.tensor([[0.1, 0.0]]))
+
+    def test_ball_goal_and_player_ball_progress_are_signed(self):
+        reward = component_reward(
+            ball_goal_progress_scale=1.0,
+            player_ball_progress_scale=1.0,
+        )
+        context = make_reward_context(0)
+        context.previous.ball_position[0, 1] = 0.0
+        context.current.ball_position[0, 1] = 100.0
+        context.previous.car_position[0, :, 0] = -1000.0
+        context.current.car_position[0, 0, 0] = -500.0
+        context.current.car_position[0, 1, 0] = -1500.0
+
+        value = reward(context)
+
+        self.assertGreater(value[0, 0].item(), 0)
+        self.assertLess(value[0, 1].item(), 0)
+
+    def test_flip_reset_rewards_the_touching_player(self):
+        reward = component_reward(flip_reset_scale=1.0)
+        context = make_reward_context(0)
+        context.current.car_ball_touches[0, 0] = True
+        context.previous.car_has_flipped[0, 0] = True
+        context.current.car_position[0, 0, 2] = 400.0
+        context.current.ball_position[0, 2] = 300.0
+
+        th.testing.assert_close(reward(context), th.tensor([[1.0, 0.0]]))
+
+    def test_ball_lift_is_credited_to_last_toucher(self):
+        reward = component_reward(ball_height_progress_scale=0.1)
+        touch = make_reward_context(0)
+        touch.current.car_ball_touches[0, 0] = True
+        reward(touch)
+        lift = make_reward_context(0)
+        lift.current.ball_position[0, 2] = 100.0
+
+        value = reward(lift)
+
+        self.assertGreater(value[0, 0].item(), 0)
+        self.assertEqual(value[0, 1].item(), 0)
+
+    def test_gravity_compensated_lift_ignores_ballistic_motion(self):
+        reward = component_reward(gravity_lift_scale=0.1)
+        touch = make_reward_context(0)
+        touch.current.car_ball_touches[0, 0] = True
+        reward(touch)
+        ballistic = make_reward_context(0)
+        dt = 4 / 120.0
+        ballistic.previous.ball_position[0, 2] = 500.0
+        ballistic.previous.ball_velocity[0, 2] = 300.0
+        ballistic.current.ball_position[0, 2] = 500.0 + 300.0 * dt - 325.0 * dt**2
+
+        th.testing.assert_close(
+            reward(ballistic), th.zeros((1, 2)), atol=1e-7, rtol=0
         )
 
     def test_cli_requires_replays_but_has_no_distillation_input(self):

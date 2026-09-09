@@ -40,12 +40,110 @@ from replay_resets import load_demonstration_reset_dataset
 
 GOAL_REWARD = 10.0
 SIMPLE_ARCHITECTURE = "direct-action-self-play-v1"
+BALL_RADIUS = 91.25
+BALL_MAX_SPEED = 6000.0
+CAR_MAX_SPEED = 2300.0
+CEILING_Z = 2044.0
+GOAL_Y = 5124.25
+GRAVITY_Z = 650.0
 
 
-class GoalOnlyReward:
+class MinimalReward:
+    def __init__(
+        self,
+        frameskip: int,
+        touch_scale: float = 0.05,
+        ball_velocity_scale: float = 0.05,
+        flip_reset_scale: float = 1.0,
+        ball_goal_progress_scale: float = 1.0,
+        player_ball_progress_scale: float = 0.1,
+        ball_height_progress_scale: float = 0.1,
+        gravity_lift_scale: float = 0.1,
+    ) -> None:
+        self.dt = frameskip / 120.0
+        self.touch_scale = touch_scale
+        self.ball_velocity_scale = ball_velocity_scale
+        self.flip_reset_scale = flip_reset_scale
+        self.ball_goal_progress_scale = ball_goal_progress_scale
+        self.player_ball_progress_scale = player_ball_progress_scale
+        self.ball_height_progress_scale = ball_height_progress_scale
+        self.gravity_lift_scale = gravity_lift_scale
+        self._last_touch: th.Tensor | None = None
+
     def __call__(self, context: RewardContext) -> th.Tensor:
+        current = context.current
+        previous = context.previous
+        touches = current.car_ball_touches
+        if self._last_touch is None or self._last_touch.shape != touches.shape:
+            self._last_touch = th.zeros_like(touches)
+        touched = touches.any(dim=-1)
+        self._last_touch[touched] = touches[touched]
+
+        team_sign = current.team_sign[None, :]
         score = context.events.score_delta[:, None]
-        return GOAL_REWARD * score * context.current.team_sign[None, :]
+        ball = current.ball_position[:, None, :]
+        previous_ball = previous.ball_position[:, None, :]
+        velocity_change = (
+            current.ball_velocity - previous.ball_velocity
+        ).norm(dim=-1, keepdim=True) / BALL_MAX_SPEED
+
+        opponent_goal = th.zeros_like(current.car_position)
+        opponent_goal[..., 1] = team_sign * GOAL_Y
+        goal_progress = (
+            (opponent_goal - previous_ball).norm(dim=-1)
+            - (opponent_goal - ball).norm(dim=-1)
+        ) / BALL_MAX_SPEED
+        goal_progress -= goal_progress.mean(dim=-1, keepdim=True)
+
+        player_ball_progress = (
+            (previous_ball - previous.car_position).norm(dim=-1)
+            - (ball - current.car_position).norm(dim=-1)
+        ) / CAR_MAX_SPEED
+        ball_height_progress = (
+            current.ball_position[:, 2] - previous.ball_position[:, 2]
+        )[:, None] / CEILING_Z
+        expected_height = (
+            previous.ball_position[:, 2]
+            + previous.ball_velocity[:, 2] * self.dt
+            - 0.5 * GRAVITY_Z * self.dt**2
+        )
+        gravity_lift = (
+            current.ball_position[:, 2] - expected_height
+        )[:, None] / CEILING_Z
+
+        previously_spent_flip = (
+            previous.car_has_flipped | previous.car_has_double_jumped
+        )
+        flip_available = ~(
+            current.car_has_flipped | current.car_has_double_jumped
+        )
+        car_to_ball = ball - current.car_position
+        underside_alignment = (
+            car_to_ball / car_to_ball.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            * -current.car_up
+        ).sum(dim=-1)
+        flip_reset = (
+            touches
+            & previously_spent_flip
+            & flip_available
+            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
+            & car_to_ball.norm(dim=-1).lt(2.0 * BALL_RADIUS)
+            & underside_alignment.gt(0.9)
+        ).float()
+
+        last_touch = self._last_touch.float()
+        reward = (
+            GOAL_REWARD * score * team_sign
+            + self.touch_scale * touches
+            + self.ball_velocity_scale * touches * velocity_change
+            + self.flip_reset_scale * flip_reset
+            + self.ball_goal_progress_scale * goal_progress
+            + self.player_ball_progress_scale * player_ball_progress
+            + self.ball_height_progress_scale * last_touch * ball_height_progress
+            + self.gravity_lift_scale * last_touch * gravity_lift
+        )
+        self._last_touch[context.events.done] = False
+        return reward
 
 
 class SimpleCheckpoints:
@@ -91,7 +189,7 @@ class SimpleCheckpoints:
             for name, value in vars(self.args).items()
         }
         config["architecture"] = SIMPLE_ARCHITECTURE
-        config["reward_mode"] = "goal-only-v1"
+        config["reward_mode"] = "minimal-shaping-v1"
         path = self.directory / f"simple_{step:012d}.pt"
         temporary = path.with_suffix(".pt.tmp")
         th.save({
@@ -111,7 +209,7 @@ class SimpleCheckpoints:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train direct-action self-play from scratch with +/-10 goals only."
+        description="Train direct-action self-play from scratch with minimal shaping."
     )
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--n-sim", type=int, default=256)
@@ -148,6 +246,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--touch-reward-scale", type=float, default=0.05)
+    parser.add_argument("--ball-velocity-reward-scale", type=float, default=0.05)
+    parser.add_argument("--flip-reset-reward-scale", type=float, default=1.0)
+    parser.add_argument("--ball-goal-progress-reward-scale", type=float, default=1.0)
+    parser.add_argument("--player-ball-progress-reward-scale", type=float, default=0.1)
+    parser.add_argument("--ball-height-progress-reward-scale", type=float, default=0.1)
+    parser.add_argument("--gravity-lift-reward-scale", type=float, default=0.1)
     parser.add_argument("--current-fraction", type=float, default=0.5)
     parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
     parser.add_argument("--snapshot-pool-size", type=int, default=16)
@@ -197,6 +302,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--clip must be in (0, 1)")
     if not math.isfinite(args.entropy_coef) or args.entropy_coef < 0:
         raise ValueError("--entropy-coef must be nonnegative")
+    for name in (
+        "touch_reward_scale",
+        "ball_velocity_reward_scale",
+        "flip_reset_reward_scale",
+        "ball_goal_progress_reward_scale",
+        "player_ball_progress_reward_scale",
+        "ball_height_progress_reward_scale",
+        "gravity_lift_reward_scale",
+    ):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be nonnegative")
     if not 0 <= args.current_fraction <= 1:
         raise ValueError("--current-fraction must be in [0, 1]")
     if args.snapshot_pool_size < 3:
@@ -247,7 +363,16 @@ def main() -> None:
         max_ticks=args.max_ticks,
         no_touch_timeout_seconds=args.no_touch_timeout,
         normalize=True,
-        reward_funcs=(GoalOnlyReward(),),
+        reward_funcs=(MinimalReward(
+            args.frameskip,
+            touch_scale=args.touch_reward_scale,
+            ball_velocity_scale=args.ball_velocity_reward_scale,
+            flip_reset_scale=args.flip_reset_reward_scale,
+            ball_goal_progress_scale=args.ball_goal_progress_reward_scale,
+            player_ball_progress_scale=args.player_ball_progress_reward_scale,
+            ball_height_progress_scale=args.ball_height_progress_reward_scale,
+            gravity_lift_scale=args.gravity_lift_reward_scale,
+        ),),
         discrete_actions=True,
     )
     reset_dataset = load_demonstration_reset_dataset(
