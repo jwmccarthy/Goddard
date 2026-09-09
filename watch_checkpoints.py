@@ -20,6 +20,7 @@ from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
 from replay_resets import load_demonstration_reset_dataset
+from simple import SIMPLE_ARCHITECTURE, build_policy as build_simple_policy
 from self_play import (
     FrozenPulseController,
     PulseLatentEnv,
@@ -55,13 +56,18 @@ class CheckpointRegistry:
 
     def list(self) -> list[CheckpointMetadata]:
         checkpoints = []
-        for path in self.directory.rglob("self_play_*.pt"):
+        paths = (
+            *self.directory.rglob("self_play_*.pt"),
+            *self.directory.rglob("simple_*.pt"),
+        )
+        for path in paths:
             try:
                 resolved = path.resolve(strict=True)
+                step = resolved.stem.rsplit("_", 1)[-1]
                 checkpoints.append(CheckpointMetadata(
                     resolved,
                     resolved.relative_to(self.directory).as_posix(),
-                    int(resolved.stem.removeprefix("self_play_")),
+                    int(step),
                     resolved.stat().st_mtime_ns,
                 ))
             except (OSError, ValueError):
@@ -76,7 +82,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no self-play checkpoints found in {self.directory}"
+                f"no self-play or simple checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -94,7 +100,9 @@ class CheckpointRegistry:
         if (
             self.directory not in path.parents
             or not path.is_file()
-            or not path.match("self_play_*.pt")
+            or not (
+                path.match("self_play_*.pt") or path.match("simple_*.pt")
+            )
         ):
             raise ValueError("invalid checkpoint path")
         return path
@@ -246,7 +254,166 @@ def render_frame(
     }
 
 
-def simulate(
+def _checkpoint_architecture(payload: dict) -> str | None:
+    return payload.get("config", {}).get("architecture")
+
+
+def load_simple_checkpoint(path: Path, env: CARLTorchVectorEnv):
+    payload = th.load(path, map_location="cpu", weights_only=True)
+    config = payload.get("config", {})
+    if _checkpoint_architecture(payload) != SIMPLE_ARCHITECTURE:
+        raise ValueError(f"{path.name} is not a simple direct-action checkpoint")
+    policy = build_simple_policy(env, int(config["policy_hidden"]))
+    policy.load_state_dict(payload["policy"])
+    return policy.eval().requires_grad_(False), config
+
+
+def _simulate_simple(
+    state: SpectatorState,
+    registry: CheckpointRegistry,
+    blue_path: Path,
+    orange_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    base = None
+    try:
+        reset_dataset = load_demonstration_reset_dataset(
+            args.replay_dir,
+            "cuda:0",
+            args.frameskip,
+            args.reset_state_limit,
+            args.seed,
+        )
+        reset_sampler = DatasetResetSampler(
+            reset_dataset, probability=1.0, seed=args.seed
+        )
+        base = CARLTorchVectorEnv(
+            n_sim=1,
+            n_blue=1,
+            n_orange=1,
+            seed=args.seed,
+            frameskip=args.frameskip,
+            max_ticks=args.max_ticks,
+            normalize=True,
+            synchronize=True,
+            reset_state_provider=reset_sampler,
+            discrete_actions=True,
+        )
+        blue, blue_config = load_simple_checkpoint(blue_path, base)
+        orange, orange_config = load_simple_checkpoint(orange_path, base)
+        for config in (blue_config, orange_config):
+            if int(config["frameskip"]) != args.frameskip:
+                raise ValueError("checkpoint frameskip does not match watcher")
+
+        observation = base.reset()
+        blue_state = blue.initial_state(1)
+        orange_state = orange.initial_state(1)
+        blue_score = orange_score = 0
+        round_number = 1
+        tick = 0
+        state.publish(render_frame(
+            raw_state(base),
+            registry.directory,
+            blue_path,
+            orange_path,
+            blue_score,
+            orange_score,
+            round_number,
+            tick,
+        ))
+        state.stop.wait(args.frameskip / 120.0)
+        next_step = time.perf_counter()
+
+        while not state.stop.is_set():
+            pending = state.take_match()
+            if pending is not None:
+                try:
+                    next_blue, next_blue_config = load_simple_checkpoint(
+                        pending[0], base
+                    )
+                    next_orange, next_orange_config = load_simple_checkpoint(
+                        pending[1], base
+                    )
+                    for config in (next_blue_config, next_orange_config):
+                        if int(config["frameskip"]) != args.frameskip:
+                            raise ValueError(
+                                "checkpoint frameskip does not match watcher"
+                            )
+                except Exception as error:
+                    state.publish({"error": f"{type(error).__name__}: {error}"})
+                else:
+                    blue_path, orange_path = pending
+                    blue, orange = next_blue, next_orange
+                    state.reset.set()
+
+            if state.reset.is_set():
+                state.reset.clear()
+                observation = base.reset()
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
+                blue_score = orange_score = 0
+                round_number = 1
+                tick = 0
+                state.publish(render_frame(
+                    raw_state(base),
+                    registry.directory,
+                    blue_path,
+                    orange_path,
+                    blue_score,
+                    orange_score,
+                    round_number,
+                    tick,
+                ))
+                state.stop.wait(args.frameskip / 120.0)
+                next_step = time.perf_counter()
+                continue
+
+            with th.inference_mode():
+                blue_output = blue.act(
+                    observation[:1], blue_state, deterministic=True
+                )
+                orange_output = orange.act(
+                    observation[1:], orange_state, deterministic=True
+                )
+                blue_state = blue_output.next_state
+                orange_state = orange_output.next_state
+                actions = th.cat((blue_output.action, orange_output.action))
+            observation, reward, terminated, truncated, _ = base.step(actions)
+            tick += args.frameskip
+
+            goal = int(reward[0].item())
+            blue_score += max(goal, 0)
+            orange_score += max(-goal, 0)
+            if (terminated | truncated).any():
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
+                round_number += 1
+                tick = 0
+
+            state.publish(render_frame(
+                raw_state(base),
+                registry.directory,
+                blue_path,
+                orange_path,
+                blue_score,
+                orange_score,
+                round_number,
+                tick,
+            ))
+            next_step += args.frameskip / 120.0
+            delay = next_step - time.perf_counter()
+            if delay > 0:
+                state.stop.wait(delay)
+            else:
+                next_step = time.perf_counter()
+    except Exception as error:
+        state.publish({"error": f"{type(error).__name__}: {error}"})
+    finally:
+        if base is not None:
+            base.close()
+
+
+def _simulate_pulse(
     state: SpectatorState,
     registry: CheckpointRegistry,
     blue_path: Path,
@@ -452,6 +619,30 @@ def simulate(
     finally:
         if base is not None:
             base.close()
+
+
+def simulate(
+    state: SpectatorState,
+    registry: CheckpointRegistry,
+    blue_path: Path,
+    orange_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    try:
+        blue = th.load(blue_path, map_location="cpu", weights_only=True)
+        orange = th.load(orange_path, map_location="cpu", weights_only=True)
+        architectures = {
+            _checkpoint_architecture(blue),
+            _checkpoint_architecture(orange),
+        }
+        if architectures == {SIMPLE_ARCHITECTURE}:
+            _simulate_simple(state, registry, blue_path, orange_path, args)
+        elif SIMPLE_ARCHITECTURE in architectures:
+            raise ValueError("cannot mix simple and PULSE checkpoints")
+        else:
+            _simulate_pulse(state, registry, blue_path, orange_path, args)
+    except Exception as error:
+        state.publish({"error": f"{type(error).__name__}: {error}"})
 
 
 def make_handler(
