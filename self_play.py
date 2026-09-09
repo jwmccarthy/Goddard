@@ -1086,9 +1086,14 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
             self.state = self.state * keep
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    *,
+    description: str = "Train a PULSE latent policy with Rocket League self-play.",
+    checkpoint_dir: Path = Path("checkpoints/self_play"),
+    include_reward_args: bool = True,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a PULSE latent policy with Rocket League self-play."
+        description=description
     )
     parser.add_argument("--distill-checkpoint", type=Path, required=True)
     parser.add_argument("--replay-dir", type=Path, required=True)
@@ -1118,15 +1123,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--historical-policies", type=int, default=4)
     parser.add_argument("--demonstration-reset-fraction", type=float, default=0.8)
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
-    parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
-    parser.add_argument("--goal-reward-scale", type=float, default=10.0)
-    parser.add_argument("--touch-reward-scale", type=float, default=0.1)
-    parser.add_argument("--no-touch-penalty", type=float, default=1.0)
+    if include_reward_args:
+        parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
+        parser.add_argument("--goal-reward-scale", type=float, default=10.0)
+        parser.add_argument("--touch-reward-scale", type=float, default=0.1)
+        parser.add_argument("--no-touch-penalty", type=float, default=1.0)
+    else:
+        parser.set_defaults(
+            nexto_shaping_scale=0.0,
+            goal_reward_scale=10.0,
+            touch_reward_scale=0.0,
+            no_touch_penalty=0.0,
+        )
     parser.add_argument("--timesteps", type=int, default=2_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     parser.add_argument(
-        "--checkpoint-dir", type=Path, default=Path("checkpoints/self_play")
+        "--checkpoint-dir", type=Path, default=checkpoint_dir
     )
     parser.add_argument("--checkpoint-interval", type=int, default=10_000_000)
     parser.add_argument("--checkpoint-keep", type=int, default=5)
@@ -1232,8 +1245,12 @@ def build_policy_and_critic(
     return policy, critic
 
 
-def main() -> None:
-    args = parse_args()
+def train(
+    args: argparse.Namespace,
+    *,
+    reward_function=None,
+    run_prefix: str = "self-play",
+) -> None:
     validate_args(args)
     th.manual_seed(args.seed)
 
@@ -1251,17 +1268,19 @@ def main() -> None:
         probability=args.demonstration_reset_fraction,
         seed=args.seed,
     )
-    reward = AnnealedNextoReward(
-        1,
-        1,
-        shaping_scale=args.nexto_shaping_scale,
-        goal_scale=args.goal_reward_scale,
-        touch_scale=args.touch_reward_scale,
-        no_touch_penalty=args.no_touch_penalty,
-        no_touch_timeout_steps=math.ceil(
-            args.no_touch_timeout_seconds * 120 / args.frameskip
-        ),
-    )
+    reward = reward_function
+    if reward is None:
+        reward = AnnealedNextoReward(
+            1,
+            1,
+            shaping_scale=args.nexto_shaping_scale,
+            goal_scale=args.goal_reward_scale,
+            touch_scale=args.touch_reward_scale,
+            no_touch_penalty=args.no_touch_penalty,
+            no_touch_timeout_steps=math.ceil(
+                args.no_touch_timeout_seconds * 120 / args.frameskip
+            ),
+        )
     base_env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=1,
@@ -1305,7 +1324,7 @@ def main() -> None:
         args.gru_input_size,
     )
 
-    run_id = datetime.now().strftime("self-play-%Y%m%d-%H%M%S-%f")
+    run_id = datetime.now().strftime(f"{run_prefix}-%Y%m%d-%H%M%S-%f")
     pool = SnapshotPool(
         policy,
         max_size=args.snapshot_pool_size,
@@ -1341,7 +1360,7 @@ def main() -> None:
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
-        gameplay_reward=reward,
+        gameplay_reward=reward if isinstance(reward, AnnealedNextoReward) else None,
     )
 
     optimizer = Adam((*policy.parameters(), *critic.parameters()), lr=args.lr)
@@ -1377,19 +1396,21 @@ def main() -> None:
         ),
         section="PPO",
     )
-    value_scheduler = ValueScheduler(
-        ScheduledValue.attribute(
-            "nexto_shaping_scale",
-            reward,
-            "shaping_scale",
-            lambda progress: nexto_shaping_scale(
-                round(progress * args.timesteps),
-                args.nexto_shaping_scale,
-                args.timesteps,
+    value_scheduler = None
+    if isinstance(reward, AnnealedNextoReward):
+        value_scheduler = ValueScheduler(
+            ScheduledValue.attribute(
+                "nexto_shaping_scale",
+                reward,
+                "shaping_scale",
+                lambda progress: nexto_shaping_scale(
+                    round(progress * args.timesteps),
+                    args.nexto_shaping_scale,
+                    args.timesteps,
+                ),
             ),
-        ),
-        section="Reward",
-    )
+            section="Reward",
+        )
     checkpoints = SelfPlayCheckpoints(
         args.checkpoint_dir / run_id,
         args.checkpoint_interval,
@@ -1403,17 +1424,21 @@ def main() -> None:
     )
     checkpoints.save(0, force=True)
     logger = Logger(args.log_dir / run_id)
-    for section, key, label, format_spec in (
+    progress_metrics = [
         ("PPO", "policy_loss", "policy loss", ".4f"),
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "approx_kl", "approx KL", ".4f"),
         ("episode", "historical_reward", "historical reward", ".3f"),
         ("episode", "baseline_reward", "baseline reward", ".3f"),
-        ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
-        ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
-        ("Gameplay", "baseline_win_rate", "base win", ".3f"),
-        ("Reward", "nexto_shaping_scale", "reward shaping", ".3f"),
-    ):
+    ]
+    if isinstance(reward, AnnealedNextoReward):
+        progress_metrics.extend((
+            ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
+            ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
+            ("Gameplay", "baseline_win_rate", "base win", ".3f"),
+            ("Reward", "nexto_shaping_scale", "reward shaping", ".3f"),
+        ))
+    for section, key, label, format_spec in progress_metrics:
         logger.register_progress_metric(section, key, label, format_spec)
 
     def log_diagnostics(trainer: Trainer) -> None:
@@ -1438,6 +1463,10 @@ def main() -> None:
     finally:
         logger.close()
         env.close()
+
+
+def main() -> None:
+    train(parse_args())
 
 
 if __name__ == "__main__":
