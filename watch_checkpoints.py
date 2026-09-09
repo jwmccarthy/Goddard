@@ -263,7 +263,11 @@ def load_simple_checkpoint(path: Path, env: CARLTorchVectorEnv):
     config = payload.get("config", {})
     if _checkpoint_architecture(payload) != SIMPLE_ARCHITECTURE:
         raise ValueError(f"{path.name} is not a simple direct-action checkpoint")
-    policy = build_simple_policy(env, int(config["policy_hidden"]))
+    policy = build_simple_policy(
+        env,
+        int(config["policy_hidden"]),
+        recurrent=bool(config.get("recurrent", False)),
+    )
     policy.load_state_dict(payload["policy"])
     return policy.eval().requires_grad_(False), config
 

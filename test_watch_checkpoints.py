@@ -43,12 +43,14 @@ class SimpleCheckpointWatcherTest(unittest.TestCase):
                     "architecture": SIMPLE_ARCHITECTURE,
                     "policy_hidden": 16,
                     "frameskip": 4,
+                    "recurrent": True,
                 },
             }, path)
 
             loaded, config = load_simple_checkpoint(path, env)
 
         self.assertEqual(config["architecture"], SIMPLE_ARCHITECTURE)
+        self.assertIsNotNone(loaded.initial_state(1))
         for key, value in policy.state_dict().items():
             th.testing.assert_close(loaded.state_dict()[key], value)
 

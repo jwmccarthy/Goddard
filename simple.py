@@ -10,8 +10,9 @@ import torch.nn as nn
 from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium.state import RewardContext
 from jarl.collect import (
-    CriticCapture,
     LogProbCapture,
+    RecurrentCriticCapture,
+    RecurrentStateCapture,
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
@@ -26,12 +27,12 @@ from jarl.learn import (
 )
 from jarl.envs import DatasetResetSampler
 from jarl.log.logger import Logger
-from jarl.modules import MLP, orthogonal_init
+from jarl.modules import GRU, MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, Trainer
-from jarl.sample import RolloutMinibatches
+from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
@@ -190,6 +191,7 @@ class SimpleCheckpoints:
         }
         config["architecture"] = SIMPLE_ARCHITECTURE
         config["reward_mode"] = "minimal-shaping-v1"
+        config["recurrent"] = True
         path = self.directory / f"simple_{step:012d}.pt"
         temporary = path.with_suffix(".pt.tmp")
         th.save({
@@ -226,6 +228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--policy-hidden", type=int, default=512)
     parser.add_argument("--critic-hidden", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -287,6 +290,7 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     for name in (
         "n_sim", "frameskip", "max_ticks", "rollout", "batch_size", "epochs",
+        "sequence_length",
         "policy_hidden", "critic_hidden", "snapshot_interval", "snapshot_pool_size",
         "historical_policies", "timesteps", "checkpoint_interval", "checkpoint_keep",
         "reset_state_limit",
@@ -328,14 +332,27 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--kickoff-reset-fraction must be in [0, 1]")
     if args.batch_size > args.rollout * args.n_sim * 2:
         raise ValueError("--batch-size must fit the rollout")
+    if args.sequence_length > args.rollout:
+        raise ValueError("--sequence-length cannot exceed --rollout")
+    if args.batch_size < args.sequence_length:
+        raise ValueError("--batch-size must fit at least one sequence")
     if not args.replay_dir.is_dir():
         raise FileNotFoundError(args.replay_dir)
 
 
-def build_policy(env, hidden_size: int) -> MultiCategoricalPolicy:
+def build_policy(
+    env,
+    hidden_size: int,
+    *,
+    recurrent: bool = True,
+) -> MultiCategoricalPolicy:
     return MultiCategoricalPolicy(
         foot=LinearEncoder(hidden_size, func=nn.ReLU),
-        body=MLP(dims=[hidden_size], func=nn.ReLU),
+        body=(
+            GRU(hidden_size=hidden_size)
+            if recurrent
+            else MLP(dims=[hidden_size], func=nn.ReLU)
+        ),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=0.01)),
         action_codec=env.action_codec,
     ).build(env).to(env.device)
@@ -344,7 +361,7 @@ def build_policy(env, hidden_size: int) -> MultiCategoricalPolicy:
 def build_critic(env, hidden_size: int) -> Critic:
     return Critic(
         foot=LinearEncoder(hidden_size, func=nn.ReLU),
-        body=MLP(dims=[hidden_size], func=nn.ReLU),
+        body=GRU(hidden_size=hidden_size),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
     ).build(env).to(env.device)
 
@@ -416,14 +433,30 @@ def main() -> None:
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
-        captures=(LogProbCapture(), CriticCapture(critic)),
+        captures=(
+            LogProbCapture(),
+            RecurrentStateCapture(),
+            RecurrentCriticCapture(critic),
+        ),
     )
 
     policy_optimizer = th.optim.Adam(policy.parameters(), lr=args.lr)
     critic_optimizer = th.optim.Adam(critic.parameters(), lr=args.lr)
     update = Update(
         transforms=(GAE(gamma=args.gamma, lambda_=args.gae_lambda),),
-        sampler=RolloutMinibatches(args.batch_size, args.epochs),
+        sampler=RecurrentRolloutMinibatches(
+            sequence_length=args.sequence_length,
+            sequences_per_batch=max(1, args.batch_size // args.sequence_length),
+            epochs=args.epochs,
+            fields=(
+                "observation",
+                "action",
+                "advantage",
+                "old_log_prob",
+                "baseline_value",
+                "returns",
+            ),
+        ),
         loss=PPOLoss(
             policy,
             critic,
