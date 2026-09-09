@@ -8,7 +8,7 @@ import torch as th
 
 from gymnasium.vector.utils import batch_space
 
-from gaifo import build_policy
+from gaifo import GAIFO_ARCHITECTURE, build_policy
 from jarl.modules import MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
@@ -159,6 +159,11 @@ class FrameskipValidationTest(unittest.TestCase):
 class ArchitectureValidationTest(unittest.TestCase):
     def test_require_gaifo_config_accepts_valid(self):
         require_gaifo_config(
+            {"architecture": GAIFO_ARCHITECTURE}, Path("x.pt")
+        )
+
+    def test_require_gaifo_config_accepts_v1_policy(self):
+        require_gaifo_config(
             {"architecture": "scene-marl-gaifo-1v1-v1"}, Path("x.pt")
         )
 
@@ -174,7 +179,7 @@ class ArchitectureValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             require_compatible_checkpoints(
                 Path("blue.pt"),
-                {"config": {"architecture": "scene-marl-gaifo-1v1-v1", "frameskip": 4}},
+                {"config": {"architecture": GAIFO_ARCHITECTURE, "frameskip": 4}},
                 Path("orange.pt"),
                 {"config": {"architecture": "other", "frameskip": 4}},
                 None,
@@ -183,9 +188,9 @@ class ArchitectureValidationTest(unittest.TestCase):
     def test_require_compatible_checkpoints_returns_frameskip(self):
         frameskip = require_compatible_checkpoints(
             Path("blue.pt"),
-            {"config": {"architecture": "scene-marl-gaifo-1v1-v1", "frameskip": 8}},
+            {"config": {"architecture": GAIFO_ARCHITECTURE, "frameskip": 8}},
             Path("orange.pt"),
-            {"config": {"architecture": "scene-marl-gaifo-1v1-v1", "frameskip": 8}},
+            {"config": {"architecture": GAIFO_ARCHITECTURE, "frameskip": 8}},
             None,
         )
         self.assertEqual(frameskip, 8)
@@ -205,7 +210,7 @@ class LoadPolicyTest(unittest.TestCase):
         path: Path,
         policy: MultiCategoricalPolicy,
         frameskip: int = 4,
-        architecture: str = "scene-marl-gaifo-1v1-v1",
+        architecture: str = GAIFO_ARCHITECTURE,
     ) -> None:
         th.save(
             {
@@ -237,7 +242,7 @@ class LoadPolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "gaifo_000000000001.pt"
             self._save_checkpoint(
-                path, policy, architecture="scene-marl-gaifo-1v1-v2"
+                path, policy, architecture="other"
             )
             with self.assertRaises(ValueError):
                 load_policy(path, env)

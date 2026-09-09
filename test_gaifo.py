@@ -11,14 +11,18 @@ from gymnasium.vector.utils import batch_space
 
 from jarl.data.batch import TensorBatch
 from jarl.modules import MLP, orthogonal_init
+from jarl.store.rollout import Rollout
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.policy import MultiCategoricalPolicy
 
 from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 
 from gaifo import (
+    AdaptiveDiscriminatorUpdate,
     ExpertSceneDataset,
+    GAIFO_ARCHITECTURE,
     GAIFOCheckpoints,
+    HistoricalReplayBuffer,
     SceneDiscriminator,
     SceneDiscriminatorLoss,
     SceneDiscriminatorReward,
@@ -27,6 +31,7 @@ from gaifo import (
     add_scene_noise,
     build_scene_windows,
     extract_scene_observations,
+    opponent_view,
     resample_scene,
     validate_args,
 )
@@ -64,6 +69,17 @@ class DeterministicDiscriminator(th.nn.Module):
         return windows[:, :, 0].sum(dim=-1)
 
 
+class TrivialSignDiscriminator(th.nn.Module):
+    """Logit = mean of an invariant marker feature (index 50) + bias."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bias = th.nn.Parameter(th.zeros(1))
+
+    def forward(self, windows: th.Tensor) -> th.Tensor:
+        return windows[..., 50].mean(dim=-1) + self.bias
+
+
 def make_rollout_batch(
     time: int = 8,
     n_sim: int = 2,
@@ -94,8 +110,8 @@ def add_scene_window_fields(batch: TensorBatch, trajectory_length: int) -> Tenso
         trajectory_length,
     )
     return batch.with_fields(
-        scene_window=windows.repeat_interleave(2, dim=1),
-        scene_window_valid=valid.repeat_interleave(2, dim=1),
+        scene_window=windows,
+        scene_window_valid=valid,
     )
 
 
@@ -116,8 +132,14 @@ class ArgumentValidationTest(unittest.TestCase):
             discriminator_epochs=1,
             discriminator_lr=3e-4,
             discriminator_hidden=64,
+            discriminator_heldout_size=1024,
+            discriminator_accuracy_target=0.8,
             frame_embedding=64,
             temporal_hidden=64,
+            history_capacity=262_144,
+            history_add_size=16_384,
+            history_mix_fraction=0.5,
+            reward_max_magnitude=10.0,
             ppo_batch=16,
             ppo_epochs=2,
             ppo_lr=3e-4,
@@ -193,6 +215,33 @@ class ArgumentValidationTest(unittest.TestCase):
             np.save(path / "blue-0-match.npy", np.zeros((20, 161), dtype=np.float32))
             args = self._valid_args(path)
             args.replay_reset_fraction = 1.1
+            with self.assertRaises(ValueError):
+                validate_args(args)
+
+    def test_rejects_history_add_size_exceeding_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            np.save(path / "blue-0-match.npy", np.zeros((20, 161), dtype=np.float32))
+            args = self._valid_args(path)
+            args.history_add_size = args.history_capacity + 1
+            with self.assertRaises(ValueError):
+                validate_args(args)
+
+    def test_rejects_history_mix_fraction_out_of_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            np.save(path / "blue-0-match.npy", np.zeros((20, 161), dtype=np.float32))
+            args = self._valid_args(path)
+            args.history_mix_fraction = 1.5
+            with self.assertRaises(ValueError):
+                validate_args(args)
+
+    def test_rejects_accuracy_target_out_of_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            np.save(path / "blue-0-match.npy", np.zeros((20, 161), dtype=np.float32))
+            args = self._valid_args(path)
+            args.discriminator_accuracy_target = 1.1
             with self.assertRaises(ValueError):
                 validate_args(args)
 
@@ -295,6 +344,54 @@ class ExpertDatasetTest(unittest.TestCase):
                 reset.data["car_internal_state"][:, 1], th.full((5, 19), 2.0)
             )
 
+    def test_expert_sample_includes_both_ego_viewpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            rows = np.zeros((10, 161), dtype=np.float32)
+            rows[:, 0] = np.arange(10)  # distinguish frames
+            rows[:, 9] = 1.0  # blue car x
+            rows[:, 30] = 2.0  # orange car x
+            np.save(path / "blue-0-match.npy", rows)
+
+            dataset = ExpertSceneDataset(path, trajectory_length=2)
+            windows = dataset.sample(8, th.device("cpu"))
+            self.assertEqual(windows.shape, (8, 2, 51))
+            canonical = windows[::2]
+            opponent = windows[1::2]
+            # Opponent view negates x positions and swaps cars.
+            self.assertTrue((canonical[..., 9] == 1.0).all())
+            self.assertTrue((canonical[..., 30] == 2.0).all())
+            self.assertTrue((opponent[..., 9] == -2.0).all())
+            self.assertTrue((opponent[..., 30] == -1.0).all())
+            # Ball x is negated in opponent view.
+            self.assertTrue((canonical[..., 0] == opponent[..., 0] * -1.0).all())
+
+    def test_expert_heldout_split_leaves_training_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self._save_replay(path / "blue-0-a.npy", 10, value=1.0)
+            dataset = ExpertSceneDataset(path, trajectory_length=2, heldout_size=2, seed=0)
+            self.assertEqual(dataset.heldout_total, 2)
+            self.assertEqual(dataset.train_total, 6)
+            _ = dataset.sample(2, th.device("cpu"))
+            _ = dataset.sample_heldout(2, th.device("cpu"))
+
+    def test_heldout_replay_is_excluded_from_training_and_resets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self._save_replay(path / "blue-0-a.npy", 10, value=1.0)
+            self._save_replay(path / "blue-1-b.npy", 10, value=2.0)
+            dataset = ExpertSceneDataset(
+                path, trajectory_length=2, heldout_size=2, seed=0
+            )
+
+            train_frames = set(dataset.train_window_starts.tolist())
+            heldout_frames = set(dataset.heldout_window_starts.tolist())
+            self.assertFalse(train_frames & heldout_frames)
+            self.assertEqual(len(dataset.reset_dataset()), 10)
+            self.assertEqual(dataset.train_total, 9)
+            self.assertEqual(dataset.heldout_total, 9)
+
 
 class NoiseMaskTest(unittest.TestCase):
     def test_noise_mask_preserves_boolean_car_features(self):
@@ -326,8 +423,39 @@ class NoiseMaskTest(unittest.TestCase):
         self.assertGreater(continuous_mse2.item(), 0.0)
 
 
+class OpponentViewTest(unittest.TestCase):
+    def test_opponent_view_rotates_xy_and_swaps_cars(self):
+        scene = th.zeros(51)
+        scene[0:3] = th.tensor([1.0, 2.0, 3.0])  # ball position
+        scene[9 + 0:9 + 3] = th.tensor([4.0, 5.0, 6.0])  # blue position
+        scene[30 + 0:30 + 3] = th.tensor([7.0, 8.0, 9.0])  # orange position
+
+        view = opponent_view(scene)
+        th.testing.assert_close(view[0:3], th.tensor([-1.0, -2.0, 3.0]))
+        th.testing.assert_close(view[9 + 0:9 + 3], th.tensor([-7.0, -8.0, 9.0]))
+        th.testing.assert_close(view[30 + 0:30 + 3], th.tensor([-4.0, -5.0, 6.0]))
+
+    def test_opponent_view_rotates_forward_and_up_vectors(self):
+        scene = th.zeros(51)
+        scene[9 + 9:9 + 12] = th.tensor([1.0, 0.0, 0.0])
+        scene[9 + 12:9 + 15] = th.tensor([0.0, 0.0, 1.0])
+        scene[30 + 9:30 + 12] = th.tensor([0.0, 1.0, 0.0])
+        scene[30 + 12:30 + 15] = th.tensor([0.0, 0.0, 1.0])
+
+        view = opponent_view(scene)
+        th.testing.assert_close(
+            view[9 + 9:9 + 12], th.tensor([0.0, -1.0, 0.0])
+        )
+        th.testing.assert_close(
+            view[9 + 12:9 + 15], th.tensor([0.0, 0.0, 1.0])
+        )
+        th.testing.assert_close(
+            view[30 + 9:30 + 12], th.tensor([-1.0, -0.0, 0.0])
+        )
+
+
 class SceneExtractionTest(unittest.TestCase):
-    def test_extract_scene_uses_first_actor_per_simulation(self):
+    def test_extract_scene_returns_every_actor_first_51(self):
         T, n_sim, obs_dim = 3, 2, 60
         n_envs = n_sim * 2
         obs = th.zeros(T, n_envs, obs_dim)
@@ -336,9 +464,11 @@ class SceneExtractionTest(unittest.TestCase):
         obs[:, 2, :51] = 3.0  # blue, simulation 1
         obs[:, 3, :51] = 4.0  # orange, simulation 1
         scene = extract_scene_observations(obs)
-        self.assertEqual(scene.shape, (T, n_sim, 51))
+        self.assertEqual(scene.shape, (T, n_envs, 51))
         th.testing.assert_close(scene[:, 0, 0], th.full((T,), 1.0))
-        th.testing.assert_close(scene[:, 1, 0], th.full((T,), 3.0))
+        th.testing.assert_close(scene[:, 1, 0], th.full((T,), 2.0))
+        th.testing.assert_close(scene[:, 2, 0], th.full((T,), 3.0))
+        th.testing.assert_close(scene[:, 3, 0], th.full((T,), 4.0))
 
     def test_build_scene_windows_respects_episode_boundaries(self):
         T, n_sim, obs_dim = 8, 1, 60
@@ -346,21 +476,24 @@ class SceneExtractionTest(unittest.TestCase):
         obs = th.zeros(T, n_envs, obs_dim)
         next_obs = th.zeros(T, n_envs, obs_dim)
         obs[:, 0, 0] = th.arange(T)
+        obs[:, 1, 0] = th.arange(T)
         next_obs[:, 0, 0] = th.arange(T) + 0.5
-        next_obs[3, 0, 0] = 100.0
+        next_obs[:, 1, 0] = th.arange(T) + 0.5
+        next_obs[3, :, 0] = 100.0
         done = th.zeros(T, n_envs, dtype=th.bool)
         done[3, :] = True
         windows, valid = build_scene_windows(obs, next_obs, done, trajectory_length=4)
         # Episode boundary after transition 3; windows ending at 4 cross it.
-        self.assertTrue(valid[3].item())
-        self.assertFalse(valid[4].item())
-        self.assertFalse(valid[5].item())
+        self.assertTrue(valid[3].all())
+        self.assertFalse(valid[4].any())
+        self.assertFalse(valid[5].any())
         # Once enough history exists in the new episode, windows are valid again.
-        self.assertTrue(valid[6].item())
-        th.testing.assert_close(
-            windows[6, 0, :, 0],
-            th.tensor([4.0, 5.0, 6.0, 6.5]),
-        )
+        self.assertTrue(valid[6].all())
+        for actor in (0, 1):
+            th.testing.assert_close(
+                windows[6, actor, :, 0],
+                th.tensor([4.0, 5.0, 6.0, 6.5]),
+            )
 
     def test_windows_include_next_obs_for_scored_transition(self):
         T, n_sim, obs_dim = 4, 1, 60
@@ -368,15 +501,18 @@ class SceneExtractionTest(unittest.TestCase):
         obs = th.zeros(T, n_envs, obs_dim)
         next_obs = th.zeros(T, n_envs, obs_dim)
         obs[:, 0, 0] = th.arange(T, dtype=th.float32)
+        obs[:, 1, 0] = th.arange(T, dtype=th.float32)
         next_obs[:, 0, 0] = th.arange(T, dtype=th.float32) + 100.0
+        next_obs[:, 1, 0] = th.arange(T, dtype=th.float32) + 100.0
         done = th.zeros(T, n_envs, dtype=th.bool)
         windows, valid = build_scene_windows(obs, next_obs, done, trajectory_length=2)
-        # First valid window is transition 0: [obs[0], next_obs[0]]
-        self.assertTrue(valid[0].item())
-        self.assertEqual(windows[0, 0, 0, 0].item(), 0.0)
-        self.assertEqual(windows[0, 0, 1, 0].item(), 100.0)
+        # First valid window is transition 0: [obs[0], next_obs[0]] for both actors.
+        self.assertTrue(valid[0].all())
+        for actor in (0, 1):
+            self.assertEqual(windows[0, actor, 0, 0].item(), 0.0)
+            self.assertEqual(windows[0, actor, 1, 0].item(), 100.0)
 
-    def test_scene_capture_keeps_history_across_rollout_boundaries(self):
+    def test_scene_capture_keeps_history_across_rollout_boundaries_per_actor(self):
         capture = SceneWindowCapture(trajectory_length=4)
         capture.reset(2)
 
@@ -384,8 +520,10 @@ class SceneExtractionTest(unittest.TestCase):
         for value in range(3):
             observation = th.zeros(2, 60)
             observation[0, 0] = value
+            observation[1, 0] = value + 10.0
             next_obs = observation.clone()
             next_obs[0, 0] = value + 0.5
+            next_obs[1, 0] = value + 10.5
             outputs.append(capture(SimpleNamespace(
                 observation=observation,
                 env_step=SimpleNamespace(
@@ -401,18 +539,22 @@ class SceneExtractionTest(unittest.TestCase):
             outputs[2]["scene_window"][0, :, 0],
             th.tensor([0.0, 1.0, 2.0, 2.5]),
         )
+        th.testing.assert_close(
+            outputs[2]["scene_window"][1, :, 0],
+            th.tensor([10.0, 11.0, 12.0, 12.5]),
+        )
 
 
 class RewardTest(unittest.TestCase):
-    def test_reward_is_identical_for_both_cars_and_differs_across_simulations(self):
+    def test_reward_is_per_actor_not_broadcast(self):
         T, n_sim, obs_dim = 4, 2, 60
         n_envs = n_sim * 2
         obs = th.zeros(T, n_envs, obs_dim)
-        # Give each simulation a unique first feature.
+        # Give each actor a unique first feature so windows differ.
         obs[:, 0, 0] = 1.0
-        obs[:, 1, 0] = 1.0
-        obs[:, 2, 0] = 2.0
-        obs[:, 3, 0] = 2.0
+        obs[:, 1, 0] = 2.0
+        obs[:, 2, 0] = 3.0
+        obs[:, 3, 0] = 4.0
         next_obs = obs.clone()
         done = th.zeros(T, n_envs, dtype=th.bool)
         batch = add_scene_window_fields(TensorBatch(
@@ -430,11 +572,9 @@ class RewardTest(unittest.TestCase):
         result = reward_transform(batch, None)
         reward = result["imitation_reward"]
         self.assertEqual(reward.shape, (T, n_envs))
-        for t in range(T):
-            self.assertEqual(reward[t, 0].item(), reward[t, 1].item())
-            self.assertEqual(reward[t, 2].item(), reward[t, 3].item())
-            # Simulations 0 and 1 see different windows, so different rewards.
-            self.assertNotEqual(reward[t, 0].item(), reward[t, 2].item())
+        # Within a timestep, the two actors of a simulation now see different windows.
+        self.assertFalse(th.allclose(reward[:, 0], reward[:, 1]))
+        self.assertFalse(th.allclose(reward[:, 2], reward[:, 3]))
 
     def test_reward_masks_incomplete_episode_history_for_both_cars(self):
         batch = add_scene_window_fields(
@@ -473,7 +613,60 @@ class RewardTest(unittest.TestCase):
             batch_size=3,
         )(batch, None)
 
-        self.assertEqual(discriminator.batch_sizes, [3, 3, 2])
+        # Every actor has its own window: 4 timesteps * 4 actors = 16 windows.
+        self.assertEqual(discriminator.batch_sizes, [3, 3, 3, 3, 3, 1])
+
+    def test_reward_clamps_and_normalizes_per_rollout(self):
+        T, n_sim, obs_dim = 4, 1, 60
+        n_envs = n_sim * 2
+        obs = th.zeros(T, n_envs, obs_dim)
+        obs[:, 0, 0] = th.arange(T, dtype=th.float32) + 1.0
+        obs[:, 1, 0] = -(th.arange(T, dtype=th.float32) + 1.0)
+        next_obs = obs.clone()
+        done = th.zeros(T, n_envs, dtype=th.bool)
+        batch = add_scene_window_fields(TensorBatch(
+            {
+                "observation": obs,
+                "next_obs": next_obs,
+                "terminated": done,
+                "truncated": done,
+            }
+        ), trajectory_length=2)
+
+        class BigLogitDiscriminator(th.nn.Module):
+            def forward(self, windows: th.Tensor) -> th.Tensor:
+                # Make logits huge so clamping matters.
+                return windows[:, :, 0].sum(dim=-1) * 100.0
+
+        reward_transform = SceneDiscriminatorReward(
+            BigLogitDiscriminator(),
+            noise_std=0.0,
+            trajectory_length=2,
+            max_magnitude=5.0,
+        )
+        result = reward_transform(batch, None)
+        reward = result["imitation_reward"]
+        valid = result["learner_mask"]
+        # All valid rewards are within the clamped symmetric bound.
+        self.assertTrue((reward[valid] <= 5.0).all())
+        self.assertTrue((reward[valid] >= -5.0).all())
+        # Valid rewards have zero mean and unit variance across the rollout.
+        valid_rewards = reward[valid]
+        self.assertAlmostEqual(valid_rewards.mean().item(), 0.0, places=6)
+        self.assertAlmostEqual(valid_rewards.std(unbiased=False).item(), 1.0, places=6)
+
+    def test_reward_bound_applies_after_normalization(self):
+        batch = add_scene_window_fields(
+            make_rollout_batch(time=4, n_sim=1), trajectory_length=2
+        )
+        result = SceneDiscriminatorReward(
+            DeterministicDiscriminator(trajectory_length=2),
+            noise_std=0.0,
+            trajectory_length=2,
+            max_magnitude=1.0,
+        )(batch, None)
+        reward = result["imitation_reward"][result["learner_mask"]]
+        self.assertLessEqual(reward.abs().max().item(), 1.0)
 
 
 class PolicyTest(unittest.TestCase):
@@ -537,6 +730,85 @@ class DiscriminatorSamplerTest(unittest.TestCase):
             self.assertEqual(sample["is_agent"][:4].sum().item(), 4)
             self.assertEqual(sample["is_agent"][4:].sum().item(), 0)
 
+    def test_sampler_mixes_historical_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            np.save(path / "blue-0-match.npy", np.full((20, 161), -1.0, dtype=np.float32))
+            expert = ExpertSceneDataset(path, trajectory_length=2)
+
+        # Current generated windows are all +1.
+        T, n_envs = 4, 2
+        obs = th.ones(T, n_envs, 60)
+        batch = TensorBatch({
+            "observation": obs,
+            "next_obs": obs,
+            "terminated": th.zeros(T, n_envs, dtype=th.bool),
+            "truncated": th.zeros(T, n_envs, dtype=th.bool),
+        })
+        batch = add_scene_window_fields(batch, trajectory_length=2)
+
+        history = HistoricalReplayBuffer(
+            capacity=100,
+            trajectory_length=2,
+            device=th.device("cpu"),
+            seed=0,
+        )
+        # Seed history with windows that are all +10.
+        history.add(th.full((4, 2, 51), 10.0), add_size=4)
+
+        sampler = SceneGAIFOMinibatches(
+            expert,
+            batch_size=4,
+            epochs=1,
+            noise_std=0.0,
+            history=history,
+            mix_fraction=0.5,
+        )
+        samples = list(sampler(batch))
+        # Eight generated windows with batch size 4 produces two minibatches.
+        self.assertEqual(len(samples), 2)
+        for sample in samples:
+            agent_windows = sample["window"][:4]
+            # Half of the agent batch should be historical (+10).
+            self.assertTrue(
+                (agent_windows[:2] == 10.0).all() or (agent_windows[2:] == 10.0).all()
+            )
+
+
+class HistoricalReplayBufferTest(unittest.TestCase):
+    def test_capacity_and_fifo_overwrite(self):
+        buffer = HistoricalReplayBuffer(
+            capacity=3,
+            trajectory_length=2,
+            device=th.device("cpu"),
+            seed=0,
+        )
+        windows = th.arange(6).view(3, 2, 1).float().expand(3, 2, 51).clone()
+        buffer.add(windows, add_size=10)
+        self.assertEqual(buffer.size, 3)
+        sample = buffer.sample(100, th.device("cpu"))
+        self.assertEqual(sample.shape, (3, 2, 51))
+
+        # Overwrite oldest with new values.
+        new = th.full((1, 2, 51), 99.0)
+        buffer.add(new, add_size=1)
+        sample = buffer.sample(100, th.device("cpu"))
+        self.assertTrue((sample == 99.0).any())
+        self.assertEqual(buffer.size, 3)
+        retained = set(sample[:, 0, 0].tolist())
+        self.assertEqual(retained, {2.0, 4.0, 99.0})
+
+    def test_add_takes_bounded_random_subset(self):
+        buffer = HistoricalReplayBuffer(
+            capacity=100,
+            trajectory_length=2,
+            device=th.device("cpu"),
+            seed=0,
+        )
+        windows = th.arange(20).view(10, 2, 1).float().expand(10, 2, 51).clone()
+        buffer.add(windows, add_size=4)
+        self.assertEqual(buffer.size, 4)
+
 
 class DiscriminatorLossTest(unittest.TestCase):
     def test_loss_returns_loss_output_metrics(self):
@@ -552,6 +824,118 @@ class DiscriminatorLossTest(unittest.TestCase):
         self.assertEqual(output.loss.shape, ())
         for key in ("agent_score", "expert_score", "agent_accuracy", "expert_accuracy"):
             self.assertIn(key, output.metrics)
+
+
+class AdaptiveDiscriminatorTest(unittest.TestCase):
+    def _make_expert(self, path: Path, marker: float, heldout_size: int = 0) -> ExpertSceneDataset:
+        rows = np.full((20, 161), 0.0, dtype=np.float32)
+        rows[:, 25:30] = marker
+        rows[:, 46:51] = marker
+        np.save(path / "blue-0-match.npy", rows)
+        return ExpertSceneDataset(path, trajectory_length=2, heldout_size=heldout_size, seed=0)
+
+    def _make_rollout_batch(self) -> TensorBatch:
+        T, n_envs = 4, 4
+        obs = th.zeros(T, n_envs, 60)
+        obs[..., 50] = 1.0
+        return TensorBatch({
+            "observation": obs,
+            "next_obs": obs,
+            "terminated": th.zeros(T, n_envs, dtype=th.bool),
+            "truncated": th.zeros(T, n_envs, dtype=th.bool),
+        })
+
+    def test_skips_update_when_heldout_accuracy_above_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            expert = self._make_expert(path, marker=-1.0, heldout_size=4)
+            discriminator = TrivialSignDiscriminator()
+            # Generated marker +1, expert marker -1; bias 0.5 makes both classes correct.
+            discriminator.bias.data[0] = 0.5
+            optimizer = th.optim.Adam(discriminator.parameters(), lr=1e-2)
+            history = HistoricalReplayBuffer(100, 2, th.device("cpu"), seed=0)
+            rollout = Rollout(steps=add_scene_window_fields(self._make_rollout_batch(), 2))
+            stage = AdaptiveDiscriminatorUpdate(
+                expert=expert,
+                history=history,
+                batch_size=4,
+                epochs=1,
+                noise_std=0.0,
+                heldout_size=4,
+                accuracy_target=0.8,
+                history_add_size=4,
+                history_mix_fraction=0.5,
+                max_grad_norm=0.5,
+                discriminator=discriminator,
+                optimizer=optimizer,
+                loss=SceneDiscriminatorLoss(discriminator),
+            )
+            _, metrics = stage.run(rollout)
+        self.assertIn("heldout_accuracy", metrics["Discriminator"])
+        self.assertEqual(metrics["Discriminator"]["updated"], 0.0)
+        self.assertEqual(metrics["Discriminator"]["minibatches"], 0.0)
+        self.assertGreaterEqual(metrics["Discriminator"]["heldout_accuracy"], 0.8)
+        # History was still populated even though the update was skipped.
+        self.assertGreater(history.size, 0)
+
+    def test_runs_update_when_heldout_accuracy_below_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            expert = self._make_expert(path, marker=-1.0, heldout_size=4)
+            discriminator = TrivialSignDiscriminator()
+            # Bias -1.5 makes generated windows classified as expert (wrong) and expert
+            # windows classified as expert (correct): balanced accuracy 0.5.
+            discriminator.bias.data[0] = -1.5
+            optimizer = th.optim.Adam(discriminator.parameters(), lr=1.0)
+            history = HistoricalReplayBuffer(100, 2, th.device("cpu"), seed=0)
+            rollout = Rollout(steps=add_scene_window_fields(self._make_rollout_batch(), 2))
+            stage = AdaptiveDiscriminatorUpdate(
+                expert=expert,
+                history=history,
+                batch_size=4,
+                epochs=20,
+                noise_std=0.0,
+                heldout_size=4,
+                accuracy_target=0.8,
+                history_add_size=4,
+                history_mix_fraction=0.5,
+                max_grad_norm=0.5,
+                discriminator=discriminator,
+                optimizer=optimizer,
+                loss=SceneDiscriminatorLoss(discriminator),
+            )
+            _, metrics = stage.run(rollout)
+        self.assertEqual(metrics["Discriminator"]["updated"], 1.0)
+        self.assertGreater(metrics["Discriminator"]["minibatches"], 0.0)
+        self.assertIn("loss", metrics["Discriminator"])
+
+    def test_generated_holdout_keeps_simulation_actors_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            expert = self._make_expert(path, marker=-1.0, heldout_size=4)
+            discriminator = TrivialSignDiscriminator()
+            stage = AdaptiveDiscriminatorUpdate(
+                expert=expert,
+                history=HistoricalReplayBuffer(100, 2, th.device("cpu")),
+                batch_size=4,
+                epochs=1,
+                noise_std=0.0,
+                heldout_size=1,
+                accuracy_target=0.8,
+                history_add_size=4,
+                history_mix_fraction=0.5,
+                max_grad_norm=0.5,
+                discriminator=discriminator,
+                optimizer=th.optim.Adam(discriminator.parameters()),
+                loss=SceneDiscriminatorLoss(discriminator),
+            )
+            batch = add_scene_window_fields(self._make_rollout_batch(), 2)
+            train, heldout = stage._split_generated(batch["scene_window_valid"])
+
+        heldout_actors = set((heldout % 4).tolist())
+        train_actors = set((train % 4).tolist())
+        self.assertIn(heldout_actors, ({0, 1}, {2, 3}))
+        self.assertFalse(heldout_actors & train_actors)
 
 
 class CheckpointTest(unittest.TestCase):
@@ -595,6 +979,7 @@ class CheckpointTest(unittest.TestCase):
                 "config",
             ):
                 self.assertIn(key, payload)
+            self.assertEqual(payload["config"]["architecture"], GAIFO_ARCHITECTURE)
 
     def test_periodic_checkpoint_waits_for_rollout_boundary(self):
         buffer = SimpleNamespace(position=1)

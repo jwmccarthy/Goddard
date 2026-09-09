@@ -23,6 +23,7 @@ from jarl.envs import DatasetResetSampler
 
 ROOT = Path(__file__).parent
 GAIFO_ARCHITECTURE = gaifo.GAIFO_ARCHITECTURE
+GAIFO_POLICY_ARCHITECTURES = gaifo.GAIFO_POLICY_ARCHITECTURES
 
 
 @dataclass(frozen=True)
@@ -85,10 +86,10 @@ class CheckpointRegistry:
 
 
 def require_gaifo_config(config: dict, path: Path) -> None:
-    if config.get("architecture") != GAIFO_ARCHITECTURE:
+    if config.get("architecture") not in GAIFO_POLICY_ARCHITECTURES:
         raise ValueError(
             f"checkpoint {path} has architecture {config.get('architecture')!r}, "
-            f"expected {GAIFO_ARCHITECTURE!r}"
+            f"expected a policy-compatible GAIFO architecture"
         )
 
 
