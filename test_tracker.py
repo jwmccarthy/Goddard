@@ -75,6 +75,7 @@ class TrackerTest(unittest.TestCase):
             clip=0.2,
             clip_final=0.1,
             max_grad_norm=0.5,
+            tracking_progress_scale=4.0,
         )
         validate_args(args)
 
@@ -83,6 +84,11 @@ class TrackerTest(unittest.TestCase):
             validate_args(args)
 
         args.gae_lambda = 0.98
+        args.tracking_progress_scale = -1
+        with self.assertRaisesRegex(ValueError, "tracking-progress-scale"):
+            validate_args(args)
+
+        args.tracking_progress_scale = 4.0
         args.timesteps = 6_000_001
         with self.assertRaisesRegex(ValueError, "divisible"):
             validate_args(args)
@@ -502,6 +508,28 @@ class TrackerTest(unittest.TestCase):
 
         th.testing.assert_close(value, th.ones((1, 1)))
 
+    def test_tracking_progress_is_signed_and_does_not_reward_oscillation(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        far_tensor = target_tensor.clone()
+        far_tensor[:, 9] = 0.02
+        close_tensor = target_tensor.clone()
+        close_tensor[:, 9] = 0.01
+        far = CARLObservation.from_tensor(far_tensor, 1)
+        close = CARLObservation.from_tensor(close_tensor, 1)
+        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        reward = TrackingReward(replays, progress_scale=4.0)
+
+        toward = reward(self._tracking_context(close, previous=far))
+        gain = reward.progress.clone()
+        away = reward(self._tracking_context(far, previous=close))
+        loss = reward.progress.clone()
+
+        self.assertGreater(gain.item(), 0)
+        th.testing.assert_close(loss, -gain)
+        self.assertGreater(toward.item(), reward.value.item())
+        self.assertLess(away.item(), reward.value.item())
+
     def test_ball_outcome_multiplies_car_reward_after_touch_and_latches(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         target = CARLObservation.from_tensor(target_tensor, 1)
@@ -805,9 +833,18 @@ class TrackerTest(unittest.TestCase):
         return wrapper, environment, observation
 
     @staticmethod
-    def _tracking_context(observation, *, touched=False, done=False):
+    def _tracking_context(
+        observation,
+        *,
+        previous=None,
+        touched=False,
+        done=False,
+    ):
+        if previous is None:
+            previous = observation
         return SimpleNamespace(
             current_observation=observation,
+            previous_observation=previous,
             current=SimpleNamespace(
                 car_ball_touches=th.tensor([[touched]], dtype=th.bool)
             ),

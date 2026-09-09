@@ -615,15 +615,18 @@ class TrackingReward:
 
     def __init__(
         self,
-        replays:    ExpertGoalStates,
-        scale:      float = 1.0,
-        car_scale:  float = 2.0,
+        replays:        ExpertGoalStates,
+        scale:          float = 1.0,
+        car_scale:      float = 2.0,
+        progress_scale: float = 4.0,
     ) -> None:
         self.replays = replays
         self.scale = scale
         self.car_scale = car_scale
+        self.progress_scale = progress_scale
         self.position_scale = th.tensor(POSITION_SCALE, device=replays.device) / 100
         self.value: th.Tensor | None = None
+        self.progress: th.Tensor | None = None
         self.touched: th.Tensor | None = None
         self._ball_tracking_active: th.Tensor | None = None
 
@@ -635,18 +638,13 @@ class TrackingReward:
         else:
             self._ball_tracking_active[mask] = False
 
-    def __call__(self, context: RewardContext) -> th.Tensor:
-        actual = context.current_observation
-        target = self.replays.current()
+    def _potential(
+        self,
+        actual: CARLObservation,
+        target: CARLObservation,
+    ) -> th.Tensor:
         actual_ego = actual.cars.ego
         target_ego = target.cars.ego
-        self.touched = context.current.car_ball_touches[:, 0]
-        if (
-            self._ball_tracking_active is None
-            or self._ball_tracking_active.shape != self.touched.shape
-        ):
-            self._ball_tracking_active = th.zeros_like(self.touched)
-        self._ball_tracking_active |= self.touched
 
         car_position_error = (
             actual_ego.position - target_ego.position
@@ -702,15 +700,29 @@ class TrackingReward:
             + 0.05
             * th.exp(-0.1 * ball_angular_velocity_error.square().sum(-1))
         )
-        reward = th.where(
+        return th.where(
             self._ball_tracking_active,
             car_reward * ball_score,
             car_reward,
         )
 
-        self.value = reward
+    def __call__(self, context: RewardContext) -> th.Tensor:
+        target = self.replays.current()
+        self.touched = context.current.car_ball_touches[:, 0]
+        if (
+            self._ball_tracking_active is None
+            or self._ball_tracking_active.shape != self.touched.shape
+        ):
+            self._ball_tracking_active = th.zeros_like(self.touched)
+        self._ball_tracking_active |= self.touched
+
+        previous = self._potential(context.previous_observation, target)
+        current = self._potential(context.current_observation, target)
+        self.progress = current - previous
+        self.value = current
         self._ball_tracking_active[context.events.done] = False
 
+        reward = current + self.progress_scale * self.progress
         return self.scale * reward[:, None]
 
 
@@ -723,6 +735,7 @@ class ExpertLookaheadEnv:
         replays:                 ExpertGoalStates,
         reward_scale:            float = 1.0,
         car_scale:               float = 2.0,
+        progress_scale:          float = 4.0,
         minimum_reward:          float = 0.1,
         minimum_tracking_frames: int = 1,
     ) -> None:
@@ -761,6 +774,7 @@ class ExpertLookaheadEnv:
             replays,
             reward_scale,
             car_scale,
+            progress_scale,
         )
         self.env.register_reward(self.reward)
 
@@ -952,6 +966,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tracking-reward-scale",   type=float, default=1.0)
     parser.add_argument("--car-scale",               type=float, default=2.0)
+    parser.add_argument("--tracking-progress-scale", type=float, default=4.0)
     parser.add_argument("--minimum-tracking-reward", type=float, default=0.1)
     parser.add_argument("--minimum-tracking-frames", type=int,   default=16)
     parser.add_argument("--minimum-remaining-frames", type=int, default=128)
@@ -1040,6 +1055,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-grad-norm must be finite and positive")
     if not 0 <= args.hard_negative_fraction <= 1:
         raise ValueError("--hard-negative-fraction must be in [0, 1]")
+    if not math.isfinite(args.tracking_progress_scale) or args.tracking_progress_scale < 0:
+        raise ValueError("--tracking-progress-scale must be finite and nonnegative")
 
 
 def set_learning_rate(optimizers: Sequence[th.optim.Optimizer], value: float) -> None:
@@ -1079,6 +1096,7 @@ def main() -> None:
         replays,
         reward_scale=args.tracking_reward_scale,
         car_scale=args.car_scale,
+        progress_scale=args.tracking_progress_scale,
         minimum_reward=args.minimum_tracking_reward,
         minimum_tracking_frames=args.minimum_tracking_frames,
     )
@@ -1115,6 +1133,7 @@ def main() -> None:
             "epochs": args.epochs,
             "sequence_length": args.sequence_length,
             "minimum_tracking_frames": args.minimum_tracking_frames,
+            "tracking_progress_scale": args.tracking_progress_scale,
             "max_grad_norm": args.max_grad_norm,
         },
     )
