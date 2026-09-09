@@ -117,7 +117,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-sim", type=int, default=256)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
-    parser.add_argument("--no-touch-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--no-touch-timeout",
+        "--no-touch-timeout-seconds",
+        dest="no_touch_timeout",
+        type=float,
+        default=30.0,
+        help="seconds without a ball touch before resetting",
+    )
     parser.add_argument("--rollout", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--epochs", type=int, default=4)
@@ -133,7 +140,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
     parser.add_argument("--snapshot-pool-size", type=int, default=16)
     parser.add_argument("--historical-policies", type=int, default=4)
-    parser.add_argument("--replay-reset-fraction", type=float, default=0.8)
+    reset_group = parser.add_mutually_exclusive_group()
+    reset_group.add_argument(
+        "--replay-reset-fraction",
+        type=float,
+        default=0.8,
+        help="fraction of resets sampled from replay states (default: 0.8)",
+    )
+    reset_group.add_argument(
+        "--kickoff-reset-fraction",
+        type=float,
+        help="fraction of resets using standard kickoffs",
+    )
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
     parser.add_argument("--timesteps", type=int, default=10_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
@@ -143,7 +161,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-interval", type=int, default=10_000_000)
     parser.add_argument("--checkpoint-keep", type=int, default=5)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.kickoff_reset_fraction is not None:
+        args.replay_reset_fraction = 1.0 - args.kickoff_reset_fraction
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -172,6 +193,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--historical-policies must be smaller than the snapshot pool")
     if not 0 <= args.replay_reset_fraction <= 1:
         raise ValueError("--replay-reset-fraction must be in [0, 1]")
+    if (
+        args.kickoff_reset_fraction is not None
+        and not 0 <= args.kickoff_reset_fraction <= 1
+    ):
+        raise ValueError("--kickoff-reset-fraction must be in [0, 1]")
     if args.batch_size > args.rollout * args.n_sim * 2:
         raise ValueError("--batch-size must fit the rollout")
     if not args.replay_dir.is_dir():

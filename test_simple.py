@@ -47,6 +47,24 @@ class SimpleSelfPlayTest(unittest.TestCase):
         self.assertEqual(args.checkpoint_dir, Path("checkpoints/simple"))
         self.assertEqual(args.timesteps, 10_000_000_000)
 
+    def test_kickoff_fraction_sets_complementary_replay_fraction(self):
+        with patch(
+            "sys.argv",
+            [
+                "simple.py",
+                "--replay-dir",
+                "replays",
+                "--kickoff-reset-fraction",
+                "0.35",
+                "--no-touch-timeout-seconds",
+                "12",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertAlmostEqual(args.replay_reset_fraction, 0.65)
+        self.assertEqual(args.no_touch_timeout, 12.0)
+
     def test_periodic_checkpoint_waits_for_completed_rollout(self):
         checkpoint = SimpleCheckpoints.__new__(SimpleCheckpoints)
         checkpoint.next_step = 10
