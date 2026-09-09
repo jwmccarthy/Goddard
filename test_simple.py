@@ -1,9 +1,19 @@
 import unittest
 
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import torch as th
 
-from simple import GoalOnlyReward
-from test_self_play import make_reward_context
+from simple import GoalOnlyReward, SimpleCheckpoints, parse_args, validate_args
+
+
+def make_reward_context(score_delta: int):
+    return SimpleNamespace(
+        events=SimpleNamespace(score_delta=th.tensor([score_delta])),
+        current=SimpleNamespace(team_sign=th.tensor([1.0, -1.0])),
+    )
 
 
 class SimpleSelfPlayTest(unittest.TestCase):
@@ -23,9 +33,36 @@ class SimpleSelfPlayTest(unittest.TestCase):
         reward = GoalOnlyReward()
 
         th.testing.assert_close(
-            reward(make_reward_context(touched_car=0, truncated=True)),
+            reward(make_reward_context(score_delta=0)),
             th.zeros((1, 2)),
         )
+
+    def test_cli_requires_replays_but_has_no_distillation_input(self):
+        with patch("sys.argv", ["simple.py", "--replay-dir", "replays"]):
+            args = parse_args()
+
+        self.assertFalse(hasattr(args, "distill_checkpoint"))
+        self.assertEqual(args.replay_dir, Path("replays"))
+        self.assertEqual(args.replay_reset_fraction, 0.8)
+        self.assertEqual(args.checkpoint_dir, Path("checkpoints/simple"))
+        self.assertEqual(args.timesteps, 10_000_000_000)
+
+    def test_periodic_checkpoint_waits_for_completed_rollout(self):
+        checkpoint = SimpleCheckpoints.__new__(SimpleCheckpoints)
+        checkpoint.next_step = 10
+        checkpoint.buffer = SimpleNamespace(position=1)
+
+        self.assertFalse(checkpoint.ready(10))
+        checkpoint.buffer.position = 0
+        self.assertTrue(checkpoint.ready(10))
+
+    def test_validation_rejects_nonfinite_optimizer_settings(self):
+        with patch("sys.argv", ["simple.py", "--replay-dir", "."]):
+            args = parse_args()
+        args.lr = float("inf")
+
+        with self.assertRaisesRegex(ValueError, "--lr"):
+            validate_args(args)
 
 
 if __name__ == "__main__":

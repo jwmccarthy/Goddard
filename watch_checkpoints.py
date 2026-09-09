@@ -19,12 +19,12 @@ import torch as th
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
+from replay_resets import load_demonstration_reset_dataset
 from self_play import (
     FrozenPulseController,
     PulseLatentEnv,
     build_policy,
     file_sha256,
-    load_demonstration_reset_dataset,
     policy_observation,
 )
 

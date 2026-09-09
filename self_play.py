@@ -24,7 +24,7 @@ from jarl.collect.runner import _make_env_step
 from jarl.data.records import Evaluation, PolicyOutput
 from jarl.learn import Algorithm, OptimizerStep, PPOConfig, PPOLoss, Update
 from jarl.log.logger import Logger
-from jarl.data import TensorBatch, TensorDataset
+from jarl.data import TensorBatch
 from jarl.envs import DatasetResetSampler
 from jarl.modules import GRU, MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
@@ -43,92 +43,8 @@ from distill import (
     factor_actions,
     masked_logits,
 )
-from physics_utils import forward_up_to_quat
-from replay_safety import infer_unsafe_start_mask
+from replay_resets import load_demonstration_reset_dataset
 from rewards import AnnealedNextoReward, nexto_shaping_scale
-from tracker import (
-    BALL_MAX_ANG_SPEED,
-    BALL_MAX_SPEED,
-    BOOST_MAX,
-    CAR_MAX_ANG_SPEED,
-    CAR_MAX_SPEED,
-    POSITION_SCALE,
-)
-
-
-def load_demonstration_reset_dataset(
-    replay_dir: Path,
-    device,
-    frame_skip: int,
-    limit: int | None = None,
-    seed: int = 0,
-) -> TensorDataset:
-    random = np.random.default_rng(seed)
-    rows = []
-    paths = []
-
-    for path in sorted(replay_dir.glob("*.npy")):
-        source = np.load(path, mmap_mode="r")
-        if source.ndim == 2 and source.shape[1] == 161:
-            paths.append(path)
-
-    if not paths:
-        raise ValueError(f"no 1v1 demonstrations found in {replay_dir}")
-    quota = None if limit is None else max(1, math.ceil(limit / len(paths)))
-
-    for path in paths:
-        source = np.load(path, mmap_mode="r")
-
-        unsafe_path = path.with_suffix(".unsafe-starts.npz")
-        if unsafe_path.is_file():
-            with np.load(unsafe_path) as stored:
-                unsafe = np.asarray(stored["unsafe"], dtype=bool)
-                stored_skip = int(stored.get("frame_skip", frame_skip))
-            if stored_skip != frame_skip:
-                raise ValueError(
-                    f"unsafe-start mask for {path.name} uses frame skip "
-                    f"{stored_skip}, expected {frame_skip}"
-                )
-            if unsafe.shape != (len(source),):
-                raise ValueError(f"unsafe-start mask for {path.name} has wrong shape")
-        else:
-            unsafe = infer_unsafe_start_mask(
-                source[:, 3:6] * BALL_MAX_SPEED, frame_skip
-            )
-
-        cars = source[:, 9:51].reshape(-1, 2, 21)
-        invalid = source[:, -4:].astype(bool).any(axis=-1)
-        stable = cars[..., 16].astype(bool).all(axis=-1)
-        stable &= ~cars[..., 17:21].astype(bool).any(axis=(-2, -1))
-        eligible = np.flatnonzero(~unsafe & ~invalid & stable)
-        if len(eligible):
-            if quota is not None and len(eligible) > quota:
-                eligible = random.choice(eligible, size=quota, replace=False)
-            rows.append(np.asarray(source[eligible, :51], dtype=np.float32))
-
-    if not rows:
-        raise ValueError(f"no safe grounded 1v1 states found in {replay_dir}")
-
-    states = np.concatenate(rows)
-    if limit is not None and len(states) > limit:
-        selected = random.choice(len(states), size=limit, replace=False)
-        states = states[selected]
-    state = th.from_numpy(np.ascontiguousarray(states)).to(device)
-    ball = state[:, :9]
-    cars = state[:, 9:51].reshape(-1, 2, 21)
-    position_scale = th.tensor(POSITION_SCALE, device=device)
-    data = TensorBatch({
-        "ball_position": ball[:, :3] * position_scale,
-        "ball_velocity": ball[:, 3:6] * BALL_MAX_SPEED,
-        "ball_angular_velocity": ball[:, 6:9] * BALL_MAX_ANG_SPEED,
-        "car_position": cars[..., :3] * position_scale,
-        "car_rotation": forward_up_to_quat(cars[..., 9:12], cars[..., 12:15]),
-        "car_velocity": cars[..., 3:6] * CAR_MAX_SPEED,
-        "car_angular_velocity": cars[..., 6:9] * CAR_MAX_ANG_SPEED,
-        "car_demoed": cars[..., 17].bool(),
-        "car_boost": cars[..., 15] * BOOST_MAX,
-    })
-    return TensorDataset(data)
 
 
 def primitive_discount(frameskip: int, half_life_seconds: float) -> float:
@@ -1086,14 +1002,9 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
             self.state = self.state * keep
 
 
-def parse_args(
-    *,
-    description: str = "Train a PULSE latent policy with Rocket League self-play.",
-    checkpoint_dir: Path = Path("checkpoints/self_play"),
-    include_reward_args: bool = True,
-) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=description
+        description="Train a PULSE latent policy with Rocket League self-play."
     )
     parser.add_argument("--distill-checkpoint", type=Path, required=True)
     parser.add_argument("--replay-dir", type=Path, required=True)
@@ -1123,23 +1034,15 @@ def parse_args(
     parser.add_argument("--historical-policies", type=int, default=4)
     parser.add_argument("--demonstration-reset-fraction", type=float, default=0.8)
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
-    if include_reward_args:
-        parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
-        parser.add_argument("--goal-reward-scale", type=float, default=10.0)
-        parser.add_argument("--touch-reward-scale", type=float, default=0.1)
-        parser.add_argument("--no-touch-penalty", type=float, default=1.0)
-    else:
-        parser.set_defaults(
-            nexto_shaping_scale=0.0,
-            goal_reward_scale=10.0,
-            touch_reward_scale=0.0,
-            no_touch_penalty=0.0,
-        )
+    parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
+    parser.add_argument("--goal-reward-scale", type=float, default=10.0)
+    parser.add_argument("--touch-reward-scale", type=float, default=0.1)
+    parser.add_argument("--no-touch-penalty", type=float, default=1.0)
     parser.add_argument("--timesteps", type=int, default=2_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     parser.add_argument(
-        "--checkpoint-dir", type=Path, default=checkpoint_dir
+        "--checkpoint-dir", type=Path, default=Path("checkpoints/self_play")
     )
     parser.add_argument("--checkpoint-interval", type=int, default=10_000_000)
     parser.add_argument("--checkpoint-keep", type=int, default=5)
@@ -1245,12 +1148,8 @@ def build_policy_and_critic(
     return policy, critic
 
 
-def train(
-    args: argparse.Namespace,
-    *,
-    reward_function=None,
-    run_prefix: str = "self-play",
-) -> None:
+def main() -> None:
+    args = parse_args()
     validate_args(args)
     th.manual_seed(args.seed)
 
@@ -1268,19 +1167,17 @@ def train(
         probability=args.demonstration_reset_fraction,
         seed=args.seed,
     )
-    reward = reward_function
-    if reward is None:
-        reward = AnnealedNextoReward(
-            1,
-            1,
-            shaping_scale=args.nexto_shaping_scale,
-            goal_scale=args.goal_reward_scale,
-            touch_scale=args.touch_reward_scale,
-            no_touch_penalty=args.no_touch_penalty,
-            no_touch_timeout_steps=math.ceil(
-                args.no_touch_timeout_seconds * 120 / args.frameskip
-            ),
-        )
+    reward = AnnealedNextoReward(
+        1,
+        1,
+        shaping_scale=args.nexto_shaping_scale,
+        goal_scale=args.goal_reward_scale,
+        touch_scale=args.touch_reward_scale,
+        no_touch_penalty=args.no_touch_penalty,
+        no_touch_timeout_steps=math.ceil(
+            args.no_touch_timeout_seconds * 120 / args.frameskip
+        ),
+    )
     base_env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=1,
@@ -1324,7 +1221,7 @@ def train(
         args.gru_input_size,
     )
 
-    run_id = datetime.now().strftime(f"{run_prefix}-%Y%m%d-%H%M%S-%f")
+    run_id = datetime.now().strftime("self-play-%Y%m%d-%H%M%S-%f")
     pool = SnapshotPool(
         policy,
         max_size=args.snapshot_pool_size,
@@ -1360,7 +1257,7 @@ def train(
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
-        gameplay_reward=reward if isinstance(reward, AnnealedNextoReward) else None,
+        gameplay_reward=reward,
     )
 
     optimizer = Adam((*policy.parameters(), *critic.parameters()), lr=args.lr)
@@ -1396,21 +1293,19 @@ def train(
         ),
         section="PPO",
     )
-    value_scheduler = None
-    if isinstance(reward, AnnealedNextoReward):
-        value_scheduler = ValueScheduler(
-            ScheduledValue.attribute(
-                "nexto_shaping_scale",
-                reward,
-                "shaping_scale",
-                lambda progress: nexto_shaping_scale(
-                    round(progress * args.timesteps),
-                    args.nexto_shaping_scale,
-                    args.timesteps,
-                ),
+    value_scheduler = ValueScheduler(
+        ScheduledValue.attribute(
+            "nexto_shaping_scale",
+            reward,
+            "shaping_scale",
+            lambda progress: nexto_shaping_scale(
+                round(progress * args.timesteps),
+                args.nexto_shaping_scale,
+                args.timesteps,
             ),
-            section="Reward",
-        )
+        ),
+        section="Reward",
+    )
     checkpoints = SelfPlayCheckpoints(
         args.checkpoint_dir / run_id,
         args.checkpoint_interval,
@@ -1424,21 +1319,17 @@ def train(
     )
     checkpoints.save(0, force=True)
     logger = Logger(args.log_dir / run_id)
-    progress_metrics = [
+    for section, key, label, format_spec in (
         ("PPO", "policy_loss", "policy loss", ".4f"),
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "approx_kl", "approx KL", ".4f"),
         ("episode", "historical_reward", "historical reward", ".3f"),
         ("episode", "baseline_reward", "baseline reward", ".3f"),
-    ]
-    if isinstance(reward, AnnealedNextoReward):
-        progress_metrics.extend((
-            ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
-            ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
-            ("Gameplay", "baseline_win_rate", "base win", ".3f"),
-            ("Reward", "nexto_shaping_scale", "reward shaping", ".3f"),
-        ))
-    for section, key, label, format_spec in progress_metrics:
+        ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
+        ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
+        ("Gameplay", "baseline_win_rate", "base win", ".3f"),
+        ("Reward", "nexto_shaping_scale", "reward shaping", ".3f"),
+    ):
         logger.register_progress_metric(section, key, label, format_spec)
 
     def log_diagnostics(trainer: Trainer) -> None:
@@ -1463,10 +1354,6 @@ def train(
     finally:
         logger.close()
         env.close()
-
-
-def main() -> None:
-    train(parse_args())
 
 
 if __name__ == "__main__":
