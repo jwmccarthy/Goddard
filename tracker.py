@@ -445,6 +445,10 @@ class ExpertGoalStates:
             demo[:, -5, None],
             raw_actions,
         ), axis=-1).astype(np.float32, copy=False)
+        ego_touch = demo[:, -5].astype(bool)
+        ego_touch_guard = ego_touch.copy()
+        ego_touch_guard[1:] |= ego_touch[:-1]
+        ego_touch_guard[:-1] |= ego_touch[1:]
         # The parsed tail is ego touch, then non-ego touch and invalid events.
         invalid_events = demo[:, -4:].astype(bool).any(axis=-1)
         invalid = invalid_events.copy()
@@ -459,6 +463,7 @@ class ExpertGoalStates:
 
             if length >= self._min_len:
                 segment_unsafe = unsafe[start:end].copy()
+                segment_unsafe |= ego_touch_guard[start:end]
                 latest_start = length - self.minimum_remaining_frames - 1
                 segment_unsafe[latest_start + 1:] = True
                 try:
@@ -540,13 +545,11 @@ class ExpertGoalStates:
             - self.minimum_remaining_frames
         )
         self._cursors[mask] = starts
-        if queued is not None:
-            self._cursors[mask] = self._safe_cursors[self._cursors[mask]]
-        elif not self.start_at_beginning:
+        if queued is None and not self.start_at_beginning:
             self._cursors[mask] += (
                 th.rand(n_resets, device=self.device) * choices
             ).long()
-            self._cursors[mask] = self._safe_cursors[self._cursors[mask]]
+        self._cursors[mask] = self._safe_cursors[self._cursors[mask]]
 
         return TensorBatch({
             "observation": CARLObservation.from_tensor(
@@ -571,8 +574,12 @@ class ExpertGoalStates:
             :GOAL_STATE_SIZE,
         ]
 
-    def current_ego_touch(self) -> th.Tensor:
-        return self._replays[self._cursors, EXPERT_TOUCH_INDEX].bool()
+    def current_ego_touch(self, offset: int = 0) -> th.Tensor:
+        indices = th.minimum(
+            self._cursors + offset,
+            self._offsets[self._demo_id + 1] - 1,
+        )
+        return self._replays[indices, EXPERT_TOUCH_INDEX].bool()
 
     def current_raw_action(self, offset: int = 0) -> th.Tensor:
         rows = self._replays[self._cursors + offset]
@@ -828,7 +835,10 @@ class ExpertLookaheadEnv:
             raise RuntimeError("tracking reward did not capture ball touches")
 
         simulated_touch = self.reward.touched & ~native
-        expert_touch = self.replays.current_ego_touch() & ~native
+        expert_touch = (
+            self.replays.current_ego_touch()
+            | self.replays.current_ego_touch(offset=1)
+        ) & ~native
         release = simulated_touch | expert_touch
         anchor = self._ball_anchored & ~native & ~release
         self._ball_anchored[release] = False
