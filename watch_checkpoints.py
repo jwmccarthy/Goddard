@@ -20,7 +20,11 @@ from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
 from replay_resets import load_demonstration_reset_dataset
-from simple import SIMPLE_ARCHITECTURE, build_policy as build_simple_policy
+from simple import (
+    LEGACY_SIMPLE_ARCHITECTURE,
+    SIMPLE_ARCHITECTURE,
+    build_policy as build_simple_policy,
+)
 from self_play import (
     FrozenPulseController,
     PulseLatentEnv,
@@ -261,12 +265,14 @@ def _checkpoint_architecture(payload: dict) -> str | None:
 def load_simple_checkpoint(path: Path, env: CARLTorchVectorEnv):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload.get("config", {})
-    if _checkpoint_architecture(payload) != SIMPLE_ARCHITECTURE:
+    architecture = _checkpoint_architecture(payload)
+    if architecture not in {LEGACY_SIMPLE_ARCHITECTURE, SIMPLE_ARCHITECTURE}:
         raise ValueError(f"{path.name} is not a simple direct-action checkpoint")
     policy = build_simple_policy(
         env,
         int(config["policy_hidden"]),
         recurrent=bool(config.get("recurrent", False)),
+        legacy=architecture == LEGACY_SIMPLE_ARCHITECTURE,
     )
     policy.load_state_dict(payload["policy"])
     return policy.eval().requires_grad_(False), config
@@ -639,9 +645,10 @@ def simulate(
             _checkpoint_architecture(blue),
             _checkpoint_architecture(orange),
         }
-        if architectures == {SIMPLE_ARCHITECTURE}:
+        simple_architectures = {LEGACY_SIMPLE_ARCHITECTURE, SIMPLE_ARCHITECTURE}
+        if architectures <= simple_architectures:
             _simulate_simple(state, registry, blue_path, orange_path, args)
-        elif SIMPLE_ARCHITECTURE in architectures:
+        elif architectures & simple_architectures:
             raise ValueError("cannot mix simple and PULSE checkpoints")
         else:
             _simulate_pulse(state, registry, blue_path, orange_path, args)

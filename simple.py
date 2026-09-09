@@ -1,6 +1,7 @@
 import argparse
 import math
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,14 @@ from jarl.modules import GRU, MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
-from jarl.runtime import OnPolicySchedule, Trainer
+from jarl.runtime import (
+    LinearSchedule,
+    MappedSchedule,
+    OnPolicySchedule,
+    ScheduledValue,
+    Trainer,
+    ValueScheduler,
+)
 from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
@@ -40,7 +48,8 @@ from replay_resets import load_demonstration_reset_dataset
 
 
 GOAL_REWARD = 10.0
-SIMPLE_ARCHITECTURE = "direct-action-self-play-v1"
+LEGACY_SIMPLE_ARCHITECTURE = "direct-action-self-play-v1"
+SIMPLE_ARCHITECTURE = "direct-action-self-play-v2"
 BALL_RADIUS = 91.25
 BALL_MAX_SPEED = 6000.0
 CAR_MAX_SPEED = 2300.0
@@ -214,40 +223,49 @@ def parse_args() -> argparse.Namespace:
         description="Train direct-action self-play from scratch with minimal shaping."
     )
     parser.add_argument("--replay-dir", type=Path, required=True)
-    parser.add_argument("--n-sim", type=int, default=256)
-    parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument("--max-ticks", type=int, default=1_000_000)
+    parser.add_argument("--n-sim", type=int, default=1024)
+    parser.add_argument("--frameskip", type=int, default=8)
+    parser.add_argument("--max-ticks", type=int, default=14_400)
     parser.add_argument(
         "--no-touch-timeout",
         "--no-touch-timeout-seconds",
         dest="no_touch_timeout",
         type=float,
-        default=30.0,
+        default=16.0,
         help="seconds without a ball touch before resetting",
     )
-    parser.add_argument("--rollout", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=16_384)
-    parser.add_argument("--epochs", type=int, default=4)
-    parser.add_argument("--sequence-length", type=int, default=32)
-    parser.add_argument("--policy-hidden", type=int, default=512)
-    parser.add_argument("--critic-hidden", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--rollout", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=65_536)
+    parser.add_argument("--epochs", type=int, default=32)
+    parser.add_argument("--sequence-length", type=int, default=16)
+    parser.add_argument("--policy-hidden", type=int, default=256)
+    parser.add_argument("--critic-hidden", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr-end-factor", type=float, default=0.5)
     parser.add_argument(
         "--gamma",
         type=float,
-        default=0.9997,
-        help="reward discount factor (default: 0.9997 for long-horizon credit)",
+        default=None,
+        help="constant discount override; disables the half-life schedule",
     )
+    parser.add_argument("--discount-half-life", type=float, default=10.0)
+    parser.add_argument("--discount-half-life-end", type=float, default=20.0)
     parser.add_argument(
         "--gae-lambda",
         "--lambda",
         dest="gae_lambda",
         type=float,
-        default=0.999,
-        help="GAE trace factor (default: 0.999 for long-horizon credit)",
+        default=0.99,
+        help="GAE trace factor",
     )
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument("--entropy-coef-end", type=float, default=0.005)
+    parser.add_argument(
+        "--bf16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--touch-reward-scale", type=float, default=0.05)
     parser.add_argument("--ball-velocity-reward-scale", type=float, default=0.05)
@@ -256,16 +274,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--player-ball-progress-reward-scale", type=float, default=0.1)
     parser.add_argument("--ball-height-progress-reward-scale", type=float, default=0.1)
     parser.add_argument("--gravity-lift-reward-scale", type=float, default=0.1)
-    parser.add_argument("--current-fraction", type=float, default=0.5)
-    parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
-    parser.add_argument("--snapshot-pool-size", type=int, default=16)
+    parser.add_argument("--current-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--snapshot-interval",
+        type=int,
+        default=16,
+        help="rollouts between policy snapshots",
+    )
+    parser.add_argument("--snapshot-pool-size", type=int, default=8)
     parser.add_argument("--historical-policies", type=int, default=4)
     reset_group = parser.add_mutually_exclusive_group()
     reset_group.add_argument(
         "--replay-reset-fraction",
         type=float,
-        default=0.8,
-        help="fraction of resets sampled from replay states (default: 0.8)",
+        default=0.7,
+        help="fraction of resets sampled from replay states (default: 0.7)",
     )
     reset_group.add_argument(
         "--kickoff-reset-fraction",
@@ -297,15 +320,32 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    for name in ("no_touch_timeout", "lr", "max_grad_norm"):
+    for name in (
+        "no_touch_timeout",
+        "lr",
+        "discount_half_life",
+        "discount_half_life_end",
+        "max_grad_norm",
+    ):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if not 0 < args.gamma <= 1 or not 0 < args.gae_lambda <= 1:
-        raise ValueError("--gamma and --gae-lambda must be in (0, 1]")
+    if args.gamma is not None and (
+        not math.isfinite(args.gamma) or not 0 < args.gamma <= 1
+    ):
+        raise ValueError("--gamma must be in (0, 1]")
+    if not math.isfinite(args.gae_lambda) or not 0 < args.gae_lambda <= 1:
+        raise ValueError("--gae-lambda must be in (0, 1]")
     if not 0 < args.clip < 1:
         raise ValueError("--clip must be in (0, 1)")
-    if not math.isfinite(args.entropy_coef) or args.entropy_coef < 0:
-        raise ValueError("--entropy-coef must be nonnegative")
+    if (
+        not math.isfinite(args.entropy_coef)
+        or not math.isfinite(args.entropy_coef_end)
+        or args.entropy_coef < 0
+        or args.entropy_coef_end < 0
+    ):
+        raise ValueError("entropy coefficients must be nonnegative")
+    if not math.isfinite(args.lr_end_factor) or not 0 < args.lr_end_factor <= 1:
+        raise ValueError("--lr-end-factor must be in (0, 1]")
     for name in (
         "touch_reward_scale",
         "ball_velocity_reward_scale",
@@ -345,6 +385,7 @@ def build_policy(
     hidden_size: int,
     *,
     recurrent: bool = True,
+    legacy: bool = False,
 ) -> MultiCategoricalPolicy:
     return MultiCategoricalPolicy(
         foot=LinearEncoder(hidden_size, func=nn.ReLU),
@@ -353,7 +394,11 @@ def build_policy(
             if recurrent
             else MLP(dims=[hidden_size], func=nn.ReLU)
         ),
-        head=MLP(dims=[], out_init_func=orthogonal_init(std=0.01)),
+        head=MLP(
+            dims=[] if legacy else [hidden_size, hidden_size // 2],
+            func=nn.LeakyReLU,
+            out_init_func=orthogonal_init(std=0.01),
+        ),
         action_codec=env.action_codec,
     ).build(env).to(env.device)
 
@@ -362,7 +407,11 @@ def build_critic(env, hidden_size: int) -> Critic:
     return Critic(
         foot=LinearEncoder(hidden_size, func=nn.ReLU),
         body=GRU(hidden_size=hidden_size),
-        head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
+        head=MLP(
+            dims=[hidden_size // 2, hidden_size // 4],
+            func=nn.LeakyReLU,
+            out_init_func=orthogonal_init(std=1.0),
+        ),
     ).build(env).to(env.device)
 
 
@@ -409,8 +458,14 @@ def main() -> None:
     pool = SnapshotPool(
         policy,
         max_size=args.snapshot_pool_size,
-        snapshot_interval=args.snapshot_interval,
-        active_cache_size=args.historical_policies,
+        snapshot_interval=int(
+            env.n_envs
+            * (1.0 + args.current_fraction)
+            / 2.0
+            * args.rollout
+            * args.snapshot_interval
+        ),
+        active_cache_size=max(4, args.historical_policies * 2),
         seed=args.seed,
         checkpoint_dir=None,
     )
@@ -418,7 +473,7 @@ def main() -> None:
         num_matches=args.n_sim,
         team_sizes=(1, 1),
         current_fraction=args.current_fraction,
-        historical_ids=(0,),
+        historical_ids=pool.select_ids(args.historical_policies),
         device=env.device,
         seed=args.seed,
     )
@@ -442,8 +497,23 @@ def main() -> None:
 
     policy_optimizer = th.optim.Adam(policy.parameters(), lr=args.lr)
     critic_optimizer = th.optim.Adam(critic.parameters(), lr=args.lr)
+    actions_per_second = 120.0 / args.frameskip
+    initial_gamma = args.gamma or 0.5 ** (
+        1.0 / (actions_per_second * args.discount_half_life)
+    )
+    gae = GAE(gamma=initial_gamma, lambda_=args.gae_lambda)
+    ppo_loss = PPOLoss(
+        policy,
+        critic,
+        PPOConfig(
+            clip=args.clip,
+            value_clip=args.clip,
+            entropy_coef=args.entropy_coef,
+            bf16=args.bf16,
+        ),
+    )
     update = Update(
-        transforms=(GAE(gamma=args.gamma, lambda_=args.gae_lambda),),
+        transforms=(gae,),
         sampler=RecurrentRolloutMinibatches(
             sequence_length=args.sequence_length,
             sequences_per_batch=max(1, args.batch_size // args.sequence_length),
@@ -457,21 +527,45 @@ def main() -> None:
                 "returns",
             ),
         ),
-        loss=PPOLoss(
-            policy,
-            critic,
-            PPOConfig(
-                clip=args.clip,
-                value_clip=args.clip,
-                entropy_coef=args.entropy_coef,
-            ),
-        ),
+        loss=ppo_loss,
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(policy, policy_optimizer, max_grad_norm=args.max_grad_norm),
             OptimizerStep(critic, critic_optimizer, max_grad_norm=args.max_grad_norm),
         ),
         section="PPO",
     )
+
+    learning_rate = LinearSchedule(args.lr, args.lr * args.lr_end_factor)
+    entropy_coef = LinearSchedule(args.entropy_coef, args.entropy_coef_end)
+    half_life = LinearSchedule(
+        args.discount_half_life,
+        args.discount_half_life_end,
+    )
+    gamma = MappedSchedule(
+        half_life,
+        lambda seconds: 0.5 ** (1.0 / (actions_per_second * seconds)),
+    )
+
+    def set_learning_rate(value: float) -> None:
+        for optimizer in (policy_optimizer, critic_optimizer):
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = value
+
+    def set_entropy_coef(value: float) -> None:
+        ppo_loss.config = replace(ppo_loss.config, entropy_coef=value)
+
+    scheduled_values = [
+        ScheduledValue("learning_rate", learning_rate, set_learning_rate),
+        ScheduledValue("entropy_coef", entropy_coef, set_entropy_coef),
+    ]
+    if args.gamma is None:
+        scheduled_values.extend(
+            (
+                ScheduledValue.metric("discount_half_life", half_life),
+                ScheduledValue.attribute("gamma", gae, "gamma", gamma),
+            )
+        )
+    value_scheduler = ValueScheduler(*scheduled_values)
 
     run_id = datetime.now().strftime("simple-%Y%m%d-%H%M%S-%f")
     logger = Logger(args.log_dir / run_id)
@@ -501,6 +595,7 @@ def main() -> None:
         OnPolicySchedule(),
         logger=logger,
         checkpoint=checkpoints,
+        value_scheduler=value_scheduler,
     )
 
     try:

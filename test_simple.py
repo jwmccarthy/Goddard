@@ -135,11 +135,20 @@ class SimpleSelfPlayTest(unittest.TestCase):
 
         self.assertFalse(hasattr(args, "distill_checkpoint"))
         self.assertEqual(args.replay_dir, Path("replays"))
-        self.assertEqual(args.replay_reset_fraction, 0.8)
+        self.assertEqual(args.replay_reset_fraction, 0.7)
         self.assertEqual(args.checkpoint_dir, Path("checkpoints/simple"))
         self.assertEqual(args.timesteps, 10_000_000_000)
-        self.assertEqual(args.gamma, 0.9997)
-        self.assertEqual(args.gae_lambda, 0.999)
+        self.assertIsNone(args.gamma)
+        self.assertEqual(args.discount_half_life, 10.0)
+        self.assertEqual(args.discount_half_life_end, 20.0)
+        self.assertEqual(args.gae_lambda, 0.99)
+        self.assertEqual(args.n_sim, 1024)
+        self.assertEqual(args.frameskip, 8)
+        self.assertEqual(args.rollout, 512)
+        self.assertEqual(args.sequence_length, 16)
+        self.assertEqual(args.policy_hidden, 256)
+        self.assertEqual(args.critic_hidden, 256)
+        self.assertEqual(args.current_fraction, 0.8)
 
     def test_kickoff_fraction_sets_complementary_replay_fraction(self):
         with patch(
