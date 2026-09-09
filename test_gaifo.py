@@ -163,6 +163,7 @@ class ArgumentValidationTest(unittest.TestCase):
             discriminator_noise=0.01,
             discriminator_batch=8,
             discriminator_epochs=1,
+            discriminator_update_interval=4,
             discriminator_lr=3e-4,
             discriminator_hidden=64,
             discriminator_heldout_size=1024,
@@ -910,6 +911,41 @@ class AdaptiveDiscriminatorTest(unittest.TestCase):
         self.assertGreaterEqual(metrics["Discriminator"]["heldout_accuracy"], 0.8)
         # History is populated while adaptive stopping limits training to one batch.
         self.assertGreater(history.size, 0)
+
+    def test_update_interval_leaves_policy_rollouts_between_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            expert = self._make_expert(path, marker=-1.0, heldout_size=4)
+            discriminator = TrivialSignDiscriminator()
+            discriminator.bias.data[0] = 0.5
+            history = HistoricalReplayBuffer(100, 2, th.device("cpu"), seed=0)
+            rollout = Rollout(
+                steps=add_scene_window_fields(self._make_rollout_batch(), 2)
+            )
+            stage = AdaptiveDiscriminatorUpdate(
+                expert=expert,
+                history=history,
+                batch_size=4,
+                epochs=1,
+                noise_std=0.0,
+                heldout_size=4,
+                accuracy_target=0.8,
+                history_add_size=4,
+                history_mix_fraction=0.5,
+                max_grad_norm=0.5,
+                discriminator=discriminator,
+                optimizer=th.optim.Adam(discriminator.parameters(), lr=0.0),
+                loss=SceneDiscriminatorLoss(discriminator),
+                update_interval=4,
+            )
+
+            updates = [
+                stage.run(rollout)[1]["Discriminator"]["updated"]
+                for _ in range(5)
+            ]
+
+        self.assertEqual(updates, [1.0, 0.0, 0.0, 0.0, 1.0])
+        self.assertGreater(history.size, 4)
 
     def test_runs_update_when_heldout_accuracy_below_target(self):
         with tempfile.TemporaryDirectory() as directory:

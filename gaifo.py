@@ -1410,6 +1410,7 @@ class AdaptiveDiscriminatorUpdate:
         valid_field: str = "scene_window_valid",
         section: str = "Discriminator",
         require_valid: bool = True,
+        update_interval: int = 1,
     ) -> None:
         if heldout_size < 0:
             raise ValueError("heldout size must be non-negative")
@@ -1419,6 +1420,8 @@ class AdaptiveDiscriminatorUpdate:
             raise ValueError("history mix fraction must be in [0, 1)")
         if not math.isfinite(max_grad_norm) or max_grad_norm <= 0.0:
             raise ValueError("max gradient norm must be positive")
+        if update_interval < 1:
+            raise ValueError("update interval must be positive")
         self.expert = expert
         self.history = history
         self.batch_size = batch_size
@@ -1436,8 +1439,11 @@ class AdaptiveDiscriminatorUpdate:
         self.valid_field = valid_field
         self.section = section
         self.require_valid = require_valid
+        self.update_interval = update_interval
         self._progress_callback = None
         self._heldout_sim: th.Tensor | None = None
+        self._has_updated = False
+        self._rollouts_since_update = 0
 
     def set_progress_callback(self, callback) -> None:
         self._progress_callback = callback
@@ -1452,6 +1458,7 @@ class AdaptiveDiscriminatorUpdate:
             "heldout_accuracy": 0.0,
             "updated": 0.0,
             "minibatches": 0.0,
+            "scheduled": 0.0,
         }
 
     def run(self, experience: Rollout | TensorBatch):
@@ -1474,12 +1481,19 @@ class AdaptiveDiscriminatorUpdate:
         heldout_generated = flat_windows[heldout_indices]
 
         evaluation = self._evaluate(heldout_generated)
+        if self._has_updated:
+            self._rollouts_since_update += 1
+        scheduled = (
+            not self._has_updated
+            or self._rollouts_since_update >= self.update_interval
+        )
         metrics: dict[str, float] = evaluation | {
             "updated": 0.0,
             "minibatches": 0.0,
+            "scheduled": float(scheduled),
         }
 
-        if len(train_indices) > 0:
+        if scheduled and len(train_indices) > 0:
             sampler = SceneGAIFOMinibatches(
                 self.expert,
                 self.batch_size,
@@ -1523,6 +1537,8 @@ class AdaptiveDiscriminatorUpdate:
                     callback.finish()
 
             if minibatch_count > 0:
+                self._has_updated = True
+                self._rollouts_since_update = 0
                 metrics["minibatches"] = float(minibatch_count)
                 for key, total in metric_totals.items():
                     averaged = total / minibatch_count
@@ -1757,6 +1773,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
     parser.add_argument("--discriminator-batch", type=int, default=16_384)
     parser.add_argument("--discriminator-epochs", type=int, default=1)
+    parser.add_argument("--discriminator-update-interval", type=int, default=4)
     parser.add_argument("--discriminator-lr", type=float, default=3e-4)
     parser.add_argument("--discriminator-hidden", type=int, default=128)
     parser.add_argument("--discriminator-heldout-size", type=int, default=16_384)
@@ -1814,6 +1831,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "long_history_add_size",
         "discriminator_batch",
         "discriminator_epochs",
+        "discriminator_update_interval",
         "discriminator_hidden",
         "discriminator_heldout_size",
         "frame_embedding",
@@ -2067,6 +2085,7 @@ def main() -> None:
         valid_field="scene_window_valid",
         section="ShortDiscriminator",
         require_valid=True,
+        update_interval=args.discriminator_update_interval,
     )
 
     long_discriminator_update = AdaptiveDiscriminatorUpdate(
@@ -2087,6 +2106,7 @@ def main() -> None:
         valid_field="long_scene_window_valid",
         section="LongDiscriminator",
         require_valid=False,
+        update_interval=args.discriminator_update_interval,
     )
 
     ppo_update = Update(
@@ -2140,6 +2160,7 @@ def main() -> None:
         ("ShortDiscriminator", "heldout_accuracy", "short heldout accuracy", ".3f"),
         ("ShortDiscriminator", "updated", "short updated", ".0f"),
         ("ShortDiscriminator", "minibatches", "short D batches", ".0f"),
+        ("ShortDiscriminator", "scheduled", "short D due", ".0f"),
         ("LongDiscriminator", "loss", "long D loss", ".4f"),
         ("LongDiscriminator", "agent_score", "long agent score", ".3f"),
         ("LongDiscriminator", "expert_score", "long expert score", ".3f"),
@@ -2148,6 +2169,7 @@ def main() -> None:
         ("LongDiscriminator", "heldout_accuracy", "long heldout accuracy", ".3f"),
         ("LongDiscriminator", "updated", "long updated", ".0f"),
         ("LongDiscriminator", "minibatches", "long D batches", ".0f"),
+        ("LongDiscriminator", "scheduled", "long D due", ".0f"),
         ("PPO", "policy_loss", "policy loss", ".4f"),
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "entropy", "entropy", ".3f"),
