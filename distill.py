@@ -267,6 +267,27 @@ def load_teacher(
     return teacher.eval().requires_grad_(False)
 
 
+class DeterministicTeacher:
+    def __init__(self, teacher) -> None:
+        self.teacher = teacher
+
+    @property
+    def device(self):
+        return self.teacher.device
+
+    def initial_state(self, batch_size: int):
+        return self.teacher.initial_state(batch_size)
+
+    def act(
+        self,
+        observation: th.Tensor,
+        state: th.Tensor | None = None,
+        *,
+        deterministic: bool = False,
+    ) -> PolicyOutput:
+        return self.teacher.act(observation, state, deterministic=True)
+
+
 class TeacherActionCapture(CaptureBase):
     def __init__(self, teacher) -> None:
         self.teacher = teacher
@@ -570,11 +591,13 @@ def main() -> None:
         minimum_reward=args.minimum_tracking_reward,
         minimum_tracking_frames=args.minimum_tracking_frames,
     )
-    teacher = load_teacher(
-        args.tracker_checkpoint,
-        env,
-        args.windows,
-        args.frameskip,
+    teacher = DeterministicTeacher(
+        load_teacher(
+            args.tracker_checkpoint,
+            env,
+            args.windows,
+            args.frameskip,
+        )
     )
     observation_dim = env.single_observation_space.shape[0]
     policy = PulsePolicy(

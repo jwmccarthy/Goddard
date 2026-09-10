@@ -11,6 +11,7 @@ from distill import (
     ACTION_SIZES,
     ActionDecoder,
     ConditionalPrior,
+    DeterministicTeacher,
     DistillCheckpoints,
     DistillRolloutTransform,
     GaussianEncoder,
@@ -25,6 +26,7 @@ from distill import (
     validate_args,
 )
 from jarl.data.batch import TensorBatch
+from jarl.data.records import PolicyOutput
 from tracker import GOAL_STATE_SIZE
 
 
@@ -123,6 +125,31 @@ class ConditionalPriorTest(unittest.TestCase):
         mean_b, _ = prior(state, th.tensor([10]))
 
         self.assertFalse(th.allclose(mean_a, mean_b))
+
+
+class DeterministicTeacherTest(unittest.TestCase):
+    def test_forces_deterministic_recurrent_actions(self):
+        class Teacher:
+            device = th.device("cpu")
+
+            @staticmethod
+            def initial_state(batch_size):
+                return th.zeros(batch_size, 1)
+
+            @staticmethod
+            def act(observation, state, *, deterministic=False):
+                return PolicyOutput(
+                    action=th.full((len(observation), 7), int(deterministic)),
+                    next_state=state + 1,
+                )
+
+        teacher = DeterministicTeacher(Teacher())
+        state = teacher.initial_state(2)
+
+        output = teacher.act(th.zeros((2, GOAL_STATE_SIZE)), state)
+
+        th.testing.assert_close(output.action, th.ones((2, 7), dtype=th.long))
+        th.testing.assert_close(output.next_state, th.ones((2, 1)))
 
 
 class CategoricalDistillationLossTest(unittest.TestCase):
