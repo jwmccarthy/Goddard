@@ -30,6 +30,7 @@ from jarl.data.records import PolicyOutput
 from jarl.learn import (
     Algorithm,
     IndependentOptimizerSteps,
+    LossOutput,
     OptimizerStep,
     PPOConfig,
     PPOLoss,
@@ -41,7 +42,7 @@ from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
-from jarl.sample import RecurrentRolloutMinibatches
+from jarl.sample import RecurrentRolloutMinibatches, SequenceBatch
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
@@ -58,8 +59,11 @@ BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
 CAR_STATE_SIZE     = 21
 INTERNAL_STATE_SIZE = 19
+INTERNAL_IS_HOLDING_JUMP_INDEX = 5
 EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
 ACTION_FACTORS = 7
+JUMP_ACTION_FACTOR = 6
+RAW_JUMP_INDEX = 5
 RAW_ACTION_INDEX = EXPERT_TOUCH_INDEX + 1
 RAW_ACTION_SIZE = 8
 STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
@@ -585,6 +589,22 @@ class ExpertGoalStates:
         rows = self._replays[self._cursors + offset]
         return rows[:, RAW_ACTION_INDEX:STORED_REPLAY_SIZE]
 
+    def current_jump_supervision(
+        self,
+        offset: int = 0,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        starts = self._offsets[self._demo_id]
+        indices = (self._cursors + offset).maximum(starts)
+        previous_indices = (indices - 1).maximum(starts)
+        rows = self._replays[indices]
+        previous_rows = self._replays[previous_indices]
+        jump = rows[:, RAW_ACTION_INDEX + RAW_JUMP_INDEX].ge(0.5)
+        previous_jump = previous_rows[:, RAW_ACTION_INDEX + RAW_JUMP_INDEX].ge(0.5)
+        internal = rows[:, GOAL_STATE_SIZE:EXPERT_TOUCH_INDEX]
+        airborne_after_first_jump = ~internal[:, 0].bool() & internal[:, 3].bool()
+        second_jump = jump & ~previous_jump & airborne_after_first_jump
+        return jump.long(), second_jump
+
     def current_demo_name(self) -> str:
         return self._demo_names[self._demo_id[0].item()]
 
@@ -764,6 +784,8 @@ class ExpertLookaheadEnv:
         self._ball_anchored = th.ones(env.n_sim, dtype=th.bool, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
         self.last_raw_expert_action: th.Tensor | None = None
+        self.last_expert_jump: th.Tensor | None = None
+        self.last_expert_second_jump: th.Tensor | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size
 
@@ -826,6 +848,23 @@ class ExpertLookaheadEnv:
         current = obs[..., :GOAL_STATE_SIZE]
         return th.nn.functional.pad(current, (0, self.replays.goal_size))
 
+    @staticmethod
+    def _set_actual_jump_hold(
+        obs: th.Tensor,
+        action: th.Tensor | np.ndarray,
+        reset: th.Tensor,
+    ) -> th.Tensor:
+        active = ~reset
+        if not active.any():
+            return obs
+        action = th.as_tensor(action, device=obs.device).reshape(-1, ACTION_FACTORS)
+        obs = obs.clone()
+        obs[
+            active,
+            GOAL_STATE_SIZE + INTERNAL_IS_HOLDING_JUMP_INDEX,
+        ] = action[active, JUMP_ACTION_FACTOR].to(obs.dtype)
+        return obs
+
     def reset(self, **kwargs: Any) -> th.Tensor:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
         return obs
@@ -857,6 +896,10 @@ class ExpertLookaheadEnv:
 
     def step(self, action: th.Tensor | np.ndarray):
         self.last_raw_expert_action = self.replays.current_raw_action(offset=-1)
+        (
+            self.last_expert_jump,
+            self.last_expert_second_jump,
+        ) = self.replays.current_jump_supervision(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
         obs = self._anchor_ball(obs, native)
@@ -897,6 +940,7 @@ class ExpertLookaheadEnv:
             reset_obs, _ = self.replays.next_goals(reset_obs, reset)
             obs[reset] = reset_obs
 
+        obs = self._set_actual_jump_hold(obs, action, native | reset)
         return obs, reward, term | reset, trunc, info
 
 
@@ -970,6 +1014,139 @@ class StatelessCriticCapture(CaptureBase):
         }
 
 
+class ExpertJumpCapture(CaptureBase):
+    def __init__(self, env: ExpertLookaheadEnv) -> None:
+        self.env = env
+
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        jump = self.env.last_expert_jump
+        second_jump = self.env.last_expert_second_jump
+        if jump is None or second_jump is None:
+            raise RuntimeError("environment did not expose expert jump controls")
+        return {
+            "expert_jump": jump,
+            "expert_second_jump": second_jump,
+        }
+
+
+def _expert_jump_loss(
+    logits: th.Tensor,
+    action_mask: th.Tensor,
+    expert_jump: th.Tensor,
+    expert_second_jump: th.Tensor,
+    sequence_valid: th.Tensor,
+    sizes: Sequence[int],
+    second_jump_weight: float,
+) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+    jump_logits = logits.split(tuple(sizes), dim=-1)[JUMP_ACTION_FACTOR]
+    jump_mask = action_mask.split(tuple(sizes), dim=-1)[JUMP_ACTION_FACTOR]
+    target = expert_jump.long()
+    target_legal = jump_mask.gather(-1, target[..., None]).squeeze(-1)
+    valid = sequence_valid & target_legal
+    if not valid.any():
+        zero = logits.sum() * 0
+        return zero, logits.new_zeros(()), logits.new_zeros(()), logits.new_zeros(())
+
+    masked_logits = jump_logits.masked_fill(
+        ~jump_mask,
+        th.finfo(jump_logits.dtype).min,
+    ).float()
+    per_step = nn.functional.cross_entropy(
+        masked_logits[valid],
+        target[valid],
+        reduction="none",
+    )
+    second_jump = expert_second_jump.bool() & valid
+    weights = th.where(
+        second_jump[valid],
+        per_step.new_full((), second_jump_weight),
+        per_step.new_ones(()),
+    )
+    prediction = masked_logits.argmax(-1)
+    accuracy = (prediction[valid] == target[valid]).float().mean()
+    second_jump_recall = (
+        prediction[second_jump].eq(1).float().mean()
+        if second_jump.any()
+        else logits.new_zeros(())
+    )
+    return (
+        (per_step * weights).sum() / weights.sum(),
+        accuracy,
+        second_jump_recall,
+        second_jump.float().mean(),
+    )
+
+
+class ExpertJumpPPOLoss(PPOLoss):
+    def __init__(
+        self,
+        policy: MultiCategoricalPolicy,
+        critic: Critic,
+        config: PPOConfig,
+        weight: float,
+        second_jump_weight: float,
+    ) -> None:
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("jump imitation weight must be finite and nonnegative")
+        if not math.isfinite(second_jump_weight) or second_jump_weight < 1:
+            raise ValueError("second jump weight must be finite and at least one")
+        super().__init__(policy, critic, config)
+        self.weight = weight
+        self.second_jump_weight = second_jump_weight
+        self._expert_logits: th.Tensor | None = None
+
+    def _evaluate(self, batch, state, critic_state, reset):
+        observation = batch["observation"]
+        features, _ = self.policy.body_features(observation, state, reset)
+        evaluation = self.policy.evaluate_from_features(
+            features,
+            observation,
+            batch["action"],
+        )
+        self._expert_logits = self.policy.head(features)
+
+        value = evaluation.value
+        if value is None:
+            if self.critic_recurrent:
+                if critic_state is None:
+                    raise ValueError("recurrent critic requires an initial state")
+                value = self.critic.evaluate_values(
+                    observation,
+                    critic_state,
+                    reset=reset,
+                )
+            else:
+                value = self.critic.evaluate_values(observation)
+        return evaluation, value
+
+    def __call__(self, sample: TensorBatch | SequenceBatch) -> LossOutput:
+        output = super().__call__(sample)
+        batch, _, _, _, sequence_valid = self._unpack_sample(sample)
+        logits = self._expert_logits
+        if logits is None:
+            raise RuntimeError("PPO evaluation did not expose tracker logits")
+        jump_loss, accuracy, second_jump_recall, second_jump_rate = (
+            _expert_jump_loss(
+                logits,
+                self.policy.action_codec.mask(batch["observation"]),
+                batch["expert_jump"],
+                batch["expert_second_jump"],
+                sequence_valid,
+                self.policy.sizes,
+                self.second_jump_weight,
+            )
+        )
+        return LossOutput(
+            output.loss + self.weight * jump_loss,
+            output.metrics | {
+                "jump_imitation_loss": jump_loss,
+                "jump_accuracy": accuracy,
+                "second_jump_recall": second_jump_recall,
+                "second_jump_sample_rate": second_jump_rate,
+            },
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO trajectory trackers.")
 
@@ -992,6 +1169,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-final",                type=float, default=1e-5)
     parser.add_argument("--entropy-coef",            type=float, default=1e-3)
     parser.add_argument("--entropy-coef-final",      type=float, default=1e-4)
+    parser.add_argument("--jump-imitation-weight",   type=float, default=0.1)
+    parser.add_argument("--second-jump-weight",      type=float, default=8.0)
     parser.add_argument("--clip",                    type=float, default=0.2)
     parser.add_argument("--clip-final",              type=float, default=0.1)
     parser.add_argument("--gamma",                   type=float, default=0.997)
@@ -1062,6 +1241,10 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ("entropy_coef", "entropy_coef_final"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    if not math.isfinite(args.jump_imitation_weight) or args.jump_imitation_weight < 0:
+        raise ValueError("--jump-imitation-weight must be finite and nonnegative")
+    if not math.isfinite(args.second_jump_weight) or args.second_jump_weight < 1:
+        raise ValueError("--second-jump-weight must be finite and at least one")
     for name in ("clip", "clip_final"):
         if not math.isfinite(getattr(args, name)) or not 0 < getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be in (0, 1)")
@@ -1140,6 +1323,8 @@ def main() -> None:
             "gae_lambda": args.gae_lambda,
             "learning_rate": [args.lr, args.lr_final],
             "entropy_coef": [args.entropy_coef, args.entropy_coef_final],
+            "jump_imitation_weight": args.jump_imitation_weight,
+            "second_jump_weight": args.second_jump_weight,
             "clip": [args.clip, args.clip_final],
             "schedule_timesteps": args.schedule_timesteps,
             "rollout": args.rollout,
@@ -1195,12 +1380,13 @@ def main() -> None:
                 LogProbCapture(),
                 RecurrentStateCapture(),
                 StatelessCriticCapture(critic),
+                ExpertJumpCapture(env),
             ),
         )
 
         actor_optimizer = Adam(policy.parameters(), lr=args.lr)
         critic_optimizer = Adam(critic.parameters(), lr=args.lr)
-        ppo_loss = PPOLoss(
+        ppo_loss = ExpertJumpPPOLoss(
             policy,
             critic,
             PPOConfig(
@@ -1208,6 +1394,8 @@ def main() -> None:
                 value_clip=None,
                 entropy_coef=args.entropy_coef,
             ),
+            weight=args.jump_imitation_weight,
+            second_jump_weight=args.second_jump_weight,
         )
         update = Update(
             transforms=(GAE(gamma=args.gamma, lambda_=args.gae_lambda),),
@@ -1222,6 +1410,8 @@ def main() -> None:
                     "old_log_prob",
                     "baseline_value",
                     "returns",
+                    "expert_jump",
+                    "expert_second_jump",
                 ),
             ),
             loss=ppo_loss,

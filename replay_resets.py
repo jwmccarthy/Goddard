@@ -25,6 +25,7 @@ def load_demonstration_reset_dataset(
     frame_skip: int,
     limit: int | None = None,
     seed: int = 0,
+    require_frame_skip_match: bool = True,
 ) -> TensorDataset:
     random = np.random.default_rng(seed)
     rows = []
@@ -46,7 +47,7 @@ def load_demonstration_reset_dataset(
             with np.load(unsafe_path) as stored:
                 unsafe = np.asarray(stored["unsafe"], dtype=bool)
                 stored_skip = int(stored.get("frame_skip", frame_skip))
-            if stored_skip != frame_skip:
+            if require_frame_skip_match and stored_skip != frame_skip:
                 raise ValueError(
                     f"unsafe-start mask for {path.name} uses frame skip "
                     f"{stored_skip}, expected {frame_skip}"

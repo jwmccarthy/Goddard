@@ -447,6 +447,7 @@ def main() -> None:
         args.frameskip,
         args.reset_state_limit,
         args.seed,
+        require_frame_skip_match=False,
     )
     env.reset_state_provider = DatasetResetSampler(
         reset_dataset,

@@ -74,7 +74,7 @@ class ViewerState:
 
 
 def newest_checkpoint(directory: Path) -> Path:
-    paths = list(directory.glob("tracker_*.pt"))
+    paths = list(directory.rglob("tracker_*.pt"))
     if not paths:
         raise FileNotFoundError(f"no tracker checkpoints found in {directory}")
     return max(paths, key=lambda path: path.stat().st_mtime_ns)

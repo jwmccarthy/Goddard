@@ -25,9 +25,12 @@ from tracker import (
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
+    INTERNAL_IS_HOLDING_JUMP_INDEX,
     INTERNAL_STATE_SIZE,
     PHC_TRACKER_ARCHITECTURE,
     POSITION_SCALE,
+    RAW_ACTION_INDEX,
+    RAW_JUMP_INDEX,
     RoutedTrackerPolicy,
     SegmentScores,
     StatelessCriticCapture,
@@ -41,6 +44,7 @@ from tracker import (
     specialist_assignments,
     validated_replay_assignments,
     validate_args,
+    _expert_jump_loss,
 )
 
 
@@ -72,6 +76,8 @@ class TrackerTest(unittest.TestCase):
             lr_final=1e-5,
             entropy_coef=1e-3,
             entropy_coef_final=1e-4,
+            jump_imitation_weight=0.1,
+            second_jump_weight=8.0,
             clip=0.2,
             clip_final=0.1,
             max_grad_norm=0.5,
@@ -92,6 +98,55 @@ class TrackerTest(unittest.TestCase):
         args.timesteps = 6_000_001
         with self.assertRaisesRegex(ValueError, "divisible"):
             validate_args(args)
+
+    def test_detects_airborne_second_jump_press_edges(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._replays = th.zeros((3, STORED_REPLAY_SIZE))
+        replays._offsets = th.tensor([0, 3])
+        replays._demo_id = th.tensor([0])
+        replays._cursors = th.tensor([2])
+        replays._replays[1, GOAL_STATE_SIZE + 3] = 1
+        replays._replays[1, RAW_ACTION_INDEX + RAW_JUMP_INDEX] = 1
+
+        jump, second_jump = replays.current_jump_supervision(offset=-1)
+
+        th.testing.assert_close(jump, th.tensor([1]))
+        th.testing.assert_close(second_jump, th.tensor([True]))
+
+    def test_jump_imitation_loss_upweights_second_jump_edges(self):
+        logits = th.zeros((2, sum(ACTION_NVECS)))
+        logits[1, -1] = 5
+        logits.requires_grad_()
+
+        loss, accuracy, recall, sample_rate = _expert_jump_loss(
+            logits,
+            th.ones_like(logits, dtype=th.bool),
+            th.tensor([0, 1]),
+            th.tensor([False, True]),
+            th.tensor([True, True]),
+            ACTION_NVECS,
+            second_jump_weight=8.0,
+        )
+
+        self.assertLess(loss.item(), np.log(2))
+        self.assertEqual(accuracy.item(), 1.0)
+        self.assertEqual(recall.item(), 1.0)
+        self.assertEqual(sample_rate.item(), 0.5)
+
+    def test_tracker_observation_records_actual_jump_hold(self):
+        observation = th.zeros((2, GOAL_STATE_SIZE + INTERNAL_STATE_SIZE))
+        action = th.zeros((2, ACTION_FACTORS), dtype=th.long)
+        action[:, -1] = 1
+
+        updated = ExpertLookaheadEnv._set_actual_jump_hold(
+            observation,
+            action,
+            th.tensor([False, True]),
+        )
+
+        index = GOAL_STATE_SIZE + INTERNAL_IS_HOLDING_JUMP_INDEX
+        self.assertEqual(updated[0, index].item(), 1)
+        self.assertEqual(updated[1, index].item(), 0)
 
     def test_learning_rate_schedule_updates_all_optimizers(self):
         actor = th.nn.Linear(2, 2)
@@ -715,10 +770,15 @@ class TrackerTest(unittest.TestCase):
 
         class Replays:
             cursor = 1
+            goal_size = INTERNAL_STATE_SIZE + len(DEFAULT_TRACKER_WINDOWS) * GOAL_STATE_SIZE
 
             def current_raw_action(self, offset=0):
                 events.append(("raw_action", self.cursor + offset))
                 return th.full((1, 8), float(self.cursor + offset))
+
+            @staticmethod
+            def current_jump_supervision(offset=0):
+                return th.zeros(1, dtype=th.long), th.zeros(1, dtype=th.bool)
 
             def current_ego_touch(self, offset=0):
                 events.append(("touch", self.cursor + offset))
@@ -733,7 +793,7 @@ class TrackerTest(unittest.TestCase):
             def next_goals(self, obs, mask=None):
                 events.append(("next", self.cursor))
                 self.cursor += 1
-                return obs, th.tensor([False])
+                return th.nn.functional.pad(obs, (0, self.goal_size)), th.tensor([False])
 
         wrapper.replays = Replays()
         wrapper.minimum_reward = 0.1
@@ -810,6 +870,10 @@ class TrackerTest(unittest.TestCase):
             @staticmethod
             def current_raw_action(offset=0):
                 return th.zeros((2, 8))
+
+            @staticmethod
+            def current_jump_supervision(offset=0):
+                return th.zeros(2, dtype=th.long), th.zeros(2, dtype=th.bool)
 
             @staticmethod
             def next_goals(obs, mask=None):

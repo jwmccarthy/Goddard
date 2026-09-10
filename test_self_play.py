@@ -263,6 +263,33 @@ class SelfPlayTest(unittest.TestCase):
         th.testing.assert_close(sample["ball_position"][0, 2], th.tensor(100.0))
         th.testing.assert_close(sample["car_boost"], th.full((1, 2), 50.0))
 
+    def test_demonstration_dataset_can_ignore_mask_frameskip(self):
+        rows = np.zeros((2, 161), dtype=np.float32)
+        rows[:, 2] = 100 / 2076
+        cars = rows[:, 9:51].reshape(2, 2, 21)
+        cars[..., 2] = 20 / 2076
+        cars[..., 9] = 1
+        cars[..., 14] = 1
+        cars[..., 16] = 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "replay.npy"
+            np.save(path, rows)
+            np.savez_compressed(
+                path.with_suffix(".unsafe-starts.npz"),
+                unsafe=np.zeros(2, dtype=bool),
+                frame_skip=4,
+            )
+
+            dataset = load_demonstration_reset_dataset(
+                Path(directory),
+                "cpu",
+                frame_skip=8,
+                require_frame_skip_match=False,
+            )
+
+        self.assertEqual(len(dataset), 2)
+
     def test_controller_loads_distillation_artifact(self):
         source = make_controller()
         payload = {
