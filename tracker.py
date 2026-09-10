@@ -59,7 +59,6 @@ BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
 CAR_STATE_SIZE     = 21
 INTERNAL_STATE_SIZE = 19
-INTERNAL_IS_HOLDING_JUMP_INDEX = 5
 EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
 ACTION_FACTORS = 7
 JUMP_ACTION_FACTOR = 6
@@ -848,23 +847,6 @@ class ExpertLookaheadEnv:
         current = obs[..., :GOAL_STATE_SIZE]
         return th.nn.functional.pad(current, (0, self.replays.goal_size))
 
-    @staticmethod
-    def _set_actual_jump_hold(
-        obs: th.Tensor,
-        action: th.Tensor | np.ndarray,
-        reset: th.Tensor,
-    ) -> th.Tensor:
-        active = ~reset
-        if not active.any():
-            return obs
-        action = th.as_tensor(action, device=obs.device).reshape(-1, ACTION_FACTORS)
-        obs = obs.clone()
-        obs[
-            active,
-            GOAL_STATE_SIZE + INTERNAL_IS_HOLDING_JUMP_INDEX,
-        ] = action[active, JUMP_ACTION_FACTOR].to(obs.dtype)
-        return obs
-
     def reset(self, **kwargs: Any) -> th.Tensor:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
         return obs
@@ -940,7 +922,6 @@ class ExpertLookaheadEnv:
             reset_obs, _ = self.replays.next_goals(reset_obs, reset)
             obs[reset] = reset_obs
 
-        obs = self._set_actual_jump_hold(obs, action, native | reset)
         return obs, reward, term | reset, trunc, info
 
 

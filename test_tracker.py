@@ -25,7 +25,6 @@ from tracker import (
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
-    INTERNAL_IS_HOLDING_JUMP_INDEX,
     INTERNAL_STATE_SIZE,
     PHC_TRACKER_ARCHITECTURE,
     POSITION_SCALE,
@@ -132,21 +131,6 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(accuracy.item(), 1.0)
         self.assertEqual(recall.item(), 1.0)
         self.assertEqual(sample_rate.item(), 0.5)
-
-    def test_tracker_observation_records_actual_jump_hold(self):
-        observation = th.zeros((2, GOAL_STATE_SIZE + INTERNAL_STATE_SIZE))
-        action = th.zeros((2, ACTION_FACTORS), dtype=th.long)
-        action[:, -1] = 1
-
-        updated = ExpertLookaheadEnv._set_actual_jump_hold(
-            observation,
-            action,
-            th.tensor([False, True]),
-        )
-
-        index = GOAL_STATE_SIZE + INTERNAL_IS_HOLDING_JUMP_INDEX
-        self.assertEqual(updated[0, index].item(), 1)
-        self.assertEqual(updated[1, index].item(), 0)
 
     def test_learning_rate_schedule_updates_all_optimizers(self):
         actor = th.nn.Linear(2, 2)
