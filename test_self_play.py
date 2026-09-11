@@ -15,13 +15,16 @@ from gymnasium.vector.utils import batch_space
 
 from carl.gymnasium.state import CarlEvents, CarlState, RewardContext
 from distill import ACTION_FORMAT, ActionDecoder, ConditionalPrior, GOAL_STATE_SIZE
+from jarl.collect import SelfPlayMatchmaker, SnapshotPool
 from jarl.data.records import PolicyOutput
-from jarl.modules import GRU, MLP
+from jarl.modules import GRU, MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
+from jarl.modules.operator import Critic
 from rewards import AnnealedNextoReward, nexto_shaping_scale
+from tracker import CONTROL_STATE_SIZE
 
 from self_play import (
-    FixedGaussianPolicy,
+    TrainableGaussianPolicy,
     FrozenPulseController,
     PulseLatentEnv,
     RaggedRolloutBuffer,
@@ -70,12 +73,13 @@ class FakeEnv:
 def make_controller(
     latent_size: int = 3,
     max_duration: int | None = None,
+    state_size: int = GOAL_STATE_SIZE,
 ) -> FrozenPulseController:
     return FrozenPulseController(
         ConditionalPrior(
-            GOAL_STATE_SIZE, latent_size, [8], max_duration=max_duration
+            state_size, latent_size, [8], max_duration=max_duration
         ),
-        ActionDecoder(GOAL_STATE_SIZE, latent_size, [8]),
+        ActionDecoder(state_size, latent_size, [8]),
         AllValidActionCodec(),
     )
 
@@ -169,7 +173,7 @@ class SelfPlayTest(unittest.TestCase):
 
     def test_fixed_gaussian_policy_uses_requested_standard_deviation(self):
         env = PulseLatentEnv(FakeEnv(), make_controller())
-        policy = FixedGaussianPolicy(
+        policy = TrainableGaussianPolicy(
             LinearEncoder(8), MLP(dims=[8]), MLP(dims=[]), std=0.22
         ).build(env)
         observation = env.reset()
@@ -181,11 +185,28 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(output.log_prob.shape, (2,))
         self.assertEqual(evaluation.entropy.shape, (2,))
         th.testing.assert_close(policy.log_std.exp(), th.full((3,), 0.22))
-        self.assertFalse(policy.log_std.requires_grad)
+        self.assertTrue(policy.log_std.requires_grad)
+
+    def test_trainable_std_provides_entropy_gradient(self):
+        env = PulseLatentEnv(FakeEnv(), make_controller())
+        policy = TrainableGaussianPolicy(
+            LinearEncoder(8), MLP(dims=[8]), MLP(dims=[]), std=0.22
+        ).build(env)
+        observation = env.reset()
+
+        output = policy.act(observation)
+        evaluation = policy.evaluate_actions(observation, output.action)
+        loss = -evaluation.entropy.sum()
+
+        policy.zero_grad()
+        loss.backward()
+
+        self.assertIsNotNone(policy.log_std.grad)
+        self.assertTrue((policy.log_std.grad != 0).any())
 
     def test_fixed_gaussian_policy_carries_state_across_32_step_sequences(self):
         env = PulseLatentEnv(FakeEnv(), make_controller())
-        policy = FixedGaussianPolicy(
+        policy = TrainableGaussianPolicy(
             LinearEncoder(8), GRU(hidden_size=4), MLP(dims=[]), std=0.22
         ).build(env)
         state = policy.initial_state(2)
@@ -386,6 +407,44 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(loaded.skill_horizon_jitter, 4)
         for expected, actual in zip(source.parameters(), loaded.parameters()):
             th.testing.assert_close(expected, actual)
+
+    def test_controller_uses_opponent_aware_control_state_from_new_artifact(self):
+        source = make_controller(max_duration=12, state_size=CONTROL_STATE_SIZE)
+        payload = {
+            "prior": source.prior.state_dict(),
+            "decoder": source.decoder.state_dict(),
+            "config": {
+                "action_format": ACTION_FORMAT,
+                "control_state_size": CONTROL_STATE_SIZE,
+                "latent_size": 3,
+                "encoder_hidden": [8],
+                "decoder_hidden": [8],
+                "frameskip": 4,
+                "skill_horizon": 8,
+                "skill_horizon_jitter": 4,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "distill.pt"
+            th.save(payload, checkpoint)
+            loaded = FrozenPulseController.load(
+                checkpoint, AllValidActionCodec(), "cpu", frame_skip=4
+            )
+
+        observation = th.zeros((2, CONTROL_STATE_SIZE))
+        observation[:, GOAL_STATE_SIZE:] = 0.75
+        captured = []
+        hook = loaded.decoder.register_forward_pre_hook(
+            lambda module, inputs: captured.append(inputs[0].clone())
+        )
+        full_latent = loaded.select_latent(
+            observation, th.zeros((2, 3)), duration=8
+        )
+        loaded.decode(observation, full_latent)
+        hook.remove()
+
+        self.assertEqual(loaded.prior.state_dim, CONTROL_STATE_SIZE)
+        th.testing.assert_close(captured[0], observation)
 
     def test_new_artifact_full_latent_remains_exact_across_observations(self):
         controller = make_controller(latent_size=3, max_duration=12)
@@ -591,6 +650,11 @@ class SelfPlayTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_args(too_small_jitter)
 
+            invalid_shaping = copy.deepcopy(base)
+            invalid_shaping.shaping_anneal_fraction = 0.0
+            with self.assertRaises(ValueError):
+                validate_args(invalid_shaping)
+
     @staticmethod
     def _base_args(distill_checkpoint, replay_dir):
         return argparse.Namespace(
@@ -621,6 +685,7 @@ class SelfPlayTest(unittest.TestCase):
             current_fraction=0.5,
             demonstration_reset_fraction=0.0,
             nexto_shaping_scale=0.0,
+            shaping_anneal_fraction=0.5,
             goal_reward_scale=1.0,
             touch_reward_scale=0.1,
             no_touch_penalty=1.0,
@@ -820,23 +885,47 @@ class TestSemiMarkovSelfPlayRunner(unittest.TestCase):
         expected = th.tensor([1.9, 1.9])
         th.testing.assert_close(steps["reward"][0], expected)
 
-    def test_rollout_cut_closes_partial_skills_before_update(self):
+    def test_rollout_waits_for_slow_actor_skill_boundary(self):
         runner, env, policy, critic, controller, buffer = self._make_runner(
-            n_envs=2, horizon=2, jitter=0, gamma=0.9
+            n_envs=2, horizon=1, jitter=0, gamma=0.9
         )
         buffer.horizon = 1
         runner.reset()
-        runner._planned_duration[:] = th.tensor([1, 2])
+        runner._planned_duration[:] = th.tensor([1, 3])
 
         runner.step()
 
+        # The fast actor is ready to update, but the slow actor is still mid-skill.
+        self.assertFalse(buffer.full)
+        th.testing.assert_close(buffer.counts, th.tensor([1, 0]))
+        th.testing.assert_close(runner._elapsed, th.tensor([0, 1]))
+        self.assertEqual(runner._planned_duration[1].item(), 3)
+
+        runner.step()
+
+        self.assertFalse(buffer.full)
+        th.testing.assert_close(buffer.counts, th.tensor([2, 0]))
+        th.testing.assert_close(runner._elapsed, th.tensor([0, 2]))
+        # The slow actor's latent is held constant across its first two steps.
+        self.assertTrue(th.allclose(env.step_actions[0][1], env.step_actions[1][1]))
+
+        runner.step()
+
+        # The slow actor reaches its real boundary; only then is the rollout full.
         self.assertTrue(buffer.full)
-        th.testing.assert_close(buffer.counts, th.tensor([1, 1]))
+        th.testing.assert_close(buffer.counts, th.tensor([3, 1]))
         th.testing.assert_close(runner._elapsed, th.zeros(2, dtype=th.int64))
         steps = buffer.finish().steps
-        self.assertEqual(steps["duration"][0, 1].item(), 1)
+        self.assertEqual(steps["duration"][0, 1].item(), 3)
         self.assertFalse(steps["terminated"][0, 1])
         self.assertFalse(steps["truncated"][0, 1])
+        # The held latent stayed constant until the slow actor's boundary.
+        self.assertTrue(th.allclose(env.step_actions[1][1], env.step_actions[2][1]))
+
+        runner.after_update(0)
+        runner.step()
+        self.assertFalse(th.allclose(env.step_actions[2][1], env.step_actions[3][1]))
+
 
     def test_fast_actor_does_not_cut_slow_actor_before_rollout_target(self):
         runner, env, policy, critic, controller, buffer = self._make_runner(
@@ -850,6 +939,35 @@ class TestSemiMarkovSelfPlayRunner(unittest.TestCase):
 
         th.testing.assert_close(buffer.counts, th.tensor([1, 0]))
         th.testing.assert_close(runner._elapsed, th.tensor([0, 1]))
+
+    def test_rollout_drains_crossing_skills_before_update(self):
+        runner, env, policy, critic, controller, buffer = self._make_runner(
+            n_envs=2, horizon=2, jitter=0, gamma=0.9
+        )
+        buffer.horizon = 1
+        runner.reset()
+        runner._planned_duration[:] = th.tensor([2, 3])
+
+        runner.step()
+        runner.step()
+        runner.step()
+
+        self.assertTrue(runner._draining)
+        self.assertFalse(buffer.full)
+        self.assertTrue(buffer.blocked)
+        th.testing.assert_close(buffer.counts, th.tensor([1, 1]))
+        self.assertFalse(runner._filler_mask[0].item())
+        self.assertTrue(runner._filler_mask[1].item())
+
+        runner.step()
+
+        self.assertTrue(buffer.full)
+        self.assertFalse(buffer.blocked)
+        self.assertEqual(runner.timestep_count, 1)
+        self.assertTrue(runner._filler_mask.all().item())
+        th.testing.assert_close(buffer.counts, th.tensor([2, 1]))
+        # The waiting actor's filler primitive is not recorded as a new skill.
+        self.assertEqual(runner._planned_duration[1].item(), -1)
 
     def test_gameplay_diagnostics_include_fixed_baseline_results(self):
         runner, env, policy, critic, controller, buffer = self._make_runner(
@@ -951,6 +1069,71 @@ class TestSemiMarkovSelfPlayRunner(unittest.TestCase):
         observed_durations = steps["duration"][steps["valid"]]
         self.assertTrue((observed_durations >= 5).all().item())
         self.assertTrue((observed_durations <= 11).all().item())
+
+    def test_after_update_resets_recurrent_hidden_states(self):
+        controller = make_controller(max_duration=2)
+        env = PulseLatentEnv(FakeEnv(), controller)
+        policy = build_policy(
+            env, exploration_std=0.22, gru_hidden_size=4, gru_input_size=8
+        )
+        critic = Critic(
+            foot=LinearEncoder(8, func=th.nn.ReLU),
+            body=GRU(hidden_size=4),
+            head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
+        ).build(env).to(env.device)
+        pool = SnapshotPool(
+            policy,
+            max_size=4,
+            snapshot_interval=1,
+            checkpoint_dir=None,
+        )
+        matchmaker = SelfPlayMatchmaker(
+            num_matches=env.n_sim,
+            team_sizes=(1, 1),
+            current_fraction=1.0,
+            historical_ids=(),
+            device=env.device,
+            seed=0,
+        )
+        buffer = RaggedRolloutBuffer(
+            horizon=2, num_envs=env.n_envs, device=env.device
+        )
+        runner = SemiMarkovSelfPlayRunner(
+            env,
+            policy,
+            critic,
+            controller,
+            buffer,
+            gamma=0.9,
+            skill_horizon=2,
+            skill_horizon_jitter=0,
+            seed=0,
+            opponent_pool=pool,
+            matchmaker=matchmaker,
+            snapshot_policy=policy,
+        )
+        runner.reset()
+
+        for _ in range(3):
+            runner.step()
+
+        self.assertIsNotNone(runner.state)
+        self.assertIsNotNone(runner._critic_state)
+        self.assertGreater(runner.state.abs().max().item(), 0.0)
+        self.assertGreater(runner._critic_state.abs().max().item(), 0.0)
+
+        before_ids = pool.ids
+        runner.after_update(1)
+
+        # Snapshot update logic is still exercised.
+        self.assertEqual(len(pool.ids), len(before_ids) + 1)
+        # Recurrent actor and critic states are reset to initial values.
+        th.testing.assert_close(
+            runner.state, policy.initial_state(env.n_envs)
+        )
+        th.testing.assert_close(
+            runner._critic_state, critic.initial_state(env.n_envs)
+        )
 
 
 if __name__ == "__main__":

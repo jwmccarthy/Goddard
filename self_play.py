@@ -134,14 +134,15 @@ class FrozenPulseController(nn.Module):
         max_duration = None
         if skill_horizon is not None and skill_horizon_jitter is not None:
             max_duration = int(skill_horizon) + int(skill_horizon_jitter)
+        control_state_size = int(config.get("control_state_size", GOAL_STATE_SIZE))
         prior = ConditionalPrior(
-            GOAL_STATE_SIZE,
+            control_state_size,
             int(config["latent_size"]),
             list(config["encoder_hidden"]),
             max_duration=max_duration,
         ).to(device)
         decoder = ActionDecoder(
-            GOAL_STATE_SIZE,
+            control_state_size,
             int(config["latent_size"]),
             list(config["decoder_hidden"]),
         ).to(device)
@@ -167,7 +168,7 @@ class FrozenPulseController(nn.Module):
         residual: th.Tensor,
         duration: int | th.Tensor | None = None,
     ) -> th.Tensor:
-        state = observation[..., :GOAL_STATE_SIZE]
+        state = observation[..., :self.prior.state_dim]
         with th.autocast(
             device_type=state.device.type,
             dtype=th.bfloat16,
@@ -183,7 +184,7 @@ class FrozenPulseController(nn.Module):
 
     @th.no_grad()
     def decode(self, observation: th.Tensor, residual: th.Tensor) -> th.Tensor:
-        state = observation[..., :GOAL_STATE_SIZE]
+        state = observation[..., :self.prior.state_dim]
         with th.autocast(
             device_type=state.device.type,
             dtype=th.bfloat16,
@@ -260,12 +261,13 @@ class RaggedRolloutBuffer:
         self.num_envs = num_envs
         self.device = th.device(device)
         self.copy_on_finish = copy_on_finish
+        self.blocked = False
         self.counts = th.zeros(num_envs, dtype=th.int64, device=self.device)
         self._storage: dict[str, th.Tensor] | None = None
 
     @property
     def full(self) -> bool:
-        return int(self.counts.min().item()) >= self.horizon
+        return not self.blocked and int(self.counts.min().item()) >= self.horizon
 
     def can_finish(self, active: th.Tensor) -> bool:
         active = th.as_tensor(active, dtype=th.bool, device=self.device)
@@ -355,18 +357,18 @@ class RaggedRolloutBuffer:
     def clear(self) -> None:
         self.counts.zero_()
         self._storage = None
+        self.blocked = False
 
 
-class FixedGaussianPolicy(DiagonalGaussianPolicy):
+class TrainableGaussianPolicy(DiagonalGaussianPolicy):
     def __init__(self, foot: nn.Module, body: nn.Module, head: nn.Module, std: float):
         super().__init__(foot, body, head)
         self.fixed_std = std
 
-    def build(self, env) -> "FixedGaussianPolicy":
+    def build(self, env) -> "TrainableGaussianPolicy":
         super().build(env)
         with th.no_grad():
             self.log_std.fill_(math.log(self.fixed_std))
-        self.log_std.requires_grad_(False)
         return self
 
     def _distribution(self, features: th.Tensor) -> Normal:
@@ -584,6 +586,9 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         self._start_baseline_value: th.Tensor | None = None
         self._start_learner_mask: th.Tensor | None = None
         self._diagnostics: dict[str, th.Tensor] = {}
+        self._draining = False
+        self._filler_mask: th.Tensor | None = None
+        self._active_step: th.Tensor | None = None
 
     @property
     def timestep_count(self) -> int:
@@ -613,7 +618,29 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         return policy_observation(physical, duration, max_duration)
 
     def _at_boundary(self) -> th.Tensor:
-        return self._elapsed == 0
+        boundary = self._elapsed == 0
+        if self._filler_mask is not None:
+            boundary &= ~self._filler_mask
+        return boundary
+
+    def _mark_filler(self, mask: th.Tensor) -> None:
+        if not mask.any():
+            return
+        self._filler_mask[mask] = True
+        self._planned_duration[mask] = -1
+        self._queued_duration[mask] = -1
+        self._elapsed[mask] = 0
+        self._reward_sum[mask] = 0.0
+
+    def _update_drain_state(self, completion_mask: th.Tensor) -> None:
+        if self._draining:
+            self._mark_filler(completion_mask)
+        elif int(self.buffer.counts.min().item()) >= self.buffer.horizon:
+            self._draining = True
+            self._mark_filler(self._elapsed == 0)
+
+        if self._draining:
+            self.buffer.blocked = not bool(self._filler_mask.all().item())
 
     def _act_boundary(
         self,
@@ -756,7 +783,11 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
 
     def _episode_groups(self) -> dict[str, th.Tensor]:
         groups = super()._episode_groups()
-        groups["baseline"] = self.matchmaker.learner_mask & self._baseline_mask()
+        active = self._active_step
+        groups = {name: mask & active for name, mask in groups.items()}
+        groups["baseline"] = (
+            self.matchmaker.learner_mask & self._baseline_mask() & active
+        )
         return groups
 
     def _record_diagnostics(self, env_step) -> None:
@@ -767,7 +798,7 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         if touches is None or score is None:
             return
 
-        learner = self.matchmaker.learner_mask
+        learner = self.matchmaker.learner_mask & ~self._filler_mask
         done = th.as_tensor(env_step.done, dtype=th.bool, device=self.env.device)
         no_touch_timeout = self.gameplay_reward.last_no_touch_timeout
         if no_touch_timeout is None:
@@ -931,6 +962,12 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
             if self._critic_state is not None
             else None
         )
+        self._draining = False
+        self._filler_mask = th.zeros(
+            self.n_envs, dtype=th.bool, device=device
+        )
+        self._active_step = ~self._filler_mask
+        self.buffer.blocked = False
 
         self.matchmaker.rematch()
         self._diagnostics = {
@@ -946,7 +983,9 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
                 "baseline_wins",
             )
         }
-        self._timestep_count = self.matchmaker.learner_count
+        self._timestep_count = int(
+            (self.matchmaker.learner_mask & ~self._filler_mask).sum().item()
+        )
         return self.observation
 
     @th.no_grad()
@@ -954,29 +993,45 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         if self.observation is None:
             raise RuntimeError("runner must be reset before stepping")
 
-        self._timestep_count = self.matchmaker.learner_count
+        self._timestep_count = int(
+            (self.matchmaker.learner_mask & ~self._filler_mask).sum().item()
+        )
 
         physical_observation = th.as_tensor(
             self.observation, device=self.policy.device
         )
+        self._active_step = ~self._filler_mask
         boundary_mask = self._at_boundary()
         if boundary_mask.any():
             self._start_skill_at_boundary(physical_observation, boundary_mask)
+
+        if self._filler_mask.any():
+            filler_count = int(self._filler_mask.sum().item())
+            residual = th.zeros(
+                (filler_count, self.controller.latent_size),
+                dtype=physical_observation.dtype,
+                device=self.env.device,
+            )
+            self._held_latent[self._filler_mask] = self.controller.select_latent(
+                physical_observation[self._filler_mask],
+                residual,
+                self.skill_horizon,
+            )
 
         env_step = _make_env_step(self.env.step(self._held_latent))
         self._record_diagnostics(env_step)
 
         reward = th.as_tensor(env_step.reward, device=self.env.device)
-        self._reward_sum += (self.gamma ** self._elapsed) * reward
-        self._elapsed += 1
+        active = self._active_step
+        self._reward_sum[active] += (
+            self.gamma ** self._elapsed[active]
+        ) * reward[active]
+        self._elapsed[active] += 1
 
         completion_mask = self._completion_mask(env_step)
         if completion_mask.any():
             self._close_skills(env_step, completion_mask)
-        partial = self._elapsed > 0
-        if self.buffer.can_finish(partial):
-            if partial.any():
-                self._close_skills(env_step, partial)
+        self._update_drain_state(completion_mask)
 
         self.observation = env_step.observation
 
@@ -987,19 +1042,25 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         return env_step
 
     def after_update(self, timesteps: int) -> None:
-        if self.opponent_pool is None:
-            return
-        if not self.opponent_pool.ready(timesteps):
-            return
+        if self.opponent_pool is not None and self.opponent_pool.ready(timesteps):
+            self.opponent_pool.add(self.snapshot_policy, timesteps, protected_ids=(0,))
+            self.matchmaker.set_historical_ids(
+                baseline_opponent_ids(self.opponent_pool, self.historical_policies)
+            )
+            self.matchmaker.remap_stale_opponents()
 
-        self.opponent_pool.add(self.snapshot_policy, timesteps, protected_ids=(0,))
-        self.matchmaker.set_historical_ids(
-            baseline_opponent_ids(self.opponent_pool, self.historical_policies)
-        )
-        remapped = self.matchmaker.remap_stale_opponents()
-        if self.state is not None:
-            keep = (~remapped).view(-1, *(1,) * (self.state.ndim - 1))
-            self.state = self.state * keep
+        with th.no_grad():
+            if self.state is not None:
+                self.state = self.policy.initial_state(self.n_envs)
+            if self._critic_state is not None:
+                self._critic_state = self.critic.initial_state(self.n_envs)
+        self._draining = False
+        self._filler_mask.zero_()
+        self._planned_duration.fill_(-1)
+        self._queued_duration.fill_(-1)
+        self._elapsed.zero_()
+        self._reward_sum.zero_()
+        self.buffer.blocked = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -1032,9 +1093,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
     parser.add_argument("--snapshot-pool-size", type=int, default=16)
     parser.add_argument("--historical-policies", type=int, default=4)
-    parser.add_argument("--demonstration-reset-fraction", type=float, default=0.8)
+    parser.add_argument("--demonstration-reset-fraction", type=float, default=0.5)
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
     parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
+    parser.add_argument("--shaping-anneal-fraction", type=float, default=0.5)
     parser.add_argument("--goal-reward-scale", type=float, default=10.0)
     parser.add_argument("--touch-reward-scale", type=float, default=0.1)
     parser.add_argument("--no-touch-penalty", type=float, default=1.0)
@@ -1098,6 +1160,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--demonstration-reset-fraction must be between zero and one")
     if not 0.0 <= args.nexto_shaping_scale <= 1.0:
         raise ValueError("--nexto-shaping-scale must be between zero and one")
+    if not 0.0 < args.shaping_anneal_fraction <= 1.0:
+        raise ValueError("--shaping-anneal-fraction must be in (0, 1]")
     if not math.isfinite(args.goal_reward_scale) or args.goal_reward_scale <= 0:
         raise ValueError("--goal-reward-scale must be positive and finite")
     for name in ("touch_reward_scale", "no_touch_penalty"):
@@ -1116,9 +1180,9 @@ def build_policy(
     exploration_std: float,
     gru_hidden_size: int | None = None,
     gru_input_size: int | None = None,
-) -> FixedGaussianPolicy:
+) -> TrainableGaussianPolicy:
     feature_size = 2048 if gru_input_size is None else gru_input_size
-    return FixedGaussianPolicy(
+    return TrainableGaussianPolicy(
         foot=LinearEncoder(feature_size, func=nn.ReLU),
         body=(
             GRU(hidden_size=gru_hidden_size)
@@ -1301,7 +1365,7 @@ def main() -> None:
             lambda progress: nexto_shaping_scale(
                 round(progress * args.timesteps),
                 args.nexto_shaping_scale,
-                args.timesteps,
+                max(1, round(args.timesteps * args.shaping_anneal_fraction)),
             ),
         ),
         section="Reward",

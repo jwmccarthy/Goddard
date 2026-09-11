@@ -20,15 +20,19 @@ from tracker import (
     ACTION_FACTORS,
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
+    CONTROL_STATE_SIZE,
     DEFAULT_TRACKER_WINDOWS,
     EXPERT_TOUCH_INDEX,
     ExpertGoalStates,
     ExpertLookaheadEnv,
     GOAL_STATE_SIZE,
     INTERNAL_STATE_SIZE,
+    OPPONENT_STATE_INDEX,
+    OPPONENT_STATE_SIZE,
     PHC_TRACKER_ARCHITECTURE,
     POSITION_SCALE,
     RAW_ACTION_INDEX,
+    RAW_ACTION_SIZE,
     RAW_JUMP_INDEX,
     RoutedTrackerPolicy,
     SegmentScores,
@@ -938,6 +942,110 @@ class TrackerTest(unittest.TestCase):
             )
 
         self.assertEqual(viewer.frame["demo"], "demo")
+
+    def test_filter_appends_first_non_ego_car_state_without_shifting_existing_indices(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._min_len = 3
+        replays.minimum_remaining_frames = 1
+        demo = np.zeros((10, 161), dtype=np.float32)
+        demo[:, :GOAL_STATE_SIZE] = np.arange(GOAL_STATE_SIZE)
+        demo[:, GOAL_STATE_SIZE:CONTROL_STATE_SIZE] = np.arange(OPPONENT_STATE_SIZE) + 1000
+        internal_start = 83 + 27 * 2
+        demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE] = (
+            np.arange(INTERNAL_STATE_SIZE) + 200
+        )
+        demo[3, -5] = 1.0
+        raw_actions = np.zeros((10, RAW_ACTION_SIZE), dtype=np.float32)
+        raw_actions[:] = np.arange(RAW_ACTION_SIZE) + 300
+
+        loaded, _ = replays._filter(demo, np.zeros(10, dtype=bool), raw_actions)[0]
+
+        self.assertEqual(loaded.shape[1], STORED_REPLAY_SIZE)
+        np.testing.assert_array_equal(
+            loaded[:, :GOAL_STATE_SIZE].numpy(),
+            demo[:, :GOAL_STATE_SIZE],
+        )
+        np.testing.assert_array_equal(
+            loaded[:, GOAL_STATE_SIZE:EXPERT_TOUCH_INDEX].numpy(),
+            demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
+        )
+        np.testing.assert_array_equal(loaded[:, EXPERT_TOUCH_INDEX].numpy(), demo[:, -5])
+        np.testing.assert_array_equal(
+            loaded[:, RAW_ACTION_INDEX:RAW_ACTION_INDEX + RAW_ACTION_SIZE].numpy(),
+            raw_actions,
+        )
+        np.testing.assert_array_equal(
+            loaded[:, OPPONENT_STATE_INDEX:].numpy(),
+            demo[:, GOAL_STATE_SIZE:CONTROL_STATE_SIZE],
+        )
+
+    def test_filter_skips_teammates_when_selecting_opponent_context(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._min_len = 3
+        replays.minimum_remaining_frames = 1
+        demo = np.zeros((10, 215), dtype=np.float32)
+        teammate = slice(30, 51)
+        opponent = slice(51, 72)
+        demo[:, teammate] = 1.0
+        demo[:, opponent] = 2.0
+
+        loaded, _ = replays._filter(
+            demo,
+            np.zeros(10, dtype=bool),
+            np.zeros((10, RAW_ACTION_SIZE), dtype=np.float32),
+        )[0]
+
+        np.testing.assert_array_equal(
+            loaded[:, OPPONENT_STATE_INDEX:].numpy(), demo[:, opponent]
+        )
+
+    def test_current_opponent_state_clamps_to_segment_boundaries(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._demo_id = th.tensor([0, 1])
+        replays._offsets = th.tensor([0, 2, 4])
+        replays._cursors = th.tensor([0, 2])
+        replays._replays = th.zeros((4, STORED_REPLAY_SIZE))
+        replays._replays[0, OPPONENT_STATE_INDEX:] = th.arange(OPPONENT_STATE_SIZE) + 1.0
+        replays._replays[1, OPPONENT_STATE_INDEX:] = th.arange(OPPONENT_STATE_SIZE) + 2.0
+        replays._replays[2, OPPONENT_STATE_INDEX:] = th.arange(OPPONENT_STATE_SIZE) + 3.0
+        replays._replays[3, OPPONENT_STATE_INDEX:] = th.arange(OPPONENT_STATE_SIZE) + 4.0
+
+        at_start = replays.current_opponent_state(offset=-1)
+        self.assertEqual(at_start.shape, (2, OPPONENT_STATE_SIZE))
+        th.testing.assert_close(at_start[0], th.arange(OPPONENT_STATE_SIZE) + 1.0)
+        th.testing.assert_close(at_start[1], th.arange(OPPONENT_STATE_SIZE) + 3.0)
+
+        at_end = replays.current_opponent_state(offset=5)
+        th.testing.assert_close(at_end[0], th.arange(OPPONENT_STATE_SIZE) + 2.0)
+        th.testing.assert_close(at_end[1], th.arange(OPPONENT_STATE_SIZE) + 4.0)
+
+    def test_tracker_observation_space_unchanged_by_opponent_context(self):
+        env = SimpleNamespace(
+            n_cars=1,
+            n_envs=2,
+            n_sim=2,
+            device="cpu",
+            action_space=gym.vector.utils.batch_space(
+                gym.spaces.MultiDiscrete(ACTION_NVECS), 2
+            ),
+            single_action_space=gym.spaces.MultiDiscrete(ACTION_NVECS),
+            register_reward=lambda reward: None,
+        )
+        opponent = th.arange(OPPONENT_STATE_SIZE, dtype=th.float32)[None, :].expand(2, -1) + 1000
+        replays = SimpleNamespace(
+            goal_size=INTERNAL_STATE_SIZE + len(DEFAULT_TRACKER_WINDOWS) * GOAL_STATE_SIZE,
+            current_opponent_state=lambda offset=0: opponent if offset == -1 else None,
+            device="cpu",
+        )
+        wrapper = ExpertLookaheadEnv(env, replays)
+        expected_size = GOAL_STATE_SIZE + replays.goal_size
+        self.assertEqual(wrapper.single_observation_space.shape, (expected_size,))
+
+        observation = th.arange(GOAL_STATE_SIZE, dtype=th.float32)[None, :].expand(2, -1) + 1
+        control = wrapper.control_state(observation)
+        self.assertEqual(control.shape, (2, CONTROL_STATE_SIZE))
+        th.testing.assert_close(control[:, :GOAL_STATE_SIZE], observation)
+        th.testing.assert_close(control[:, GOAL_STATE_SIZE:], opponent)
 
     @staticmethod
     def _anchor_fixture(

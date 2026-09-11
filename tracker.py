@@ -58,6 +58,8 @@ CAR_MAX_ANG_SPEED  = 5.5
 BOOST_MAX          = 100.0
 GOAL_STATE_SIZE    = 30
 CAR_STATE_SIZE     = 21
+OPPONENT_STATE_SIZE = 21
+CONTROL_STATE_SIZE = GOAL_STATE_SIZE + OPPONENT_STATE_SIZE
 INTERNAL_STATE_SIZE = 19
 EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
 ACTION_FACTORS = 7
@@ -65,7 +67,8 @@ JUMP_ACTION_FACTOR = 6
 RAW_JUMP_INDEX = 5
 RAW_ACTION_INDEX = EXPERT_TOUCH_INDEX + 1
 RAW_ACTION_SIZE = 8
-STORED_REPLAY_SIZE = RAW_ACTION_INDEX + RAW_ACTION_SIZE
+OPPONENT_STATE_INDEX = RAW_ACTION_INDEX + RAW_ACTION_SIZE
+STORED_REPLAY_SIZE = OPPONENT_STATE_INDEX + OPPONENT_STATE_SIZE
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
 TRACKER_ARCHITECTURE = "categorical-all-gru-v3"
@@ -352,7 +355,13 @@ class ExpertGoalStates:
         self._sampling_probabilities = self._base_sampling_probabilities.clone()
         self._demo_names = tuple(names)
         self._demo_manifest = tuple(
-            f"{name}:{len(demo)}:{hashlib.sha256(demo.numpy()).hexdigest()}"
+            f"{name}:{len(demo)}:"
+            f"{hashlib.sha256(np.ascontiguousarray(demo[:, :OPPONENT_STATE_INDEX].numpy())).hexdigest()}"
+            for name, demo in zip(names, replays)
+        )
+        self._control_manifest = tuple(
+            f"{name}:{len(demo)}:"
+            f"{hashlib.sha256(np.ascontiguousarray(demo.numpy())).hexdigest()}"
             for name, demo in zip(names, replays)
         )
         self._offsets = th.cat((
@@ -405,6 +414,10 @@ class ExpertGoalStates:
     def demo_manifest(self) -> tuple[str, ...]:
         return self._demo_manifest
 
+    @property
+    def control_manifest(self) -> tuple[str, ...]:
+        return self._control_manifest
+
     def focus_hard_negatives(self, scores: SegmentScores, fraction: float) -> None:
         if not 0 <= fraction <= 1:
             raise ValueError("hard-negative fraction must be in [0, 1]")
@@ -442,11 +455,14 @@ class ExpertGoalStates:
             raise ValueError("raw expert actions must have shape [N, 8]")
         if not np.isfinite(raw_actions).all():
             raise ValueError("raw expert actions contain non-finite values")
+        opponent_start = 9 + (n_cars // 2) * CAR_STATE_SIZE
+        opponent_end = opponent_start + OPPONENT_STATE_SIZE
         observation = np.concatenate((
             demo[:, :GOAL_STATE_SIZE],
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
             demo[:, -5, None],
             raw_actions,
+            demo[:, opponent_start:opponent_end],
         ), axis=-1).astype(np.float32, copy=False)
         ego_touch = demo[:, -5].astype(bool)
         ego_touch_guard = ego_touch.copy()
@@ -586,7 +602,16 @@ class ExpertGoalStates:
 
     def current_raw_action(self, offset: int = 0) -> th.Tensor:
         rows = self._replays[self._cursors + offset]
-        return rows[:, RAW_ACTION_INDEX:STORED_REPLAY_SIZE]
+        return rows[:, RAW_ACTION_INDEX:RAW_ACTION_INDEX + RAW_ACTION_SIZE]
+
+    def current_opponent_state(self, offset: int = 0) -> th.Tensor:
+        starts = self._offsets[self._demo_id]
+        ends = self._offsets[self._demo_id + 1]
+        indices = (self._cursors + offset).clamp(starts, ends - 1)
+        return self._replays[
+            indices,
+            OPPONENT_STATE_INDEX:OPPONENT_STATE_INDEX + OPPONENT_STATE_SIZE,
+        ]
 
     def current_jump_supervision(
         self,
@@ -846,6 +871,10 @@ class ExpertLookaheadEnv:
     def _pad_goals(self, obs: th.Tensor) -> th.Tensor:
         current = obs[..., :GOAL_STATE_SIZE]
         return th.nn.functional.pad(current, (0, self.replays.goal_size))
+
+    def control_state(self, observation: th.Tensor) -> th.Tensor:
+        opponent = self.replays.current_opponent_state(offset=-1)
+        return th.cat((observation[..., :GOAL_STATE_SIZE], opponent), dim=-1)
 
     def reset(self, **kwargs: Any) -> th.Tensor:
         obs, _ = self.replays.next_goals(self.env.reset(**kwargs))
