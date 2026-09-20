@@ -31,6 +31,8 @@ from tracker import (
     OPPONENT_STATE_SIZE,
     PHC_TRACKER_ARCHITECTURE,
     POSITION_SCALE,
+    RAW_ACTION_SIZE,
+    RAW_JUMP_INDEX,
     RoutedTrackerPolicy,
     SegmentScores,
     StatelessCriticCapture,
@@ -49,6 +51,7 @@ from tracker import (
     specialist_assignments,
     validated_replay_assignments,
     validate_args,
+    _expert_jump_loss,
 )
 
 
@@ -79,6 +82,8 @@ class TrackerTest(unittest.TestCase):
             lr_final=1e-5,
             entropy_coef=1e-3,
             entropy_coef_final=1e-4,
+            jump_imitation_weight=0.0,
+            second_jump_weight=8.0,
             clip=0.2,
             clip_final=0.1,
             max_grad_norm=0.5,
@@ -108,6 +113,17 @@ class TrackerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "discriminator-weight"):
             validate_args(args)
 
+        args.discriminator_weight = 0.0
+        args.jump_imitation_weight = -0.1
+        with self.assertRaisesRegex(ValueError, "jump-imitation-weight"):
+            validate_args(args)
+
+        args.jump_imitation_weight = 0.1
+        args.second_jump_weight = 0.5
+        with self.assertRaisesRegex(ValueError, "second-jump-weight"):
+            validate_args(args)
+
+        args.second_jump_weight = 8.0
         args.discriminator_weight = 0.5
         args.discriminator_window = 0
         with self.assertRaisesRegex(ValueError, "discriminator-window"):
@@ -122,6 +138,41 @@ class TrackerTest(unittest.TestCase):
         args.timesteps = 6_000_001
         with self.assertRaisesRegex(ValueError, "divisible"):
             validate_args(args)
+
+    def test_detects_airborne_second_jump_press_edges(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._replays = th.zeros((3, STORED_REPLAY_SIZE))
+        replays._raw_actions = th.zeros((3, RAW_ACTION_SIZE))
+        replays._offsets = th.tensor([0, 3])
+        replays._demo_id = th.tensor([0])
+        replays._cursors = th.tensor([2])
+        replays._replays[1, GOAL_STATE_SIZE + 3] = 1
+        replays._raw_actions[1, RAW_JUMP_INDEX] = 1
+
+        jump, second_jump = replays.current_jump_supervision(offset=-1)
+
+        th.testing.assert_close(jump, th.tensor([1]))
+        th.testing.assert_close(second_jump, th.tensor([True]))
+
+    def test_jump_imitation_loss_upweights_second_jump_edges(self):
+        logits = th.zeros((2, sum(ACTION_NVECS)))
+        logits[1, -1] = 5
+        logits.requires_grad_()
+
+        loss, accuracy, recall, sample_rate = _expert_jump_loss(
+            logits,
+            th.ones_like(logits, dtype=th.bool),
+            th.tensor([0, 1]),
+            th.tensor([False, True]),
+            th.tensor([True, True]),
+            ACTION_NVECS,
+            second_jump_weight=8.0,
+        )
+
+        self.assertLess(loss.item(), np.log(2))
+        self.assertEqual(accuracy.item(), 1.0)
+        self.assertEqual(recall.item(), 1.0)
+        self.assertEqual(sample_rate.item(), 0.5)
 
     def test_learning_rate_schedule_updates_all_optimizers(self):
         actor = th.nn.Linear(2, 2)
@@ -408,13 +459,54 @@ class TrackerTest(unittest.TestCase):
 
         self.assertEqual(loaded, [])
 
+    def test_dataset_loads_optional_expert_actions_for_jump_supervision(self):
+        demo = np.zeros((150, 161), dtype=np.float32)
+        demo[10, -5] = 1.0
+        actions = np.zeros((150, RAW_ACTION_SIZE), dtype=np.float32)
+        actions[60, RAW_JUMP_INDEX] = 1.0
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "replay.npy"
+            np.save(path, demo)
+            np.savez_compressed(path.with_suffix(".actions.npz"), raw=actions)
+            replays = ExpertGoalStates(
+                directory,
+                n_env=1,
+                n_cars=1,
+                device="cpu",
+                minimum_remaining_frames=1,
+            )
+
+        self.assertTrue(replays.has_expert_actions)
+        replays._cursors = th.tensor([60])
+        jump, _ = replays.current_jump_supervision(offset=0)
+        th.testing.assert_close(jump, th.tensor([1]))
+
+    def test_dataset_without_actions_reports_missing_supervision(self):
+        demo = np.zeros((150, 161), dtype=np.float32)
+        demo[10, -5] = 1.0
+        with tempfile.TemporaryDirectory() as directory:
+            np.save(Path(directory) / "replay.npy", demo)
+            replays = ExpertGoalStates(
+                directory,
+                n_env=1,
+                n_cars=1,
+                device="cpu",
+                minimum_remaining_frames=1,
+            )
+
+        self.assertFalse(replays.has_expert_actions)
+        replays._cursors = th.tensor([60])
+        jump, second_jump = replays.current_jump_supervision(offset=0)
+        th.testing.assert_close(jump, th.tensor([0]))
+        th.testing.assert_close(second_jump, th.tensor([False]))
+
     def test_dataset_loading_preserves_expert_ego_touch_timing(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._min_len = 30
         replays.minimum_remaining_frames = 1
         demo = np.zeros((30, 161), dtype=np.float32)
         demo[7, -5] = 1.0
-        loaded, _ = replays._filter(demo, np.zeros(30, dtype=bool))[0]
+        loaded, _, _ = replays._filter(demo, np.zeros(30, dtype=bool))[0]
         replays._replays = loaded
         replays._cursors = th.tensor([7])
         replays._demo_id = th.tensor([0])
@@ -464,7 +556,7 @@ class TrackerTest(unittest.TestCase):
         demo = np.zeros((12, 161), dtype=np.float32)
         demo[0, -5] = 1.0
 
-        _, start_map = replays._filter(demo, np.zeros(12, dtype=bool))[0]
+        _, start_map, _ = replays._filter(demo, np.zeros(12, dtype=bool))[0]
 
         self.assertEqual(start_map[0].item(), 2)
 
@@ -830,6 +922,10 @@ class TrackerTest(unittest.TestCase):
             cursor = 1
             goal_size = INTERNAL_STATE_SIZE + len(DEFAULT_TRACKER_WINDOWS) * GOAL_STATE_SIZE
 
+            @staticmethod
+            def current_jump_supervision(offset=0):
+                return th.zeros(1, dtype=th.long), th.zeros(1, dtype=th.bool)
+
             def current_ego_touch(self, offset=0):
                 events.append(("touch", self.cursor + offset))
                 return th.tensor([False])
@@ -916,6 +1012,10 @@ class TrackerTest(unittest.TestCase):
             goal_size = INTERNAL_STATE_SIZE + 7 * GOAL_STATE_SIZE
 
             @staticmethod
+            def current_jump_supervision(offset=0):
+                return th.zeros(2, dtype=th.long), th.zeros(2, dtype=th.bool)
+
+            @staticmethod
             def next_goals(obs, mask=None):
                 count = len(obs)
                 return th.nn.functional.pad(obs, (0, goal_size)), th.zeros(
@@ -992,7 +1092,7 @@ class TrackerTest(unittest.TestCase):
         )
         demo[3, -5] = 1.0
 
-        loaded, _ = replays._filter(demo, np.zeros(10, dtype=bool))[0]
+        loaded, _, _ = replays._filter(demo, np.zeros(10, dtype=bool))[0]
 
         self.assertEqual(loaded.shape[1], STORED_REPLAY_SIZE)
         np.testing.assert_array_equal(
@@ -1020,7 +1120,7 @@ class TrackerTest(unittest.TestCase):
         demo[:, opponent] = 2.0
         demo[4, -5] = 1.0
 
-        loaded, _ = replays._filter(demo, np.zeros(10, dtype=bool))[0]
+        loaded, _, _ = replays._filter(demo, np.zeros(10, dtype=bool))[0]
 
         np.testing.assert_array_equal(
             loaded[:, OPPONENT_STATE_INDEX:].numpy(), demo[:, opponent]

@@ -62,6 +62,9 @@ CONTROL_STATE_SIZE = GOAL_STATE_SIZE + OPPONENT_STATE_SIZE
 INTERNAL_STATE_SIZE = 19
 EXPERT_TOUCH_INDEX = GOAL_STATE_SIZE + INTERNAL_STATE_SIZE
 ACTION_FACTORS = 7
+JUMP_ACTION_FACTOR = 6
+RAW_JUMP_INDEX = 5
+RAW_ACTION_SIZE = 8
 OPPONENT_STATE_INDEX = EXPERT_TOUCH_INDEX + 1
 STORED_REPLAY_SIZE = OPPONENT_STATE_INDEX + OPPONENT_STATE_SIZE
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
@@ -292,23 +295,30 @@ class ExpertGoalStates:
         modes:      list[int] = []
         names:      list[str] = []
         start_maps: list[th.Tensor] = []
+        actions: list[th.Tensor] = []
         total = 0
+        all_have_actions = True
 
         self._min_len = max(30, minimum_remaining_frames + 1)
 
         for path in sorted(Path(replay_dir).rglob("*.npy")):
             source = np.load(path, mmap_mode="r")
             replay_cars = self._infer_n_cars(source.shape[1])
+            raw_actions = self._load_expert_actions(path, len(source))
+            if raw_actions is None:
+                all_have_actions = False
             demos = self._filter(
                 source,
                 self._unsafe_mask(path, source),
+                raw_actions,
             )
 
-            replays.extend(demo for demo, _ in demos)
-            start_maps.extend(start_map for _, start_map in demos)
+            replays.extend(demo for demo, _, _ in demos)
+            start_maps.extend(start_map for _, start_map, _ in demos)
+            actions.extend(action for _, _, action in demos)
             modes.extend([replay_cars // 2] * len(demos))
             names.extend([path.stem] * len(demos))
-            total += sum(len(demo) for demo, _ in demos)
+            total += sum(len(demo) for demo, _, _ in demos)
 
             if obs_limit is not None and total >= obs_limit:
                 break
@@ -317,6 +327,7 @@ class ExpertGoalStates:
             raise ValueError(
                 "no replay segments satisfy the minimum remaining frame requirement"
             )
+        self._has_expert_actions = all_have_actions
 
         lengths = th.tensor([len(r) for r in replays], device=device)
 
@@ -324,6 +335,7 @@ class ExpertGoalStates:
         self._demo_id = th.zeros(n_env, device=device).long()
         self._windows = th.tensor(windows).to(device)[None, :]
         self._replays = th.concat(replays).to(device)
+        self._raw_actions = th.concat(actions).to(device)
         self._modes = th.tensor(modes, device=device)
         self._mode_demo_ids = tuple(
             (self._modes == mode).nonzero(as_tuple=True)[0]
@@ -390,6 +402,28 @@ class ExpertGoalStates:
     def n_demos(self) -> int:
         return self._n_demos
 
+    @property
+    def has_expert_actions(self) -> bool:
+        return self._has_expert_actions
+
+    @staticmethod
+    def _load_expert_actions(path: Path, length: int) -> np.ndarray | None:
+        action_path = path.with_suffix(".actions.npz")
+        if not action_path.exists():
+            return None
+        with np.load(action_path) as stored_actions:
+            if "raw" not in stored_actions:
+                raise ValueError(f"expert actions for {path.name} have no raw array")
+            raw_actions = np.asarray(stored_actions["raw"], dtype=np.float32)
+        if raw_actions.shape != (length, RAW_ACTION_SIZE):
+            raise ValueError(
+                f"expert actions for {path.name} have shape {raw_actions.shape}, "
+                f"expected {(length, RAW_ACTION_SIZE)}"
+            )
+        if not np.isfinite(raw_actions).all():
+            raise ValueError(f"expert actions for {path.name} contain non-finite values")
+        return raw_actions
+
     def current_demo_ids(self) -> th.Tensor:
         return self._demo_id.clone()
 
@@ -428,9 +462,12 @@ class ExpertGoalStates:
         self,
         demo:   np.ndarray,
         unsafe: np.ndarray,
-    ) -> list[tuple[th.Tensor, th.Tensor]]:
+        raw_actions: np.ndarray | None = None,
+    ) -> list[tuple[th.Tensor, th.Tensor, th.Tensor]]:
         n_cars = self._infer_n_cars(demo.shape[1])
         internal_start = 83 + 27 * n_cars
+        if raw_actions is None:
+            raw_actions = np.zeros((len(demo), RAW_ACTION_SIZE), dtype=np.float32)
         opponent_start = 9 + (n_cars // 2) * CAR_STATE_SIZE
         opponent_end = opponent_start + OPPONENT_STATE_SIZE
         observation = np.concatenate((
@@ -449,7 +486,7 @@ class ExpertGoalStates:
         invalid[1:] |= invalid_events[:-1]
         invalid[:-1] |= invalid_events[1:]
 
-        demos: list[tuple[th.Tensor, th.Tensor]] = []
+        demos: list[tuple[th.Tensor, th.Tensor, th.Tensor]] = []
         start = 0
 
         for end in np.append(np.flatnonzero(invalid), len(demo)):
@@ -468,6 +505,7 @@ class ExpertGoalStates:
                 demos.append((
                     th.from_numpy(observation[start:end].copy()),
                     th.from_numpy(start_map),
+                    th.from_numpy(raw_actions[start:end].copy()),
                 ))
 
             start = end + 1
@@ -590,6 +628,20 @@ class ExpertGoalStates:
             indices,
             OPPONENT_STATE_INDEX:OPPONENT_STATE_INDEX + OPPONENT_STATE_SIZE,
         ]
+
+    def current_jump_supervision(
+        self,
+        offset: int = 0,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        starts = self._offsets[self._demo_id]
+        indices = (self._cursors + offset).maximum(starts)
+        previous_indices = (indices - 1).maximum(starts)
+        jump = self._raw_actions[indices, RAW_JUMP_INDEX].ge(0.5)
+        previous_jump = self._raw_actions[previous_indices, RAW_JUMP_INDEX].ge(0.5)
+        internal = self._replays[indices, GOAL_STATE_SIZE:EXPERT_TOUCH_INDEX]
+        airborne_after_first_jump = ~internal[:, 0].bool() & internal[:, 3].bool()
+        second_jump = jump & ~previous_jump & airborne_after_first_jump
+        return jump.long(), second_jump
 
     def current_demo_name(self) -> str:
         return self._demo_names[self._demo_id[0].item()]
@@ -796,6 +848,8 @@ class ExpertLookaheadEnv:
         self._low_reward_frames = th.zeros(env.n_envs, dtype=th.long, device=env.device)
         self._ball_anchored = th.ones(env.n_sim, dtype=th.bool, device=env.device)
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
+        self.last_expert_jump: th.Tensor | None = None
+        self.last_expert_second_jump: th.Tensor | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size
 
@@ -892,6 +946,10 @@ class ExpertLookaheadEnv:
         )
 
     def step(self, action: th.Tensor | np.ndarray):
+        (
+            self.last_expert_jump,
+            self.last_expert_second_jump,
+        ) = self.replays.current_jump_supervision(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
         obs = self._anchor_ball(obs, native)
@@ -1003,6 +1061,139 @@ class StatelessCriticCapture(CaptureBase):
             "baseline_value": self.critic.value(context.observation),
             "baseline_next_value": self.critic.value(next_observation),
         }
+
+
+class ExpertJumpCapture(CaptureBase):
+    def __init__(self, env: ExpertLookaheadEnv) -> None:
+        self.env = env
+
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        jump = self.env.last_expert_jump
+        second_jump = self.env.last_expert_second_jump
+        if jump is None or second_jump is None:
+            raise RuntimeError("environment did not expose expert jump controls")
+        return {
+            "expert_jump": jump,
+            "expert_second_jump": second_jump,
+        }
+
+
+def _expert_jump_loss(
+    logits: th.Tensor,
+    action_mask: th.Tensor,
+    expert_jump: th.Tensor,
+    expert_second_jump: th.Tensor,
+    sequence_valid: th.Tensor,
+    sizes: Sequence[int],
+    second_jump_weight: float,
+) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+    jump_logits = logits.split(tuple(sizes), dim=-1)[JUMP_ACTION_FACTOR]
+    jump_mask = action_mask.split(tuple(sizes), dim=-1)[JUMP_ACTION_FACTOR]
+    target = expert_jump.long()
+    target_legal = jump_mask.gather(-1, target[..., None]).squeeze(-1)
+    valid = sequence_valid & target_legal
+    if not valid.any():
+        zero = logits.sum() * 0
+        return zero, logits.new_zeros(()), logits.new_zeros(()), logits.new_zeros(())
+
+    masked_logits = jump_logits.masked_fill(
+        ~jump_mask,
+        th.finfo(jump_logits.dtype).min,
+    ).float()
+    per_step = nn.functional.cross_entropy(
+        masked_logits[valid],
+        target[valid],
+        reduction="none",
+    )
+    second_jump = expert_second_jump.bool() & valid
+    weights = th.where(
+        second_jump[valid],
+        per_step.new_full((), second_jump_weight),
+        per_step.new_ones(()),
+    )
+    prediction = masked_logits.argmax(-1)
+    accuracy = (prediction[valid] == target[valid]).float().mean()
+    second_jump_recall = (
+        prediction[second_jump].eq(1).float().mean()
+        if second_jump.any()
+        else logits.new_zeros(())
+    )
+    return (
+        (per_step * weights).sum() / weights.sum(),
+        accuracy,
+        second_jump_recall,
+        second_jump.float().mean(),
+    )
+
+
+class ExpertJumpPPOLoss(PPOLoss):
+    def __init__(
+        self,
+        policy: MultiCategoricalPolicy,
+        critic: Critic,
+        config: PPOConfig,
+        weight: float,
+        second_jump_weight: float,
+    ) -> None:
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("jump imitation weight must be finite and nonnegative")
+        if not math.isfinite(second_jump_weight) or second_jump_weight < 1:
+            raise ValueError("second jump weight must be finite and at least one")
+        super().__init__(policy, critic, config)
+        self.weight = weight
+        self.second_jump_weight = second_jump_weight
+        self._expert_logits: th.Tensor | None = None
+
+    def _evaluate(self, batch, state, critic_state, reset):
+        observation = batch["observation"]
+        features, _ = self.policy.body_features(observation, state, reset)
+        evaluation = self.policy.evaluate_from_features(
+            features,
+            observation,
+            batch["action"],
+        )
+        self._expert_logits = self.policy.head(features)
+
+        value = evaluation.value
+        if value is None:
+            if self.critic_recurrent:
+                if critic_state is None:
+                    raise ValueError("recurrent critic requires an initial state")
+                value = self.critic.evaluate_values(
+                    observation,
+                    critic_state,
+                    reset=reset,
+                )
+            else:
+                value = self.critic.evaluate_values(observation)
+        return evaluation, value
+
+    def __call__(self, sample: TensorBatch) -> LossOutput:
+        output = super().__call__(sample)
+        batch, _, _, _, sequence_valid = self._unpack_sample(sample)
+        logits = self._expert_logits
+        if logits is None:
+            raise RuntimeError("PPO evaluation did not expose tracker logits")
+        jump_loss, accuracy, second_jump_recall, second_jump_rate = (
+            _expert_jump_loss(
+                logits,
+                self.policy.action_codec.mask(batch["observation"]),
+                batch["expert_jump"],
+                batch["expert_second_jump"],
+                sequence_valid,
+                self.policy.sizes,
+                self.second_jump_weight,
+            )
+        )
+        return LossOutput(
+            output.loss + self.weight * jump_loss,
+            output.metrics | {
+                "jump_imitation_loss": jump_loss,
+                "jump_accuracy": accuracy,
+                "second_jump_recall": second_jump_recall,
+                "second_jump_sample_rate": second_jump_rate,
+            },
+        )
 
 
 class TrackerDiscriminator(nn.Module):
@@ -1223,6 +1414,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-final",                type=float, default=1e-5)
     parser.add_argument("--entropy-coef",            type=float, default=1e-3)
     parser.add_argument("--entropy-coef-final",      type=float, default=1e-4)
+    parser.add_argument("--jump-imitation-weight",   type=float, default=0.0)
+    parser.add_argument("--second-jump-weight",      type=float, default=8.0)
     parser.add_argument("--discriminator-weight",    type=float, default=0.0)
     parser.add_argument("--discriminator-window",    type=int,   default=8)
     parser.add_argument("--discriminator-feature-size", type=int, default=128)
@@ -1306,6 +1499,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--hard-negative-fraction must be in [0, 1]")
     if not math.isfinite(args.tracking_progress_scale) or args.tracking_progress_scale < 0:
         raise ValueError("--tracking-progress-scale must be finite and nonnegative")
+    if not math.isfinite(args.jump_imitation_weight) or args.jump_imitation_weight < 0:
+        raise ValueError("--jump-imitation-weight must be finite and nonnegative")
+    if not math.isfinite(args.second_jump_weight) or args.second_jump_weight < 1:
+        raise ValueError("--second-jump-weight must be finite and at least one")
     if not math.isfinite(args.discriminator_weight) or args.discriminator_weight < 0:
         raise ValueError("--discriminator-weight must be finite and nonnegative")
     if args.discriminator_weight > 0:
@@ -1353,6 +1550,10 @@ def main() -> None:
         frame_skip=args.frameskip,
         minimum_remaining_frames=args.minimum_remaining_frames,
     )
+    if args.jump_imitation_weight > 0 and not replays.has_expert_actions:
+        raise ValueError(
+            "--jump-imitation-weight requires expert .actions.npz files"
+        )
     env = ExpertLookaheadEnv(
         base_env,
         replays,
@@ -1396,6 +1597,8 @@ def main() -> None:
             "gae_lambda": args.gae_lambda,
             "learning_rate": [args.lr, args.lr_final],
             "entropy_coef": [args.entropy_coef, args.entropy_coef_final],
+            "jump_imitation_weight": args.jump_imitation_weight,
+            "second_jump_weight": args.second_jump_weight,
             "clip": [args.clip, args.clip_final],
             "schedule_timesteps": args.schedule_timesteps,
             "rollout": args.rollout,
@@ -1448,6 +1651,8 @@ def main() -> None:
             LogProbCapture(),
             StatelessCriticCapture(critic),
         )
+        if args.jump_imitation_weight > 0:
+            captures += (ExpertJumpCapture(env),)
         if discriminator is not None:
             captures += (
                 DiscriminatorWindowCapture(args.discriminator_window, env.device),
@@ -1461,15 +1666,21 @@ def main() -> None:
 
         actor_optimizer = Adam(policy.parameters(), lr=args.lr)
         critic_optimizer = Adam(critic.parameters(), lr=args.lr)
-        ppo_loss = PPOLoss(
-            policy,
-            critic,
-            PPOConfig(
-                clip=args.clip,
-                value_clip=None,
-                entropy_coef=args.entropy_coef,
-            ),
+        ppo_config = PPOConfig(
+            clip=args.clip,
+            value_clip=None,
+            entropy_coef=args.entropy_coef,
         )
+        if args.jump_imitation_weight > 0:
+            ppo_loss = ExpertJumpPPOLoss(
+                policy,
+                critic,
+                ppo_config,
+                weight=args.jump_imitation_weight,
+                second_jump_weight=args.second_jump_weight,
+            )
+        else:
+            ppo_loss = PPOLoss(policy, critic, ppo_config)
         transforms = (GAE(gamma=args.gamma, lambda_=args.gae_lambda),)
         if discriminator is not None:
             transforms = (
