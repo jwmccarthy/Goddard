@@ -196,21 +196,6 @@ def factor_actions(logits: th.Tensor) -> th.Tensor:
     )
 
 
-def encode_action_factors(action: th.Tensor) -> th.Tensor:
-    """Convert a [..., 7] tensor of categorical action factors into a
-    [..., ACTION_DIM] one-hot float tensor.
-    """
-    return th.cat(
-        [
-            nn.functional.one_hot(
-                action[..., index].long(), num_classes=size
-            ).float()
-            for index, size in enumerate(ACTION_SIZES)
-        ],
-        dim=-1,
-    )
-
-
 def exact_action_accuracy(
     logits: th.Tensor,
     target: th.Tensor,

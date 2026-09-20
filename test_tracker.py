@@ -31,9 +31,6 @@ from tracker import (
     OPPONENT_STATE_SIZE,
     PHC_TRACKER_ARCHITECTURE,
     POSITION_SCALE,
-    RAW_ACTION_INDEX,
-    RAW_ACTION_SIZE,
-    RAW_JUMP_INDEX,
     RoutedTrackerPolicy,
     SegmentScores,
     StatelessCriticCapture,
@@ -52,7 +49,6 @@ from tracker import (
     specialist_assignments,
     validated_replay_assignments,
     validate_args,
-    _expert_jump_loss,
 )
 
 
@@ -83,8 +79,6 @@ class TrackerTest(unittest.TestCase):
             lr_final=1e-5,
             entropy_coef=1e-3,
             entropy_coef_final=1e-4,
-            jump_imitation_weight=0.1,
-            second_jump_weight=8.0,
             clip=0.2,
             clip_final=0.1,
             max_grad_norm=0.5,
@@ -128,40 +122,6 @@ class TrackerTest(unittest.TestCase):
         args.timesteps = 6_000_001
         with self.assertRaisesRegex(ValueError, "divisible"):
             validate_args(args)
-
-    def test_detects_airborne_second_jump_press_edges(self):
-        replays = ExpertGoalStates.__new__(ExpertGoalStates)
-        replays._replays = th.zeros((3, STORED_REPLAY_SIZE))
-        replays._offsets = th.tensor([0, 3])
-        replays._demo_id = th.tensor([0])
-        replays._cursors = th.tensor([2])
-        replays._replays[1, GOAL_STATE_SIZE + 3] = 1
-        replays._replays[1, RAW_ACTION_INDEX + RAW_JUMP_INDEX] = 1
-
-        jump, second_jump = replays.current_jump_supervision(offset=-1)
-
-        th.testing.assert_close(jump, th.tensor([1]))
-        th.testing.assert_close(second_jump, th.tensor([True]))
-
-    def test_jump_imitation_loss_upweights_second_jump_edges(self):
-        logits = th.zeros((2, sum(ACTION_NVECS)))
-        logits[1, -1] = 5
-        logits.requires_grad_()
-
-        loss, accuracy, recall, sample_rate = _expert_jump_loss(
-            logits,
-            th.ones_like(logits, dtype=th.bool),
-            th.tensor([0, 1]),
-            th.tensor([False, True]),
-            th.tensor([True, True]),
-            ACTION_NVECS,
-            second_jump_weight=8.0,
-        )
-
-        self.assertLess(loss.item(), np.log(2))
-        self.assertEqual(accuracy.item(), 1.0)
-        self.assertEqual(recall.item(), 1.0)
-        self.assertEqual(sample_rate.item(), 0.5)
 
     def test_learning_rate_schedule_updates_all_optimizers(self):
         actor = th.nn.Linear(2, 2)
@@ -848,14 +808,6 @@ class TrackerTest(unittest.TestCase):
             cursor = 1
             goal_size = INTERNAL_STATE_SIZE + len(DEFAULT_TRACKER_WINDOWS) * GOAL_STATE_SIZE
 
-            def current_raw_action(self, offset=0):
-                events.append(("raw_action", self.cursor + offset))
-                return th.full((1, 8), float(self.cursor + offset))
-
-            @staticmethod
-            def current_jump_supervision(offset=0):
-                return th.zeros(1, dtype=th.long), th.zeros(1, dtype=th.bool)
-
             def current_ego_touch(self, offset=0):
                 events.append(("touch", self.cursor + offset))
                 return th.tensor([False])
@@ -889,7 +841,6 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("raw_action", 0),
                 ("touch", 1),
                 ("touch", 2),
                 ("current", 1),
@@ -897,7 +848,6 @@ class TrackerTest(unittest.TestCase):
             ],
         )
         self.assertEqual(wrapper.replays.cursor, 2)
-        th.testing.assert_close(wrapper.last_raw_expert_action, th.zeros((1, 8)))
 
     def test_native_final_observation_padding_defers_action_hints(self):
         wrapper = ExpertLookaheadEnv.__new__(ExpertLookaheadEnv)
@@ -944,14 +894,6 @@ class TrackerTest(unittest.TestCase):
             goal_size = INTERNAL_STATE_SIZE + 7 * GOAL_STATE_SIZE
 
             @staticmethod
-            def current_raw_action(offset=0):
-                return th.zeros((2, 8))
-
-            @staticmethod
-            def current_jump_supervision(offset=0):
-                return th.zeros(2, dtype=th.long), th.zeros(2, dtype=th.bool)
-
-            @staticmethod
             def next_goals(obs, mask=None):
                 count = len(obs)
                 return th.nn.functional.pad(obs, (0, goal_size)), th.zeros(
@@ -987,21 +929,6 @@ class TrackerTest(unittest.TestCase):
         th.testing.assert_close(captured["baseline_value"], th.tensor([3.0]))
         th.testing.assert_close(captured["baseline_next_value"], th.tensor([7.0]))
 
-    def test_demonstration_frame_includes_raw_expert_actions(self):
-        raw_expert_action = th.tensor([[0.25, -0.5, 0.75, 1.0, 0.0, 1.0, 0.0, 1.0]])
-
-        frame = frame_from_state(
-            th.zeros(31),
-            Path("tracker.pt"),
-            th.tensor([1.0]),
-            th.zeros(GOAL_STATE_SIZE),
-            "demo",
-            th.zeros((1, ACTION_FACTORS)),
-            raw_expert_action,
-        )
-
-        self.assertEqual(frame["raw_expert_action"], raw_expert_action[0].tolist())
-
     def test_watcher_publishes_expert_row_matching_eager_replay_cursor(self):
         class Replays:
             @staticmethod
@@ -1026,7 +953,6 @@ class TrackerTest(unittest.TestCase):
                 Path("tracker.pt"),
                 th.zeros(1),
                 th.zeros((1, ACTION_FACTORS)),
-                th.zeros((1, 8)),
             )
 
         self.assertEqual(viewer.frame["demo"], "demo")
@@ -1043,10 +969,8 @@ class TrackerTest(unittest.TestCase):
             np.arange(INTERNAL_STATE_SIZE) + 200
         )
         demo[3, -5] = 1.0
-        raw_actions = np.zeros((10, RAW_ACTION_SIZE), dtype=np.float32)
-        raw_actions[:] = np.arange(RAW_ACTION_SIZE) + 300
 
-        loaded, _ = replays._filter(demo, np.zeros(10, dtype=bool), raw_actions)[0]
+        loaded, _ = replays._filter(demo, np.zeros(10, dtype=bool))[0]
 
         self.assertEqual(loaded.shape[1], STORED_REPLAY_SIZE)
         np.testing.assert_array_equal(
@@ -1058,10 +982,6 @@ class TrackerTest(unittest.TestCase):
             demo[:, internal_start:internal_start + INTERNAL_STATE_SIZE],
         )
         np.testing.assert_array_equal(loaded[:, EXPERT_TOUCH_INDEX].numpy(), demo[:, -5])
-        np.testing.assert_array_equal(
-            loaded[:, RAW_ACTION_INDEX:RAW_ACTION_INDEX + RAW_ACTION_SIZE].numpy(),
-            raw_actions,
-        )
         np.testing.assert_array_equal(
             loaded[:, OPPONENT_STATE_INDEX:].numpy(),
             demo[:, GOAL_STATE_SIZE:CONTROL_STATE_SIZE],
@@ -1078,11 +998,7 @@ class TrackerTest(unittest.TestCase):
         demo[:, opponent] = 2.0
         demo[4, -5] = 1.0
 
-        loaded, _ = replays._filter(
-            demo,
-            np.zeros(10, dtype=bool),
-            np.zeros((10, RAW_ACTION_SIZE), dtype=np.float32),
-        )[0]
+        loaded, _ = replays._filter(demo, np.zeros(10, dtype=bool))[0]
 
         np.testing.assert_array_equal(
             loaded[:, OPPONENT_STATE_INDEX:].numpy(), demo[:, opponent]

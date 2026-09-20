@@ -120,7 +120,6 @@ def frame_from_state(
     expert:     th.Tensor,
     demo_name:  str,
     action:     th.Tensor,
-    raw_expert_action: th.Tensor,
 ) -> dict:
     cars = state[9:31].view(1, 22)
     rendered = []
@@ -150,7 +149,6 @@ def frame_from_state(
         "demo":       demo_name,
         "reward":     reward.cpu().tolist(),
         "action":     action[0].cpu().tolist(),
-        "raw_expert_action": raw_expert_action[0].cpu().tolist(),
         "ball":       {"pos": state[:3].cpu().tolist()},
         "cars":       rendered,
         "expert":     frame_from_expert(expert),
@@ -164,7 +162,6 @@ def publish_frame(
     checkpoint: Path,
     reward:     th.Tensor,
     action:     th.Tensor,
-    raw_expert_action: th.Tensor,
 ) -> None:
     th.cuda.synchronize(base.device)
     raw = th.from_dlpack(base._env.get_state()).clone()[0]
@@ -176,7 +173,6 @@ def publish_frame(
         expert,
         replays.current_demo_name(),
         action,
-        raw_expert_action,
     ))
 
 
@@ -220,7 +216,6 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
         policy_state = policy.initial_state(1)
         checkpoint_mtime = checkpoint.stat().st_mtime_ns
         observation = env.reset()
-        empty_raw_expert_action = th.zeros((1, 8), device=env.device)
         publish_frame(
             viewer,
             base,
@@ -228,7 +223,6 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
             checkpoint,
             th.zeros(1, device=env.device),
             th.zeros((1, 7), device=env.device),
-            empty_raw_expert_action,
         )
         viewer.stop.wait(viewer.frame_time(args.frameskip))
         next_step = time.perf_counter()
@@ -252,7 +246,6 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     checkpoint,
                     th.zeros(1, device=env.device),
                     th.zeros((1, 7), device=env.device),
-                    empty_raw_expert_action,
                 )
                 viewer.stop.wait(viewer.frame_time(args.frameskip))
                 next_step = time.perf_counter()
@@ -273,7 +266,6 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     checkpoint,
                     th.zeros(1, device=env.device),
                     th.zeros((1, 7), device=env.device),
-                    empty_raw_expert_action,
                 )
                 viewer.stop.wait(viewer.frame_time(args.frameskip))
                 next_step = time.perf_counter()
@@ -293,14 +285,9 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                     policy_state = policy_state.clone()
                     policy_state[done] = 0
 
-            if env.last_raw_expert_action is None:
-                raise RuntimeError("tracker environment did not expose raw expert actions")
             if done.any():
                 reward = th.zeros_like(reward)
                 action = th.zeros_like(action)
-                raw_expert_action = empty_raw_expert_action
-            else:
-                raw_expert_action = env.last_raw_expert_action
             publish_frame(
                 viewer,
                 base,
@@ -308,7 +295,6 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                 checkpoint,
                 reward,
                 action,
-                raw_expert_action,
             )
 
             next_step += viewer.frame_time(args.frameskip)

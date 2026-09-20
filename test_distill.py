@@ -23,7 +23,6 @@ from distill import (
     PulsePolicy,
     categorical_distillation_loss,
     diagonal_gaussian_kl,
-    encode_action_factors,
     exact_action_accuracy,
     factor_actions,
     kl_coefficient,
@@ -155,14 +154,6 @@ class CategoricalDistillationLossTest(unittest.TestCase):
         logits[1, 10] = 10.0
 
         self.assertAlmostEqual(exact_action_accuracy(logits, target).item(), 2 / 3)
-
-    def test_action_factors_round_trip_through_one_hot(self):
-        action = th.tensor([[0, 1, 2, 0, 1, 0, 1]])
-
-        encoded = encode_action_factors(action)
-
-        self.assertEqual(encoded.shape, (1, sum(ACTION_SIZES)))
-        self.assertEqual(factor_actions(encoded).tolist(), action.tolist())
 
     def test_masked_logits_blocks_illegal_actions(self):
         logits = th.zeros(1, sum(ACTION_SIZES))
