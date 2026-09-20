@@ -685,7 +685,7 @@ class TrackingReward:
     ) -> th.Tensor:
         actual_ego = actual.cars.ego
         target_ego = target.cars.ego
-        start = self.replays.origin()[:, 9:GOAL_STATE_SIZE]
+        start = self.replays.origin()[:, 9:12]
 
         car_position_error = (
             (actual_ego.position - start) - (target_ego.position - start)
