@@ -21,7 +21,6 @@ from carl.gymnasium import CARLObservation
 from carl.gymnasium.state import RewardContext
 from jarl.collect import (
     LogProbCapture,
-    RecurrentStateCapture,
     Runner,
 )
 from jarl.collect.capture import CaptureBase, CaptureContext
@@ -37,12 +36,12 @@ from jarl.learn import (
     Update,
 )
 from jarl.log.logger import Logger
-from jarl.modules import GRU, MLP
+from jarl.modules import MLP
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
-from jarl.sample import RecurrentRolloutMinibatches, SequenceBatch
+from jarl.sample import RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
@@ -71,8 +70,8 @@ OPPONENT_STATE_INDEX = RAW_ACTION_INDEX + RAW_ACTION_SIZE
 STORED_REPLAY_SIZE = OPPONENT_STATE_INDEX + OPPONENT_STATE_SIZE
 DEFAULT_TRACKER_WINDOWS = (1, 2, 4, 8, 16, 32, 64)
 TRACKER_FEATURE_SIZE = 512
-TRACKER_ARCHITECTURE = "categorical-all-gru-v3"
-PHC_TRACKER_ARCHITECTURE = "categorical-phc-gru-v3"
+TRACKER_ARCHITECTURE = "categorical-all-mlp-v4"
+PHC_TRACKER_ARCHITECTURE = "categorical-phc-mlp-v4"
 
 
 class SegmentScores:
@@ -127,7 +126,7 @@ def build_tracker_policy(
 ) -> MultiCategoricalPolicy:
     return MultiCategoricalPolicy(
         foot=LinearEncoder(TRACKER_FEATURE_SIZE, func=nn.SiLU),
-        body=GRU(hidden_size=TRACKER_FEATURE_SIZE),
+        body=MLP(dims=[TRACKER_FEATURE_SIZE, TRACKER_FEATURE_SIZE], func=nn.SiLU),
         head=MLP(dims=[]),
         action_codec=env.action_codec,
     ).build(env).to(env.device)
@@ -215,7 +214,7 @@ def load_tracker_policy(
     architecture = config.get("architecture") if isinstance(config, dict) else None
     if architecture not in (TRACKER_ARCHITECTURE, PHC_TRACKER_ARCHITECTURE):
         raise RuntimeError(
-            "legacy tracker checkpoint is incompatible with the recurrent "
+            "legacy tracker checkpoint is incompatible with the feed-forward "
             "tracker architecture; retrain the tracker"
         )
     if tuple(config.get("windows", ())) != tuple(windows):
@@ -1395,7 +1394,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout",                 type=int,   default=128)
     parser.add_argument("--batch-size",              type=int,   default=16_384)
     parser.add_argument("--epochs",                  type=int,   default=4)
-    parser.add_argument("--sequence-length",         type=int,   default=64)
     parser.add_argument("--lr",                      type=float, default=1e-4)
     parser.add_argument("--lr-final",                type=float, default=1e-5)
     parser.add_argument("--entropy-coef",            type=float, default=1e-3)
@@ -1456,16 +1454,11 @@ def validate_args(args: argparse.Namespace) -> None:
         "rollout",
         "batch_size",
         "epochs",
-        "sequence_length",
         "timesteps",
         "stage_timesteps",
     ):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.sequence_length > args.rollout:
-        raise ValueError("--sequence-length cannot exceed --rollout")
-    if args.batch_size < args.sequence_length:
-        raise ValueError("--batch-size must fit at least one sequence")
     if args.schedule_timesteps < 1:
         raise ValueError("--schedule-timesteps must be positive")
     if args.timesteps % args.stage_timesteps:
@@ -1590,7 +1583,6 @@ def main() -> None:
             "rollout": args.rollout,
             "batch_size": args.batch_size,
             "epochs": args.epochs,
-            "sequence_length": args.sequence_length,
             "minimum_tracking_frames": args.minimum_tracking_frames,
             "tracking_progress_scale": args.tracking_progress_scale,
             "max_grad_norm": args.max_grad_norm,
@@ -1636,7 +1628,6 @@ def main() -> None:
         )
         captures = (
             LogProbCapture(),
-            RecurrentStateCapture(),
             StatelessCriticCapture(critic),
             ExpertJumpCapture(env),
         )
@@ -1673,21 +1664,7 @@ def main() -> None:
             ) + transforms
         update = Update(
             transforms=transforms,
-            sampler=RecurrentRolloutMinibatches(
-                sequence_length=args.sequence_length,
-                sequences_per_batch=max(1, args.batch_size // args.sequence_length),
-                epochs=args.epochs,
-                fields=(
-                    "observation",
-                    "action",
-                    "advantage",
-                    "old_log_prob",
-                    "baseline_value",
-                    "returns",
-                    "expert_jump",
-                    "expert_second_jump",
-                ),
-            ),
+            sampler=RolloutMinibatches(args.batch_size, args.epochs),
             loss=ppo_loss,
             optimizer_step=IndependentOptimizerSteps(
                 OptimizerStep(policy, actor_optimizer, max_grad_norm=args.max_grad_norm),

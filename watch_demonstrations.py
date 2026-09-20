@@ -289,7 +289,7 @@ def simulate(viewer: ViewerState, args: argparse.Namespace) -> None:
                 policy_state = policy_output.next_state
                 observation, reward, term, trunc, _ = env.step(action)
                 done = term | trunc
-                if done.any():
+                if done.any() and policy_state is not None:
                     policy_state = policy_state.clone()
                     policy_state[done] = 0
 

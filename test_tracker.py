@@ -73,7 +73,6 @@ class TrackerTest(unittest.TestCase):
             rollout=64,
             batch_size=16_384,
             epochs=4,
-            sequence_length=64,
             timesteps=6_000_000,
             stage_timesteps=1_000_000,
             hard_negative_fraction=0.8,
