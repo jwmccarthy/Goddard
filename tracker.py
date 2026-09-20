@@ -1155,7 +1155,7 @@ class ExpertJumpPPOLoss(PPOLoss):
                 value = self.critic.evaluate_values(observation)
         return evaluation, value
 
-    def __call__(self, sample: TensorBatch | SequenceBatch) -> LossOutput:
+    def __call__(self, sample: TensorBatch) -> LossOutput:
         output = super().__call__(sample)
         batch, _, _, _, sequence_valid = self._unpack_sample(sample)
         logits = self._expert_logits
