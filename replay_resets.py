@@ -31,7 +31,7 @@ def load_demonstration_reset_dataset(
     rows = []
     paths = []
 
-    for path in sorted(replay_dir.glob("*.npy")):
+    for path in sorted(replay_dir.rglob("*.npy")):
         source = np.load(path, mmap_mode="r")
         if source.ndim == 2 and source.shape[1] == 161:
             paths.append(path)

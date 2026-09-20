@@ -301,7 +301,7 @@ class ExpertGoalStates:
 
         self._min_len = max(30, minimum_remaining_frames + 1)
 
-        for path in sorted(Path(replay_dir).glob("*.npy")):
+        for path in sorted(Path(replay_dir).rglob("*.npy")):
             source = np.load(path, mmap_mode="r")
             replay_cars = self._infer_n_cars(source.shape[1])
             action_path = path.with_suffix(".actions.npz")
