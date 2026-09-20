@@ -764,17 +764,41 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(environment.calls, [])
         self.assertIs(returned, observation)
 
-    def test_expert_touch_keeps_the_ball_anchored(self):
-        wrapper, environment, observation = self._anchor_fixture()
+    def test_missed_expert_touch_releases_without_applying_expert_impulse(self):
+        wrapper, environment, observation = self._anchor_fixture(
+            expert_touch=True
+        )
 
-        anchored = wrapper._anchor_ball(observation, th.tensor([False]))
+        returned = wrapper._anchor_ball(observation, th.tensor([False]))
 
-        self.assertTrue(wrapper._ball_anchored.item())
-        self.assertEqual(len(environment.calls), 1)
-        position, velocity, angular_velocity, indices = environment.calls[0]
-        th.testing.assert_close(position, th.tensor([[410.8, 1200.0, 622.8]]))
-        th.testing.assert_close(indices, th.tensor([0]))
-        th.testing.assert_close(anchored, th.ones_like(observation))
+        self.assertFalse(wrapper._ball_anchored.item())
+        self.assertEqual(environment.calls, [])
+        self.assertIs(returned, observation)
+
+    def test_upcoming_expert_touch_releases_before_replay_impulse(self):
+        wrapper, environment, observation = self._anchor_fixture(
+            upcoming_expert_touch=True
+        )
+
+        returned = wrapper._anchor_ball(observation, th.tensor([False]))
+
+        self.assertFalse(wrapper._ball_anchored.item())
+        self.assertEqual(environment.calls, [])
+        self.assertIs(returned, observation)
+
+    def test_expert_touch_lookahead_stays_within_replay_segment(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays._replays = th.zeros((4, STORED_REPLAY_SIZE))
+        replays._replays[2, EXPERT_TOUCH_INDEX] = 1
+        replays._cursors = th.tensor([1])
+        replays._demo_id = th.tensor([0])
+        replays._offsets = th.tensor([0, 2, 4])
+
+        self.assertFalse(replays.current_ego_touch(offset=1).item())
+
+        replays._replays[1, EXPERT_TOUCH_INDEX] = 1
+        replays._cursors[0] = 0
+        self.assertTrue(replays.current_ego_touch(offset=1).item())
 
     def test_step_anchors_before_advancing_replay_cursor(self):
         wrapper, environment, observation = self._anchor_fixture()
@@ -783,6 +807,10 @@ class TrackerTest(unittest.TestCase):
         class Replays:
             cursor = 1
             goal_size = INTERNAL_STATE_SIZE + len(DEFAULT_TRACKER_WINDOWS) * GOAL_STATE_SIZE
+
+            def current_ego_touch(self, offset=0):
+                events.append(("touch", self.cursor + offset))
+                return th.tensor([False])
 
             def current(self):
                 events.append(("current", self.cursor))
@@ -813,6 +841,8 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                ("touch", 1),
+                ("touch", 2),
                 ("current", 1),
                 ("next", 1),
             ],
@@ -1023,7 +1053,10 @@ class TrackerTest(unittest.TestCase):
         th.testing.assert_close(control[:, GOAL_STATE_SIZE:], opponent)
 
     @staticmethod
-    def _anchor_fixture():
+    def _anchor_fixture(
+        expert_touch: bool = False,
+        upcoming_expert_touch: bool = False,
+    ):
         expert_tensor = th.zeros((1, GOAL_STATE_SIZE))
         expert_tensor[:, :9] = th.tensor(
             [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -1053,7 +1086,12 @@ class TrackerTest(unittest.TestCase):
         environment = FakeEnvironment()
         wrapper = ExpertLookaheadEnv.__new__(ExpertLookaheadEnv)
         wrapper.env = environment
-        wrapper.replays = SimpleNamespace(current=lambda: expert)
+        wrapper.replays = SimpleNamespace(
+            current=lambda: expert,
+            current_ego_touch=lambda offset=0: th.tensor([
+                expert_touch if offset == 0 else upcoming_expert_touch
+            ]),
+        )
         wrapper.reward = SimpleNamespace(touched=th.tensor([False]))
         wrapper._ball_anchored = th.tensor([True])
         wrapper._pos_scale = th.tensor(POSITION_SCALE)
