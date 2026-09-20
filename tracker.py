@@ -373,6 +373,7 @@ class ExpertGoalStates:
             for index, start_map in enumerate(start_maps)
         ])
         self._cursors = th.zeros(n_env, device=device).long()
+        self._origin = th.zeros(n_env, GOAL_STATE_SIZE, device=device)
 
     def _unsafe_mask(self, path: Path, source: np.ndarray) -> np.ndarray:
         unsafe_path = path.with_suffix(".unsafe-starts.npz")
@@ -480,7 +481,7 @@ class ExpertGoalStates:
         for end in np.append(np.flatnonzero(invalid), len(demo)):
             length = end - start
 
-            if length >= self._min_len:
+            if length >= self._min_len and ego_touch[start:end].any():
                 segment_unsafe = unsafe[start:end].copy()
                 segment_unsafe |= ego_touch_guard[start:end]
                 latest_start = length - self.minimum_remaining_frames - 1
@@ -569,6 +570,10 @@ class ExpertGoalStates:
                 th.rand(n_resets, device=self.device) * choices
             ).long()
         self._cursors[mask] = self._safe_cursors[self._cursors[mask]]
+        self._origin[mask] = self._replays[
+            self._cursors[mask],
+            :GOAL_STATE_SIZE,
+        ]
 
         return TensorBatch({
             "observation": CARLObservation.from_tensor(
@@ -592,6 +597,9 @@ class ExpertGoalStates:
             self._cursors + offset,
             :GOAL_STATE_SIZE,
         ]
+
+    def origin(self) -> th.Tensor:
+        return self._origin
 
     def current_ego_touch(self, offset: int = 0) -> th.Tensor:
         indices = th.minimum(
@@ -664,6 +672,29 @@ class ExpertGoalStates:
 
         return th.cat((obs[:, :GOAL_STATE_SIZE], internal_state, goals), dim=-1), end
 
+    def sample_windows(self, count: int, window: int) -> th.Tensor:
+        """Sample [count, window, GOAL_STATE_SIZE] windows from replay segments."""
+        if window < 1:
+            raise ValueError("discriminator window must be positive")
+        lengths = self._offsets[1:] - self._offsets[:-1]
+        probabilities = self._sampling_probabilities * (lengths >= window)
+        total = probabilities.sum()
+        if total <= 0:
+            raise ValueError(
+                "no replay segment is long enough for the discriminator window"
+            )
+        demo_id = th.multinomial(probabilities / total, count, replacement=True)
+        starts = self._offsets[demo_id]
+        offset = (
+            th.rand(count, device=self.device) * (lengths[demo_id] - window + 1)
+        ).long()
+        indices = (
+            starts[:, None]
+            + offset[:, None]
+            + th.arange(window, device=self.device)[None, :]
+        )
+        return self._replays[indices, :GOAL_STATE_SIZE]
+
 
 class TrackingReward:
     """Scores the ego car state against the replay."""
@@ -700,9 +731,10 @@ class TrackingReward:
     ) -> th.Tensor:
         actual_ego = actual.cars.ego
         target_ego = target.cars.ego
+        start = self.replays.origin()[:, 9:GOAL_STATE_SIZE]
 
         car_position_error = (
-            actual_ego.position - target_ego.position
+            (actual_ego.position - start) - (target_ego.position - start)
         ) * self.position_scale
 
         velocity_error = (
@@ -735,9 +767,6 @@ class TrackingReward:
         )
 
         ball_position_error = (
-            actual.ball.position - target.ball.position
-        ) * self.position_scale
-        relative_ball_position_error = (
             (actual.ball.position - actual_ego.position)
             - (target.ball.position - target_ego.position)
         ) * self.position_scale
@@ -748,9 +777,7 @@ class TrackingReward:
             actual.ball.angular_velocity - target.ball.angular_velocity
         ) * BALL_MAX_ANG_SPEED
         ball_score = (
-            0.35 * th.exp(-1.25 * ball_position_error.square().sum(-1))
-            + 0.35
-            * th.exp(-1.25 * relative_ball_position_error.square().sum(-1))
+            0.70 * th.exp(-1.25 * ball_position_error.square().sum(-1))
             + 0.25 * th.exp(-0.1 * ball_velocity_error.square().sum(-1))
             + 0.05
             * th.exp(-0.1 * ball_angular_velocity_error.square().sum(-1))
@@ -1157,6 +1184,200 @@ class ExpertJumpPPOLoss(PPOLoss):
         )
 
 
+class TrackerDiscriminator(nn.Module):
+    """Temporal discriminator scoring simulated rollouts against replay segments."""
+
+    def __init__(self, window: int, feature_size: int, hidden_size: int) -> None:
+        super().__init__()
+        if window < 1:
+            raise ValueError("discriminator window must be positive")
+        self.window = window
+        self.encoder = nn.Sequential(
+            nn.Linear(GOAL_STATE_SIZE, feature_size),
+            nn.SiLU(),
+            nn.Linear(feature_size, feature_size),
+            nn.SiLU(),
+        )
+        self.gru = nn.GRU(feature_size, hidden_size, batch_first=True)
+        self.head = nn.Linear(hidden_size, 1)
+
+    def logits(self, windows: th.Tensor) -> th.Tensor:
+        if windows.shape[-2] != self.window or windows.shape[-1] != GOAL_STATE_SIZE:
+            raise ValueError(
+                f"discriminator windows must end with shape ({self.window}, "
+                f"{GOAL_STATE_SIZE})"
+            )
+        features = self.encoder(windows)
+        encoded, _ = self.gru(features)
+        return self.head(encoded[..., -1, :]).squeeze(-1)
+
+
+def _discriminator_noise_mask(device: th.device) -> th.Tensor:
+    mask = th.ones(GOAL_STATE_SIZE, device=device)
+    mask[25:] = 0.0
+    return mask
+
+
+def add_window_noise(windows: th.Tensor, std: float) -> th.Tensor:
+    if std <= 0:
+        return windows
+    noise = th.randn_like(windows) * std
+    return windows + noise * _discriminator_noise_mask(windows.device)
+
+
+class DiscriminatorWindowCapture(CaptureBase):
+    """Keeps a rolling window of simulated states for the discriminator."""
+
+    def __init__(self, window: int, device: str | th.device) -> None:
+        self.window = window
+        self.device = th.device(device)
+        self._history = th.zeros(0, window, GOAL_STATE_SIZE, device=self.device)
+        self._count = th.zeros(0, dtype=th.long, device=self.device)
+
+    def reset(self, batch_size: int) -> None:
+        self._history = th.zeros(
+            batch_size, self.window, GOAL_STATE_SIZE, device=self.device
+        )
+        self._count = th.zeros(batch_size, dtype=th.long, device=self.device)
+
+    @th.no_grad()
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        state = th.as_tensor(
+            context.observation, device=self.device
+        )[..., :GOAL_STATE_SIZE].detach()
+        self._history = th.cat((self._history[:, 1:], state[:, None]), dim=1)
+        self._count += 1
+        valid = self._count >= self.window
+        done = th.as_tensor(
+            context.env_step.done, dtype=th.bool, device=self.device
+        )
+        self._count[done] = 0
+        return {
+            "discriminator_window": self._history.clone(),
+            "discriminator_window_valid": valid,
+        }
+
+
+class DiscriminatorRewardTransform:
+    """Adds the discriminator's normalized expert-likeness score to the reward."""
+
+    def __init__(
+        self,
+        discriminator: TrackerDiscriminator,
+        weight: float,
+        max_magnitude: float = 10.0,
+    ) -> None:
+        self.discriminator = discriminator
+        self.weight = weight
+        self.max_magnitude = max_magnitude
+
+    @th.no_grad()
+    def __call__(self, batch: TensorBatch, context) -> TensorBatch:
+        windows = batch["discriminator_window"]
+        valid = batch["discriminator_window_valid"]
+        time, num_envs = valid.shape
+        logits = self.discriminator.logits(
+            windows.reshape(
+                time * num_envs,
+                self.discriminator.window,
+                GOAL_STATE_SIZE,
+            )
+        ).reshape(time, num_envs)
+        valid_float = valid.float()
+        count = valid_float.sum(dim=0, keepdim=True).clamp_min(1.0)
+        mean = (logits * valid_float).sum(dim=0, keepdim=True) / count
+        variance = (
+            ((logits - mean).square() * valid_float).sum(dim=0, keepdim=True)
+            / count
+        )
+        normalized = (logits - mean) / variance.sqrt().clamp_min(1e-6)
+        imitation = (
+            normalized.clamp(-self.max_magnitude, self.max_magnitude)
+            * valid_float
+            * self.weight
+        ).reshape(batch["reward"].shape)
+        return batch.replace_fields(
+            reward=batch["reward"] + imitation
+        ).with_fields(imitation_reward=imitation)
+
+
+class DiscriminatorUpdate:
+    """Trains the tracker discriminator between PPO updates."""
+
+    def __init__(
+        self,
+        discriminator: TrackerDiscriminator,
+        optimizer: th.optim.Optimizer,
+        replays: ExpertGoalStates,
+        batch_size: int,
+        epochs: int,
+        noise_std: float,
+        section: str = "Discriminator",
+    ) -> None:
+        if batch_size < 1 or epochs < 1:
+            raise ValueError("discriminator batch and epoch counts must be positive")
+        self.discriminator = discriminator
+        self.optimizer = optimizer
+        self.replays = replays
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.noise_std = noise_std
+        self.section = section
+
+    def set_progress_callback(self, callback) -> None:
+        return
+
+    def run(self, experience):
+        steps = getattr(experience, "steps", experience)
+        windows = steps["discriminator_window"]
+        valid = steps["discriminator_window_valid"]
+        agent = windows[valid]
+        if not len(agent):
+            raise RuntimeError("rollout contains no valid discriminator windows")
+        expert = self.replays.sample_windows(len(agent), self.discriminator.window)
+
+        loss = th.zeros((), device=agent.device)
+        for _ in range(self.epochs):
+            order = th.randperm(len(agent), device=agent.device)
+            for left in range(0, len(agent), self.batch_size):
+                selected = order[left:left + self.batch_size]
+                logits = th.cat((
+                    self.discriminator.logits(
+                        add_window_noise(agent[selected], self.noise_std)
+                    ),
+                    self.discriminator.logits(
+                        add_window_noise(expert[selected], self.noise_std)
+                    ),
+                ))
+                target = th.cat((
+                    th.zeros(len(selected), device=logits.device),
+                    th.ones(len(selected), device=logits.device),
+                ))
+                loss = nn.functional.binary_cross_entropy_with_logits(
+                    logits, target
+                )
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+        with th.no_grad():
+            agent_logits = self.discriminator.logits(agent)
+            expert_logits = self.discriminator.logits(expert)
+            accuracy = th.cat((
+                (agent_logits < 0).float(),
+                (expert_logits > 0).float(),
+            )).mean()
+
+        return experience, {
+            self.section: {
+                "discriminator_loss": loss.item(),
+                "discriminator_accuracy": accuracy.item(),
+                "agent_logit": agent_logits.mean().item(),
+                "expert_logit": expert_logits.mean().item(),
+            }
+        }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO trajectory trackers.")
 
@@ -1181,6 +1402,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entropy-coef-final",      type=float, default=1e-4)
     parser.add_argument("--jump-imitation-weight",   type=float, default=0.1)
     parser.add_argument("--second-jump-weight",      type=float, default=8.0)
+    parser.add_argument("--discriminator-weight",    type=float, default=0.0)
+    parser.add_argument("--discriminator-window",    type=int,   default=8)
+    parser.add_argument("--discriminator-feature-size", type=int, default=128)
+    parser.add_argument("--discriminator-hidden",    type=int,   default=128)
+    parser.add_argument("--discriminator-lr",        type=float, default=1e-4)
+    parser.add_argument("--discriminator-batch",     type=int,   default=16_384)
+    parser.add_argument("--discriminator-epochs",    type=int,   default=1)
+    parser.add_argument("--discriminator-noise",     type=float, default=0.01)
     parser.add_argument("--clip",                    type=float, default=0.2)
     parser.add_argument("--clip-final",              type=float, default=0.1)
     parser.add_argument("--gamma",                   type=float, default=0.997)
@@ -1264,6 +1493,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--hard-negative-fraction must be in [0, 1]")
     if not math.isfinite(args.tracking_progress_scale) or args.tracking_progress_scale < 0:
         raise ValueError("--tracking-progress-scale must be finite and nonnegative")
+    if not math.isfinite(args.discriminator_weight) or args.discriminator_weight < 0:
+        raise ValueError("--discriminator-weight must be finite and nonnegative")
+    if args.discriminator_weight > 0:
+        if args.discriminator_window < 1:
+            raise ValueError("--discriminator-window must be positive")
+        if args.discriminator_feature_size < 1 or args.discriminator_hidden < 1:
+            raise ValueError("--discriminator sizes must be positive")
+        if not math.isfinite(args.discriminator_lr) or args.discriminator_lr <= 0:
+            raise ValueError("--discriminator-lr must be finite and positive")
+        if args.discriminator_batch < 1 or args.discriminator_epochs < 1:
+            raise ValueError("--discriminator batch and epochs must be positive")
+        if not math.isfinite(args.discriminator_noise) or args.discriminator_noise < 0:
+            raise ValueError("--discriminator-noise must be finite and nonnegative")
 
 
 def set_learning_rate(optimizers: Sequence[th.optim.Optimizer], value: float) -> None:
@@ -1314,6 +1556,14 @@ def main() -> None:
     previous_critic: Critic | None = None
     policy_count = args.timesteps // args.stage_timesteps
 
+    discriminator = None
+    if args.discriminator_weight > 0:
+        discriminator = TrackerDiscriminator(
+            args.discriminator_window,
+            args.discriminator_feature_size,
+            args.discriminator_hidden,
+        ).to(env.device)
+
     checkpoint = PHCCheckpoint(
         directory=args.checkpoint_dir,
         interval=args.checkpoint_interval,
@@ -1344,6 +1594,8 @@ def main() -> None:
             "minimum_tracking_frames": args.minimum_tracking_frames,
             "tracking_progress_scale": args.tracking_progress_scale,
             "max_grad_norm": args.max_grad_norm,
+            "discriminator_weight": args.discriminator_weight,
+            "discriminator_window": args.discriminator_window,
         },
     )
     completed_timesteps = 0
@@ -1382,16 +1634,21 @@ def main() -> None:
             device=env.device,
             copy_on_finish=False,
         )
+        captures = (
+            LogProbCapture(),
+            RecurrentStateCapture(),
+            StatelessCriticCapture(critic),
+            ExpertJumpCapture(env),
+        )
+        if discriminator is not None:
+            captures += (
+                DiscriminatorWindowCapture(args.discriminator_window, env.device),
+            )
         runner = Runner(
             env=env,
             policy=policy,
             buffer=buffer,
-            captures=(
-                LogProbCapture(),
-                RecurrentStateCapture(),
-                StatelessCriticCapture(critic),
-                ExpertJumpCapture(env),
-            ),
+            captures=captures,
         )
 
         actor_optimizer = Adam(policy.parameters(), lr=args.lr)
@@ -1407,8 +1664,15 @@ def main() -> None:
             weight=args.jump_imitation_weight,
             second_jump_weight=args.second_jump_weight,
         )
+        transforms = (GAE(gamma=args.gamma, lambda_=args.gae_lambda),)
+        if discriminator is not None:
+            transforms = (
+                DiscriminatorRewardTransform(
+                    discriminator, args.discriminator_weight
+                ),
+            ) + transforms
         update = Update(
-            transforms=(GAE(gamma=args.gamma, lambda_=args.gae_lambda),),
+            transforms=transforms,
             sampler=RecurrentRolloutMinibatches(
                 sequence_length=args.sequence_length,
                 sequences_per_batch=max(1, args.batch_size // args.sequence_length),
@@ -1470,12 +1734,31 @@ def main() -> None:
             section="Schedule",
         )
 
+        stages = [update]
+        if discriminator is not None:
+            stages.append(DiscriminatorUpdate(
+                discriminator,
+                Adam(discriminator.parameters(), lr=args.discriminator_lr),
+                replays,
+                args.discriminator_batch,
+                args.discriminator_epochs,
+                args.discriminator_noise,
+            ))
+        logger = Logger(log_dir=str(args.log_dir / run_id / f"stage-{stage}"))
+        if discriminator is not None:
+            for key, label, format_spec in (
+                ("discriminator_loss", "discriminator loss", ".4f"),
+                ("discriminator_accuracy", "discriminator accuracy", ".3f"),
+            ):
+                logger.register_progress_metric(
+                    "Discriminator", key, label, format_spec
+                )
         trainer = Trainer(
             runner,
             buffer,
-            Algorithm(update),
+            Algorithm(*stages),
             OnPolicySchedule(),
-            logger=Logger(log_dir=str(args.log_dir / run_id / f"stage-{stage}")),
+            logger=logger,
             checkpoint=checkpoint,
             value_scheduler=value_scheduler,
         )

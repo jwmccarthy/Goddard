@@ -22,7 +22,7 @@ from tracker import (
 def load_demonstration_reset_dataset(
     replay_dir: Path,
     device,
-    frame_skip: int,
+    frame_skip: int = 4,
     limit: int | None = None,
     seed: int = 0,
     require_frame_skip_match: bool = True,

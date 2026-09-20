@@ -39,8 +39,13 @@ from tracker import (
     StatelessCriticCapture,
     STORED_REPLAY_SIZE,
     TrackingReward,
+    TrackerDiscriminator,
+    add_window_noise,
     annealed_value,
     build_tracker_policy,
+    DiscriminatorRewardTransform,
+    DiscriminatorUpdate,
+    DiscriminatorWindowCapture,
     evaluate_tracker_policy,
     load_tracker_policy,
     set_learning_rate,
@@ -85,6 +90,14 @@ class TrackerTest(unittest.TestCase):
             clip_final=0.1,
             max_grad_norm=0.5,
             tracking_progress_scale=4.0,
+            discriminator_weight=0.0,
+            discriminator_window=8,
+            discriminator_feature_size=128,
+            discriminator_hidden=128,
+            discriminator_lr=1e-4,
+            discriminator_batch=16_384,
+            discriminator_epochs=1,
+            discriminator_noise=0.01,
         )
         validate_args(args)
 
@@ -98,6 +111,21 @@ class TrackerTest(unittest.TestCase):
             validate_args(args)
 
         args.tracking_progress_scale = 4.0
+        args.discriminator_weight = -1
+        with self.assertRaisesRegex(ValueError, "discriminator-weight"):
+            validate_args(args)
+
+        args.discriminator_weight = 0.5
+        args.discriminator_window = 0
+        with self.assertRaisesRegex(ValueError, "discriminator-window"):
+            validate_args(args)
+
+        args.discriminator_window = 8
+        args.discriminator_lr = 0
+        with self.assertRaisesRegex(ValueError, "discriminator-lr"):
+            validate_args(args)
+
+        args.discriminator_lr = 1e-4
         args.timesteps = 6_000_001
         with self.assertRaisesRegex(ValueError, "divisible"):
             validate_args(args)
@@ -411,7 +439,7 @@ class TrackerTest(unittest.TestCase):
         np.testing.assert_array_equal(projected[:, 2], [1, 0, 2])
         np.testing.assert_array_equal(projected[:, 5], [1, 0, 2])
 
-    def test_dataset_loading_keeps_segments_without_ball_touches(self):
+    def test_dataset_loading_drops_segments_without_ego_touches(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._min_len = 30
         replays.minimum_remaining_frames = 1
@@ -419,9 +447,7 @@ class TrackerTest(unittest.TestCase):
 
         loaded = replays._filter(demo, np.zeros(30, dtype=bool))
 
-        self.assertEqual(len(loaded), 1)
-        self.assertEqual(len(loaded[0][0]), 30)
-        self.assertEqual(loaded[0][0].shape[1], STORED_REPLAY_SIZE)
+        self.assertEqual(loaded, [])
 
     def test_dataset_loading_preserves_expert_ego_touch_timing(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
@@ -446,6 +472,8 @@ class TrackerTest(unittest.TestCase):
                 replays.minimum_remaining_frames = 1
                 demo = np.zeros((12, width), dtype=np.float32)
                 demo[:, 9] = np.arange(12)
+                demo[2, -5] = 1.0
+                demo[8, -5] = 1.0
                 demo[5, -4] = 1.0
 
                 loaded = replays._filter(demo, np.zeros(12, dtype=bool))
@@ -498,6 +526,7 @@ class TrackerTest(unittest.TestCase):
         replays._safe_cursors = th.arange(length)
         replays._cursors = th.zeros(count, dtype=th.long)
         replays._replays = th.zeros((length, STORED_REPLAY_SIZE))
+        replays._origin = th.zeros((count, GOAL_STATE_SIZE))
 
         replays.reset(th.ones(count, dtype=th.bool))
 
@@ -517,18 +546,24 @@ class TrackerTest(unittest.TestCase):
         replays._safe_cursors = th.tensor([1, 1, 2, 4, 4, 5])
         replays._cursors = th.zeros(2, dtype=th.long)
         replays._replays = th.zeros((6, STORED_REPLAY_SIZE))
+        replays._replays[1, 0] = 5.0
+        replays._replays[4, 0] = 7.0
+        replays._origin = th.zeros((2, GOAL_STATE_SIZE))
         replays.queue_demo_ids(th.tensor([0, 1]))
 
         replays.reset(th.ones(2, dtype=th.bool))
 
         th.testing.assert_close(replays._demo_id, th.tensor([0, 1]))
         th.testing.assert_close(replays._cursors, th.tensor([1, 4]))
+        th.testing.assert_close(replays.origin()[0, 0], th.tensor(5.0))
+        th.testing.assert_close(replays.origin()[1, 0], th.tensor(7.0))
 
     def test_filter_rejects_segments_with_no_safe_early_start(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
         replays._min_len = 129
         replays.minimum_remaining_frames = 128
         demo = np.zeros((150, 161), dtype=np.float32)
+        demo[60, -5] = 1.0
         unsafe = np.ones(150, dtype=bool)
         unsafe[50] = False
 
@@ -589,7 +624,11 @@ class TrackerTest(unittest.TestCase):
         actual_tensor[:, :9] = 100.0
         target = CARLObservation.from_tensor(target_tensor, 1)
         actual = CARLObservation.from_tensor(actual_tensor, 1)
-        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+        )
         reward = TrackingReward(replays)
 
         value = reward(self._tracking_context(actual))
@@ -605,7 +644,11 @@ class TrackerTest(unittest.TestCase):
         close_tensor[:, 9] = 0.01
         far = CARLObservation.from_tensor(far_tensor, 1)
         close = CARLObservation.from_tensor(close_tensor, 1)
-        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+        )
         reward = TrackingReward(replays, progress_scale=4.0)
 
         toward = reward(self._tracking_context(close, previous=far))
@@ -624,7 +667,11 @@ class TrackerTest(unittest.TestCase):
         missed_ball_tensor = target_tensor.clone()
         missed_ball_tensor[:, :9] = 100.0
         missed_ball = CARLObservation.from_tensor(missed_ball_tensor, 1)
-        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+        )
         reward = TrackingReward(replays)
 
         before_contact = reward(self._tracking_context(missed_ball))
@@ -644,7 +691,11 @@ class TrackerTest(unittest.TestCase):
         aligned_tensor[:, 9] = 0.005
         opposed_tensor = aligned_tensor.clone()
         opposed_tensor[:, 9] = -0.005
-        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+        )
 
         aligned = TrackingReward(replays)(
             self._tracking_context(
@@ -661,13 +712,47 @@ class TrackerTest(unittest.TestCase):
 
         self.assertGreater(aligned.item(), opposed.item())
 
+    def test_ball_outcome_uses_ego_relative_ball_position_only(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        behind_tensor = target_tensor.clone()
+        behind_tensor[0, 0] = 0.015
+        behind_tensor[0, 9] = 0.02
+        ahead_tensor = target_tensor.clone()
+        ahead_tensor[0, 0] = 0.025
+        ahead_tensor[0, 9] = 0.02
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+        )
+
+        behind = TrackingReward(replays)(
+            self._tracking_context(
+                CARLObservation.from_tensor(behind_tensor, 1),
+                touched=True,
+            )
+        )
+        ahead = TrackingReward(replays)(
+            self._tracking_context(
+                CARLObservation.from_tensor(ahead_tensor, 1),
+                touched=True,
+            )
+        )
+
+        th.testing.assert_close(behind, ahead)
+
     def test_ball_outcome_latch_resets_with_replay_segment(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         target = CARLObservation.from_tensor(target_tensor, 1)
         missed_ball_tensor = target_tensor.clone()
         missed_ball_tensor[:, :9] = 100.0
         missed_ball = CARLObservation.from_tensor(missed_ball_tensor, 1)
-        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+        )
         reward = TrackingReward(replays)
         reward(self._tracking_context(missed_ball, touched=True))
 
@@ -682,7 +767,11 @@ class TrackerTest(unittest.TestCase):
         missed_ball_tensor = target_tensor.clone()
         missed_ball_tensor[:, :9] = 100.0
         missed_ball = CARLObservation.from_tensor(missed_ball_tensor, 1)
-        replays = SimpleNamespace(device=th.device("cpu"), current=lambda: target)
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+        )
         reward = TrackingReward(replays)
 
         terminal = reward(
@@ -988,6 +1077,7 @@ class TrackerTest(unittest.TestCase):
         opponent = slice(51, 72)
         demo[:, teammate] = 1.0
         demo[:, opponent] = 2.0
+        demo[4, -5] = 1.0
 
         loaded, _ = replays._filter(
             demo,
@@ -1111,6 +1201,188 @@ class TrackerTest(unittest.TestCase):
             ),
             events=SimpleNamespace(done=th.tensor([done], dtype=th.bool)),
         )
+
+
+class DiscriminatorTest(unittest.TestCase):
+    def test_discriminator_scores_windows(self):
+        discriminator = TrackerDiscriminator(window=3, feature_size=8, hidden_size=8)
+
+        logits = discriminator(th.randn(5, 3, GOAL_STATE_SIZE))
+
+        self.assertEqual(logits.shape, (5,))
+
+    def test_discriminator_rejects_wrong_window_shape(self):
+        discriminator = TrackerDiscriminator(window=3, feature_size=8, hidden_size=8)
+
+        with self.assertRaisesRegex(ValueError, "windows"):
+            discriminator(th.randn(5, 4, GOAL_STATE_SIZE))
+
+    def test_window_noise_preserves_car_flags(self):
+        windows = th.ones(2, 3, GOAL_STATE_SIZE)
+
+        noised = add_window_noise(windows, 0.1)
+
+        th.testing.assert_close(noised[..., 25:], windows[..., 25:])
+        self.assertGreater((noised[..., :25] - windows[..., :25]).abs().max(), 0.0)
+
+    def test_window_capture_builds_chronological_windows(self):
+        capture = DiscriminatorWindowCapture(3, "cpu")
+        capture.reset(2)
+
+        outputs = []
+        for step in range(3):
+            outputs.append(capture(SimpleNamespace(
+                observation=th.full((2, GOAL_STATE_SIZE), float(step)),
+                env_step=SimpleNamespace(done=th.zeros(2, dtype=th.bool)),
+            )))
+
+        self.assertFalse(outputs[0]["discriminator_window_valid"].any())
+        self.assertFalse(outputs[1]["discriminator_window_valid"].any())
+        self.assertTrue(outputs[2]["discriminator_window_valid"].all())
+        window = outputs[2]["discriminator_window"]
+        th.testing.assert_close(window[:, 0, 0], th.zeros(2))
+        th.testing.assert_close(window[:, 1, 0], th.ones(2))
+        th.testing.assert_close(window[:, 2, 0], th.full((2,), 2.0))
+
+    def test_window_capture_resets_count_on_done(self):
+        capture = DiscriminatorWindowCapture(2, "cpu")
+        capture.reset(1)
+        capture(SimpleNamespace(
+            observation=th.zeros((1, GOAL_STATE_SIZE)),
+            env_step=SimpleNamespace(done=th.tensor([True])),
+        ))
+
+        output = capture(SimpleNamespace(
+            observation=th.full((1, GOAL_STATE_SIZE), 1.0),
+            env_step=SimpleNamespace(done=th.zeros(1, dtype=th.bool)),
+        ))
+
+        self.assertFalse(output["discriminator_window_valid"].any())
+
+    def test_sample_windows_stay_within_one_segment(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays.device = th.device("cpu")
+        replays._replays = th.zeros((12, STORED_REPLAY_SIZE))
+        replays._replays[6:, 0] = 1.0
+        replays._offsets = th.tensor([0, 6, 12])
+        replays._sampling_probabilities = th.tensor([0.5, 0.5])
+
+        windows = replays.sample_windows(7, 3)
+
+        self.assertEqual(windows.shape, (7, 3, GOAL_STATE_SIZE))
+        starts = windows[:, 0, 0]
+        th.testing.assert_close(windows[:, 1, 0], starts)
+        th.testing.assert_close(windows[:, 2, 0], starts)
+
+    def test_sample_windows_requires_long_enough_segments(self):
+        replays = ExpertGoalStates.__new__(ExpertGoalStates)
+        replays.device = th.device("cpu")
+        replays._replays = th.zeros((6, STORED_REPLAY_SIZE))
+        replays._offsets = th.tensor([0, 3, 6])
+        replays._sampling_probabilities = th.tensor([0.5, 0.5])
+
+        windows = replays.sample_windows(4, 3)
+
+        self.assertEqual(windows.shape, (4, 3, GOAL_STATE_SIZE))
+        with self.assertRaisesRegex(ValueError, "long enough"):
+            replays.sample_windows(1, 4)
+
+    def test_reward_transform_adds_normalized_discriminator_score(self):
+        discriminator = TrackerDiscriminator(window=2, feature_size=8, hidden_size=8)
+        transform = DiscriminatorRewardTransform(
+            discriminator, weight=0.5, max_magnitude=1e6
+        )
+        valid = th.tensor([
+            [False, True],
+            [True, True],
+            [True, True],
+            [True, True],
+        ])
+        batch = TensorBatch({
+            "reward": th.zeros(4, 2, 1),
+            "discriminator_window": th.randn(4, 2, 2, GOAL_STATE_SIZE),
+            "discriminator_window_valid": valid,
+        })
+
+        transformed = transform(batch, None)
+
+        imitation = transformed["imitation_reward"]
+        self.assertEqual(imitation.shape, (4, 2, 1))
+        self.assertEqual(imitation[0, 0].item(), 0.0)
+        valid_float = valid.float()
+        means = (imitation[..., 0] * valid_float).sum(0) / valid_float.sum(0)
+        th.testing.assert_close(means, th.zeros(2), atol=1e-4, rtol=0.0)
+        th.testing.assert_close(transformed["reward"], imitation)
+
+    def test_reward_transform_clamps_extreme_scores(self):
+        discriminator = TrackerDiscriminator(window=2, feature_size=8, hidden_size=8)
+        transform = DiscriminatorRewardTransform(
+            discriminator, weight=2.0, max_magnitude=0.5
+        )
+        batch = TensorBatch({
+            "reward": th.zeros(3, 2, 1),
+            "discriminator_window": th.randn(3, 2, 2, GOAL_STATE_SIZE),
+            "discriminator_window_valid": th.ones(3, 2, dtype=th.bool),
+        })
+
+        transformed = transform(batch, None)
+
+        self.assertLessEqual(transformed["imitation_reward"].abs().max().item(), 1.0)
+
+    def test_discriminator_update_trains_and_returns_experience(self):
+        discriminator = TrackerDiscriminator(window=2, feature_size=8, hidden_size=8)
+        optimizer = th.optim.Adam(discriminator.parameters(), lr=1e-2)
+        replays = SimpleNamespace(
+            sample_windows=lambda count, window: th.randn(
+                count, window, GOAL_STATE_SIZE
+            )
+        )
+        update = DiscriminatorUpdate(
+            discriminator,
+            optimizer,
+            replays,
+            batch_size=4,
+            epochs=1,
+            noise_std=0.0,
+        )
+        experience = SimpleNamespace(steps=TensorBatch({
+            "discriminator_window": th.randn(4, 2, 2, GOAL_STATE_SIZE),
+            "discriminator_window_valid": th.ones(4, 2, dtype=th.bool),
+        }))
+        before = [parameter.detach().clone() for parameter in discriminator.parameters()]
+
+        returned, metrics = update.run(experience)
+
+        self.assertIs(returned, experience)
+        self.assertGreaterEqual(metrics["Discriminator"]["discriminator_loss"], 0.0)
+        self.assertIn("discriminator_accuracy", metrics["Discriminator"])
+        self.assertTrue(any(
+            not th.equal(previous, current.detach())
+            for previous, current in zip(before, discriminator.parameters())
+        ))
+
+    def test_discriminator_update_requires_valid_windows(self):
+        discriminator = TrackerDiscriminator(window=2, feature_size=8, hidden_size=8)
+        optimizer = th.optim.Adam(discriminator.parameters(), lr=1e-2)
+        replays = SimpleNamespace(
+            sample_windows=lambda count, window: th.randn(
+                count, window, GOAL_STATE_SIZE
+            )
+        )
+        update = DiscriminatorUpdate(
+            discriminator,
+            optimizer,
+            replays,
+            batch_size=4,
+            epochs=1,
+            noise_std=0.0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "no valid discriminator windows"):
+            update.run(SimpleNamespace(steps=TensorBatch({
+                "discriminator_window": th.randn(4, 2, 2, GOAL_STATE_SIZE),
+                "discriminator_window_valid": th.zeros(4, 2, dtype=th.bool),
+            })))
 
 
 if __name__ == "__main__":

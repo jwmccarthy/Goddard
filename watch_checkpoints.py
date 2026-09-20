@@ -20,17 +20,11 @@ from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
 from replay_resets import load_demonstration_reset_dataset
-from simple import (
-    LEGACY_SIMPLE_ARCHITECTURE,
-    SIMPLE_ARCHITECTURE,
-    build_policy as build_simple_policy,
-)
 from self_play import (
     FrozenPulseController,
     PulseLatentEnv,
     build_policy,
     file_sha256,
-    policy_observation,
 )
 
 
@@ -60,10 +54,7 @@ class CheckpointRegistry:
 
     def list(self) -> list[CheckpointMetadata]:
         checkpoints = []
-        paths = (
-            *self.directory.rglob("self_play_*.pt"),
-            *self.directory.rglob("simple_*.pt"),
-        )
+        paths = self.directory.rglob("self_play_*.pt")
         for path in paths:
             try:
                 resolved = path.resolve(strict=True)
@@ -86,7 +77,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no self-play or simple checkpoints found in {self.directory}"
+                f"no self-play checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -104,9 +95,7 @@ class CheckpointRegistry:
         if (
             self.directory not in path.parents
             or not path.is_file()
-            or not (
-                path.match("self_play_*.pt") or path.match("simple_*.pt")
-            )
+            or not path.match("self_play_*.pt")
         ):
             raise ValueError("invalid checkpoint path")
         return path
@@ -144,8 +133,8 @@ def load_checkpoint(path: Path, env: PulseLatentEnv):
     policy = build_policy(
         env,
         float(config["exploration_std"]),
-        config.get("gru_hidden_size"),
-        config.get("gru_input_size"),
+        int(config["feature_size"]),
+        list(config["policy_hidden"]),
     )
     policy.load_state_dict(payload["policy"])
     metadata = {
@@ -153,27 +142,13 @@ def load_checkpoint(path: Path, env: PulseLatentEnv):
         "pulse_artifact": payload["pulse_artifact"],
         "pulse_sha256": payload["pulse_sha256"],
         "bf16": bool(config.get("bf16", False)),
-        "skill_horizon": config.get("skill_horizon"),
-        "skill_horizon_jitter": config.get("skill_horizon_jitter"),
     }
     return policy.eval().requires_grad_(False), metadata
-
-
-def skill_semantics(metadata: dict) -> tuple[int, int] | None:
-    horizon = metadata.get("skill_horizon")
-    jitter = metadata.get("skill_horizon_jitter")
-    if horizon is None and jitter is None:
-        return None
-    if horizon is None or jitter is None:
-        raise ValueError("checkpoint has incomplete skill duration configuration")
-    return int(horizon), int(jitter)
 
 
 def require_compatible_policies(blue: dict, orange: dict) -> None:
     if blue["bf16"] != orange["bf16"]:
         raise ValueError("selected policies use different decoder precision")
-    if skill_semantics(blue) != skill_semantics(orange):
-        raise ValueError("selected policies use different skill durations")
 
 
 def resolve_pulse_artifact(
@@ -258,171 +233,6 @@ def render_frame(
     }
 
 
-def _checkpoint_architecture(payload: dict) -> str | None:
-    return payload.get("config", {}).get("architecture")
-
-
-def load_simple_checkpoint(path: Path, env: CARLTorchVectorEnv):
-    payload = th.load(path, map_location="cpu", weights_only=True)
-    config = payload.get("config", {})
-    architecture = _checkpoint_architecture(payload)
-    if architecture not in {LEGACY_SIMPLE_ARCHITECTURE, SIMPLE_ARCHITECTURE}:
-        raise ValueError(f"{path.name} is not a simple direct-action checkpoint")
-    policy = build_simple_policy(
-        env,
-        int(config["policy_hidden"]),
-        recurrent=bool(config.get("recurrent", False)),
-        legacy=architecture == LEGACY_SIMPLE_ARCHITECTURE,
-    )
-    policy.load_state_dict(payload["policy"])
-    return policy.eval().requires_grad_(False), config
-
-
-def _simulate_simple(
-    state: SpectatorState,
-    registry: CheckpointRegistry,
-    blue_path: Path,
-    orange_path: Path,
-    args: argparse.Namespace,
-) -> None:
-    base = None
-    try:
-        reset_dataset = load_demonstration_reset_dataset(
-            args.replay_dir,
-            "cuda:0",
-            args.frameskip,
-            args.reset_state_limit,
-            args.seed,
-        )
-        reset_sampler = DatasetResetSampler(
-            reset_dataset, probability=1.0, seed=args.seed
-        )
-        base = CARLTorchVectorEnv(
-            n_sim=1,
-            n_blue=1,
-            n_orange=1,
-            seed=args.seed,
-            frameskip=args.frameskip,
-            max_ticks=args.max_ticks,
-            normalize=True,
-            synchronize=True,
-            reset_state_provider=reset_sampler,
-            discrete_actions=True,
-        )
-        blue, blue_config = load_simple_checkpoint(blue_path, base)
-        orange, orange_config = load_simple_checkpoint(orange_path, base)
-        for config in (blue_config, orange_config):
-            if int(config["frameskip"]) != args.frameskip:
-                raise ValueError("checkpoint frameskip does not match watcher")
-
-        observation = base.reset()
-        blue_state = blue.initial_state(1)
-        orange_state = orange.initial_state(1)
-        blue_score = orange_score = 0
-        round_number = 1
-        tick = 0
-        state.publish(render_frame(
-            raw_state(base),
-            registry.directory,
-            blue_path,
-            orange_path,
-            blue_score,
-            orange_score,
-            round_number,
-            tick,
-        ))
-        state.stop.wait(args.frameskip / 120.0)
-        next_step = time.perf_counter()
-
-        while not state.stop.is_set():
-            pending = state.take_match()
-            if pending is not None:
-                try:
-                    next_blue, next_blue_config = load_simple_checkpoint(
-                        pending[0], base
-                    )
-                    next_orange, next_orange_config = load_simple_checkpoint(
-                        pending[1], base
-                    )
-                    for config in (next_blue_config, next_orange_config):
-                        if int(config["frameskip"]) != args.frameskip:
-                            raise ValueError(
-                                "checkpoint frameskip does not match watcher"
-                            )
-                except Exception as error:
-                    state.publish({"error": f"{type(error).__name__}: {error}"})
-                else:
-                    blue_path, orange_path = pending
-                    blue, orange = next_blue, next_orange
-                    state.reset.set()
-
-            if state.reset.is_set():
-                state.reset.clear()
-                observation = base.reset()
-                blue_state = blue.initial_state(1)
-                orange_state = orange.initial_state(1)
-                blue_score = orange_score = 0
-                round_number = 1
-                tick = 0
-                state.publish(render_frame(
-                    raw_state(base),
-                    registry.directory,
-                    blue_path,
-                    orange_path,
-                    blue_score,
-                    orange_score,
-                    round_number,
-                    tick,
-                ))
-                state.stop.wait(args.frameskip / 120.0)
-                next_step = time.perf_counter()
-                continue
-
-            with th.inference_mode():
-                blue_output = blue.act(
-                    observation[:1], blue_state, deterministic=True
-                )
-                orange_output = orange.act(
-                    observation[1:], orange_state, deterministic=True
-                )
-                blue_state = blue_output.next_state
-                orange_state = orange_output.next_state
-                actions = th.cat((blue_output.action, orange_output.action))
-            observation, reward, terminated, truncated, _ = base.step(actions)
-            tick += args.frameskip
-
-            goal = int(reward[0].item())
-            blue_score += max(goal, 0)
-            orange_score += max(-goal, 0)
-            if (terminated | truncated).any():
-                blue_state = blue.initial_state(1)
-                orange_state = orange.initial_state(1)
-                round_number += 1
-                tick = 0
-
-            state.publish(render_frame(
-                raw_state(base),
-                registry.directory,
-                blue_path,
-                orange_path,
-                blue_score,
-                orange_score,
-                round_number,
-                tick,
-            ))
-            next_step += args.frameskip / 120.0
-            delay = next_step - time.perf_counter()
-            if delay > 0:
-                state.stop.wait(delay)
-            else:
-                next_step = time.perf_counter()
-    except Exception as error:
-        state.publish({"error": f"{type(error).__name__}: {error}"})
-    finally:
-        if base is not None:
-            base.close()
-
-
 def _simulate_pulse(
     state: SpectatorState,
     registry: CheckpointRegistry,
@@ -482,9 +292,6 @@ def _simulate_pulse(
         observation = env.reset()
         blue_state = blue.initial_state(1)
         orange_state = orange.initial_state(1)
-        blue_latent = orange_latent = None
-        blue_remaining = orange_remaining = 0
-        duration_generator = th.Generator(device=base.device).manual_seed(args.seed)
         blue_score = orange_score = 0
         round_number = 1
         tick = 0
@@ -499,12 +306,6 @@ def _simulate_pulse(
                     require_compatible_policies(
                         next_blue_payload, next_orange_payload
                     )
-                    if skill_semantics(next_blue_payload) != skill_semantics(
-                        blue_metadata
-                    ):
-                        raise ValueError(
-                            "selected policies use different skill duration semantics"
-                        )
                     next_artifact = str(next_blue_payload["distill_sha256"])
                     if next_artifact != artifact_id:
                         raise ValueError(
@@ -528,73 +329,21 @@ def _simulate_pulse(
                 observation = env.reset()
                 blue_state = blue.initial_state(1)
                 orange_state = orange.initial_state(1)
-                blue_latent = orange_latent = None
-                blue_remaining = orange_remaining = 0
-                duration_generator.manual_seed(args.seed)
                 blue_score = orange_score = 0
                 round_number = 1
                 tick = 0
 
             with th.inference_mode():
-                semantics = skill_semantics(blue_metadata)
-                if semantics is None:
-                    blue_duration = orange_duration = 1
-                else:
-                    horizon, jitter = semantics
-                    if blue_remaining == 0:
-                        blue_duration = int(th.randint(
-                            horizon - jitter,
-                            horizon + jitter + 1,
-                            (1,),
-                            generator=duration_generator,
-                            device=base.device,
-                        ).item())
-                    if orange_remaining == 0:
-                        orange_duration = int(th.randint(
-                            horizon - jitter,
-                            horizon + jitter + 1,
-                            (1,),
-                            generator=duration_generator,
-                            device=base.device,
-                        ).item())
-
-                if blue_remaining == 0:
-                    blue_input = policy_observation(
-                        observation[:1], blue_duration, controller.max_duration
-                    )
-                    blue_output = blue.act(
-                        blue_input, blue_state, deterministic=True
-                    )
-                    blue_state = blue_output.next_state
-                    blue_latent = (
-                        blue_output.action
-                        if semantics is None
-                        else controller.select_latent(
-                            observation[:1], blue_output.action, blue_duration
-                        )
-                    )
-                    blue_remaining = blue_duration
-                if orange_remaining == 0:
-                    orange_input = policy_observation(
-                        observation[1:], orange_duration, controller.max_duration
-                    )
-                    orange_output = orange.act(
-                        orange_input, orange_state, deterministic=True
-                    )
-                    orange_state = orange_output.next_state
-                    orange_latent = (
-                        orange_output.action
-                        if semantics is None
-                        else controller.select_latent(
-                            observation[1:], orange_output.action, orange_duration
-                        )
-                    )
-                    orange_remaining = orange_duration
-
-                latent = th.cat((blue_latent, orange_latent))
+                blue_output = blue.act(
+                    observation[:1], blue_state, deterministic=True
+                )
+                orange_output = orange.act(
+                    observation[1:], orange_state, deterministic=True
+                )
+                blue_state = blue_output.next_state
+                orange_state = orange_output.next_state
+                latent = th.cat((blue_output.action, orange_output.action))
             observation, reward, terminated, truncated, _ = env.step(latent)
-            blue_remaining -= 1
-            orange_remaining -= 1
             tick += args.frameskip
 
             goal = int(reward[0].item())
@@ -603,8 +352,6 @@ def _simulate_pulse(
             if (terminated | truncated).any():
                 blue_state = blue.initial_state(1)
                 orange_state = orange.initial_state(1)
-                blue_latent = orange_latent = None
-                blue_remaining = orange_remaining = 0
                 round_number += 1
                 tick = 0
 
@@ -639,19 +386,7 @@ def simulate(
     args: argparse.Namespace,
 ) -> None:
     try:
-        blue = th.load(blue_path, map_location="cpu", weights_only=True)
-        orange = th.load(orange_path, map_location="cpu", weights_only=True)
-        architectures = {
-            _checkpoint_architecture(blue),
-            _checkpoint_architecture(orange),
-        }
-        simple_architectures = {LEGACY_SIMPLE_ARCHITECTURE, SIMPLE_ARCHITECTURE}
-        if architectures <= simple_architectures:
-            _simulate_simple(state, registry, blue_path, orange_path, args)
-        elif architectures & simple_architectures:
-            raise ValueError("cannot mix simple and PULSE checkpoints")
-        else:
-            _simulate_pulse(state, registry, blue_path, orange_path, args)
+        _simulate_pulse(state, registry, blue_path, orange_path, args)
     except Exception as error:
         state.publish({"error": f"{type(error).__name__}: {error}"})
 

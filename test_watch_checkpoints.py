@@ -5,24 +5,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch as th
-
-from simple import SIMPLE_ARCHITECTURE, build_policy
-from test_watch_gaifo import FakeEnv
 from watch_checkpoints import (
     CheckpointRegistry,
-    load_simple_checkpoint,
+    file_sha256,
+    resolve_pulse_artifact,
     simulate,
 )
 
 
-class SimpleCheckpointWatcherTest(unittest.TestCase):
-    def test_registry_discovers_nested_simple_checkpoints(self):
+class SelfPlayCheckpointWatcherTest(unittest.TestCase):
+    def test_registry_discovers_nested_self_play_checkpoints(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            run = root / "simple-run"
+            run = root / "self-play-run"
             run.mkdir()
-            checkpoint = run / "simple_000000000123.pt"
+            checkpoint = run / "self_play_000000000123.pt"
             checkpoint.touch()
             registry = CheckpointRegistry(root)
 
@@ -32,37 +29,69 @@ class SimpleCheckpointWatcherTest(unittest.TestCase):
             self.assertEqual(listed[0].step, 123)
             self.assertEqual(registry.resolve(listed[0].relative_path), checkpoint)
 
-    def test_loads_direct_action_simple_policy(self):
-        env = FakeEnv()
-        policy = build_policy(env, 16)
+    def test_registry_ignores_other_checkpoint_kinds(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "simple_000000000001.pt"
-            th.save({
-                "policy": policy.state_dict(),
-                "config": {
-                    "architecture": SIMPLE_ARCHITECTURE,
-                    "policy_hidden": 16,
-                    "frameskip": 4,
-                    "recurrent": True,
-                },
-            }, path)
+            root = Path(directory)
+            (root / "simple_000000000001.pt").touch()
+            registry = CheckpointRegistry(root)
 
-            loaded, config = load_simple_checkpoint(path, env)
+            self.assertEqual(registry.list(), [])
 
-        self.assertEqual(config["architecture"], SIMPLE_ARCHITECTURE)
-        self.assertIsNotNone(loaded.initial_state(1))
-        for key, value in policy.state_dict().items():
-            th.testing.assert_close(loaded.state_dict()[key], value)
+    def test_resolve_pulse_artifact_verifies_embedded_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "frozen_pulse.pt"
+            artifact.touch()
+            payload = {
+                "distill_sha256": "abc",
+                "pulse_artifact": "frozen_pulse.pt",
+                "pulse_sha256": file_sha256(artifact),
+            }
+            checkpoint = root / "self_play_000000000001.pt"
+            checkpoint.touch()
 
-    def test_simulation_dispatches_simple_checkpoints_without_pulse(self):
-        payload = {"config": {"architecture": SIMPLE_ARCHITECTURE}}
+            resolved = resolve_pulse_artifact(None, checkpoint, payload, payload)
+
+            self.assertEqual(resolved, artifact)
+
+    def test_resolve_pulse_artifact_rejects_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "frozen_pulse.pt"
+            artifact.touch()
+            payload = {
+                "distill_sha256": "abc",
+                "pulse_artifact": "frozen_pulse.pt",
+                "pulse_sha256": "wrong",
+            }
+            checkpoint = root / "self_play_000000000001.pt"
+            checkpoint.touch()
+
+            with self.assertRaisesRegex(ValueError, "verification"):
+                resolve_pulse_artifact(None, checkpoint, payload, payload)
+
+    def test_simulation_uses_the_pulse_pipeline(self):
         state = SimpleNamespace(publish=MagicMock())
         registry = SimpleNamespace()
 
-        with (
-            patch("watch_checkpoints.th.load", return_value=payload),
-            patch("watch_checkpoints._simulate_simple") as direct,
-            patch("watch_checkpoints._simulate_pulse") as pulse,
+        with patch("watch_checkpoints._simulate_pulse") as pulse:
+            simulate(
+                state,
+                registry,
+                Path("blue.pt"),
+                Path("orange.pt"),
+                SimpleNamespace(),
+            )
+
+        pulse.assert_called_once()
+        state.publish.assert_not_called()
+
+    def test_simulation_publishes_pipeline_errors(self):
+        state = SimpleNamespace(publish=MagicMock())
+        registry = SimpleNamespace()
+
+        with patch(
+            "watch_checkpoints._simulate_pulse", side_effect=ValueError("bad")
         ):
             simulate(
                 state,
@@ -72,9 +101,8 @@ class SimpleCheckpointWatcherTest(unittest.TestCase):
                 SimpleNamespace(),
             )
 
-        direct.assert_called_once()
-        pulse.assert_not_called()
-        state.publish.assert_not_called()
+        state.publish.assert_called_once()
+        self.assertIn("bad", state.publish.call_args.args[0]["error"])
 
 
 if __name__ == "__main__":

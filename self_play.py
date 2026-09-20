@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 
 import gymnasium as gym
-import numpy as np
 import torch as th
 import torch.nn as nn
 
@@ -20,20 +19,19 @@ from jarl.collect import (
     SelfPlayRunner,
     SnapshotPool,
 )
-from jarl.collect.runner import _make_env_step
+from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.data.records import Evaluation, PolicyOutput
 from jarl.learn import Algorithm, OptimizerStep, PPOConfig, PPOLoss, Update
 from jarl.log.logger import Logger
-from jarl.data import TensorBatch
 from jarl.envs import DatasetResetSampler
-from jarl.modules import GRU, MLP, orthogonal_init
+from jarl.modules import MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import DiagonalGaussianPolicy
 from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
-from jarl.sample import RecurrentRolloutMinibatches
-from jarl.store.rollout import Rollout
-from jarl.transform import SemiMarkovGAE
+from jarl.sample import RolloutMinibatches
+from jarl.store.rollout import RolloutBuffer
+from jarl.transform import GAE
 
 from distill import (
     ACTION_FORMAT,
@@ -48,69 +46,28 @@ from rewards import AnnealedNextoReward, nexto_shaping_scale
 
 
 def primitive_discount(frameskip: int, half_life_seconds: float) -> float:
-    """Per-skill-step discount given the physics frame skip and a half-life."""
+    """Per-step discount given the physics frame skip and a half-life."""
     if frameskip <= 0 or not math.isfinite(half_life_seconds) or half_life_seconds <= 0:
         raise ValueError("frameskip and half_life_seconds must be positive")
     ticks_per_second = 120.0
     return math.exp(-math.log(2.0) * frameskip / (ticks_per_second * half_life_seconds))
 
 
-def policy_observation(
-    physical: np.ndarray | th.Tensor,
-    duration: int | float | th.Tensor,
-    max_duration: int | None,
-) -> np.ndarray | th.Tensor:
-    """Return the high-level observation used to choose a latent skill.
-
-    For legacy artifacts without a duration budget, the physical observation is
-    returned unchanged. New artifacts append a normalized duration scalar.
-    """
-    if max_duration is None:
-        return physical
-    physical_tensor = th.as_tensor(physical)
-    if physical_tensor.ndim == 0:
-        physical_tensor = physical_tensor.unsqueeze(0)
-    normalized = (
-        th.as_tensor(duration, dtype=physical_tensor.dtype, device=physical_tensor.device)
-        / max_duration
-    )
-    if normalized.ndim == 0:
-        normalized = normalized.unsqueeze(0)
-    normalized = normalized.reshape(physical_tensor.shape[:-1] + (1,))
-    return th.cat((physical_tensor, normalized), dim=-1)
-
-
-def _build_policy_observation_space(
-    physical_space: gym.spaces.Space,
-    max_duration: int | None,
-) -> gym.spaces.Space:
-    if max_duration is None or not isinstance(physical_space, gym.spaces.Box):
-        return physical_space
-    low = policy_observation(physical_space.low, 0, max_duration)
-    high = policy_observation(physical_space.high, max_duration, max_duration)
-    low = low.cpu().numpy() if isinstance(low, th.Tensor) else low
-    high = high.cpu().numpy() if isinstance(high, th.Tensor) else high
-    return gym.spaces.Box(low, high, dtype=physical_space.dtype)
-
-
 class FrozenPulseController(nn.Module):
+    """Frozen PULSE prior and decoder used as the self-play action layer."""
+
     def __init__(
         self,
         prior: ConditionalPrior,
         decoder: ActionDecoder,
         action_codec,
         bf16: bool = False,
-        skill_horizon: int | None = None,
-        skill_horizon_jitter: int | None = None,
     ) -> None:
         super().__init__()
         self.prior = prior.eval().requires_grad_(False)
         self.decoder = decoder.eval().requires_grad_(False)
         self.action_codec = action_codec
         self.bf16 = bf16
-        self.skill_horizon = skill_horizon
-        self.skill_horizon_jitter = skill_horizon_jitter
-        self.max_duration = prior.max_duration
 
     @classmethod
     def load(
@@ -129,17 +86,11 @@ class FrozenPulseController(nn.Module):
             raise ValueError(
                 "self-play frame skip does not match the distillation artifact"
             )
-        skill_horizon = config.get("skill_horizon")
-        skill_horizon_jitter = config.get("skill_horizon_jitter")
-        max_duration = None
-        if skill_horizon is not None and skill_horizon_jitter is not None:
-            max_duration = int(skill_horizon) + int(skill_horizon_jitter)
         control_state_size = int(config.get("control_state_size", GOAL_STATE_SIZE))
         prior = ConditionalPrior(
             control_state_size,
             int(config["latent_size"]),
             list(config["encoder_hidden"]),
-            max_duration=max_duration,
         ).to(device)
         decoder = ActionDecoder(
             control_state_size,
@@ -148,54 +99,41 @@ class FrozenPulseController(nn.Module):
         ).to(device)
         prior.load_state_dict(payload["prior"])
         decoder.load_state_dict(payload["decoder"])
-        return cls(
-            prior,
-            decoder,
-            action_codec,
-            bf16,
-            skill_horizon=skill_horizon,
-            skill_horizon_jitter=skill_horizon_jitter,
-        )
+        return cls(prior, decoder, action_codec, bf16)
 
     @property
     def latent_size(self) -> int:
-        return self.prior.mean.out_features
+        return self.prior.latent_dim
+
+    @th.no_grad()
+    def prior_mean(self, observation: th.Tensor) -> th.Tensor:
+        state = observation[..., : self.prior.state_dim]
+        with th.autocast(
+            device_type=state.device.type,
+            dtype=th.bfloat16,
+            enabled=self.bf16 and state.device.type == "cuda",
+        ):
+            mean, _ = self.prior(state)
+        return mean
 
     @th.no_grad()
     def select_latent(
         self,
         observation: th.Tensor,
         residual: th.Tensor,
-        duration: int | th.Tensor | None = None,
     ) -> th.Tensor:
-        state = observation[..., :self.prior.state_dim]
-        with th.autocast(
-            device_type=state.device.type,
-            dtype=th.bfloat16,
-            enabled=self.bf16 and state.device.type == "cuda",
-        ):
-            if self.max_duration is None:
-                prior_mean, _ = self.prior(state)
-            else:
-                if duration is None:
-                    duration = self.max_duration
-                prior_mean, _ = self.prior(state, th.as_tensor(duration, device=state.device))
-        return prior_mean + residual
+        return self.prior_mean(observation) + residual
 
     @th.no_grad()
     def decode(self, observation: th.Tensor, residual: th.Tensor) -> th.Tensor:
-        state = observation[..., :self.prior.state_dim]
+        state = observation[..., : self.prior.state_dim]
         with th.autocast(
             device_type=state.device.type,
             dtype=th.bfloat16,
             enabled=self.bf16 and state.device.type == "cuda",
         ):
-            if self.max_duration is None:
-                prior_mean, _ = self.prior(state)
-                latent = prior_mean + residual
-            else:
-                latent = residual
-            logits = self.decoder(state, latent)
+            prior_mean, _ = self.prior(state)
+            logits = self.decoder(state, prior_mean + residual)
         return factor_actions(masked_logits(logits, state, self.action_codec))
 
 
@@ -208,12 +146,8 @@ class PulseLatentEnv:
         self.n_envs = env.n_envs
         self.n_sim = env.n_sim
         self.device = env.device
-        self.single_observation_space = _build_policy_observation_space(
-            env.single_observation_space, controller.max_duration
-        )
-        self.observation_space = batch_space(
-            self.single_observation_space, self.n_envs
-        )
+        self.single_observation_space = env.single_observation_space
+        self.observation_space = env.observation_space
         self.single_action_space = gym.spaces.Box(
             -math.inf,
             math.inf,
@@ -243,121 +177,6 @@ class PulseLatentEnv:
 
     def close(self) -> None:
         self.env.close()
-
-
-class RaggedRolloutBuffer:
-    """Rollout buffer that records a variable number of steps per actor."""
-
-    def __init__(
-        self,
-        horizon: int,
-        num_envs: int,
-        device: str | th.device,
-        copy_on_finish: bool = False,
-    ) -> None:
-        if horizon < 1 or num_envs < 1:
-            raise ValueError("horizon and num_envs must be positive")
-        self.horizon = horizon
-        self.num_envs = num_envs
-        self.device = th.device(device)
-        self.copy_on_finish = copy_on_finish
-        self.blocked = False
-        self.counts = th.zeros(num_envs, dtype=th.int64, device=self.device)
-        self._storage: dict[str, th.Tensor] | None = None
-
-    @property
-    def full(self) -> bool:
-        return not self.blocked and int(self.counts.min().item()) >= self.horizon
-
-    def can_finish(self, active: th.Tensor) -> bool:
-        active = th.as_tensor(active, dtype=th.bool, device=self.device)
-        if active.shape != self.counts.shape:
-            raise ValueError("active skill mask must match rollout actors")
-        projected = self.counts + active.long()
-        return int(projected.min().item()) >= self.horizon
-
-    @property
-    def position(self) -> int:
-        if self.counts.max().item() == 0:
-            return 0
-        return int(self.counts.max().item())
-
-    def _initialize(self, transition: dict[str, object]) -> None:
-        self._storage = {}
-        for key, value in transition.items():
-            tensor = th.as_tensor(value, device=self.device)
-            self._storage[key] = th.zeros(
-                (self.horizon, self.num_envs, *tensor.shape[1:]),
-                dtype=tensor.dtype,
-                device=self.device,
-            )
-
-    def _grow(self) -> None:
-        if self._storage is None:
-            return
-        capacity = next(iter(self._storage.values())).shape[0]
-        for key, value in self._storage.items():
-            padding = th.zeros_like(value[:capacity])
-            self._storage[key] = th.cat((value, padding), dim=0)
-
-    def append(
-        self,
-        indices: list[int] | th.Tensor | np.ndarray,
-        transition: dict[str, object],
-    ) -> None:
-        indices = th.as_tensor(indices, dtype=th.long, device=self.device)
-        if indices.numel() == 0:
-            return
-        if self._storage is None:
-            self._initialize(transition)
-        if int(self.counts[indices].max().item()) >= next(
-            iter(self._storage.values())
-        ).shape[0]:
-            self._grow()
-        if set(transition.keys()) != set(self._storage.keys()):
-            raise KeyError("transition fields changed after storage initialization")
-
-        positions = self.counts[indices]
-        for key, value in transition.items():
-            tensor = th.as_tensor(value, device=self.device)
-            expected_feature = self._storage[key].shape[2:]
-            if tensor.shape != (len(indices), *expected_feature):
-                raise ValueError(
-                    f"field {key!r} has shape {tuple(tensor.shape)}, "
-                    f"expected ({len(indices)}, *{tuple(expected_feature)})"
-                )
-            self._storage[key][positions, indices] = tensor
-        self.counts[indices] += 1
-
-    def finish(self) -> Rollout:
-        if self.position == 0 or self._storage is None:
-            raise RuntimeError("cannot finish an empty ragged rollout")
-
-        length = self.position
-        steps: dict[str, th.Tensor] = {}
-        for key, value in self._storage.items():
-            steps[key] = (
-                value[:length].clone()
-                if self.copy_on_finish
-                else value[:length]
-            )
-
-        valid = (
-            th.arange(length, device=self.device).unsqueeze(1)
-            < self.counts.unsqueeze(0)
-        )
-        if "learner_mask" in steps:
-            learner_mask = steps.pop("learner_mask") & valid
-        else:
-            learner_mask = valid.clone()
-        steps["valid"] = valid
-        steps["learner_mask"] = learner_mask
-        return Rollout(TensorBatch(steps))
-
-    def clear(self) -> None:
-        self.counts.zero_()
-        self._storage = None
-        self.blocked = False
 
 
 class TrainableGaussianPolicy(DiagonalGaussianPolicy):
@@ -433,6 +252,22 @@ class TrainableGaussianPolicy(DiagonalGaussianPolicy):
         )
 
 
+class CriticValueCapture(CaptureBase):
+    def __init__(self, critic: Critic) -> None:
+        self.critic = critic
+
+    @th.no_grad()
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        next_observation = th.as_tensor(
+            context.env_step.next_obs,
+            device=context.observation.device,
+        )
+        return {
+            "baseline_value": self.critic.value(context.observation),
+            "baseline_next_value": self.critic.value(next_observation),
+        }
+
+
 class SelfPlayCheckpoints:
     def __init__(
         self,
@@ -442,7 +277,7 @@ class SelfPlayCheckpoints:
         policy: nn.Module,
         critic: nn.Module,
         optimizer: th.optim.Optimizer,
-        buffer: RaggedRolloutBuffer,
+        buffer: RolloutBuffer,
         controller: FrozenPulseController,
         args: argparse.Namespace,
     ) -> None:
@@ -524,251 +359,51 @@ def baseline_opponent_ids(pool: SnapshotPool, count: int) -> tuple[int, ...]:
     return (0, *recent[-(count - 1):])
 
 
-class SemiMarkovSelfPlayRunner(SelfPlayRunner):
-    """Collect semi-Markov skill transitions with planned durations and held latents.
+class DiagnosticSelfPlayRunner(SelfPlayRunner):
+    """Self-play runner that tracks gameplay diagnostics for logging."""
 
-    One call to :meth:`step` advances the underlying environment by one primitive
-    step.  Skills start at actor boundaries with an independently sampled
-    duration; the full latent is computed once per skill and held constant while
-    primitive rewards are aggregated with per-primitive discounting.  Only actors
-    at a boundary invoke the live learner or a routed historical snapshot, and
-    only boundary steps advance the actor and recurrent critic states.
-    """
-
-    def __init__(
-        self,
-        env,
-        policy,
-        critic,
-        controller: FrozenPulseController,
-        buffer,
-        gamma: float,
-        skill_horizon: int,
-        skill_horizon_jitter: int,
-        seed: int,
-        opponent_pool: SnapshotPool | None = None,
-        matchmaker: SelfPlayMatchmaker | None = None,
-        snapshot_policy=None,
-        historical_policies: int = 1,
-        gameplay_reward: AnnealedNextoReward | None = None,
-    ) -> None:
-        super().__init__(
-            env=env,
-            policy=policy,
-            buffer=buffer,
-            opponent_pool=opponent_pool,
-            matchmaker=matchmaker,
-            snapshot_policy=snapshot_policy,
-            historical_policies=historical_policies,
-            captures=(),
-        )
-        self.critic = critic
-        self.controller = controller
-        self.gamma = gamma
-        self.skill_horizon = skill_horizon
-        self.skill_horizon_jitter = skill_horizon_jitter
+    def __init__(self, *args, gameplay_reward: AnnealedNextoReward | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
         self.gameplay_reward = gameplay_reward
-        self._duration_generator = th.Generator(
-            device=self.env.device
-        ).manual_seed(seed)
+        self._diagnostics: dict[str, th.Tensor] | None = None
 
-        self._elapsed: th.Tensor | None = None
-        self._planned_duration: th.Tensor | None = None
-        self._queued_duration: th.Tensor | None = None
-        self._reward_sum: th.Tensor | None = None
-        self._held_latent: th.Tensor | None = None
-        self._critic_state: th.Tensor | None = None
-        self._start_observation: th.Tensor | None = None
-        self._start_action: th.Tensor | None = None
-        self._start_log_prob: th.Tensor | None = None
-        self._start_policy_state: th.Tensor | None = None
-        self._start_critic_state: th.Tensor | None = None
-        self._start_baseline_value: th.Tensor | None = None
-        self._start_learner_mask: th.Tensor | None = None
-        self._diagnostics: dict[str, th.Tensor] = {}
-        self._draining = False
-        self._filler_mask: th.Tensor | None = None
-        self._active_step: th.Tensor | None = None
-
-    @property
-    def timestep_count(self) -> int:
-        return self._timestep_count
-
-    def _sample_durations(self, count: int) -> th.Tensor:
-        if count == 0:
-            return th.empty(
-                (0,), dtype=th.int64, device=self.env.device
+    def reset(self):
+        observation = super().reset()
+        self._diagnostics = {
+            name: th.zeros((), dtype=th.float32, device=self.env.device)
+            for name in (
+                "steps",
+                "touches",
+                "goals_for",
+                "goals_against",
+                "episodes",
+                "timeouts",
+                "baseline_episodes",
+                "baseline_wins",
             )
-        low = self.skill_horizon - self.skill_horizon_jitter
-        high = self.skill_horizon + self.skill_horizon_jitter
-        return th.randint(
-            low,
-            high + 1,
-            (count,),
-            generator=self._duration_generator,
-            device=self.env.device,
-        )
+        }
+        return observation
 
-    def _augment_observation(
-        self,
-        physical: th.Tensor,
-        duration: th.Tensor,
-    ) -> th.Tensor:
-        max_duration = self.skill_horizon + self.skill_horizon_jitter
-        return policy_observation(physical, duration, max_duration)
+    def step(self):
+        env_step = super().step()
+        self._record_diagnostics(env_step)
+        return env_step
 
-    def _at_boundary(self) -> th.Tensor:
-        boundary = self._elapsed == 0
-        if self._filler_mask is not None:
-            boundary &= ~self._filler_mask
-        return boundary
-
-    def _mark_filler(self, mask: th.Tensor) -> None:
-        if not mask.any():
+    def after_update(self, timesteps: int) -> None:
+        if self.opponent_pool is None or not self.opponent_pool.ready(timesteps):
             return
-        self._filler_mask[mask] = True
-        self._planned_duration[mask] = -1
-        self._queued_duration[mask] = -1
-        self._elapsed[mask] = 0
-        self._reward_sum[mask] = 0.0
-
-    def _update_drain_state(self, completion_mask: th.Tensor) -> None:
-        if self._draining:
-            self._mark_filler(completion_mask)
-        elif int(self.buffer.counts.min().item()) >= self.buffer.horizon:
-            self._draining = True
-            self._mark_filler(self._elapsed == 0)
-
-        if self._draining:
-            self.buffer.blocked = not bool(self._filler_mask.all().item())
-
-    def _act_boundary(
-        self,
-        observation: th.Tensor,
-        boundary_mask: th.Tensor,
-    ) -> PolicyOutput:
-        """Invoke the learner or routed historical policies for boundary actors."""
-        action = th.zeros(
-            (self.n_envs, self.env.single_action_space.shape[0]),
-            dtype=observation.dtype,
-            device=observation.device,
+        self.opponent_pool.add(
+            self.snapshot_policy,
+            timesteps,
+            protected_ids=(0,),
         )
-        log_prob = th.zeros(self.n_envs, dtype=th.float32, device=observation.device)
-        next_state = None if self.state is None else self.state.clone()
-
-        learner_mask = self.matchmaker.learner_mask
-        boundary_learner_mask = boundary_mask & learner_mask
-
-        if boundary_learner_mask.any():
-            learner_output = self.policy.act(
-                observation[boundary_learner_mask],
-                self._state_for(boundary_learner_mask),
-            )
-            action[boundary_learner_mask] = learner_output.action
-            log_prob[boundary_learner_mask] = learner_output.log_prob
-            if next_state is not None:
-                next_state[boundary_learner_mask] = learner_output.next_state
-
-        historical_boundary_mask = boundary_mask & ~learner_mask
-        if historical_boundary_mask.any():
-            opponent_ids = self.matchmaker.opponent_ids
-            for snapshot_id in opponent_ids[historical_boundary_mask].unique().tolist():
-                mask = historical_boundary_mask & (opponent_ids == snapshot_id)
-                if not mask.any():
-                    continue
-                opponent = self.opponent_pool.policy(snapshot_id, observation.device)
-                output = opponent.act(observation[mask], self._state_for(mask))
-                action[mask] = output.action
-                log_prob[mask] = output.log_prob
-                if next_state is not None:
-                    next_state[mask] = output.next_state
-
-        return PolicyOutput(action=action, log_prob=log_prob, next_state=next_state)
-
-    def _evaluate_critic_boundary(
-        self,
-        observation: th.Tensor,
-        boundary_mask: th.Tensor,
-    ) -> tuple[th.Tensor, th.Tensor | None]:
-        """Evaluate the recurrent critic for boundary actors and advance its state."""
-        if self._critic_state is None:
-            value = self.critic.value(observation[boundary_mask])
-            full_value = th.zeros(
-                self.n_envs, dtype=th.float32, device=observation.device
-            )
-            full_value[boundary_mask] = value
-            return full_value, None
-
-        pre_state = self._critic_state
-        features, next_state = self.critic.body_features(
-            observation[boundary_mask], pre_state[boundary_mask]
+        self.matchmaker.set_historical_ids(
+            baseline_opponent_ids(self.opponent_pool, self.historical_policies)
         )
-        value = self.critic.value_from_features(features)
-
-        full_value = th.zeros(
-            self.n_envs, dtype=th.float32, device=observation.device
-        )
-        full_value[boundary_mask] = value
-
-        full_next_state = pre_state.clone()
-        full_next_state[boundary_mask] = next_state
-        return full_value, full_next_state
-
-    def _start_skill_at_boundary(
-        self,
-        physical_observation: th.Tensor,
-        boundary_mask: th.Tensor,
-    ) -> None:
-        """Sample duration, evaluate actor/critic, and hold the full latent."""
-        planned = self._planned_duration[boundary_mask]
-        needs_sample = planned == -1
-        sampled = self._sample_durations(int(needs_sample.sum().item()))
-        sampled_full = th.empty_like(planned)
-        sampled_full[needs_sample] = sampled
-        planned = th.where(needs_sample, sampled_full, planned)
-        self._planned_duration[boundary_mask] = planned
-        self._queued_duration[boundary_mask] = -1
-
-        augmented_obs = self._augment_observation(
-            physical_observation, self._planned_duration
-        )
-
-        pre_policy_state = self.state.clone() if self.state is not None else None
-        pre_critic_state = (
-            self._critic_state.clone()
-            if self._critic_state is not None
-            else None
-        )
-
-        output = self._act_boundary(augmented_obs, boundary_mask)
-        baseline_value, next_critic_state = self._evaluate_critic_boundary(
-            augmented_obs, boundary_mask
-        )
-
-        self._start_observation[boundary_mask] = augmented_obs[boundary_mask]
-        self._start_action[boundary_mask] = output.action[boundary_mask]
-        self._start_log_prob[boundary_mask] = output.log_prob[boundary_mask]
-        if pre_policy_state is not None:
-            self._start_policy_state[boundary_mask] = pre_policy_state[boundary_mask]
-        if pre_critic_state is not None:
-            self._start_critic_state[boundary_mask] = pre_critic_state[boundary_mask]
-        self._start_baseline_value[boundary_mask] = baseline_value[boundary_mask]
-        self._start_learner_mask[boundary_mask] = self.matchmaker.learner_mask[boundary_mask]
-
-        self.state = output.next_state
-        self._critic_state = next_critic_state
-
-        self._held_latent[boundary_mask] = self.controller.select_latent(
-            physical_observation[boundary_mask],
-            output.action[boundary_mask],
-            self._planned_duration[boundary_mask],
-        )
-
-    def _completion_mask(self, env_step) -> th.Tensor:
-        done = th.as_tensor(env_step.done, dtype=th.bool, device=self.env.device)
-        return (
-            (self._elapsed == self._planned_duration) | done
-        ) & (self._planned_duration != -1)
+        remapped = self.matchmaker.remap_stale_opponents()
+        if self.state is not None:
+            keep = (~remapped).view(-1, *(1,) * (self.state.ndim - 1))
+            self.state = self.state * keep
 
     def _baseline_mask(self) -> th.Tensor:
         baseline_matches = (
@@ -781,24 +416,15 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         )
         return baseline_matches.repeat_interleave(self.matchmaker.players_per_match)
 
-    def _episode_groups(self) -> dict[str, th.Tensor]:
-        groups = super()._episode_groups()
-        active = self._active_step
-        groups = {name: mask & active for name, mask in groups.items()}
-        groups["baseline"] = (
-            self.matchmaker.learner_mask & self._baseline_mask() & active
-        )
-        return groups
-
     def _record_diagnostics(self, env_step) -> None:
-        if self.gameplay_reward is None:
+        if self.gameplay_reward is None or self._diagnostics is None:
             return
         touches = self.gameplay_reward.last_touches
         score = self.gameplay_reward.last_score_for_actor
         if touches is None or score is None:
             return
 
-        learner = self.matchmaker.learner_mask & ~self._filler_mask
+        learner = self.matchmaker.learner_mask
         done = th.as_tensor(env_step.done, dtype=th.bool, device=self.env.device)
         no_touch_timeout = self.gameplay_reward.last_no_touch_timeout
         if no_touch_timeout is None:
@@ -820,7 +446,7 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
         self._diagnostics["baseline_wins"] += ((score > 0) & baseline).sum()
 
     def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
-        if not self._diagnostics:
+        if self._diagnostics is None:
             return {}
         metrics = {}
         steps = self._diagnostics["steps"]
@@ -851,221 +477,10 @@ class SemiMarkovSelfPlayRunner(SelfPlayRunner):
             "Gameplay": {name: value.item() for name, value in metrics.items()}
         } if metrics else {}
 
-    def _close_skills(self, env_step, completion_mask: th.Tensor) -> None:
-        """Append completed skill transitions and prepare the next queued duration."""
-        completion_indices = completion_mask.nonzero(as_tuple=True)[0]
-        count = len(completion_indices)
-
-        queued = self._sample_durations(count)
-        self._queued_duration[completion_mask] = queued
-
-        next_physical = th.as_tensor(
-            env_step.next_obs, device=self.env.device
-        )
-        next_obs = self._augment_observation(
-            next_physical, self._queued_duration
-        )
-
-        with th.no_grad():
-            features, _ = self.critic.body_features(
-                next_obs[completion_mask], self._critic_state[completion_mask]
-            )
-            baseline_next = self.critic.value_from_features(features)
-
-        full_baseline_next = th.zeros(
-            self.n_envs, dtype=th.float32, device=self.env.device
-        )
-        full_baseline_next[completion_mask] = baseline_next
-
-        transition = {
-            "observation": self._start_observation[completion_mask],
-            "action": self._start_action[completion_mask],
-            "reward": self._reward_sum[completion_mask],
-            "next_obs": next_obs[completion_mask],
-            "duration": self._elapsed[completion_mask],
-            "terminated": env_step.terminated[completion_mask],
-            "truncated": env_step.truncated[completion_mask],
-            "bootstrap": env_step.bootstrap[completion_mask],
-            "old_log_prob": self._start_log_prob[completion_mask],
-            "baseline_value": self._start_baseline_value[completion_mask],
-            "baseline_next_value": full_baseline_next[completion_mask],
-            "learner_mask": self._start_learner_mask[completion_mask],
-        }
-        if self._start_policy_state is not None:
-            transition["policy_state"] = self._start_policy_state[completion_mask]
-        if self._start_critic_state is not None:
-            transition["critic_state"] = self._start_critic_state[completion_mask]
-
-        self.buffer.append(completion_indices, transition)
-        self._reward_sum[completion_mask] = 0.0
-
-        done = th.as_tensor(env_step.done, dtype=th.bool, device=self.env.device)
-        done_completion = completion_mask & done
-        if done_completion.any():
-            self._queued_duration[done_completion] = -1
-            self._planned_duration[done_completion] = -1
-            self._elapsed[done_completion] = 0
-            self._reward_sum[done_completion] = 0.0
-            if self.state is not None:
-                self.state[done_completion] = 0
-            if self._critic_state is not None:
-                self._critic_state[done_completion] = 0
-
-        non_done_completion = completion_mask & ~done
-        if non_done_completion.any():
-            self._planned_duration[non_done_completion] = self._queued_duration[
-                non_done_completion
-            ]
-            self._queued_duration[non_done_completion] = -1
-            self._elapsed[non_done_completion] = 0
-
-    def reset(self):
-        self.observation = self.env.reset()
-        self.state = self.policy.initial_state(self.n_envs)
-        self._critic_state = self.critic.initial_state(self.n_envs)
-
-        device = self.env.device
-        latent_size = self.env.single_action_space.shape[0]
-        obs_dim = self.observation.shape[-1] + 1
-
-        self._elapsed = th.zeros(self.n_envs, dtype=th.int64, device=device)
-        self._planned_duration = th.full(
-            (self.n_envs,), -1, dtype=th.int64, device=device
-        )
-        self._queued_duration = th.full(
-            (self.n_envs,), -1, dtype=th.int64, device=device
-        )
-        self._reward_sum = th.zeros(self.n_envs, dtype=th.float32, device=device)
-        self._held_latent = th.zeros(
-            (self.n_envs, latent_size), dtype=th.float32, device=device
-        )
-
-        self._start_observation = th.zeros(
-            (self.n_envs, obs_dim), dtype=th.float32, device=device
-        )
-        self._start_action = th.zeros(
-            (self.n_envs, latent_size), dtype=th.float32, device=device
-        )
-        self._start_log_prob = th.zeros(self.n_envs, dtype=th.float32, device=device)
-        self._start_baseline_value = th.zeros(
-            self.n_envs, dtype=th.float32, device=device
-        )
-        self._start_learner_mask = th.zeros(
-            self.n_envs, dtype=th.bool, device=device
-        )
-
-        self._start_policy_state = (
-            th.zeros_like(self.state) if self.state is not None else None
-        )
-        self._start_critic_state = (
-            th.zeros_like(self._critic_state)
-            if self._critic_state is not None
-            else None
-        )
-        self._draining = False
-        self._filler_mask = th.zeros(
-            self.n_envs, dtype=th.bool, device=device
-        )
-        self._active_step = ~self._filler_mask
-        self.buffer.blocked = False
-
-        self.matchmaker.rematch()
-        self._diagnostics = {
-            name: th.zeros((), dtype=th.float32, device=device)
-            for name in (
-                "steps",
-                "touches",
-                "goals_for",
-                "goals_against",
-                "episodes",
-                "timeouts",
-                "baseline_episodes",
-                "baseline_wins",
-            )
-        }
-        self._timestep_count = int(
-            (self.matchmaker.learner_mask & ~self._filler_mask).sum().item()
-        )
-        return self.observation
-
-    @th.no_grad()
-    def step(self):
-        if self.observation is None:
-            raise RuntimeError("runner must be reset before stepping")
-
-        self._timestep_count = int(
-            (self.matchmaker.learner_mask & ~self._filler_mask).sum().item()
-        )
-
-        physical_observation = th.as_tensor(
-            self.observation, device=self.policy.device
-        )
-        self._active_step = ~self._filler_mask
-        boundary_mask = self._at_boundary()
-        if boundary_mask.any():
-            self._start_skill_at_boundary(physical_observation, boundary_mask)
-
-        if self._filler_mask.any():
-            filler_count = int(self._filler_mask.sum().item())
-            residual = th.zeros(
-                (filler_count, self.controller.latent_size),
-                dtype=physical_observation.dtype,
-                device=self.env.device,
-            )
-            self._held_latent[self._filler_mask] = self.controller.select_latent(
-                physical_observation[self._filler_mask],
-                residual,
-                self.skill_horizon,
-            )
-
-        env_step = _make_env_step(self.env.step(self._held_latent))
-        self._record_diagnostics(env_step)
-
-        reward = th.as_tensor(env_step.reward, device=self.env.device)
-        active = self._active_step
-        self._reward_sum[active] += (
-            self.gamma ** self._elapsed[active]
-        ) * reward[active]
-        self._elapsed[active] += 1
-
-        completion_mask = self._completion_mask(env_step)
-        if completion_mask.any():
-            self._close_skills(env_step, completion_mask)
-        self._update_drain_state(completion_mask)
-
-        self.observation = env_step.observation
-
-        env_step.episode_groups = self._episode_groups()
-        env_step.info = self._learner_episode_info(env_step)
-
-        self.matchmaker.rematch(env_step.done)
-        return env_step
-
-    def after_update(self, timesteps: int) -> None:
-        if self.opponent_pool is not None and self.opponent_pool.ready(timesteps):
-            self.opponent_pool.add(self.snapshot_policy, timesteps, protected_ids=(0,))
-            self.matchmaker.set_historical_ids(
-                baseline_opponent_ids(self.opponent_pool, self.historical_policies)
-            )
-            self.matchmaker.remap_stale_opponents()
-
-        with th.no_grad():
-            if self.state is not None:
-                self.state = self.policy.initial_state(self.n_envs)
-            if self._critic_state is not None:
-                self._critic_state = self.critic.initial_state(self.n_envs)
-        self._draining = False
-        self._filler_mask.zero_()
-        self._planned_duration.fill_(-1)
-        self._queued_duration.fill_(-1)
-        self._elapsed.zero_()
-        self._reward_sum.zero_()
-        self.buffer.blocked = False
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a PULSE latent policy with Rocket League self-play."
+        description="Train a feed-forward PULSE latent policy with Rocket League self-play."
     )
     parser.add_argument("--distill-checkpoint", type=Path, required=True)
     parser.add_argument("--replay-dir", type=Path, required=True)
@@ -1075,13 +490,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-touch-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--rollout", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=16_384)
-    parser.add_argument("--skill-horizon", type=int, default=16)
-    parser.add_argument("--skill-horizon-jitter", type=int, default=4)
     parser.add_argument("--discount-half-life-seconds", type=float, default=10.0)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--epochs", type=int, default=6)
-    parser.add_argument("--sequence-length", type=int, default=32)
-    parser.add_argument("--gru-input-size", type=int, default=512)
-    parser.add_argument("--gru-hidden-size", type=int, default=256)
+    parser.add_argument("--feature-size", type=int, default=512)
+    parser.add_argument("--policy-hidden", type=int, nargs="+", default=[512, 512])
+    parser.add_argument("--critic-hidden", type=int, nargs="+", default=[512, 512])
     parser.add_argument(
         "--bf16", action=argparse.BooleanOptionalAction, default=True
     )
@@ -1119,9 +533,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "rollout",
         "batch_size",
         "epochs",
-        "sequence_length",
-        "gru_input_size",
-        "gru_hidden_size",
+        "feature_size",
         "lr",
         "exploration_std",
         "max_grad_norm",
@@ -1132,22 +544,15 @@ def validate_args(args: argparse.Namespace) -> None:
         "timesteps",
         "checkpoint_interval",
         "checkpoint_keep",
-        "skill_horizon",
         "discount_half_life_seconds",
     )
     for name in positive:
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.skill_horizon_jitter < 0:
-        raise ValueError("--skill-horizon-jitter must be nonnegative")
-    if not math.isfinite(args.skill_horizon) or not math.isfinite(
-        args.skill_horizon_jitter
-    ):
-        raise ValueError("--skill-horizon and --skill-horizon-jitter must be finite")
-    if args.skill_horizon - args.skill_horizon_jitter < 1:
-        raise ValueError("--skill-horizon minus --skill-horizon-jitter must be at least one")
     if not math.isfinite(args.discount_half_life_seconds):
         raise ValueError("--discount-half-life-seconds must be finite")
+    if not 0 < args.gae_lambda <= 1:
+        raise ValueError("--gae-lambda must be in (0, 1]")
     if args.snapshot_pool_size < 3:
         raise ValueError("--snapshot-pool-size must be at least three")
     if not math.isfinite(args.entropy_coef) or args.entropy_coef < 0:
@@ -1178,17 +583,12 @@ def validate_args(args: argparse.Namespace) -> None:
 def build_policy(
     env,
     exploration_std: float,
-    gru_hidden_size: int | None = None,
-    gru_input_size: int | None = None,
+    feature_size: int,
+    hidden: list[int],
 ) -> TrainableGaussianPolicy:
-    feature_size = 2048 if gru_input_size is None else gru_input_size
     return TrainableGaussianPolicy(
         foot=LinearEncoder(feature_size, func=nn.ReLU),
-        body=(
-            GRU(hidden_size=gru_hidden_size)
-            if gru_hidden_size is not None
-            else MLP(dims=[1024, 512], func=nn.ReLU)
-        ),
+        body=MLP(dims=list(hidden), func=nn.ReLU),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=0.01)),
         std=exploration_std,
     ).build(env).to(env.device)
@@ -1197,16 +597,14 @@ def build_policy(
 def build_policy_and_critic(
     env,
     exploration_std: float,
-    gru_hidden_size: int,
-    gru_input_size: int,
+    feature_size: int,
+    policy_hidden: list[int],
+    critic_hidden: list[int],
 ):
-    policy = build_policy(
-        env, exploration_std, gru_hidden_size, gru_input_size
-    )
-
+    policy = build_policy(env, exploration_std, feature_size, policy_hidden)
     critic = Critic(
-        foot=LinearEncoder(gru_input_size, func=nn.ReLU),
-        body=GRU(hidden_size=gru_hidden_size),
+        foot=LinearEncoder(feature_size, func=nn.ReLU),
+        body=MLP(dims=list(critic_hidden), func=nn.ReLU),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
     ).build(env).to(env.device)
     return policy, critic
@@ -1219,18 +617,6 @@ def main() -> None:
 
     gamma = primitive_discount(args.frameskip, args.discount_half_life_seconds)
 
-    reset_dataset = load_demonstration_reset_dataset(
-        args.replay_dir,
-        "cuda:0",
-        args.frameskip,
-        args.reset_state_limit,
-        args.seed,
-    )
-    reset_sampler = DatasetResetSampler(
-        reset_dataset,
-        probability=args.demonstration_reset_fraction,
-        seed=args.seed,
-    )
     reward = AnnealedNextoReward(
         1,
         1,
@@ -1251,10 +637,22 @@ def main() -> None:
         max_ticks=args.max_ticks,
         no_touch_timeout_seconds=args.no_touch_timeout_seconds,
         normalize=True,
-        reset_state_provider=reset_sampler,
         reward_funcs=(reward,),
         discrete_actions=True,
     )
+    reset_dataset = load_demonstration_reset_dataset(
+        args.replay_dir,
+        base_env.device,
+        args.frameskip,
+        args.reset_state_limit,
+        args.seed,
+    )
+    reset_sampler = DatasetResetSampler(
+        reset_dataset,
+        probability=args.demonstration_reset_fraction,
+        seed=args.seed,
+    )
+    base_env.reset_state_provider = reset_sampler
     controller = FrozenPulseController.load(
         args.distill_checkpoint,
         base_env.action_codec,
@@ -1262,27 +660,13 @@ def main() -> None:
         frame_skip=args.frameskip,
         bf16=args.bf16,
     )
-    if (
-        controller.skill_horizon is None
-        or controller.skill_horizon_jitter is None
-    ):
-        raise ValueError(
-            "legacy distill artifact without skill_horizon and skill_horizon_jitter "
-            "is not supported for new semi-Markov training"
-        )
-    if (
-        controller.skill_horizon != args.skill_horizon
-        or controller.skill_horizon_jitter != args.skill_horizon_jitter
-    ):
-        raise ValueError(
-            "distill artifact skill_horizon/skill_horizon_jitter do not match args"
-        )
     env = PulseLatentEnv(base_env, controller)
     policy, critic = build_policy_and_critic(
         env,
         args.exploration_std,
-        args.gru_hidden_size,
-        args.gru_input_size,
+        args.feature_size,
+        args.policy_hidden,
+        args.critic_hidden,
     )
 
     run_id = datetime.now().strftime("self-play-%Y%m%d-%H%M%S-%f")
@@ -1301,45 +685,28 @@ def main() -> None:
         device=env.device,
         seed=args.seed,
     )
-    buffer = RaggedRolloutBuffer(
+    buffer = RolloutBuffer(
         horizon=args.rollout,
         num_envs=env.n_envs,
         device=env.device,
         copy_on_finish=False,
     )
-    runner = SemiMarkovSelfPlayRunner(
+    runner = DiagnosticSelfPlayRunner(
         env,
         policy,
-        critic,
-        controller,
         buffer,
-        gamma=gamma,
-        skill_horizon=args.skill_horizon,
-        skill_horizon_jitter=args.skill_horizon_jitter,
-        seed=args.seed,
         opponent_pool=pool,
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
+        captures=(CriticValueCapture(critic),),
         gameplay_reward=reward,
     )
 
     optimizer = Adam((*policy.parameters(), *critic.parameters()), lr=args.lr)
     update = Update(
-        transforms=(SemiMarkovGAE(gamma=gamma, lambda_=0.95),),
-        sampler=RecurrentRolloutMinibatches(
-            sequence_length=args.sequence_length,
-            sequences_per_batch=max(1, args.batch_size // args.sequence_length),
-            epochs=args.epochs,
-            fields=(
-                "observation",
-                "action",
-                "advantage",
-                "old_log_prob",
-                "baseline_value",
-                "returns",
-            ),
-        ),
+        transforms=(GAE(gamma=gamma, lambda_=args.gae_lambda),),
+        sampler=RolloutMinibatches(args.batch_size, args.epochs),
         loss=PPOLoss(
             policy,
             critic,
