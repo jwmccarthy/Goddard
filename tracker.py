@@ -862,12 +862,7 @@ class ExpertLookaheadEnv:
         if self.reward.touched is None:
             raise RuntimeError("tracking reward did not capture ball touches")
 
-        simulated_touch = self.reward.touched & ~native
-        expert_touch = (
-            self.replays.current_ego_touch()
-            | self.replays.current_ego_touch(offset=1)
-        ) & ~native
-        release = simulated_touch | expert_touch
+        release = self.reward.touched & ~native
         anchor = self._ball_anchored & ~native & ~release
         self._ball_anchored[release] = False
         if not anchor.any():
