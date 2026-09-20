@@ -146,13 +146,15 @@ class TrackerTest(unittest.TestCase):
         replays._offsets = th.tensor([0, 3])
         replays._demo_id = th.tensor([0])
         replays._cursors = th.tensor([2])
+        replays._demo_has_actions = th.tensor([True])
         replays._replays[1, GOAL_STATE_SIZE + 3] = 1
         replays._raw_actions[1, RAW_JUMP_INDEX] = 1
 
-        jump, second_jump = replays.current_jump_supervision(offset=-1)
+        jump, second_jump, valid = replays.current_jump_supervision(offset=-1)
 
         th.testing.assert_close(jump, th.tensor([1]))
         th.testing.assert_close(second_jump, th.tensor([True]))
+        th.testing.assert_close(valid, th.tensor([True]))
 
     def test_jump_imitation_loss_upweights_second_jump_edges(self):
         logits = th.zeros((2, sum(ACTION_NVECS)))
@@ -477,9 +479,11 @@ class TrackerTest(unittest.TestCase):
             )
 
         self.assertTrue(replays.has_expert_actions)
+        self.assertTrue(replays.complete_expert_actions)
         replays._cursors = th.tensor([60])
-        jump, _ = replays.current_jump_supervision(offset=0)
+        jump, _, valid = replays.current_jump_supervision(offset=0)
         th.testing.assert_close(jump, th.tensor([1]))
+        th.testing.assert_close(valid, th.tensor([True]))
 
     def test_dataset_without_actions_reports_missing_supervision(self):
         demo = np.zeros((150, 161), dtype=np.float32)
@@ -496,9 +500,79 @@ class TrackerTest(unittest.TestCase):
 
         self.assertFalse(replays.has_expert_actions)
         replays._cursors = th.tensor([60])
-        jump, second_jump = replays.current_jump_supervision(offset=0)
+        jump, second_jump, valid = replays.current_jump_supervision(offset=0)
         th.testing.assert_close(jump, th.tensor([0]))
         th.testing.assert_close(second_jump, th.tensor([False]))
+        th.testing.assert_close(valid, th.tensor([False]))
+
+    def test_dataset_masks_jump_supervision_for_missing_actions(self):
+        demo = np.zeros((150, 161), dtype=np.float32)
+        demo[10, -5] = 1.0
+        actions = np.zeros((150, RAW_ACTION_SIZE), dtype=np.float32)
+        actions[60, RAW_JUMP_INDEX] = 1.0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            np.save(root / "with-actions.npy", demo)
+            np.savez_compressed(root / "with-actions.actions.npz", raw=actions)
+            np.save(root / "without-actions.npy", demo)
+            replays = ExpertGoalStates(
+                directory,
+                n_env=1,
+                n_cars=1,
+                device="cpu",
+                minimum_remaining_frames=1,
+                balance=False,
+            )
+
+        self.assertTrue(replays.has_expert_actions)
+        self.assertFalse(replays.complete_expert_actions)
+        self.assertEqual(replays.missing_expert_action_demos, 1)
+        replays._demo_id = th.tensor([0, 1])
+        replays._cursors = th.tensor([60, 60])
+        jump, _, valid = replays.current_jump_supervision()
+        th.testing.assert_close(jump, th.tensor([1, 0]))
+        th.testing.assert_close(valid, th.tensor([True, False]))
+
+    def test_dataset_finds_actions_elsewhere_in_the_replay_tree(self):
+        demo = np.zeros((150, 161), dtype=np.float32)
+        demo[10, -5] = 1.0
+        actions = np.zeros((150, RAW_ACTION_SIZE), dtype=np.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "replays").mkdir()
+            (root / "actions").mkdir()
+            np.save(root / "replays" / "replay.npy", demo)
+            np.savez_compressed(
+                root / "actions" / "replay.actions.npz", raw=actions
+            )
+            replays = ExpertGoalStates(
+                directory,
+                n_env=1,
+                n_cars=1,
+                device="cpu",
+                minimum_remaining_frames=1,
+            )
+
+        self.assertTrue(replays.has_expert_actions)
+
+    def test_jump_imitation_loss_masks_frames_without_actions(self):
+        logits = th.zeros((2, sum(ACTION_NVECS)))
+        for offset in (0, 3, 6, 9, 11, 13, 16):
+            logits[0, offset] = 5.0
+
+        loss, accuracy, _, _ = _expert_jump_loss(
+            logits,
+            th.ones_like(logits, dtype=th.bool),
+            th.zeros(2, dtype=th.long),
+            th.zeros(2, dtype=th.bool),
+            th.tensor([True, True]),
+            ACTION_NVECS,
+            second_jump_weight=8.0,
+            jump_valid=th.tensor([True, False]),
+        )
+
+        self.assertLess(loss.item(), 0.05)
+        self.assertEqual(accuracy.item(), 1.0)
 
     def test_dataset_loading_preserves_expert_ego_touch_timing(self):
         replays = ExpertGoalStates.__new__(ExpertGoalStates)
@@ -924,7 +998,11 @@ class TrackerTest(unittest.TestCase):
 
             @staticmethod
             def current_jump_supervision(offset=0):
-                return th.zeros(1, dtype=th.long), th.zeros(1, dtype=th.bool)
+                return (
+                    th.zeros(1, dtype=th.long),
+                    th.zeros(1, dtype=th.bool),
+                    th.ones(1, dtype=th.bool),
+                )
 
             def current_ego_touch(self, offset=0):
                 events.append(("touch", self.cursor + offset))
@@ -1013,7 +1091,11 @@ class TrackerTest(unittest.TestCase):
 
             @staticmethod
             def current_jump_supervision(offset=0):
-                return th.zeros(2, dtype=th.long), th.zeros(2, dtype=th.bool)
+                return (
+                    th.zeros(2, dtype=th.long),
+                    th.zeros(2, dtype=th.bool),
+                    th.ones(2, dtype=th.bool),
+                )
 
             @staticmethod
             def next_goals(obs, mask=None):

@@ -296,17 +296,21 @@ class ExpertGoalStates:
         names:      list[str] = []
         start_maps: list[th.Tensor] = []
         actions: list[th.Tensor] = []
+        demo_has_actions: list[bool] = []
         total = 0
-        all_have_actions = True
+        action_index = {
+            action_path.name[: -len(".actions.npz")]: action_path
+            for action_path in sorted(Path(replay_dir).rglob("*.actions.npz"))
+        }
 
         self._min_len = max(30, minimum_remaining_frames + 1)
 
         for path in sorted(Path(replay_dir).rglob("*.npy")):
             source = np.load(path, mmap_mode="r")
             replay_cars = self._infer_n_cars(source.shape[1])
-            raw_actions = self._load_expert_actions(path, len(source))
-            if raw_actions is None:
-                all_have_actions = False
+            raw_actions = self._load_expert_actions(
+                path, len(source), action_index
+            )
             demos = self._filter(
                 source,
                 self._unsafe_mask(path, source),
@@ -316,6 +320,7 @@ class ExpertGoalStates:
             replays.extend(demo for demo, _, _ in demos)
             start_maps.extend(start_map for _, start_map, _ in demos)
             actions.extend(action for _, _, action in demos)
+            demo_has_actions.extend([raw_actions is not None] * len(demos))
             modes.extend([replay_cars // 2] * len(demos))
             names.extend([path.stem] * len(demos))
             total += sum(len(demo) for demo, _, _ in demos)
@@ -327,7 +332,9 @@ class ExpertGoalStates:
             raise ValueError(
                 "no replay segments satisfy the minimum remaining frame requirement"
             )
-        self._has_expert_actions = all_have_actions
+        self._demo_has_actions = th.tensor(demo_has_actions, device=device)
+        self._has_expert_actions = bool(self._demo_has_actions.any().item())
+        self._complete_expert_actions = bool(self._demo_has_actions.all().item())
 
         lengths = th.tensor([len(r) for r in replays], device=device)
 
@@ -406,10 +413,24 @@ class ExpertGoalStates:
     def has_expert_actions(self) -> bool:
         return self._has_expert_actions
 
+    @property
+    def complete_expert_actions(self) -> bool:
+        return self._complete_expert_actions
+
+    @property
+    def missing_expert_action_demos(self) -> int:
+        return int((~self._demo_has_actions).sum().item())
+
     @staticmethod
-    def _load_expert_actions(path: Path, length: int) -> np.ndarray | None:
+    def _load_expert_actions(
+        path: Path,
+        length: int,
+        action_index: dict[str, Path],
+    ) -> np.ndarray | None:
         action_path = path.with_suffix(".actions.npz")
         if not action_path.exists():
+            action_path = action_index.get(path.stem)
+        if action_path is None:
             return None
         with np.load(action_path) as stored_actions:
             if "raw" not in stored_actions:
@@ -632,7 +653,7 @@ class ExpertGoalStates:
     def current_jump_supervision(
         self,
         offset: int = 0,
-    ) -> tuple[th.Tensor, th.Tensor]:
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         starts = self._offsets[self._demo_id]
         indices = (self._cursors + offset).maximum(starts)
         previous_indices = (indices - 1).maximum(starts)
@@ -641,7 +662,8 @@ class ExpertGoalStates:
         internal = self._replays[indices, GOAL_STATE_SIZE:EXPERT_TOUCH_INDEX]
         airborne_after_first_jump = ~internal[:, 0].bool() & internal[:, 3].bool()
         second_jump = jump & ~previous_jump & airborne_after_first_jump
-        return jump.long(), second_jump
+        valid = self._demo_has_actions[self._demo_id]
+        return jump.long(), second_jump, valid
 
     def current_demo_name(self) -> str:
         return self._demo_names[self._demo_id[0].item()]
@@ -850,6 +872,7 @@ class ExpertLookaheadEnv:
         self._pos_scale = th.tensor(POSITION_SCALE, device=self.device)
         self.last_expert_jump: th.Tensor | None = None
         self.last_expert_second_jump: th.Tensor | None = None
+        self.last_expert_jump_valid: th.Tensor | None = None
 
         size = GOAL_STATE_SIZE + replays.goal_size
 
@@ -949,6 +972,7 @@ class ExpertLookaheadEnv:
         (
             self.last_expert_jump,
             self.last_expert_second_jump,
+            self.last_expert_jump_valid,
         ) = self.replays.current_jump_supervision(offset=-1)
         obs, reward, term, trunc, info = self.env.step(action)
         native = term | trunc
@@ -1070,11 +1094,13 @@ class ExpertJumpCapture(CaptureBase):
     def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
         jump = self.env.last_expert_jump
         second_jump = self.env.last_expert_second_jump
-        if jump is None or second_jump is None:
+        valid = self.env.last_expert_jump_valid
+        if jump is None or second_jump is None or valid is None:
             raise RuntimeError("environment did not expose expert jump controls")
         return {
             "expert_jump": jump,
             "expert_second_jump": second_jump,
+            "expert_jump_valid": valid,
         }
 
 
@@ -1086,12 +1112,15 @@ def _expert_jump_loss(
     sequence_valid: th.Tensor,
     sizes: Sequence[int],
     second_jump_weight: float,
+    jump_valid: th.Tensor | None = None,
 ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
     jump_logits = logits.split(tuple(sizes), dim=-1)[JUMP_ACTION_FACTOR]
     jump_mask = action_mask.split(tuple(sizes), dim=-1)[JUMP_ACTION_FACTOR]
     target = expert_jump.long()
     target_legal = jump_mask.gather(-1, target[..., None]).squeeze(-1)
     valid = sequence_valid & target_legal
+    if jump_valid is not None:
+        valid = valid & jump_valid
     if not valid.any():
         zero = logits.sum() * 0
         return zero, logits.new_zeros(()), logits.new_zeros(()), logits.new_zeros(())
@@ -1183,6 +1212,7 @@ class ExpertJumpPPOLoss(PPOLoss):
                 sequence_valid,
                 self.policy.sizes,
                 self.second_jump_weight,
+                jump_valid=batch.get("expert_jump_valid"),
             )
         )
         return LossOutput(
@@ -1552,7 +1582,14 @@ def main() -> None:
     )
     if args.jump_imitation_weight > 0 and not replays.has_expert_actions:
         raise ValueError(
-            "--jump-imitation-weight requires expert .actions.npz files"
+            "--jump-imitation-weight requires expert .actions.npz files, but "
+            f"none were found under {args.replay_dir}"
+        )
+    if args.jump_imitation_weight > 0 and not replays.complete_expert_actions:
+        print(
+            "Jump imitation is disabled for "
+            f"{replays.missing_expert_action_demos} replay segments without "
+            "expert .actions.npz files"
         )
     env = ExpertLookaheadEnv(
         base_env,
