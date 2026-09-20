@@ -19,16 +19,6 @@ const actionFields = [
   document.getElementById('action-roll'),
   document.getElementById('action-jump'),
 ];
-const rawActionFields = [
-  document.getElementById('raw-action-throttle'),
-  document.getElementById('raw-action-steer'),
-  document.getElementById('raw-action-pitch'),
-  document.getElementById('raw-action-yaw'),
-  document.getElementById('raw-action-roll'),
-  document.getElementById('raw-action-jump'),
-  document.getElementById('raw-action-boost'),
-  document.getElementById('raw-action-slide'),
-];
 const demoSearch = document.getElementById('demo-search');
 const demoQuery = document.getElementById('demo-query');
 const connection = document.getElementById('connection');
@@ -210,12 +200,6 @@ function setAction(fields, actions) {
   fields[6].textContent = actions[6];
 }
 
-function setRawAction(actions) {
-  rawActionFields.forEach((field, index) => {
-    field.textContent = actions[index].toFixed(index < 5 ? 2 : 0);
-  });
-}
-
 source.onopen = () => {
   connection.textContent = 'Live';
   connection.classList.add('live');
@@ -235,7 +219,6 @@ source.onmessage = ({ data }) => {
   expertBoostFill.style.width = `${frame.expert.cars[0].boost}%`;
   const actions = Array.isArray(frame.action[0]) ? frame.action[0] : frame.action;
   setAction(actionFields, actions);
-  setRawAction(frame.raw_expert_action);
   ball.position.fromArray(frame.ball.pos);
   ghostBall.position.fromArray(frame.expert.ball.pos);
   checkpoint.textContent = frame.checkpoint;
