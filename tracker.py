@@ -742,6 +742,14 @@ class TrackingReward:
             car_reward,
         )
 
+    def _release_mask(self) -> th.Tensor:
+        if self.touched is None:
+            raise RuntimeError("tracking reward did not capture ball touches")
+        touch = getattr(self.replays, "current_ego_touch", None)
+        if touch is None:
+            return self.touched
+        return self.touched | touch() | touch(offset=1)
+
     def __call__(self, context: RewardContext) -> th.Tensor:
         target = self.replays.current()
         self.touched = context.current.car_ball_touches[:, 0]
@@ -750,7 +758,7 @@ class TrackingReward:
             or self._ball_tracking_active.shape != self.touched.shape
         ):
             self._ball_tracking_active = th.zeros_like(self.touched)
-        self._ball_tracking_active |= self.touched
+        self._ball_tracking_active |= self._release_mask()
 
         previous = self._potential(context.previous_observation, target)
         current = self._potential(context.current_observation, target)

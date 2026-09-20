@@ -594,6 +594,28 @@ class TrackerTest(unittest.TestCase):
 
         th.testing.assert_close(value, th.ones((1, 1)))
 
+    def test_ball_outcome_activates_when_the_expert_releases_the_ball(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        missed_ball_tensor = target_tensor.clone()
+        missed_ball_tensor[:, :9] = 100.0
+        missed_ball = CARLObservation.from_tensor(missed_ball_tensor, 1)
+        replays = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+            current_ego_touch=lambda offset=0: th.tensor([True]),
+        )
+        reward = TrackingReward(replays)
+
+        before_release = reward(
+            self._tracking_context(CARLObservation.from_tensor(target_tensor, 1))
+        )
+        after_release = reward(self._tracking_context(missed_ball))
+
+        th.testing.assert_close(before_release, th.ones((1, 1)))
+        self.assertLess(after_release.item(), 1e-3)
+
     def test_tracking_progress_is_signed_and_does_not_reward_oscillation(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))
         target = CARLObservation.from_tensor(target_tensor, 1)
