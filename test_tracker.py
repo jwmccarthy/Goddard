@@ -1276,7 +1276,7 @@ class DiscriminatorTest(unittest.TestCase):
             for previous, current in zip(before, discriminator.parameters())
         ))
 
-    def test_discriminator_update_requires_valid_windows(self):
+    def test_discriminator_update_skips_when_no_windows_are_valid(self):
         discriminator = TrackerDiscriminator(window=2, feature_size=8, hidden_size=8)
         optimizer = th.optim.Adam(discriminator.parameters(), lr=1e-2)
         replays = SimpleNamespace(
@@ -1292,12 +1292,15 @@ class DiscriminatorTest(unittest.TestCase):
             epochs=1,
             noise_std=0.0,
         )
+        experience = SimpleNamespace(steps=TensorBatch({
+            "discriminator_window": th.randn(4, 2, 2, GOAL_STATE_SIZE),
+            "discriminator_window_valid": th.zeros(4, 2, dtype=th.bool),
+        }))
 
-        with self.assertRaisesRegex(RuntimeError, "no valid discriminator windows"):
-            update.run(SimpleNamespace(steps=TensorBatch({
-                "discriminator_window": th.randn(4, 2, 2, GOAL_STATE_SIZE),
-                "discriminator_window_valid": th.zeros(4, 2, dtype=th.bool),
-            })))
+        returned, metrics = update.run(experience)
+
+        self.assertIs(returned, experience)
+        self.assertEqual(metrics, {})
 
 
 if __name__ == "__main__":

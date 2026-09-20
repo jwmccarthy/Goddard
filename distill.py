@@ -408,12 +408,15 @@ class ConsecutiveFrameMinibatches:
         time, num_envs = data.shape[:2]
         continuations = ~(data["terminated"] | data["truncated"])[:-1]
         pair_time, pair_env = continuations.nonzero(as_tuple=True)
-        if not len(pair_time):
-            raise RuntimeError("rollout contains no consecutive frame pairs")
-
         flat = data.flatten(0, 1)
-        first = flat[pair_time * num_envs + pair_env]
-        second = flat[(pair_time + 1) * num_envs + pair_env]
+        if not len(pair_time):
+            # A drained rollout can end before any frame continues into the next;
+            # duplicate frames so the action and KL losses still train (regu is zero).
+            first = flat
+            second = flat
+        else:
+            first = flat[pair_time * num_envs + pair_env]
+            second = flat[(pair_time + 1) * num_envs + pair_env]
         pair = TensorBatch({
             key: th.stack((first[key], second[key]), dim=0)
             for key in flat

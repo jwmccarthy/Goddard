@@ -1014,6 +1014,9 @@ class TrackerDiscriminator(nn.Module):
         self.gru = nn.GRU(feature_size, hidden_size, batch_first=True)
         self.head = nn.Linear(hidden_size, 1)
 
+    def forward(self, windows: th.Tensor) -> th.Tensor:
+        return self.logits(windows)
+
     def logits(self, windows: th.Tensor) -> th.Tensor:
         if windows.shape[-2] != self.window or windows.shape[-1] != GOAL_STATE_SIZE:
             raise ValueError(
@@ -1146,7 +1149,7 @@ class DiscriminatorUpdate:
         valid = steps["discriminator_window_valid"]
         agent = windows[valid]
         if not len(agent):
-            raise RuntimeError("rollout contains no valid discriminator windows")
+            return experience, {}
         expert = self.replays.sample_windows(len(agent), self.discriminator.window)
 
         loss = th.zeros((), device=agent.device)

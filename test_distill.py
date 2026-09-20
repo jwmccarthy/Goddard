@@ -138,7 +138,7 @@ class CategoricalDistillationLossTest(unittest.TestCase):
     def test_factorized_action_loss_and_argmax(self):
         logits = th.zeros(2, sum(ACTION_SIZES))
         target = th.zeros(2, 7, dtype=th.long)
-        for offset in (0, 8, 17, 25, 30, 35, 41):
+        for offset in (0, 3, 6, 9, 11, 13, 16):
             logits[:, offset] = 10.0
 
         loss, accuracy = categorical_distillation_loss(logits, target)
@@ -149,9 +149,9 @@ class CategoricalDistillationLossTest(unittest.TestCase):
     def test_exact_accuracy_requires_every_factor(self):
         logits = th.zeros(3, sum(ACTION_SIZES))
         target = th.zeros(3, 7, dtype=th.long)
-        for offset in (0, 8, 17, 25, 30, 35, 41):
+        for offset in (0, 3, 6, 9, 11, 13, 16):
             logits[:, offset] = 10.0
-        logits[1, 10] = 10.0
+        logits[1, 10] = 20.0
 
         self.assertAlmostEqual(exact_action_accuracy(logits, target).item(), 2 / 3)
 
@@ -342,8 +342,8 @@ class ConsecutiveFrameMinibatchesTest(unittest.TestCase):
         self.assertEqual(len(batches), 1)
         pair = batches[0]["observation"]
         self.assertEqual(pair.shape, (2, 4, 1))
-        th.testing.assert_close(pair[1] - pair[0], th.full((4, 1), 10.0))
-        th.testing.assert_close(pair[0] % 10.0, pair[1] % 10.0)
+        th.testing.assert_close(pair[1] - pair[0], th.full((4, 1), 2.0))
+        th.testing.assert_close(pair[0] % 2.0, pair[1] % 2.0)
 
     def test_pairs_never_cross_episode_boundaries(self):
         sampler = ConsecutiveFrameMinibatches(batch_size=16, epochs=1)
@@ -357,7 +357,7 @@ class ConsecutiveFrameMinibatchesTest(unittest.TestCase):
         pair = batches[0]["observation"]
         self.assertEqual(pair.shape[1], 3)
         # Frame (t=1, env=0) ends its episode, so it must never be a pair start.
-        self.assertEqual((pair[0] == 10.0).sum().item(), 0)
+        self.assertEqual((pair[0] == 2.0).sum().item(), 0)
 
     def test_epochs_yield_separate_batches(self):
         sampler = ConsecutiveFrameMinibatches(batch_size=4, epochs=2)
@@ -366,20 +366,27 @@ class ConsecutiveFrameMinibatchesTest(unittest.TestCase):
 
         self.assertEqual(len(batches), 2)
         for pair in batches:
-            self.assertEqual(pair.shape, (2, 4, 1))
+            self.assertEqual(pair["observation"].shape, (2, 4, 1))
 
-    def test_all_done_rollout_raises(self):
+    def test_degenerate_rollout_yields_stable_pairs(self):
         sampler = ConsecutiveFrameMinibatches(batch_size=4, epochs=1)
         done = {(t, env): True for t in range(2) for env in range(2)}
 
-        with self.assertRaisesRegex(RuntimeError, "no consecutive frame pairs"):
-            list(sampler(self._rollout(time=2, num_envs=2, terminated=done)))
+        batches = list(sampler(self._rollout(time=2, num_envs=2, terminated=done)))
 
-    def test_single_step_rollout_raises(self):
+        self.assertEqual(len(batches), 1)
+        observation = batches[0]["observation"]
+        self.assertEqual(observation.shape, (2, 4, 1))
+        th.testing.assert_close(observation[0], observation[1])
+
+    def test_single_step_rollout_yields_stable_pairs(self):
         sampler = ConsecutiveFrameMinibatches(batch_size=4, epochs=1)
 
-        with self.assertRaisesRegex(RuntimeError, "no consecutive frame pairs"):
-            list(sampler(self._rollout(time=1, num_envs=2)))
+        batches = list(sampler(self._rollout(time=1, num_envs=2)))
+
+        self.assertEqual(len(batches), 1)
+        observation = batches[0]["observation"]
+        th.testing.assert_close(observation[0], observation[1])
 
     def test_invalid_arguments(self):
         with self.assertRaisesRegex(ValueError, "minibatch"):

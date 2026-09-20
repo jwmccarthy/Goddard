@@ -15,6 +15,7 @@ from torch.distributions import Normal
 
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
+    LogProbCapture,
     SelfPlayMatchmaker,
     SelfPlayRunner,
     SnapshotPool,
@@ -699,7 +700,7 @@ def main() -> None:
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
-        captures=(CriticValueCapture(critic),),
+        captures=(LogProbCapture(), CriticValueCapture(critic)),
         gameplay_reward=reward,
     )
 
