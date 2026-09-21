@@ -113,7 +113,22 @@ class DifferentialRewardTest(unittest.TestCase):
         self.assertLess(float(toward[0, 0]), 0.0)
 
     def test_team_common_progress_rewards_both_cars(self):
-        reward = DifferentialReward(1, 1)
+        weights = DifferentialRewardWeights(
+            ball_goal_progress=0.0,
+            own_goal_clearance=0.0,
+            ball_height_progress=1.0,
+            ball_speed_progress=0.0,
+            ball_goal_velocity=0.0,
+            player_ball_progress=0.0,
+            alignment_progress=0.0,
+            boost_gain=0.0,
+            boost_loss=0.0,
+            demo=0.0,
+            touch_acceleration=0.0,
+            aerial_touch=0.0,
+            flip_reset=0.0,
+        )
+        reward = DifferentialReward(1, 1, weights=weights)
         value = reward(make_context(ball_z=300.0, previous_ball_z=100.0))
         self.assertTrue(bool((value > 0).all()))
 

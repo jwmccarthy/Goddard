@@ -158,7 +158,8 @@ def _cosine(left: th.Tensor, right: th.Tensor) -> th.Tensor:
 
 
 def _progress(previous_distance: th.Tensor, current_distance: th.Tensor) -> th.Tensor:
-    return th.exp(-current_distance / 1410.0) - th.exp(-previous_distance / 1410.0)
+    """Normalized linear distance reduction (positive when closing in)."""
+    return (previous_distance - current_distance) / 1410.0
 
 
 def _alignment(
@@ -1539,6 +1540,8 @@ class DIFOReward:
             else 0.0,
             "intrinsic_reward": float(intrinsic_component.mean()),
             "task_reward": float(task.mean()),
+            "task_reward_std": float(task.std(unbiased=False)),
+            "task_reward_abs": float(task.abs().mean()),
             "reward_multiplier": float(multiplier.mean()),
             "multiplier_clamped_fraction": clamped_fraction,
             "anneal": float(self.anneal),
@@ -1872,7 +1875,7 @@ class DifferentialRewardTransform:
             opponent_distance, next_opponent_goal.norm(dim=-1)
         )
         own_goal_clearance = _progress(
-            own_distance, next_own_goal.norm(dim=-1)
+            next_own_goal.norm(dim=-1), own_distance
         )
         player_ball_progress = _progress(
             car_ball_distance, next_car_ball_distance
@@ -2610,6 +2613,8 @@ def main() -> None:
         ("DIFOReward", "intrinsic_std", "DIFO intrinsic std", ".3f"),
         ("DIFOReward", "intrinsic_reward", "DIFO intrinsic", ".3f"),
         ("DIFOReward", "task_reward", "task reward", ".3f"),
+        ("DIFOReward", "task_reward_std", "task reward std", ".3f"),
+        ("DIFOReward", "task_reward_abs", "task reward abs", ".3f"),
         ("DIFOReward", "reward_multiplier", "DIFO multiplier", ".3f"),
         ("DIFOReward", "multiplier_clamped_fraction", "DIFO clamp frac", ".3f"),
         ("DIFOReward", "anneal", "DIFO anneal", ".3f"),

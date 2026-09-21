@@ -410,13 +410,12 @@ class DifferentialReward(AnnealedNextoReward):
         previous_ball_to_own_goal = own_goal - previous_ball_position
 
         ball_goal_progress = (
-            th.exp(-ball_to_goal.norm(dim=-1) / 1410.0)
-            - th.exp(-previous_ball_to_goal.norm(dim=-1) / 1410.0)
-        )
+            previous_ball_to_goal.norm(dim=-1) - ball_to_goal.norm(dim=-1)
+        ) / 1410.0
         own_goal_clearance = (
-            th.exp(-previous_ball_to_own_goal.norm(dim=-1) / 1410.0)
-            - th.exp(-ball_to_own_goal.norm(dim=-1) / 1410.0)
-        )
+            ball_to_own_goal.norm(dim=-1)
+            - previous_ball_to_own_goal.norm(dim=-1)
+        ) / 1410.0
         ball_height_progress = (
             ball_position[..., 2] - previous_ball_position[..., 2]
         ) / CEILING_Z
@@ -430,9 +429,8 @@ class DifferentialReward(AnnealedNextoReward):
             )
         ) / BALL_MAX_SPEED
         player_ball_progress = (
-            th.exp(-distance_to_ball / 1410.0)
-            - th.exp(-previous_distance_to_ball / 1410.0)
-        )
+            previous_distance_to_ball - distance_to_ball
+        ) / 1410.0
 
         alignment = 0.5 * (
             self._cosine(car_to_ball, current.car_position - own_goal)
