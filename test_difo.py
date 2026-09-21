@@ -533,6 +533,39 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             scales("unknown", 10.0, 0.7, 0.1, 1.0)
 
+    def test_normalized_intrinsic_is_zero_mean_unit_std(self):
+        global_difo, pair_difo = self._models()
+        transform = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            normalize=True,
+        )
+        rollout = self._rollout(done=False)
+        out = transform(rollout, None)
+        intrinsic = (out["reward"] - rollout["reward"]).reshape(-1)
+        self.assertLess(float(intrinsic.mean().abs()), 1e-5)
+        self.assertAlmostEqual(
+            float(intrinsic.std(unbiased=False)), 1.0, places=3
+        )
+
+    def test_unnormalized_intrinsic_keeps_raw_offset(self):
+        global_difo, pair_difo = self._models()
+        transform = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.0,
+            n_cars=N_CARS,
+            frame_skip=4,
+            normalize=False,
+        )
+        rollout = self._rollout(done=False)
+        out = transform(rollout, None)
+        intrinsic = (out["reward"] - rollout["reward"]).reshape(-1)
+        self.assertGreater(float(intrinsic.mean()), 0.5)
+
 
 class CaptureTest(unittest.TestCase):
     def test_capture_reads_contact_and_defaults_to_zero(self):

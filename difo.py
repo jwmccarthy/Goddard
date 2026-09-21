@@ -1300,6 +1300,8 @@ class DIFOReward:
         samples: int = 1,
         n_cars: int = 2,
         frame_skip: int = 4,
+        normalize: bool = True,
+        normalize_clip: float = 10.0,
     ) -> None:
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("DIFO pair reward weight must be non-negative")
@@ -1312,10 +1314,27 @@ class DIFOReward:
         self.samples = samples
         self.n_cars = n_cars
         self.frame_skip = frame_skip
+        self.normalize = normalize
+        self.normalize_clip = normalize_clip
         self._metrics: dict[str, float] = {}
 
     def metrics(self) -> dict[str, dict[str, float]]:
         return {"DIFOReward": dict(self._metrics)} if self._metrics else {}
+
+    def _normalize(
+        self,
+        values: th.Tensor,
+        selected: th.Tensor,
+        done: th.Tensor,
+    ) -> th.Tensor:
+        if not self.normalize:
+            return values
+        if not selected.any():
+            return th.zeros_like(values)
+        chosen = values[selected]
+        normalized = (values - chosen.mean()) / chosen.std(unbiased=False).clamp_min(1e-6)
+        normalized = normalized.clamp(-self.normalize_clip, self.normalize_clip)
+        return th.where(selected & ~done, normalized, th.zeros_like(values))
 
     @th.no_grad()
     def __call__(self, batch: TensorBatch, context) -> TensorBatch:
@@ -1323,6 +1342,10 @@ class DIFOReward:
         next_observation = batch["next_obs"]
         contact = batch["difo_touch_self"].bool()
         done = (batch["terminated"] | batch["truncated"]).reshape(-1)
+        learner = batch.get("learner_mask")
+        selected = ~done
+        if learner is not None:
+            selected = selected & learner.reshape(-1).bool()
         leading = observation.shape[:-1]
         flat = observation.reshape(-1, observation.shape[-1])
         flat_next = next_observation.reshape(-1, next_observation.shape[-1])
@@ -1350,17 +1373,20 @@ class DIFOReward:
             delta_t.repeat_interleave(self.n_cars, dim=0),
         ).reshape(gates.shape[0], gates.shape[1])
         gate = gates[:, 0]
-        intrinsic = self.scale * (
-            global_reward + self.beta * gate * pair_rewards[:, 0]
-        )
-        intrinsic = th.where(done, th.zeros_like(intrinsic), intrinsic)
+        raw = global_reward + self.beta * gate * pair_rewards[:, 0]
+        intrinsic = self.scale * self._normalize(raw, selected, done)
         reward = batch["reward"] + intrinsic.reshape(*leading)
         interacting = (gate > 0.5).float().mean()
         self._metrics = {
             "global_reward": float(global_reward.mean()),
             "pair_reward": float(pair_rewards[:, 0].mean()),
+            "gated_pair_reward": float((gate * pair_rewards[:, 0]).mean()),
             "gate": float(gate.mean()),
             "interacting_fraction": float(interacting),
+            "intrinsic_raw": float(raw[selected].mean()) if selected.any() else 0.0,
+            "intrinsic_std": float(raw[selected].std(unbiased=False))
+            if selected.any()
+            else 0.0,
             "intrinsic_reward": float(intrinsic.mean()),
         }
         return batch.replace_fields(reward=reward)
@@ -1674,6 +1700,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--difo-pair-loss-weight", type=float, default=1.0)
     parser.add_argument("--difo-reward-scale", type=float, default=1.0)
     parser.add_argument("--difo-reward-samples", type=int, default=1)
+    parser.add_argument(
+        "--difo-reward-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="zero-mean/unit-std the DIFO intrinsic reward over learner steps",
+    )
     parser.add_argument(
         "--reward-mode",
         choices=("nexto", "goals", "imitation"),
@@ -1992,6 +2024,8 @@ def main() -> None:
         samples=args.difo_reward_samples,
         n_cars=n_cars,
         frame_skip=args.frameskip,
+        normalize=args.difo_reward_normalize,
+        normalize_clip=args.difo_reward_clip,
     )
     update = Update(
         transforms=(
@@ -2054,10 +2088,15 @@ def main() -> None:
         ("DIFO", "pair_expert_loss", "pair expert loss", ".4f"),
         ("DIFO", "pair_agent_loss", "pair agent loss", ".4f"),
         ("DIFO", "pair_expert_accuracy", "pair expert acc", ".3f"),
+        ("DIFO", "pair_agent_accuracy", "pair agent acc", ".3f"),
         ("DIFOReward", "global_reward", "DIFO global reward", ".3f"),
         ("DIFOReward", "pair_reward", "DIFO pair reward", ".3f"),
+        ("DIFOReward", "gated_pair_reward", "DIFO gated pair", ".3f"),
         ("DIFOReward", "gate", "DIFO mean gate", ".3f"),
         ("DIFOReward", "interacting_fraction", "DIFO interacting", ".3f"),
+        ("DIFOReward", "intrinsic_raw", "DIFO intrinsic raw", ".3f"),
+        ("DIFOReward", "intrinsic_std", "DIFO intrinsic std", ".3f"),
+        ("DIFOReward", "intrinsic_reward", "DIFO intrinsic", ".3f"),
         ("MAPPO", "policy_loss", "policy loss", ".4f"),
         ("MAPPO", "critic_loss", "critic loss", ".4f"),
         ("MAPPO", "approx_kl", "approx KL", ".4f"),
