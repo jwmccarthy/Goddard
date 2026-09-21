@@ -431,19 +431,17 @@ class GateCombinationTest(unittest.TestCase):
         )
 
     def test_multiplier_bounds_and_pair_interpolation(self):
-        global_probability = th.tensor([0.0, 0.5, 1.0, 1.0, 1.0])
-        pair_probability = th.tensor([0.5, 0.5, 1.0, 0.0, 0.5])
-        gate = th.tensor([1.0, 0.0, 1.0, 1.0, 1.0])
+        global_probability = th.tensor([0.0, 0.5, 1.0, 1.0])
+        pair_probability = th.tensor([0.5, 0.5, 1.0, 0.0])
         multiplier = gate_multiplier(
-            global_probability, pair_probability, gate, 0.5, 0.25
+            global_probability, pair_probability, 0.5, 0.25
         )
         self.assertTrue(bool((multiplier >= 0.25).all()))
         self.assertTrue(bool((multiplier <= 1.0).all()))
         self.assertAlmostEqual(float(multiplier[0]), 0.25, places=5)
-        self.assertAlmostEqual(float(multiplier[1]), 0.625, places=5)
+        self.assertAlmostEqual(float(multiplier[1]), 0.53125, places=5)
         self.assertAlmostEqual(float(multiplier[2]), 1.0, places=5)
         self.assertAlmostEqual(float(multiplier[3]), 0.625, places=5)
-        self.assertAlmostEqual(float(multiplier[4]), 0.8125, places=5)
 
     def test_gate_rejects_invalid_settings(self):
         with self.assertRaises(ValueError):

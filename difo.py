@@ -6,7 +6,7 @@ discriminators providing imitation rewards:
 
 * a **global** joint-transition DIFO over the whole agent/ball transition;
 * a **pair** agent-ball DIFO with shared parameters, evaluated once per
-  agent and gated by that agent's physical relevance to the ball.
+  agent and blended into that agent's intrinsic reward.
 
 Each transition is represented as an ego-centric entity graph with a ball
 node and one node per car. Agent features are ball-relative; edges are
@@ -841,22 +841,19 @@ def discriminator_probability(reward: th.Tensor) -> th.Tensor:
 def gate_multiplier(
     global_probability: th.Tensor,
     pair_probability: th.Tensor,
-    gate: th.Tensor,
     beta: float,
     gate_min: float,
 ) -> th.Tensor:
     """Bounded multiplicative gate ``m in [gate_min, 1]``.
 
     ``global_probability`` is the team-level discriminator probability and the
-    pair term only enters where the agent is physically relevant (``gate``),
-    interpolated by ``beta``. Early in training ``D ~ 0.5`` everywhere, so the
-    multiplier stays nearly constant and does not inject discriminator noise
-    into the task reward; once the discriminator sharpens, non-expert
-    transitions have their task reward scaled down more than expert-like ones.
+    pair probability enters with weight ``beta`` (no distance gating). Early
+    in training ``D ~ 0.5`` everywhere, so the multiplier stays nearly
+    constant and does not inject discriminator noise into the task reward;
+    once the discriminator sharpens, non-expert transitions have their task
+    reward scaled down more than expert-like ones.
     """
-    pair_factor = (1.0 - beta) + beta * (
-        gate * pair_probability + (1.0 - gate)
-    )
+    pair_factor = (1.0 - beta) + beta * pair_probability
     return gate_min + (1.0 - gate_min) * global_probability * pair_factor
 
 
@@ -1475,7 +1472,7 @@ class DIFOReward:
             delta_t.repeat_interleave(self.n_cars, dim=0),
         ).reshape(gates.shape[0], gates.shape[1])
         gate = gates[:, 0]
-        raw = global_reward + self.beta * gate * pair_rewards[:, 0]
+        raw = global_reward + self.beta * pair_rewards[:, 0]
         intrinsic = self.scale * self._normalize(raw, selected, done)
         task = batch["reward"]
         global_probability = discriminator_probability(global_reward)
@@ -1485,7 +1482,6 @@ class DIFOReward:
             multiplier = gate_multiplier(
                 global_probability,
                 pair_probability,
-                gate,
                 self.beta,
                 self.gate_min,
             )
@@ -1516,7 +1512,9 @@ class DIFOReward:
         self._metrics = {
             "global_reward": float(global_reward.mean()),
             "pair_reward": float(pair_rewards[:, 0].mean()),
-            "gated_pair_reward": float((gate * pair_rewards[:, 0]).mean()),
+            "pair_contribution": float(
+                (self.beta * pair_rewards[:, 0]).mean()
+            ),
             "global_probability": float(global_probability.mean()),
             "pair_probability": float(pair_probability.mean()),
             "gate": float(gate.mean()),
@@ -2581,7 +2579,7 @@ def main() -> None:
         ("DIFO", "pair_agent_accuracy", "pair agent acc", ".3f"),
         ("DIFOReward", "global_reward", "DIFO global reward", ".3f"),
         ("DIFOReward", "pair_reward", "DIFO pair reward", ".3f"),
-        ("DIFOReward", "gated_pair_reward", "DIFO gated pair", ".3f"),
+        ("DIFOReward", "pair_contribution", "DIFO pair contribution", ".3f"),
         ("DIFOReward", "global_probability", "DIFO global D", ".3f"),
         ("DIFOReward", "pair_probability", "DIFO pair D", ".3f"),
         ("DIFOReward", "gate", "DIFO mean gate", ".3f"),
