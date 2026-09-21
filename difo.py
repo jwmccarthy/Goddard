@@ -71,6 +71,7 @@ from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import (
     LinearSchedule,
+    MappedSchedule,
     OnPolicySchedule,
     ScheduledValue,
     Trainer,
@@ -2204,13 +2205,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--discount-half-life-seconds", type=float, default=10.0)
+    parser.add_argument("--discount-half-life-end", type=float, default=20.0)
     parser.add_argument(
         "--gamma",
         type=float,
         default=None,
         help="discount factor; overrides --discount-half-life-seconds when set",
     )
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--gae-lambda", type=float, default=0.99)
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--feature-size", type=int, default=512)
     parser.add_argument("--policy-hidden", type=int, nargs="+", default=[512, 512])
@@ -2344,6 +2346,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "checkpoint_interval",
         "checkpoint_keep",
         "discount_half_life_seconds",
+        "discount_half_life_end",
         "difo_diffusion_steps",
         "difo_batch_size",
         "difo_epochs",
@@ -2423,6 +2426,8 @@ def main() -> None:
     gamma = resolve_gamma(
         args.gamma, args.frameskip, args.discount_half_life_seconds
     )
+    actions_per_second = TICKS_PER_SECOND / args.frameskip
+    gae = GAE(gamma=gamma, lambda_=args.gae_lambda)
     no_touch_timeout_steps = math.ceil(
         args.no_touch_timeout_seconds * TICKS_PER_SECOND / args.frameskip
     )
@@ -2652,7 +2657,7 @@ def main() -> None:
         transforms=(
             *((task_reward,) if task_reward is not None else ()),
             difo_reward,
-            GAE(gamma=gamma, lambda_=args.gae_lambda),
+            gae,
         ),
         sampler=RolloutMinibatches(args.batch_size, args.epochs),
         loss=PPOLoss(
@@ -2672,6 +2677,24 @@ def main() -> None:
         ),
         section="MAPPO",
     )
+    gamma_values = []
+    if args.gamma is None:
+        half_life = LinearSchedule(
+            args.discount_half_life_seconds, args.discount_half_life_end
+        )
+        gamma_values = [
+            ScheduledValue.metric("discount_half_life", half_life),
+            ScheduledValue.attribute(
+                "gamma",
+                gae,
+                "gamma",
+                MappedSchedule(
+                    half_life,
+                    lambda seconds: 0.5
+                    ** (1.0 / (actions_per_second * seconds)),
+                ),
+            ),
+        ]
     difo_anneal = ScheduledValue.attribute(
         "difo_anneal",
         difo_reward,
@@ -2691,10 +2714,11 @@ def main() -> None:
                 ),
             ),
             difo_anneal,
+            *gamma_values,
             section="Reward",
         )
         if args.reward_mode == "nexto"
-        else ValueScheduler(difo_anneal, section="Reward")
+        else ValueScheduler(difo_anneal, *gamma_values, section="Reward")
     )
     checkpoints = DIFOCheckpoints(
         args.checkpoint_dir / run_id,
@@ -2751,6 +2775,8 @@ def main() -> None:
         ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
         ("Gameplay", "baseline_win_rate", "base win", ".3f"),
         ("Reward", "nexto_shaping_scale", "reward shaping", ".3f"),
+        ("Reward", "discount_half_life", "discount half-life", ".1f"),
+        ("Reward", "gamma", "gamma", ".5f"),
     ):
         logger.register_progress_metric(section, key, label, format_spec)
 
