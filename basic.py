@@ -61,7 +61,7 @@ from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
 from replay_resets import load_demonstration_reset_dataset
-from rewards import AnnealedNextoReward, nexto_shaping_scale
+from rewards import AnnealedNextoReward, SeerNextoReward, nexto_shaping_scale
 
 
 GOAL_REWARD = 10.0
@@ -86,8 +86,10 @@ class SeerReward:
         player_ball_progress_scale: float = 0.1,
         ball_height_progress_scale: float = 0.1,
         gravity_lift_scale: float = 0.1,
+        goal_scale: float = GOAL_REWARD,
     ) -> None:
         self.dt = frameskip / 120.0
+        self.goal_scale = goal_scale
         self.touch_scale = touch_scale
         self.ball_velocity_scale = ball_velocity_scale
         self.flip_reset_scale = flip_reset_scale
@@ -161,7 +163,7 @@ class SeerReward:
 
         last_touch = self._last_touch.float()
         reward = (
-            GOAL_REWARD * score * team_sign
+            self.goal_scale * score * team_sign
             + self.touch_scale * touches
             + self.ball_velocity_scale * touches * velocity_change
             + self.flip_reset_scale * flip_reset
@@ -278,6 +280,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seer-player-ball-progress-scale", type=float, default=0.1)
     parser.add_argument("--seer-ball-height-progress-scale", type=float, default=0.1)
     parser.add_argument("--seer-gravity-lift-scale", type=float, default=0.1)
+    parser.add_argument(
+        "--seer-centered-goal-progress-scale", type=float, default=1.0
+    )
+    parser.add_argument("--seer-goal-scale", type=float, default=10.0)
     parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
     parser.add_argument("--nexto-goal-scale", type=float, default=0.0)
     parser.add_argument("--nexto-touch-scale", type=float, default=0.0)
@@ -361,6 +367,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "seer_player_ball_progress_scale",
         "seer_ball_height_progress_scale",
         "seer_gravity_lift_scale",
+        "seer_centered_goal_progress_scale",
+        "seer_goal_scale",
         "nexto_shaping_scale",
         "nexto_goal_scale",
         "nexto_touch_scale",
@@ -422,8 +430,23 @@ def build_critic(env, hidden_size: int, recurrent: bool) -> Critic:
 
 
 def build_rewards(args: argparse.Namespace) -> tuple:
+    if args.reward_mode == "both":
+        return (
+            SeerNextoReward(
+                1,
+                1,
+                frameskip=args.frameskip,
+                shaping_scale=args.nexto_shaping_scale,
+                goal_scale=args.seer_goal_scale,
+                touch_scale=0.0,
+                no_touch_penalty=0.0,
+                no_touch_timeout_steps=None,
+                centered_goal_progress_scale=args.seer_centered_goal_progress_scale,
+                gravity_lift_scale=args.seer_gravity_lift_scale,
+            ),
+        )
     reward_funcs = []
-    if args.reward_mode in ("both", "seer"):
+    if args.reward_mode == "seer":
         reward_funcs.append(
             SeerReward(
                 args.frameskip,
@@ -434,9 +457,10 @@ def build_rewards(args: argparse.Namespace) -> tuple:
                 player_ball_progress_scale=args.seer_player_ball_progress_scale,
                 ball_height_progress_scale=args.seer_ball_height_progress_scale,
                 gravity_lift_scale=args.seer_gravity_lift_scale,
+                goal_scale=args.seer_goal_scale,
             )
         )
-    if args.reward_mode in ("both", "nexto"):
+    if args.reward_mode == "nexto":
         reward_funcs.append(
             AnnealedNextoReward(
                 1,

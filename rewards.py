@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch as th
 
@@ -15,6 +15,7 @@ GOAL_HEIGHT = 642.775
 BACK_WALL_Y = 5120.0
 GOAL_DISTANCE_OFFSET = GOAL_Y - BACK_WALL_Y + BALL_RADIUS
 NEXTO_TOUCH_HEIGHT_SCALE = 2250.0
+GRAVITY_Z = 650.0
 MATCH_TICKS = 5 * 60 * 120
 HISTORICAL_GOAL_WEIGHT = 10.0
 
@@ -557,6 +558,72 @@ class DifferentialReward(AnnealedNextoReward):
 
 
 
+class SeerNextoReward(AnnealedNextoReward):
+    """The full Seer table plus Nexto progress terms, deduplicated once.
+
+    The Seer thesis weights and ``NextoRewardWeights`` are the same sixteen
+    level terms, so they are counted once here. Nexto's progress, touch and
+    flip-reset terms are kept as-is, and the only Seer terms Nexto lacks are
+    added: opponent-centered ball-goal progress and touch-gated gravity lift.
+    """
+
+    def __init__(
+        self,
+        n_blue: int,
+        n_orange: int,
+        frameskip: int = 4,
+        shaping_scale: float = 1.0,
+        goal_scale: float = 10.0,
+        touch_scale: float = 0.0,
+        no_touch_penalty: float = 1.0,
+        no_touch_timeout_steps: int | None = None,
+        weights: NextoRewardWeights = NextoRewardWeights(),
+        centered_goal_progress_scale: float = 1.0,
+        gravity_lift_scale: float = 0.1,
+    ) -> None:
+        super().__init__(
+            n_blue,
+            n_orange,
+            shaping_scale=shaping_scale,
+            goal_scale=goal_scale,
+            touch_scale=touch_scale,
+            no_touch_penalty=no_touch_penalty,
+            no_touch_timeout_steps=no_touch_timeout_steps,
+            weights=replace(weights, ball_goal_progress=0.0, ball_touch=0.0),
+        )
+        self.dt = frameskip / 120.0
+        self.centered_goal_progress_scale = centered_goal_progress_scale
+        self.gravity_lift_scale = gravity_lift_scale
+
+    def __call__(self, context: RewardContext) -> th.Tensor:
+        reward = super().__call__(context)
+        current = context.current
+        previous = context.previous
+        team_sign = current.team_sign[None, :]
+        ball = current.ball_position[:, None, :]
+        previous_ball = previous.ball_position[:, None, :]
+        opponent_goal = th.zeros_like(current.car_position)
+        opponent_goal[..., 1] = team_sign * GOAL_Y
+        progress = (
+            (opponent_goal - previous_ball).norm(dim=-1)
+            - (opponent_goal - ball).norm(dim=-1)
+        ) / BALL_MAX_SPEED
+        progress = progress - progress.mean(dim=-1, keepdim=True)
+        expected_height = (
+            previous.ball_position[:, 2]
+            + previous.ball_velocity[:, 2] * self.dt
+            - 0.5 * GRAVITY_Z * self.dt**2
+        )
+        lift = (
+            current.ball_position[:, 2] - expected_height
+        )[:, None] / CEILING_Z
+        last_touch = self._last_touch.float()
+        return reward + self.shaping_scale * (
+            self.centered_goal_progress_scale * progress
+            + self.gravity_lift_scale * last_touch * lift
+        )
+
+
 def nexto_shaping_scale(
     transitions: int,
     initial: float,
@@ -573,5 +640,6 @@ __all__ = [
     "DifferentialReward",
     "DifferentialRewardWeights",
     "NextoRewardWeights",
+    "SeerNextoReward",
     "nexto_shaping_scale",
 ]
