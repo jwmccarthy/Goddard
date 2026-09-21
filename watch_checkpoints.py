@@ -417,9 +417,16 @@ def _simulate_pulse(
             base.close()
 
 
-def load_difo_checkpoint(path: Path, env: CARLTorchVectorEnv):
+def load_difo_checkpoint(
+    path: Path, env: CARLTorchVectorEnv, frameskip: int | None = None
+):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload["config"]
+    if frameskip is not None and int(config.get("frameskip", frameskip)) != frameskip:
+        raise ValueError(
+            f"checkpoint was trained at frameskip {config['frameskip']}, "
+            f"watching at {frameskip}; pass --frameskip {config['frameskip']}"
+        )
     feature_size = int(config["feature_size"])
     policy_hidden = list(config["policy_hidden"])
     graph_config = {
@@ -477,8 +484,12 @@ def _simulate_difo(
             reset_state_provider=reset_sampler,
             discrete_actions=True,
         )
-        blue, blue_metadata = load_difo_checkpoint(blue_path, base)
-        orange, orange_metadata = load_difo_checkpoint(orange_path, base)
+        blue, blue_metadata = load_difo_checkpoint(
+            blue_path, base, args.frameskip
+        )
+        orange, orange_metadata = load_difo_checkpoint(
+            orange_path, base, args.frameskip
+        )
         require_compatible_difo(blue_metadata, orange_metadata)
         observation = base.reset()
         blue_score = orange_score = 0
@@ -554,9 +565,16 @@ def _simulate_difo(
             base.close()
 
 
-def load_basic_checkpoint(path: Path, env: CARLTorchVectorEnv):
+def load_basic_checkpoint(
+    path: Path, env: CARLTorchVectorEnv, frameskip: int | None = None
+):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload["config"]
+    if frameskip is not None and int(config.get("frameskip", frameskip)) != frameskip:
+        raise ValueError(
+            f"checkpoint was trained at frameskip {config['frameskip']}, "
+            f"watching at {frameskip}; pass --frameskip {config['frameskip']}"
+        )
     hidden = int(config["policy_hidden"])
     recurrent = bool(config.get("recurrent", True))
     policy = build_basic_policy(env, hidden, recurrent)
@@ -603,8 +621,12 @@ def _simulate_basic(
             reset_state_provider=reset_sampler,
             discrete_actions=True,
         )
-        blue, blue_metadata = load_basic_checkpoint(blue_path, base)
-        orange, orange_metadata = load_basic_checkpoint(orange_path, base)
+        blue, blue_metadata = load_basic_checkpoint(
+            blue_path, base, args.frameskip
+        )
+        orange, orange_metadata = load_basic_checkpoint(
+            orange_path, base, args.frameskip
+        )
         require_compatible_basic(blue_metadata, orange_metadata)
         observation = base.reset()
         blue_state = blue.initial_state(1)
