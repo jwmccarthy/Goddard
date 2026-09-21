@@ -22,12 +22,13 @@ a discriminator:
 
     D = sigmoid(lambda * (L_agent - L_expert))
 
-whose GAIL reward ``r = log(1 + exp(logit))`` is added to the task reward.
-``--reward-mode`` selects that task reward: the full Nexto shaping reward
-(``nexto``), the goal difference only (``goals``), or nothing
-(``imitation``). Expert transitions are sampled from state-only replays
-with the same ``delta_t`` distribution as policy transitions so timing
-cannot leak. Policy learning is MAPPO: a shared graph-conditioned
+whose GAIL reward ``r = log(1 + exp(logit))`` is combined with the task
+reward. ``--reward-mode`` selects that task reward: the full Nexto shaping
+reward (``nexto``), the goal difference only (``goals``), or nothing
+(``imitation``); ``--difo-reward-combine`` selects ``task * (1 + r)``
+(default) or ``task + r``. Expert transitions are sampled from state-only
+replays with the same ``delta_t`` distribution as policy transitions so
+timing cannot leak. Policy learning is MAPPO: a shared graph-conditioned
 multi-categorical actor with a centralized graph critic.
 """
 
@@ -1302,9 +1303,12 @@ class DIFOReward:
         frame_skip: int = 4,
         normalize: bool = True,
         normalize_clip: float = 10.0,
+        combine: str = "multiply",
     ) -> None:
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("DIFO pair reward weight must be non-negative")
+        if combine not in ("add", "multiply"):
+            raise ValueError(f"unknown DIFO reward combination: {combine}")
         self.global_difo = global_difo
         self.pair_difo = pair_difo
         self.beta = beta
@@ -1316,6 +1320,7 @@ class DIFOReward:
         self.frame_skip = frame_skip
         self.normalize = normalize
         self.normalize_clip = normalize_clip
+        self.combine = combine
         self._metrics: dict[str, float] = {}
 
     def metrics(self) -> dict[str, dict[str, float]]:
@@ -1375,7 +1380,11 @@ class DIFOReward:
         gate = gates[:, 0]
         raw = global_reward + self.beta * gate * pair_rewards[:, 0]
         intrinsic = self.scale * self._normalize(raw, selected, done)
-        reward = batch["reward"] + intrinsic.reshape(*leading)
+        task = batch["reward"]
+        if self.combine == "multiply":
+            reward = task * (1.0 + intrinsic.reshape(*leading))
+        else:
+            reward = task + intrinsic.reshape(*leading)
         interacting = (gate > 0.5).float().mean()
         self._metrics = {
             "global_reward": float(global_reward.mean()),
@@ -1388,6 +1397,10 @@ class DIFOReward:
             if selected.any()
             else 0.0,
             "intrinsic_reward": float(intrinsic.mean()),
+            "task_reward": float(task.mean()),
+            "reward_multiplier": float((1.0 + intrinsic).mean())
+            if self.combine == "multiply"
+            else 1.0,
         }
         return batch.replace_fields(reward=reward)
 
@@ -1707,6 +1720,15 @@ def parse_args() -> argparse.Namespace:
         help="zero-mean/unit-std the DIFO intrinsic reward over learner steps",
     )
     parser.add_argument(
+        "--difo-reward-combine",
+        choices=("add", "multiply"),
+        default="multiply",
+        help=(
+            "combine the intrinsic reward with the task reward: "
+            "task*(1+intrinsic) or task+intrinsic; imitation mode always adds"
+        ),
+    )
+    parser.add_argument(
         "--reward-mode",
         choices=("nexto", "goals", "imitation"),
         default="nexto",
@@ -2014,6 +2036,9 @@ def main() -> None:
         section="DIFO",
         seed=args.seed,
     )
+    reward_transform_combine = (
+        "add" if args.reward_mode == "imitation" else args.difo_reward_combine
+    )
     difo_reward = DIFOReward(
         global_difo,
         pair_difo,
@@ -2026,6 +2051,7 @@ def main() -> None:
         frame_skip=args.frameskip,
         normalize=args.difo_reward_normalize,
         normalize_clip=args.difo_reward_clip,
+        combine=reward_transform_combine,
     )
     update = Update(
         transforms=(
@@ -2097,6 +2123,8 @@ def main() -> None:
         ("DIFOReward", "intrinsic_raw", "DIFO intrinsic raw", ".3f"),
         ("DIFOReward", "intrinsic_std", "DIFO intrinsic std", ".3f"),
         ("DIFOReward", "intrinsic_reward", "DIFO intrinsic", ".3f"),
+        ("DIFOReward", "task_reward", "task reward", ".3f"),
+        ("DIFOReward", "reward_multiplier", "DIFO multiplier", ".3f"),
         ("MAPPO", "policy_loss", "policy loss", ".4f"),
         ("MAPPO", "critic_loss", "critic loss", ".4f"),
         ("MAPPO", "approx_kl", "approx KL", ".4f"),

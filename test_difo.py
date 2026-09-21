@@ -533,6 +533,58 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             scales("unknown", 10.0, 0.7, 0.1, 1.0)
 
+    def test_multiply_combines_task_and_intrinsic(self):
+        global_difo, pair_difo = self._models()
+        rollout = self._rollout(done=False)
+        th.manual_seed(1234)
+        additive = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            combine="add",
+        )
+        added = additive(rollout, None)
+        intrinsic = added["reward"] - rollout["reward"]
+        th.manual_seed(1234)
+        multiplicative = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            combine="multiply",
+        )
+        multiplied = multiplicative(rollout, None)
+        expected = rollout["reward"] * (1.0 + intrinsic)
+        self.assertTrue(th.allclose(multiplied["reward"], expected))
+        self.assertEqual(
+            multiplicative.metrics()["DIFOReward"]["reward_multiplier"],
+            float((1.0 + intrinsic).mean()),
+        )
+
+    def test_multiply_vanishes_without_task_reward(self):
+        global_difo, pair_difo = self._models()
+        transform = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            combine="multiply",
+        )
+        rollout = self._rollout(done=False).replace_fields(
+            reward=th.zeros(6, 3)
+        )
+        out = transform(rollout, None)
+        self.assertTrue(th.allclose(out["reward"], th.zeros(6, 3)))
+
+    def test_invalid_combination_is_rejected(self):
+        global_difo, pair_difo = self._models()
+        with self.assertRaises(ValueError):
+            DIFOReward(global_difo, pair_difo, combine="product")
+
     def test_normalized_intrinsic_is_zero_mean_unit_std(self):
         global_difo, pair_difo = self._models()
         transform = DIFOReward(
