@@ -29,7 +29,6 @@ from difo import (
     build_policy,
     build_transition,
     build_transition_graph,
-    combine_gated_rows,
     entities_from_observation,
     entities_from_replay_state,
     gather_pairs,
@@ -302,18 +301,6 @@ def make_graph_data(count: int = 8, seed: int = 0):
 
 
 class GraphDIFOTest(unittest.TestCase):
-    def test_gated_combine_balances_datasets(self):
-        row = th.tensor([1.0, 1.0, 3.0, 3.0])
-        is_expert = th.tensor([1.0, 1.0, 0.0, 0.0])
-        gate = th.tensor([1.0, 1.0, 1e-3, 1e-3])
-        loss = combine_gated_rows(row, gate, is_expert)
-        self.assertAlmostEqual(float(loss), 2.0, places=5)
-        plain = float((gate * row).sum() / gate.sum())
-        self.assertLess(plain, 1.1)
-        self.assertAlmostEqual(
-            float(combine_gated_rows(row, None, is_expert)), 2.0, places=5
-        )
-
     def _modules(self, target_dim: int, condition_dim: int, **kwargs):
         return GraphDIFO(
             InteractionGraph(feature_dim=16, layers=1),
@@ -354,7 +341,12 @@ class GraphDIFOTest(unittest.TestCase):
             include_ego=False,
         )
         optimizer = th.optim.Adam(model.parameters(), lr=1e-2)
-        loss = None
+        initial_loss, _ = model.training_loss(
+            graph,
+            th.cat((expert_target, agent_target)),
+            is_expert,
+            th.full((32, 1), 1 / 30),
+        )
         for _ in range(150):
             loss, _ = model.training_loss(
                 graph,
@@ -373,21 +365,9 @@ class GraphDIFOTest(unittest.TestCase):
         )
         self.assertGreater(float(final_metrics["expert_accuracy"]), 0.8)
         self.assertGreater(float(final_metrics["agent_accuracy"]), 0.8)
-        self.assertLess(float(final_loss.detach()), float(loss.detach()))
-
-    def test_gate_zero_disables_pair_rows(self):
-        pairs = None
-        graph, gates, agent_delta, ball_delta = make_graph_data(4)
-        pairs = gather_pairs(graph)
-        targets = pair_target(agent_delta, ball_delta).reshape(-1, PAIR_TARGET_DIM)
-        model = self._modules(PAIR_TARGET_DIM, 32, include_ego=True)
-        is_expert = th.tensor([1.0, 0.0] * 4)
-        zero_gate = th.zeros(4 * N_CARS)
-        gated_loss, _ = model.training_loss(
-            pairs, targets, is_expert, th.full((4 * N_CARS, 1), 1 / 30),
-            gate=zero_gate,
+        self.assertLess(
+            float(final_loss.detach()), float(initial_loss.detach())
         )
-        self.assertEqual(float(gated_loss.detach()), 0.0)
 
 
 class TransitionDenoiserTest(unittest.TestCase):

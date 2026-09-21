@@ -794,29 +794,6 @@ class TransitionDenoiser(nn.Module):
         return self.model(th.cat((noisy, embedding), dim=-1))
 
 
-def combine_gated_rows(
-    row: th.Tensor,
-    gate: th.Tensor | None,
-    is_expert: th.Tensor,
-) -> th.Tensor:
-    """Average per-row losses with balanced expert/agent gate mass.
-
-    A plain ``sum(g * row) / sum(g)`` lets one dataset dominate whenever its
-    gates are larger on average (expert transitions are near the ball far
-    more often than early policy transitions), which stops the agent half of
-    the batch from contributing and turns the discriminator into an
-    unopposed expert autoencoder. Normalizing each dataset separately keeps
-    both sides adversarial while still prioritizing interacting rows.
-    """
-    if gate is None:
-        return row.mean()
-    expert_weight = gate * is_expert
-    agent_weight = gate * (1.0 - is_expert)
-    expert_term = (expert_weight * row).sum() / expert_weight.sum().clamp_min(1e-6)
-    agent_term = (agent_weight * row).sum() / agent_weight.sum().clamp_min(1e-6)
-    return 0.5 * (expert_term + agent_term)
-
-
 class GraphDIFO(nn.Module):
     """Diffusion discriminator over graph transitions and transition deltas."""
 
@@ -912,7 +889,6 @@ class GraphDIFO(nn.Module):
         target: th.Tensor,
         is_expert: th.Tensor,
         delta_t: th.Tensor,
-        gate: th.Tensor | None = None,
         generator: th.Generator | None = None,
     ) -> tuple[th.Tensor, dict[str, th.Tensor]]:
         expert_loss, agent_loss = self.denoising_losses(
@@ -929,7 +905,7 @@ class GraphDIFO(nn.Module):
             + agent_loss * (~expert_mask) * self.agent_mse_weight
         )
         row = self.mse_weight * mse + self.bce_weight * bce
-        loss = combine_gated_rows(row, gate, is_expert)
+        loss = row.mean()
         zero = th.zeros((), device=loss.device)
         metrics = {
             "loss": loss.detach(),
@@ -946,12 +922,6 @@ class GraphDIFO(nn.Module):
             else zero,
             "agent_accuracy": (logits[agent_mask] <= 0).float().mean().detach()
             if agent_mask.any()
-            else zero,
-            "expert_gate": gate[expert_mask].mean().detach()
-            if gate is not None and expert_mask.any()
-            else zero,
-            "agent_gate": gate[agent_mask].mean().detach()
-            if gate is not None and agent_mask.any()
             else zero,
         }
         return loss, metrics
@@ -1166,8 +1136,6 @@ class DIFOUpdate:
             "agent_loss": 0.0,
             "expert_accuracy": 0.0,
             "agent_accuracy": 0.0,
-            "expert_gate": 0.0,
-            "agent_gate": 0.0,
         }
         return {
             "global_" + name: value for name, value in zeros.items()
@@ -1220,7 +1188,7 @@ class DIFOUpdate:
         next_entities = entities_from_observation(
             next_observation, self.n_cars, contact
         )
-        graph, gates, agent_delta, ball_delta = build_transition(
+        graph, _, agent_delta, ball_delta = build_transition(
             entities, next_entities, self.sigma, self.gate_power
         )
         agent_delta_t = th.full(
@@ -1238,14 +1206,13 @@ class DIFOUpdate:
                 expert_entities, expert_next, expert_delta_t = self.expert.sample(
                     batch, delta_rows, generator=self.generator
                 )
-                expert_graph, expert_gates, expert_agent_delta, expert_ball_delta = build_transition(
+                expert_graph, _, expert_agent_delta, expert_ball_delta = build_transition(
                     expert_entities,
                     expert_next,
                     self.sigma,
                     self.gate_power,
                 )
                 agent_graph = graph.index(index)
-                agent_gates = gates[index]
                 agent_agent_delta = agent_delta[index]
                 agent_ball_delta = ball_delta[index]
                 agent_delta_t_batch = agent_delta_t[index]
@@ -1296,13 +1263,11 @@ class DIFOUpdate:
                 pair_targets = pair_target(
                     pair_agent_delta, pair_ball_delta
                 ).reshape(-1, PAIR_TARGET_DIM)
-                pair_gates = th.cat((expert_gates, agent_gates), dim=0).flatten()
                 pair_loss, pair_metrics = self.pair_difo.training_loss(
                     pair_graph,
                     pair_targets,
                     is_expert.repeat_interleave(self.n_cars),
                     delta_t.repeat_interleave(self.n_cars, dim=0),
-                    gate=pair_gates,
                     generator=self.generator,
                 )
                 self._step(pair_loss * self.pair_loss_weight)
@@ -2192,8 +2157,6 @@ def main() -> None:
         ("DIFO", "pair_agent_loss", "pair agent loss", ".4f"),
         ("DIFO", "pair_expert_accuracy", "pair expert acc", ".3f"),
         ("DIFO", "pair_agent_accuracy", "pair agent acc", ".3f"),
-        ("DIFO", "pair_expert_gate", "pair expert gate", ".3f"),
-        ("DIFO", "pair_agent_gate", "pair agent gate", ".3f"),
         ("DIFOReward", "global_reward", "DIFO global reward", ".3f"),
         ("DIFOReward", "pair_reward", "DIFO pair reward", ".3f"),
         ("DIFOReward", "gated_pair_reward", "DIFO gated pair", ".3f"),
