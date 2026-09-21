@@ -74,7 +74,6 @@ from rewards import AnnealedNextoReward, nexto_shaping_scale
 from tracker import (
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
-    BOOST_MAX,
     CAR_MAX_ANG_SPEED,
     CAR_MAX_SPEED,
     CAR_STATE_SIZE,
@@ -92,7 +91,7 @@ BALL_STATE_SIZE = 9
 GOAL_CENTER_Y = 5120.0
 GOAL_CENTER_Z = 321.3875
 
-AGENT_CONT_DIM = 17
+AGENT_CONT_DIM = 15
 BALL_CONT_DIM = 15
 NODE_CONT_DIM = AGENT_CONT_DIM
 NODE_DISCRETE_DIM = 2
@@ -231,14 +230,19 @@ def entities_from_replay_state(
     cars = th.stack((ego, opponent), dim=1)
     fields = _split_cars(cars)
     scale = position_scale(rows.device)
-    goal_center = th.tensor(
+    own_goal_world = th.tensor(
+        (0.0, -GOAL_CENTER_Y, GOAL_CENTER_Z),
+        dtype=th.float32,
+        device=rows.device,
+    )
+    opponent_goal_world = th.tensor(
         (0.0, GOAL_CENTER_Y, GOAL_CENTER_Z),
         dtype=th.float32,
         device=rows.device,
     )
     ball_world = ball[:, 0:3] * scale
-    own_goal = ((goal_center * th.tensor((-1.0, 1.0, 1.0), device=rows.device)) - ball_world) / (2.0 * scale)
-    opponent_goal = (goal_center - ball_world) / (2.0 * scale)
+    own_goal = (own_goal_world - ball_world) / (2.0 * scale)
+    opponent_goal = (opponent_goal_world - ball_world) / (2.0 * scale)
     contact = th.zeros((count, 2), dtype=th.bool, device=rows.device)
     contact[:, 0] = ego_contact.reshape(-1).bool()
     return Entities(
@@ -268,8 +272,6 @@ def agent_cont_features(entities: Entities) -> th.Tensor:
             entities.car_forward,
             entities.car_up,
             entities.car_angular_velocity / CAR_MAX_ANG_SPEED,
-            (entities.car_boost / BOOST_MAX).unsqueeze(-1),
-            entities.car_on_ground.float().unsqueeze(-1),
         ),
         dim=-1,
     )
