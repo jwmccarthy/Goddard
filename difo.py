@@ -1571,6 +1571,21 @@ class DIFOReward:
             combined = task + intrinsic.reshape(*leading)
         reward = (1.0 - self.anneal) * task + self.anneal * combined
         interacting = (gate > 0.5).float().mean()
+        done_rows = (batch["terminated"] | batch["truncated"]).reshape(
+            leading
+        )
+        running = th.zeros(leading[1], device=reward.device)
+        for index in range(leading[0]):
+            running = running + reward[index]
+            running = th.where(
+                done_rows[index], th.zeros_like(running), running
+            )
+        learner_last = batch.get("learner_mask")
+        if learner_last is not None:
+            learner_last = learner_last.reshape(leading)[-1].bool()
+            current_return = running[learner_last].mean()
+        else:
+            current_return = running.mean()
         if self.combine == "add":
             intrinsic_component = intrinsic.mean()
         elif self.combine == "hybrid":
@@ -1597,6 +1612,7 @@ class DIFOReward:
             "task_reward_abs": float(task.abs().mean()),
             "reward": float(reward.mean()),
             "reward_abs": float(reward.abs().mean()),
+            "current_return": float(current_return),
             "reward_multiplier": float(multiplier.mean()),
             "multiplier_clamped_fraction": clamped_fraction,
             "anneal": float(self.anneal),
@@ -2721,6 +2737,7 @@ def main() -> None:
         ("DIFOReward", "task_reward_abs", "task reward abs", ".3f"),
         ("DIFOReward", "reward", "combined reward", ".3f"),
         ("DIFOReward", "reward_abs", "combined reward abs", ".3f"),
+        ("DIFOReward", "current_return", "return since reset", ".2f"),
         ("DIFOReward", "reward_multiplier", "DIFO multiplier", ".3f"),
         ("DIFOReward", "multiplier_clamped_fraction", "DIFO clamp frac", ".3f"),
         ("DIFOReward", "anneal", "DIFO anneal", ".3f"),
