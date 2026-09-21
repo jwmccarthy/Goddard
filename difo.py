@@ -25,10 +25,10 @@ a discriminator:
 whose GAIL reward ``r = log(1 + exp(logit))`` is combined with the task
 reward. ``--reward-mode`` selects that task reward: the full Nexto shaping
 reward (``nexto``), the goal difference only (``goals``), or nothing
-(``imitation``); ``--difo-reward-combine`` selects ``task * (1 + r)``
-(default) or ``task + r``, with the multiplier optionally floored by
-``--difo-reward-multiplier-min`` (default 0) so the task-reward sign is
-preserved. Expert transitions are sampled from state-only
+(``imitation``); ``--difo-reward-combine`` defaults to a bounded
+discriminator gate ``task * m`` with ``m in [gate_min, 1]`` (``gate_min``
+keeps shaping flowing and avoids veto dead zones), or selects ``task + r``
+or ``task * (1 + r)``. Expert transitions are sampled from state-only
 replays with the same ``delta_t`` distribution as policy transitions so
 timing cannot leak. Policy learning is MAPPO: a shared graph-conditioned
 multi-categorical actor with a centralized graph critic.
@@ -794,6 +794,33 @@ class TransitionDenoiser(nn.Module):
         return self.model(th.cat((noisy, embedding), dim=-1))
 
 
+def discriminator_probability(reward: th.Tensor) -> th.Tensor:
+    """Recover ``D = sigmoid(logit)`` from the GAIL reward ``-log(1 - D)``."""
+    return 1.0 - th.exp(-reward)
+
+
+def gate_multiplier(
+    global_probability: th.Tensor,
+    pair_probability: th.Tensor,
+    gate: th.Tensor,
+    beta: float,
+    gate_min: float,
+) -> th.Tensor:
+    """Bounded multiplicative gate ``m in [gate_min, 1]``.
+
+    ``global_probability`` is the team-level discriminator probability and the
+    pair term only enters where the agent is physically relevant (``gate``),
+    interpolated by ``beta``. Early in training ``D ~ 0.5`` everywhere, so the
+    multiplier stays nearly constant and does not inject discriminator noise
+    into the task reward; once the discriminator sharpens, non-expert
+    transitions have their task reward scaled down more than expert-like ones.
+    """
+    pair_factor = (1.0 - beta) + beta * (
+        gate * pair_probability + (1.0 - gate)
+    )
+    return gate_min + (1.0 - gate_min) * global_probability * pair_factor
+
+
 class GraphDIFO(nn.Module):
     """Diffusion discriminator over graph transitions and transition deltas."""
 
@@ -1302,15 +1329,20 @@ class DIFOReward:
         frame_skip: int = 4,
         normalize: bool = True,
         normalize_clip: float = 10.0,
-        combine: str = "multiply",
+        combine: str = "gate",
         multiplier_min: float | None = 0.0,
+        gate_min: float = 0.25,
     ) -> None:
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("DIFO pair reward weight must be non-negative")
-        if combine not in ("add", "multiply"):
+        if combine not in ("gate", "add", "multiply"):
             raise ValueError(f"unknown DIFO reward combination: {combine}")
+        if combine == "gate" and beta > 1.0:
+            raise ValueError("gated DIFO reward requires beta in [0, 1]")
         if multiplier_min is not None and not math.isfinite(multiplier_min):
             raise ValueError("DIFO reward multiplier floor must be finite")
+        if not 0.0 <= gate_min < 1.0:
+            raise ValueError("DIFO reward gate floor must be in [0, 1)")
         self.global_difo = global_difo
         self.pair_difo = pair_difo
         self.beta = beta
@@ -1324,6 +1356,7 @@ class DIFOReward:
         self.normalize_clip = normalize_clip
         self.combine = combine
         self.multiplier_min = multiplier_min
+        self.gate_min = gate_min
         self._metrics: dict[str, float] = {}
 
     def metrics(self) -> dict[str, dict[str, float]]:
@@ -1384,33 +1417,50 @@ class DIFOReward:
         raw = global_reward + self.beta * gate * pair_rewards[:, 0]
         intrinsic = self.scale * self._normalize(raw, selected, done)
         task = batch["reward"]
-        multiplier = 1.0 + intrinsic.reshape(*leading)
+        global_probability = discriminator_probability(global_reward)
+        pair_probability = discriminator_probability(pair_rewards[:, 0])
         clamped_fraction = 0.0
-        if self.combine == "multiply":
+        if self.combine == "gate":
+            multiplier = gate_multiplier(
+                global_probability,
+                pair_probability,
+                gate,
+                self.beta,
+                self.gate_min,
+            )
+            multiplier = th.where(
+                done, th.ones_like(multiplier), multiplier
+            )
+            reward = task * multiplier.reshape(*leading)
+        elif self.combine == "multiply":
+            multiplier = 1.0 + intrinsic
             if self.multiplier_min is not None:
                 clamped_fraction = float(
                     (multiplier < self.multiplier_min).float().mean()
                 )
                 multiplier = multiplier.clamp_min(self.multiplier_min)
-            reward = task * multiplier
+            reward = task * multiplier.reshape(*leading)
         else:
+            multiplier = th.ones_like(task)
             reward = task + intrinsic.reshape(*leading)
         interacting = (gate > 0.5).float().mean()
         self._metrics = {
             "global_reward": float(global_reward.mean()),
             "pair_reward": float(pair_rewards[:, 0].mean()),
             "gated_pair_reward": float((gate * pair_rewards[:, 0]).mean()),
+            "global_probability": float(global_probability.mean()),
+            "pair_probability": float(pair_probability.mean()),
             "gate": float(gate.mean()),
             "interacting_fraction": float(interacting),
             "intrinsic_raw": float(raw[selected].mean()) if selected.any() else 0.0,
             "intrinsic_std": float(raw[selected].std(unbiased=False))
             if selected.any()
             else 0.0,
-            "intrinsic_reward": float(intrinsic.mean()),
+            "intrinsic_reward": float(intrinsic.mean())
+            if self.combine == "add"
+            else float((multiplier - 1.0).mean()),
             "task_reward": float(task.mean()),
-            "reward_multiplier": float(multiplier.mean())
-            if self.combine == "multiply"
-            else 1.0,
+            "reward_multiplier": float(multiplier.mean()),
             "multiplier_clamped_fraction": clamped_fraction,
         }
         return batch.replace_fields(reward=reward)
@@ -1751,12 +1801,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--difo-reward-combine",
-        choices=("add", "multiply"),
-        default="multiply",
+        choices=("gate", "add", "multiply"),
+        default="gate",
         help=(
-            "combine the intrinsic reward with the task reward: "
-            "task*(1+intrinsic) or task+intrinsic; imitation mode always adds"
+            "combine the intrinsic reward with the task reward: bounded "
+            "discriminator gate, task+intrinsic, or task*(1+intrinsic); "
+            "imitation mode always adds"
         ),
+    )
+    parser.add_argument(
+        "--difo-reward-gate-min",
+        type=float,
+        default=0.25,
+        help="lower bound of the gated multiplier (task reward is never fully vetoed)",
     )
     parser.add_argument(
         "--difo-reward-multiplier-min",
@@ -2094,6 +2151,7 @@ def main() -> None:
         normalize_clip=args.difo_reward_clip,
         combine=reward_transform_combine,
         multiplier_min=args.difo_reward_multiplier_min,
+        gate_min=args.difo_reward_gate_min,
     )
     update = Update(
         transforms=(
@@ -2160,6 +2218,8 @@ def main() -> None:
         ("DIFOReward", "global_reward", "DIFO global reward", ".3f"),
         ("DIFOReward", "pair_reward", "DIFO pair reward", ".3f"),
         ("DIFOReward", "gated_pair_reward", "DIFO gated pair", ".3f"),
+        ("DIFOReward", "global_probability", "DIFO global D", ".3f"),
+        ("DIFOReward", "pair_probability", "DIFO pair D", ".3f"),
         ("DIFOReward", "gate", "DIFO mean gate", ".3f"),
         ("DIFOReward", "interacting_fraction", "DIFO interacting", ".3f"),
         ("DIFOReward", "intrinsic_raw", "DIFO intrinsic raw", ".3f"),

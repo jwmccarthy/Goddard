@@ -29,9 +29,11 @@ from difo import (
     build_policy,
     build_transition,
     build_transition_graph,
+    discriminator_probability,
     entities_from_observation,
     entities_from_replay_state,
     gather_pairs,
+    gate_multiplier,
     global_target,
     global_target_dim,
     observation_width,
@@ -409,6 +411,42 @@ class TransitionDenoiserTest(unittest.TestCase):
         self.assertIn("expert_accuracy", metrics)
 
 
+class GateCombinationTest(unittest.TestCase):
+    def test_probability_recovery(self):
+        reward = th.log1p(th.exp(th.tensor(2.0)))
+        self.assertAlmostEqual(
+            float(discriminator_probability(reward)),
+            float(th.sigmoid(th.tensor(2.0))),
+            places=5,
+        )
+        self.assertAlmostEqual(
+            float(discriminator_probability(th.log(th.tensor(2.0)))),
+            0.5,
+            places=5,
+        )
+
+    def test_multiplier_bounds_and_pair_interpolation(self):
+        global_probability = th.tensor([0.0, 0.5, 1.0, 1.0, 1.0])
+        pair_probability = th.tensor([0.5, 0.5, 1.0, 0.0, 0.5])
+        gate = th.tensor([1.0, 0.0, 1.0, 1.0, 1.0])
+        multiplier = gate_multiplier(
+            global_probability, pair_probability, gate, 0.5, 0.25
+        )
+        self.assertTrue(bool((multiplier >= 0.25).all()))
+        self.assertTrue(bool((multiplier <= 1.0).all()))
+        self.assertAlmostEqual(float(multiplier[0]), 0.25, places=5)
+        self.assertAlmostEqual(float(multiplier[1]), 0.625, places=5)
+        self.assertAlmostEqual(float(multiplier[2]), 1.0, places=5)
+        self.assertAlmostEqual(float(multiplier[3]), 0.625, places=5)
+        self.assertAlmostEqual(float(multiplier[4]), 0.8125, places=5)
+
+    def test_gate_rejects_invalid_settings(self):
+        with self.assertRaises(ValueError):
+            DIFOReward(None, None, combine="gate", beta=1.5)
+        with self.assertRaises(ValueError):
+            DIFOReward(None, None, combine="gate", gate_min=1.0)
+
+
 class DIFOUpdateAndRewardTest(unittest.TestCase):
     def _rollout(self, steps: int = 6, envs: int = 3, done: bool = False):
         return TensorBatch(
@@ -606,6 +644,7 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
             beta=0.5,
             n_cars=N_CARS,
             frame_skip=4,
+            combine="multiply",
             multiplier_min=None,
         )
         out = unclamped(rollout, None)
@@ -635,6 +674,29 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
         global_difo, pair_difo = self._models()
         with self.assertRaises(ValueError):
             DIFOReward(global_difo, pair_difo, combine="product")
+
+    def test_gate_multiplier_bounds_on_rollout(self):
+        global_difo, pair_difo = self._models()
+        transform = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            combine="gate",
+            gate_min=0.25,
+        )
+        rollout = self._rollout(done=False).replace_fields(
+            reward=th.full((6, 3), 2.0)
+        )
+        out = transform(rollout, None)
+        multiplier = out["reward"] / 2.0
+        self.assertTrue(bool((multiplier >= 0.25 - 1e-6).all()))
+        self.assertTrue(bool((multiplier <= 1.0 + 1e-6).all()))
+        metrics = transform.metrics()["DIFOReward"]
+        self.assertGreaterEqual(metrics["reward_multiplier"], 0.25)
+        self.assertLessEqual(metrics["reward_multiplier"], 1.0)
+        self.assertGreater(metrics["global_probability"], 0.0)
 
     def test_normalized_intrinsic_is_zero_mean_unit_std(self):
         global_difo, pair_difo = self._models()
