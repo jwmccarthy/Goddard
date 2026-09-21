@@ -38,6 +38,7 @@ from difo import (
     perturb_graph,
     position_scale,
     reward_scales,
+    TransitionDenoiser,
 )
 
 
@@ -365,6 +366,45 @@ class GraphDIFOTest(unittest.TestCase):
             gate=zero_gate,
         )
         self.assertEqual(float(gated_loss.detach()), 0.0)
+
+
+class TransitionDenoiserTest(unittest.TestCase):
+    def test_forward_with_independent_embedding_dimensions(self):
+        denoiser = TransitionDenoiser(
+            target_dim=5,
+            condition_dim=7,
+            hidden=32,
+            time_dim=8,
+            label_dim=4,
+            delta_dim=6,
+        )
+        output = denoiser(
+            noisy=th.randn(3, 5),
+            timesteps=th.tensor([0, 4, 9]),
+            labels=th.tensor([1, 0, 1]),
+            delta_t=th.full((3, 1), 1 / 30),
+            condition=th.randn(3, 7),
+        )
+        self.assertEqual(output.shape, (3, 5))
+
+    def test_graph_difo_trains_with_hidden_wider_than_label(self):
+        graph, _, agent_delta, ball_delta = make_graph_data(4)
+        model = GraphDIFO(
+            InteractionGraph(feature_dim=32, layers=1),
+            target_dim=global_target_dim(N_CARS),
+            diffusion=GaussianDiffusion(10),
+            condition_dim=32,
+            hidden=32,
+            include_ego=False,
+        )
+        loss, metrics = model.training_loss(
+            graph,
+            global_target(agent_delta, ball_delta),
+            th.tensor([1.0, 0.0, 1.0, 0.0]),
+            th.full((4, 1), 1 / 30),
+        )
+        self.assertTrue(bool(th.isfinite(loss)))
+        self.assertIn("expert_accuracy", metrics)
 
 
 class DIFOUpdateAndRewardTest(unittest.TestCase):

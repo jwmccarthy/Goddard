@@ -756,7 +756,10 @@ class TransitionDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, hidden),
         )
-        self.label = nn.Embedding(2, label_dim)
+        self.label = nn.Sequential(
+            nn.Embedding(2, label_dim),
+            nn.Linear(label_dim, hidden),
+        )
         self.delta = nn.Sequential(
             nn.Linear(1, delta_dim),
             nn.SiLU(),
