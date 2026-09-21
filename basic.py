@@ -31,7 +31,6 @@ from jarl.collect import (
     RecurrentCriticCapture,
     RecurrentStateCapture,
     SelfPlayMatchmaker,
-    SelfPlayRunner,
     SnapshotPool,
 )
 from jarl.envs import DatasetResetSampler
@@ -60,6 +59,7 @@ from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE
 
+from difo import DiagnosticSelfPlayRunner
 from replay_resets import load_demonstration_reset_dataset
 from rewards import AnnealedNextoReward, SeerNextoReward, nexto_shaping_scale
 
@@ -87,6 +87,7 @@ class SeerReward:
         ball_height_progress_scale: float = 0.1,
         gravity_lift_scale: float = 0.1,
         goal_scale: float = GOAL_REWARD,
+        no_touch_timeout_steps: int | None = None,
     ) -> None:
         self.dt = frameskip / 120.0
         self.goal_scale = goal_scale
@@ -98,6 +99,11 @@ class SeerReward:
         self.ball_height_progress_scale = ball_height_progress_scale
         self.gravity_lift_scale = gravity_lift_scale
         self._last_touch: th.Tensor | None = None
+        self.no_touch_timeout_steps = no_touch_timeout_steps
+        self._steps_since_touch: th.Tensor | None = None
+        self.last_touches: th.Tensor | None = None
+        self.last_score_for_actor: th.Tensor | None = None
+        self.last_no_touch_timeout: th.Tensor | None = None
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         current = context.current
@@ -110,6 +116,24 @@ class SeerReward:
 
         team_sign = current.team_sign[None, :]
         score = context.events.score_delta[:, None]
+        score_for_actor = score * team_sign
+        self.last_touches = touches
+        self.last_score_for_actor = score_for_actor
+        if self._steps_since_touch is None or self._steps_since_touch.shape != (
+            touches.shape[0],
+        ):
+            self._steps_since_touch = th.zeros(
+                touches.shape[0], dtype=th.long, device=touches.device
+            )
+        self._steps_since_touch += 1
+        self._steps_since_touch[touches.any(dim=-1)] = 0
+        if self.no_touch_timeout_steps is None:
+            self.last_no_touch_timeout = th.zeros_like(context.events.truncated)
+        else:
+            self.last_no_touch_timeout = context.events.truncated & (
+                self._steps_since_touch >= self.no_touch_timeout_steps
+            )
+        self._steps_since_touch[context.events.done] = 0
         ball = current.ball_position[:, None, :]
         previous_ball = previous.ball_position[:, None, :]
         velocity_change = (
@@ -425,6 +449,10 @@ def build_critic(env, hidden_size: int, recurrent: bool) -> Critic:
     ).build(env).to(env.device)
 
 
+def no_touch_timeout_steps(args: argparse.Namespace) -> int:
+    return math.ceil(args.no_touch_timeout * 120 / args.frameskip)
+
+
 def build_rewards(args: argparse.Namespace) -> tuple:
     if args.reward_mode == "both":
         return (
@@ -458,6 +486,7 @@ def build_rewards(args: argparse.Namespace) -> tuple:
                 ball_height_progress_scale=args.seer_ball_height_progress_scale,
                 gravity_lift_scale=args.seer_gravity_lift_scale,
                 goal_scale=args.seer_goal_scale,
+                no_touch_timeout_steps=no_touch_timeout_steps(args),
             )
         )
     if args.reward_mode == "nexto":
@@ -546,7 +575,7 @@ def main() -> None:
         if args.recurrent
         else (LogProbCapture(), CriticCapture(critic))
     )
-    runner = SelfPlayRunner(
+    runner = DiagnosticSelfPlayRunner(
         env,
         policy,
         buffer,
@@ -555,6 +584,7 @@ def main() -> None:
         snapshot_policy=policy,
         historical_policies=args.historical_policies,
         captures=captures,
+        gameplay_reward=rewards[0] if rewards else None,
     )
 
     policy_optimizer = th.optim.Adam(policy.parameters(), lr=args.lr)
@@ -665,8 +695,18 @@ def main() -> None:
         ("PPO", "approx_kl", "approx KL", ".4f"),
         ("episode", "current_reward", "current reward", ".3f"),
         ("episode", "historical_reward", "historical reward", ".3f"),
+        ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
+        ("Gameplay", "goals_for_per_1000_steps", "goals for/1k", ".3f"),
+        ("Gameplay", "goals_against_per_1000_steps", "goals against/1k", ".3f"),
+        ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
+        ("Gameplay", "baseline_win_rate", "base win", ".3f"),
     ):
         logger.register_progress_metric(section, key, label, format_spec)
+
+    def log_diagnostics(trainer: Trainer) -> None:
+        metrics = runner.diagnostic_metrics()
+        if metrics:
+            trainer.logger.update(metrics, step=trainer.clock.env_steps)
     checkpoints = BasicCheckpoints(
         args.checkpoint_dir / run_id,
         args.checkpoint_interval,
@@ -686,6 +726,7 @@ def main() -> None:
         logger=logger,
         checkpoint=checkpoints,
         value_scheduler=value_scheduler,
+        update_callback=log_diagnostics,
     )
 
     try:
