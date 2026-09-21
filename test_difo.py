@@ -680,6 +680,34 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             DIFOReward(global_difo, pair_difo, combine="product")
 
+    def test_hybrid_adds_first_class_discriminator_signal(self):
+        global_difo, pair_difo = self._models()
+        rollout = self._rollout(done=False)
+        kwargs = dict(beta=0.5, n_cars=N_CARS, frame_skip=4)
+        th.manual_seed(21)
+        additive = DIFOReward(
+            global_difo, pair_difo, combine="add", **kwargs
+        )
+        added = additive(rollout, None)
+        intrinsic = added["reward"] - rollout["reward"]
+        th.manual_seed(21)
+        gated = DIFOReward(
+            global_difo, pair_difo, combine="gate", **kwargs
+        )
+        gated_reward = gated(rollout, None)["reward"]
+        th.manual_seed(21)
+        hybrid = DIFOReward(
+            global_difo,
+            pair_difo,
+            combine="hybrid",
+            additive=0.3,
+            **kwargs,
+        )
+        hybrid_reward = hybrid(rollout, None)["reward"]
+        self.assertTrue(
+            th.allclose(hybrid_reward, gated_reward + 0.3 * intrinsic)
+        )
+
     def test_gate_multiplier_bounds_on_rollout(self):
         global_difo, pair_difo = self._models()
         transform = DIFOReward(

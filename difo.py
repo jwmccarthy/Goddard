@@ -25,10 +25,12 @@ a discriminator:
 whose GAIL reward ``r = log(1 + exp(logit))`` is combined with the task
 reward. ``--reward-mode`` selects that task reward: the full Nexto shaping
 reward (``nexto``), the goal difference only (``goals``), or nothing
-(``imitation``); ``--difo-reward-combine`` defaults to a bounded
-discriminator gate ``task * m`` with ``m in [gate_min, 1]`` (``gate_min``
-keeps shaping flowing and avoids veto dead zones), or selects ``task + r``
-or ``task * (1 + r)``. Expert transitions are sampled from state-only
+(``imitation``); ``--difo-reward-combine`` defaults to ``hybrid``:
+``task * m + additive * r`` where ``m`` is a bounded discriminator gate in
+``[gate_min, 1]`` and ``r`` is the zero-mean/unit-std discriminator reward,
+so imitation stays first-class even when the gate is flat. ``gate``,
+``add`` and ``multiply`` remain available. Expert transitions are sampled
+from state-only
 replays with the same ``delta_t`` distribution as policy transitions so
 timing cannot leak. Policy learning is MAPPO: a shared graph-conditioned
 multi-categorical actor with a centralized graph critic.
@@ -1385,20 +1387,23 @@ class DIFOReward:
         frame_skip: int = 4,
         normalize: bool = True,
         normalize_clip: float = 10.0,
-        combine: str = "gate",
+        combine: str = "hybrid",
         multiplier_min: float | None = 0.0,
         gate_min: float = 0.25,
+        additive: float = 0.25,
     ) -> None:
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("DIFO pair reward weight must be non-negative")
-        if combine not in ("gate", "add", "multiply"):
+        if combine not in ("hybrid", "gate", "add", "multiply"):
             raise ValueError(f"unknown DIFO reward combination: {combine}")
-        if combine == "gate" and beta > 1.0:
+        if combine in ("gate", "hybrid") and beta > 1.0:
             raise ValueError("gated DIFO reward requires beta in [0, 1]")
         if multiplier_min is not None and not math.isfinite(multiplier_min):
             raise ValueError("DIFO reward multiplier floor must be finite")
         if not 0.0 <= gate_min < 1.0:
             raise ValueError("DIFO reward gate floor must be in [0, 1)")
+        if not math.isfinite(additive) or additive < 0:
+            raise ValueError("DIFO additive reward weight must be non-negative")
         self.global_difo = global_difo
         self.pair_difo = pair_difo
         self.beta = beta
@@ -1413,6 +1418,7 @@ class DIFOReward:
         self.combine = combine
         self.multiplier_min = multiplier_min
         self.gate_min = gate_min
+        self.additive = additive
         self._metrics: dict[str, float] = {}
 
     def metrics(self) -> dict[str, dict[str, float]]:
@@ -1476,7 +1482,7 @@ class DIFOReward:
         global_probability = discriminator_probability(global_reward)
         pair_probability = discriminator_probability(pair_rewards[:, 0])
         clamped_fraction = 0.0
-        if self.combine == "gate":
+        if self.combine in ("gate", "hybrid"):
             multiplier = gate_multiplier(
                 global_probability,
                 pair_probability,
@@ -1488,6 +1494,8 @@ class DIFOReward:
                 done, th.ones_like(multiplier), multiplier
             )
             reward = task * multiplier.reshape(*leading)
+            if self.combine == "hybrid":
+                reward = reward + self.additive * intrinsic.reshape(*leading)
         elif self.combine == "multiply":
             multiplier = 1.0 + intrinsic
             if self.multiplier_min is not None:
@@ -1500,6 +1508,12 @@ class DIFOReward:
             multiplier = th.ones_like(task)
             reward = task + intrinsic.reshape(*leading)
         interacting = (gate > 0.5).float().mean()
+        if self.combine == "add":
+            intrinsic_component = intrinsic.mean()
+        elif self.combine == "hybrid":
+            intrinsic_component = self.additive * intrinsic.mean()
+        else:
+            intrinsic_component = multiplier - 1.0
         self._metrics = {
             "global_reward": float(global_reward.mean()),
             "pair_reward": float(pair_rewards[:, 0].mean()),
@@ -1512,9 +1526,7 @@ class DIFOReward:
             "intrinsic_std": float(raw[selected].std(unbiased=False))
             if selected.any()
             else 0.0,
-            "intrinsic_reward": float(intrinsic.mean())
-            if self.combine == "add"
-            else float((multiplier - 1.0).mean()),
+            "intrinsic_reward": float(intrinsic_component.mean()),
             "task_reward": float(task.mean()),
             "reward_multiplier": float(multiplier.mean()),
             "multiplier_clamped_fraction": clamped_fraction,
@@ -2107,13 +2119,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--difo-reward-combine",
-        choices=("gate", "add", "multiply"),
-        default="gate",
+        choices=("hybrid", "gate", "add", "multiply"),
+        default="hybrid",
         help=(
-            "combine the intrinsic reward with the task reward: bounded "
-            "discriminator gate, task+intrinsic, or task*(1+intrinsic); "
-            "imitation mode always adds"
+            "combine the intrinsic reward with the task reward: gated task "
+            "reward plus an additive discriminator term (hybrid), gate only, "
+            "task+intrinsic, or task*(1+intrinsic); imitation mode always adds"
         ),
+    )
+    parser.add_argument(
+        "--difo-reward-additive",
+        type=float,
+        default=0.25,
+        help="additive discriminator weight in hybrid mode",
     )
     parser.add_argument(
         "--difo-reward-gate-min",
@@ -2235,6 +2253,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "difo_mse_weight",
         "difo_bce_weight",
         "difo_agent_mse_weight",
+        "difo_reward_additive",
     ):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
@@ -2484,6 +2503,7 @@ def main() -> None:
         combine=reward_transform_combine,
         multiplier_min=args.difo_reward_multiplier_min,
         gate_min=args.difo_reward_gate_min,
+        additive=args.difo_reward_additive,
     )
     update = Update(
         transforms=(
