@@ -9,6 +9,16 @@ from rewards import DifferentialReward, DifferentialRewardWeights
 TEAM_SIGN = th.tensor([1.0, -1.0])
 
 
+def zero_weights(**overrides) -> DifferentialRewardWeights:
+    return DifferentialRewardWeights(
+        **{
+            name: 0.0
+            for name in DifferentialRewardWeights.__dataclass_fields__
+        }
+        | overrides
+    )
+
+
 def make_context(
     ball_y: float = 0.0,
     ball_z: float = 100.0,
@@ -70,42 +80,14 @@ class DifferentialRewardTest(unittest.TestCase):
         reward = DifferentialReward(
             1,
             1,
-            weights=DifferentialRewardWeights(
-                ball_goal_progress=5.0,
-                own_goal_clearance=0.0,
-                ball_height_progress=0.0,
-                ball_speed_progress=0.0,
-                ball_goal_velocity=0.0,
-                player_ball_progress=0.0,
-                alignment_progress=0.0,
-                boost_gain=0.0,
-                boost_loss=0.0,
-                demo=0.0,
-                touch_acceleration=0.0,
-                aerial_touch=0.0,
-                flip_reset=0.0,
-            ),
+            weights=zero_weights(ball_goal_progress=5.0),
         )
         value = reward(make_context(ball_y=500.0))
         self.assertGreater(float(value[0, 0]), 0.0)
         self.assertLess(float(value[0, 1]), 0.0)
 
     def test_own_goal_clearance_rewards_moving_away(self):
-        weights = DifferentialRewardWeights(
-            ball_goal_progress=0.0,
-            own_goal_clearance=2.5,
-            ball_height_progress=0.0,
-            ball_speed_progress=0.0,
-            ball_goal_velocity=0.0,
-            player_ball_progress=0.0,
-            alignment_progress=0.0,
-            boost_gain=0.0,
-            boost_loss=0.0,
-            demo=0.0,
-            touch_acceleration=0.0,
-            aerial_touch=0.0,
-            flip_reset=0.0,
-        )
+        weights = zero_weights(own_goal_clearance=2.5)
         reward = DifferentialReward(1, 1, weights=weights)
         away = reward(make_context(ball_y=500.0))
         toward = reward(make_context(ball_y=-500.0))
@@ -113,24 +95,18 @@ class DifferentialRewardTest(unittest.TestCase):
         self.assertLess(float(toward[0, 0]), 0.0)
 
     def test_team_common_progress_rewards_both_cars(self):
-        weights = DifferentialRewardWeights(
-            ball_goal_progress=0.0,
-            own_goal_clearance=0.0,
-            ball_height_progress=1.0,
-            ball_speed_progress=0.0,
-            ball_goal_velocity=0.0,
-            player_ball_progress=0.0,
-            alignment_progress=0.0,
-            boost_gain=0.0,
-            boost_loss=0.0,
-            demo=0.0,
-            touch_acceleration=0.0,
-            aerial_touch=0.0,
-            flip_reset=0.0,
-        )
+        weights = zero_weights(ball_height_progress=1.0)
         reward = DifferentialReward(1, 1, weights=weights)
         value = reward(make_context(ball_z=300.0, previous_ball_z=100.0))
         self.assertTrue(bool((value > 0).all()))
+
+    def test_distance_player_ball_level_rewards_proximity(self):
+        weights = zero_weights(distance_player_ball=0.5)
+        reward = DifferentialReward(1, 1, weights=weights)
+        near = reward(make_context(ball_y=200.0))
+        far = reward(make_context(ball_y=4000.0))
+        self.assertGreater(float(near[0, 0]), float(far[0, 0]))
+        self.assertGreater(float(far[0, 0]), 0.0)
 
     def test_no_touch_timeout_penalty(self):
         reward = DifferentialReward(1, 1, shaping_scale=0.0, no_touch_timeout_steps=1)

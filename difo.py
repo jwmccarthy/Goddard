@@ -86,6 +86,7 @@ from rewards import (
     BALL_RADIUS,
     CEILING_Z,
     DifferentialRewardWeights,
+    GOAL_DISTANCE_OFFSET,
     GOAL_HEIGHT,
     NEXTO_TOUCH_HEIGHT_SCALE,
     nexto_shaping_scale,
@@ -1888,9 +1889,40 @@ class DifferentialRewardTransform:
             (next_ball_velocity * _unit(next_opponent_goal)).sum(dim=-1)
             - (ball_velocity * _unit(opponent_goal)).sum(dim=-1)
         ) / BALL_MAX_SPEED
-        alignment_progress = _alignment(
+        alignment = _alignment(car_to_ball, own_goal, opponent_goal)
+        next_alignment = _alignment(
             next_car_to_ball, next_own_goal, next_opponent_goal
-        ) - _alignment(car_to_ball, own_goal, opponent_goal)
+        )
+        alignment_progress = next_alignment - alignment
+
+        distance_player_ball = th.exp(
+            -0.5
+            * (next_car_ball_distance - BALL_RADIUS).clamp_min(0.0)
+            / CAR_MAX_SPEED
+        )
+        distance_ball_goal = th.exp(
+            -0.5
+            * (
+                next_opponent_goal.norm(dim=-1) - GOAL_DISTANCE_OFFSET
+            ).clamp_min(0.0)
+            / BALL_MAX_SPEED
+        )
+        facing_ball = _cosine(next_car_to_ball, next_ego[:, 9:12])
+        velocity_player_ball = _cosine(
+            next_ego[:, 3:6], next_car_to_ball
+        )
+        closest = next_car_ball_distance.view(-1, self.n_cars)
+        closest_to_ball = (
+            closest.eq(closest.min(dim=-1, keepdim=True).values)
+            .float()
+            .reshape(-1)
+        )
+        ball_height_level = (
+            (next_ball[:, 2] - BALL_RADIUS) / (CEILING_Z - BALL_RADIUS)
+        ).clamp(0.0, 1.0)
+        ball_velocity_level = (
+            next_ball_velocity.norm(dim=-1) / BALL_MAX_SPEED
+        ).clamp_max(1.0)
 
         boost_current = (next_ego[:, 15] / 100.0).clamp(0.0, 1.0).sqrt()
         boost_previous = (ego[:, 15] / 100.0).clamp(0.0, 1.0).sqrt()
@@ -1948,6 +1980,14 @@ class DifferentialRewardTransform:
             + weights.touch_acceleration * touch_acceleration
             + weights.aerial_touch * aerial_touch
             + weights.flip_reset * flip_reset
+            + weights.distance_player_ball * distance_player_ball
+            + weights.distance_ball_goal * distance_ball_goal
+            + weights.facing_ball * facing_ball
+            + weights.align_ball_goal * next_alignment
+            + weights.velocity_player_ball * velocity_player_ball
+            + weights.closest_to_ball * closest_to_ball
+            + weights.ball_height * ball_height_level
+            + weights.ball_velocity * ball_velocity_level
         ) * self.shaping_scale
         done = (batch["terminated"] | batch["truncated"]).reshape(-1)
         shaping = th.where(done, th.zeros_like(shaping), shaping)

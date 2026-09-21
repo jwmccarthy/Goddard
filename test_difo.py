@@ -982,6 +982,14 @@ def only_weights(**overrides) -> DifferentialRewardWeights:
         "touch_acceleration": 0.0,
         "aerial_touch": 0.0,
         "flip_reset": 0.0,
+        "distance_player_ball": 0.0,
+        "distance_ball_goal": 0.0,
+        "facing_ball": 0.0,
+        "align_ball_goal": 0.0,
+        "velocity_player_ball": 0.0,
+        "closest_to_ball": 0.0,
+        "ball_height": 0.0,
+        "ball_velocity": 0.0,
     }
     values.update(overrides)
     return DifferentialRewardWeights(**values)
@@ -1013,6 +1021,29 @@ class DifferentialRewardTransformTest(unittest.TestCase):
         )
         out = transform(batch, None)
         self.assertTrue(bool((out["reward"] > 0).all()))
+
+    def test_distance_player_ball_level_rewards_proximity(self):
+        relative = ego_ball_offset(2)
+        transform = DifferentialRewardTransform(
+            2,
+            shaping_scale=1.0,
+            weights=only_weights(distance_player_ball=0.5),
+        )
+
+        def batch_at(distance: float) -> TensorBatch:
+            batch = make_task_batch()
+            observation = batch["observation"].clone()
+            next_observation = batch["next_obs"].clone()
+            observation[:, :, relative] = distance / (2.0 * 4108.0)
+            next_observation[:, :, relative] = distance / (2.0 * 4108.0)
+            return batch.replace_fields(
+                observation=observation, next_obs=next_observation
+            )
+
+        near = transform(batch_at(200.0), None)["reward"]
+        far = transform(batch_at(4000.0), None)["reward"]
+        self.assertGreater(float(near.mean()), float(far.mean()))
+        self.assertGreater(float(far.mean()), 0.0)
 
     def test_task_reward_scale_multiplies_shaping(self):
         batch = make_task_batch()

@@ -67,6 +67,14 @@ class DifferentialRewardWeights:
     touch_acceleration: float = 0.25
     aerial_touch: float = 1.0
     flip_reset: float = 10.0
+    distance_player_ball: float = 0.5
+    distance_ball_goal: float = 0.25
+    facing_ball: float = 0.1
+    align_ball_goal: float = 0.25
+    velocity_player_ball: float = 0.1
+    closest_to_ball: float = 0.05
+    ball_height: float = 0.05
+    ball_velocity: float = 0.05
 
 
 class AnnealedNextoReward:
@@ -444,6 +452,30 @@ class DifferentialReward(AnnealedNextoReward):
         )
         alignment_progress = alignment - previous_alignment
 
+        distance_player_ball = th.exp(
+            -0.5
+            * (distance_to_ball - BALL_RADIUS).clamp_min(0.0)
+            / CAR_MAX_SPEED
+        )
+        distance_ball_goal = th.exp(
+            -0.5
+            * (ball_to_goal.norm(dim=-1) - GOAL_DISTANCE_OFFSET).clamp_min(0.0)
+            / BALL_MAX_SPEED
+        )
+        facing_ball = self._cosine(car_to_ball, current.car_forward)
+        velocity_player_ball = self._cosine(
+            current.car_velocity, car_to_ball
+        )
+        closest_to_ball = distance_to_ball.eq(
+            distance_to_ball.min(dim=-1, keepdim=True).values
+        ).float()
+        ball_height_level = (
+            (ball_position[..., 2] - BALL_RADIUS) / (CEILING_Z - BALL_RADIUS)
+        ).clamp(0.0, 1.0)
+        ball_velocity_level = (
+            ball_velocity.norm(dim=-1) / BALL_MAX_SPEED
+        ).clamp_max(1.0)
+
         boost_current = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
         boost_previous = (previous.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
         boost_difference = boost_current - boost_previous
@@ -492,6 +524,14 @@ class DifferentialReward(AnnealedNextoReward):
             + weights.touch_acceleration * touch_acceleration
             + weights.aerial_touch * aerial_touch
             + weights.flip_reset * flip_reset
+            + weights.distance_player_ball * distance_player_ball
+            + weights.distance_ball_goal * distance_ball_goal
+            + weights.facing_ball * facing_ball
+            + weights.align_ball_goal * alignment
+            + weights.velocity_player_ball * velocity_player_ball
+            + weights.closest_to_ball * closest_to_ball
+            + weights.ball_height * ball_height_level
+            + weights.ball_velocity * ball_velocity_level
         )
 
         self.last_touches = touches
