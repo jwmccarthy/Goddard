@@ -211,6 +211,9 @@ document.getElementById('applyMatch').addEventListener('click', () => fetch('/ap
 document.getElementById('resetMatch').addEventListener('click', () => {
   fetch('/api/reset', { method: 'POST' });
 });
+document.getElementById('kickoffMatch').addEventListener('click', () => {
+  fetch('/api/kickoff', { method: 'POST' });
+});
 refreshCheckpoints();
 setInterval(refreshCheckpoints, 5000);
 addEventListener('resize', () => {

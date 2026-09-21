@@ -130,6 +130,7 @@ class SpectatorState:
         self.condition = threading.Condition()
         self.stop = threading.Event()
         self.reset = threading.Event()
+        self.kickoff = threading.Event()
         self.sequence = 0
         self.frame = None
         self.pending_match: tuple[Path, Path] | None = None
@@ -257,6 +258,18 @@ def render_frame(
     }
 
 
+def reset_observation(env, base, kickoff: bool):
+    """Reset via the demo provider or the plain random kickoff."""
+    if not kickoff:
+        return env.reset()
+    provider = base.reset_state_provider
+    base.reset_state_provider = None
+    try:
+        return env.reset()
+    finally:
+        base.reset_state_provider = provider
+
+
 def _simulate_pulse(
     state: SpectatorState,
     registry: CheckpointRegistry,
@@ -348,9 +361,11 @@ def _simulate_pulse(
                     controller.bf16 = next_blue_payload["bf16"]
                     state.reset.set()
 
-            if state.reset.is_set():
+            if state.reset.is_set() or state.kickoff.is_set():
+                kickoff = state.kickoff.is_set()
                 state.reset.clear()
-                observation = env.reset()
+                state.kickoff.clear()
+                observation = reset_observation(env, base, kickoff)
                 blue_state = blue.initial_state(1)
                 orange_state = orange.initial_state(1)
                 blue_score = orange_score = 0
@@ -493,9 +508,11 @@ def _simulate_difo(
                     orange_metadata = next_orange_metadata
                     state.reset.set()
 
-            if state.reset.is_set():
+            if state.reset.is_set() or state.kickoff.is_set():
+                kickoff = state.kickoff.is_set()
                 state.reset.clear()
-                observation = base.reset()
+                state.kickoff.clear()
+                observation = reset_observation(base, base, kickoff)
                 blue_score = orange_score = 0
                 round_number = 1
                 tick = 0
@@ -619,9 +636,11 @@ def _simulate_basic(
                     orange_metadata = next_orange_metadata
                     state.reset.set()
 
-            if state.reset.is_set():
+            if state.reset.is_set() or state.kickoff.is_set():
+                kickoff = state.kickoff.is_set()
                 state.reset.clear()
-                observation = base.reset()
+                state.kickoff.clear()
+                observation = reset_observation(base, base, kickoff)
                 blue_state = blue.initial_state(1)
                 orange_state = orange.initial_state(1)
                 blue_score = orange_score = 0
@@ -704,6 +723,11 @@ def make_handler(
         def do_POST(self) -> None:
             if self.path == "/api/reset":
                 state.reset.set()
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+            if self.path == "/api/kickoff":
+                state.kickoff.set()
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.end_headers()
                 return
