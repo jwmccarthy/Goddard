@@ -2221,8 +2221,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--current-fraction", type=float, default=0.5)
-    parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
+    parser.add_argument("--current-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--snapshot-interval",
+        type=int,
+        default=16,
+        help="rollouts between policy snapshots",
+    )
     parser.add_argument("--snapshot-pool-size", type=int, default=16)
     parser.add_argument("--historical-policies", type=int, default=4)
     parser.add_argument("--demonstration-reset-fraction", type=float, default=0.7)
@@ -2568,7 +2573,13 @@ def main() -> None:
     pool = SnapshotPool(
         policy,
         max_size=args.snapshot_pool_size,
-        snapshot_interval=args.snapshot_interval,
+        snapshot_interval=int(
+            env.n_envs
+            * (1.0 + args.current_fraction)
+            / 2.0
+            * args.rollout
+            * args.snapshot_interval
+        ),
         seed=args.seed,
         checkpoint_dir=None,
     )

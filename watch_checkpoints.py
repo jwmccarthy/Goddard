@@ -23,6 +23,7 @@ import torch as th
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
+from basic import build_policy as build_basic_policy
 from difo import build_policy as build_difo_policy
 from replay_resets import load_demonstration_reset_dataset
 from pulse import (
@@ -38,7 +39,11 @@ CAR_OFFSET = (13.8757, 0.0, 20.755)
 
 
 def checkpoint_kind(path: Path) -> str:
-    return "difo" if path.match("difo_*.pt") else "pulse"
+    if path.match("basic_*.pt"):
+        return "basic"
+    if path.match("difo_*.pt"):
+        return "difo"
+    return "pulse"
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ class CheckpointRegistry:
         checkpoints = []
         paths = list(self.directory.rglob("self_play_*.pt"))
         paths += list(self.directory.rglob("difo_*.pt"))
+        paths += list(self.directory.rglob("basic_*.pt"))
         for path in paths:
             try:
                 resolved = path.resolve(strict=True)
@@ -90,7 +96,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no PULSE or DIFO checkpoints found in {self.directory}"
+                f"no PULSE, DIFO, or basic checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -110,7 +116,9 @@ class CheckpointRegistry:
             self.directory not in path.parents
             or not path.is_file()
             or not (
-                path.match("self_play_*.pt") or path.match("difo_*.pt")
+                path.match("self_play_*.pt")
+                or path.match("difo_*.pt")
+                or path.match("basic_*.pt")
             )
         ):
             raise ValueError("invalid checkpoint path")
@@ -529,6 +537,142 @@ def _simulate_difo(
             base.close()
 
 
+def load_basic_checkpoint(path: Path, env: CARLTorchVectorEnv):
+    payload = th.load(path, map_location="cpu", weights_only=True)
+    config = payload["config"]
+    hidden = int(config["policy_hidden"])
+    recurrent = bool(config.get("recurrent", True))
+    policy = build_basic_policy(env, hidden, recurrent)
+    policy.load_state_dict(payload["policy"])
+    return policy.eval().requires_grad_(False), {
+        "signature": (hidden, recurrent)
+    }
+
+
+def require_compatible_basic(blue: dict, orange: dict) -> None:
+    if blue["signature"] != orange["signature"]:
+        raise ValueError("selected policies use different basic architectures")
+
+
+def _simulate_basic(
+    state: SpectatorState,
+    registry: CheckpointRegistry,
+    blue_path: Path,
+    orange_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    base = None
+    try:
+        reset_dataset = load_demonstration_reset_dataset(
+            args.replay_dir,
+            "cuda:0",
+            args.frameskip,
+            args.reset_state_limit,
+            args.seed,
+            require_frame_skip_match=False,
+        )
+        reset_sampler = DatasetResetSampler(
+            reset_dataset, probability=1.0, seed=args.seed
+        )
+        base = CARLTorchVectorEnv(
+            n_sim=1,
+            n_blue=1,
+            n_orange=1,
+            seed=args.seed,
+            frameskip=args.frameskip,
+            max_ticks=args.max_ticks,
+            normalize=True,
+            synchronize=True,
+            reset_state_provider=reset_sampler,
+            discrete_actions=True,
+        )
+        blue, blue_metadata = load_basic_checkpoint(blue_path, base)
+        orange, orange_metadata = load_basic_checkpoint(orange_path, base)
+        require_compatible_basic(blue_metadata, orange_metadata)
+        observation = base.reset()
+        blue_state = blue.initial_state(1)
+        orange_state = orange.initial_state(1)
+        blue_score = orange_score = 0
+        round_number = 1
+        tick = 0
+        next_step = time.perf_counter()
+
+        while not state.stop.is_set():
+            pending = state.take_match()
+            if pending is not None:
+                try:
+                    next_blue, next_blue_metadata = load_basic_checkpoint(
+                        pending[0], base
+                    )
+                    next_orange, next_orange_metadata = load_basic_checkpoint(
+                        pending[1], base
+                    )
+                    require_compatible_basic(
+                        next_blue_metadata, next_orange_metadata
+                    )
+                except Exception as error:
+                    state.publish({"error": f"{type(error).__name__}: {error}"})
+                else:
+                    blue_path, orange_path = pending
+                    blue, orange = next_blue, next_orange
+                    blue_metadata = next_blue_metadata
+                    orange_metadata = next_orange_metadata
+                    state.reset.set()
+
+            if state.reset.is_set():
+                state.reset.clear()
+                observation = base.reset()
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
+                blue_score = orange_score = 0
+                round_number = 1
+                tick = 0
+
+            with th.inference_mode():
+                blue_output = blue.act(
+                    observation[:1], blue_state, deterministic=True
+                )
+                orange_output = orange.act(
+                    observation[1:], orange_state, deterministic=True
+                )
+                blue_state = blue_output.next_state
+                orange_state = orange_output.next_state
+                action = th.cat((blue_output.action, orange_output.action))
+            observation, reward, terminated, truncated, _ = base.step(action)
+            tick += args.frameskip
+
+            goal = int(reward[0].item())
+            blue_score += max(goal, 0)
+            orange_score += max(-goal, 0)
+            if (terminated | truncated).any():
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
+                round_number += 1
+                tick = 0
+
+            state.publish(render_frame(
+                raw_state(base),
+                registry.directory,
+                blue_path,
+                orange_path,
+                blue_score,
+                orange_score,
+                round_number,
+                tick,
+            ))
+            next_step += args.frameskip / 120.0
+            delay = next_step - time.perf_counter()
+            if delay > 0:
+                state.stop.wait(delay)
+            else:
+                next_step = time.perf_counter()
+    except Exception as error:
+        state.publish({"error": f"{type(error).__name__}: {error}"})
+    finally:
+        if base is not None:
+            base.close()
+
+
 def simulate(
     state: SpectatorState,
     registry: CheckpointRegistry,
@@ -537,9 +681,12 @@ def simulate(
     args: argparse.Namespace,
 ) -> None:
     try:
-        if checkpoint_kind(blue_path) != checkpoint_kind(orange_path):
-            raise ValueError("cannot mix PULSE and DIFO checkpoints")
-        if checkpoint_kind(blue_path) == "difo":
+        kind = checkpoint_kind(blue_path)
+        if kind != checkpoint_kind(orange_path):
+            raise ValueError("cannot mix PULSE, DIFO, and basic checkpoints")
+        if kind == "basic":
+            _simulate_basic(state, registry, blue_path, orange_path, args)
+        elif kind == "difo":
             _simulate_difo(state, registry, blue_path, orange_path, args)
         else:
             _simulate_pulse(state, registry, blue_path, orange_path, args)
