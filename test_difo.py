@@ -37,6 +37,7 @@ from difo import (
     pair_target,
     perturb_graph,
     position_scale,
+    reward_scales,
 )
 
 
@@ -478,18 +479,19 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
             th.allclose(done_out["reward"], done_rollout["reward"])
         )
 
-    def test_replace_reward_mode(self):
-        global_difo, pair_difo = self._models()
-        transform = DIFOReward(
-            global_difo,
-            pair_difo,
-            beta=0.0,
-            n_cars=N_CARS,
-            replace_reward=True,
+    def test_reward_scales_by_mode(self):
+        scales = reward_scales
+        self.assertEqual(
+            scales("nexto", 10.0, 0.7, 0.1, 1.0), (10.0, 0.7, 0.1, 1.0)
         )
-        rollout = self._rollout(done=True)
-        out = transform(rollout, None)
-        self.assertTrue(th.allclose(out["reward"], th.zeros(6, 3)))
+        self.assertEqual(
+            scales("goals", 10.0, 0.7, 0.1, 1.0), (10.0, 0.0, 0.0, 0.0)
+        )
+        self.assertEqual(
+            scales("imitation", 10.0, 0.7, 0.1, 1.0), (0.0, 0.0, 0.0, 0.0)
+        )
+        with self.assertRaises(ValueError):
+            scales("unknown", 10.0, 0.7, 0.1, 1.0)
 
 
 class CaptureTest(unittest.TestCase):

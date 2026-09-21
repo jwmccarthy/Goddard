@@ -22,8 +22,10 @@ a discriminator:
 
     D = sigmoid(lambda * (L_agent - L_expert))
 
-whose GAIL reward ``r = log(1 + exp(logit))`` is added to (or replaces) the
-environment reward. Expert transitions are sampled from state-only replays
+whose GAIL reward ``r = log(1 + exp(logit))`` is added to the task reward.
+``--reward-mode`` selects that task reward: the full Nexto shaping reward
+(``nexto``), the goal difference only (``goals``), or nothing
+(``imitation``). Expert transitions are sampled from state-only replays
 with the same ``delta_t`` distribution as policy transitions so timing
 cannot leak. Policy learning is MAPPO: a shared graph-conditioned
 multi-categorical actor with a centralized graph critic.
@@ -1295,7 +1297,6 @@ class DIFOReward:
         samples: int = 1,
         n_cars: int = 2,
         frame_skip: int = 4,
-        replace_reward: bool = False,
     ) -> None:
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("DIFO pair reward weight must be non-negative")
@@ -1308,7 +1309,6 @@ class DIFOReward:
         self.samples = samples
         self.n_cars = n_cars
         self.frame_skip = frame_skip
-        self.replace_reward = replace_reward
         self._metrics: dict[str, float] = {}
 
     def metrics(self) -> dict[str, dict[str, float]]:
@@ -1351,10 +1351,7 @@ class DIFOReward:
             global_reward + self.beta * gate * pair_rewards[:, 0]
         )
         intrinsic = th.where(done, th.zeros_like(intrinsic), intrinsic)
-        if self.replace_reward:
-            reward = intrinsic.reshape(*leading)
-        else:
-            reward = batch["reward"] + intrinsic.reshape(*leading)
+        reward = batch["reward"] + intrinsic.reshape(*leading)
         interacting = (gate > 0.5).float().mean()
         self._metrics = {
             "global_reward": float(global_reward.mean()),
@@ -1373,6 +1370,28 @@ def primitive_discount(frameskip: int, half_life_seconds: float) -> float:
     return math.exp(
         -math.log(2.0) * frameskip / (TICKS_PER_SECOND * half_life_seconds)
     )
+
+
+def reward_scales(
+    mode: str,
+    goal_scale: float,
+    shaping_scale: float,
+    touch_scale: float,
+    no_touch_penalty: float,
+) -> tuple[float, float, float, float]:
+    """Environment reward scales for the task reward modes.
+
+    ``nexto`` keeps the full Nexto shaping reward, ``goals`` keeps only the
+    goal difference (scored minus conceded), and ``imitation`` zeroes the
+    task reward so the DIFO discriminators are the only signal.
+    """
+    if mode == "nexto":
+        return goal_scale, shaping_scale, touch_scale, no_touch_penalty
+    if mode == "goals":
+        return goal_scale, 0.0, 0.0, 0.0
+    if mode == "imitation":
+        return 0.0, 0.0, 0.0, 0.0
+    raise ValueError(f"unknown reward mode: {mode}")
 
 
 def baseline_opponent_ids(pool: SnapshotPool, count: int) -> tuple[int, ...]:
@@ -1652,7 +1671,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--difo-pair-loss-weight", type=float, default=1.0)
     parser.add_argument("--difo-reward-scale", type=float, default=1.0)
     parser.add_argument("--difo-reward-samples", type=int, default=1)
-    parser.add_argument("--difo-replace-reward", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--reward-mode",
+        choices=("nexto", "goals", "imitation"),
+        default="nexto",
+        help=(
+            "task reward added to the DIFO reward: full Nexto shaping, goal "
+            "difference only, or no task reward"
+        ),
+    )
     parser.add_argument("--difo-diffusion-steps", type=int, default=100)
     parser.add_argument("--difo-lambda", type=float, default=10.0)
     parser.add_argument("--difo-mse-weight", type=float, default=1.0)
@@ -1773,14 +1800,21 @@ def main() -> None:
     np.random.seed(args.seed)
 
     gamma = primitive_discount(args.frameskip, args.discount_half_life_seconds)
+    goal_scale, shaping_scale, touch_scale, no_touch_penalty = reward_scales(
+        args.reward_mode,
+        args.goal_reward_scale,
+        args.nexto_shaping_scale,
+        args.touch_reward_scale,
+        args.no_touch_penalty,
+    )
 
     reward = AnnealedNextoReward(
         1,
         1,
-        shaping_scale=args.nexto_shaping_scale,
-        goal_scale=args.goal_reward_scale,
-        touch_scale=args.touch_reward_scale,
-        no_touch_penalty=args.no_touch_penalty,
+        shaping_scale=shaping_scale,
+        goal_scale=goal_scale,
+        touch_scale=touch_scale,
+        no_touch_penalty=no_touch_penalty,
         no_touch_timeout_steps=math.ceil(
             args.no_touch_timeout_seconds * TICKS_PER_SECOND / args.frameskip
         ),
@@ -1955,7 +1989,6 @@ def main() -> None:
         samples=args.difo_reward_samples,
         n_cars=n_cars,
         frame_skip=args.frameskip,
-        replace_reward=args.difo_replace_reward,
     )
     update = Update(
         transforms=(
@@ -1987,7 +2020,7 @@ def main() -> None:
             "shaping_scale",
             lambda progress: nexto_shaping_scale(
                 round(progress * args.timesteps),
-                args.nexto_shaping_scale,
+                shaping_scale,
                 max(1, round(args.timesteps * args.shaping_anneal_fraction)),
             ),
         ),
