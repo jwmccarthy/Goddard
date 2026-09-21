@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Watch deterministic PULSE self-play from demonstration starting states."""
+"""Watch deterministic self-play from demonstration starting states.
+
+Supports both PULSE latent-policy checkpoints (``self_play_*.pt``) and
+DIFO native-action checkpoints (``difo_*.pt``).
+"""
 
 import argparse
 import json
@@ -19,6 +23,7 @@ import torch as th
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
+from difo import build_policy as build_difo_policy
 from replay_resets import load_demonstration_reset_dataset
 from pulse import (
     FrozenPulseController,
@@ -32,12 +37,17 @@ ROOT = Path(__file__).parent
 CAR_OFFSET = (13.8757, 0.0, 20.755)
 
 
+def checkpoint_kind(path: Path) -> str:
+    return "difo" if path.match("difo_*.pt") else "pulse"
+
+
 @dataclass(frozen=True)
 class CheckpointMetadata:
     path: Path
     relative_path: str
     step: int
     modified: int
+    kind: str
 
     def as_dict(self) -> dict:
         return {
@@ -45,6 +55,7 @@ class CheckpointMetadata:
             "label": self.relative_path,
             "step": self.step,
             "modified": self.modified,
+            "kind": self.kind,
         }
 
 
@@ -54,7 +65,8 @@ class CheckpointRegistry:
 
     def list(self) -> list[CheckpointMetadata]:
         checkpoints = []
-        paths = self.directory.rglob("self_play_*.pt")
+        paths = list(self.directory.rglob("self_play_*.pt"))
+        paths += list(self.directory.rglob("difo_*.pt"))
         for path in paths:
             try:
                 resolved = path.resolve(strict=True)
@@ -64,6 +76,7 @@ class CheckpointRegistry:
                     resolved.relative_to(self.directory).as_posix(),
                     int(step),
                     resolved.stat().st_mtime_ns,
+                    checkpoint_kind(resolved),
                 ))
             except (OSError, ValueError):
                 continue
@@ -77,7 +90,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no self-play checkpoints found in {self.directory}"
+                f"no PULSE or DIFO checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -85,6 +98,7 @@ class CheckpointRegistry:
                 candidate
                 for candidate in checkpoints[1:]
                 if candidate.path.parent == newest.path.parent
+                and candidate.kind == newest.kind
             ),
             newest,
         )
@@ -95,7 +109,9 @@ class CheckpointRegistry:
         if (
             self.directory not in path.parents
             or not path.is_file()
-            or not path.match("self_play_*.pt")
+            or not (
+                path.match("self_play_*.pt") or path.match("difo_*.pt")
+            )
         ):
             raise ValueError("invalid checkpoint path")
         return path
@@ -378,6 +394,141 @@ def _simulate_pulse(
             base.close()
 
 
+def load_difo_checkpoint(path: Path, env: CARLTorchVectorEnv):
+    payload = th.load(path, map_location="cpu", weights_only=True)
+    config = payload["config"]
+    feature_size = int(config["feature_size"])
+    policy_hidden = list(config["policy_hidden"])
+    graph_config = {
+        "n_cars": env.n_cars,
+        "layers": int(config.get("difo_layers", 2)),
+        "sigma": float(config.get("difo_sigma", 500.0)),
+        "gate_power": float(config.get("difo_gate_power", 4.0)),
+    }
+    policy = build_difo_policy(env, feature_size, policy_hidden, graph_config)
+    policy.load_state_dict(payload["policy"])
+    signature = (
+        feature_size,
+        tuple(policy_hidden),
+        graph_config["layers"],
+        round(graph_config["sigma"], 6),
+        graph_config["gate_power"],
+        env.n_cars,
+    )
+    return policy.eval().requires_grad_(False), {"signature": signature}
+
+
+def require_compatible_difo(blue: dict, orange: dict) -> None:
+    if blue["signature"] != orange["signature"]:
+        raise ValueError("selected policies use different DIFO architectures")
+
+
+def _simulate_difo(
+    state: SpectatorState,
+    registry: CheckpointRegistry,
+    blue_path: Path,
+    orange_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    base = None
+    try:
+        reset_dataset = load_demonstration_reset_dataset(
+            args.replay_dir,
+            "cuda:0",
+            args.frameskip,
+            args.reset_state_limit,
+            args.seed,
+        )
+        reset_sampler = DatasetResetSampler(
+            reset_dataset, probability=1.0, seed=args.seed
+        )
+        base = CARLTorchVectorEnv(
+            n_sim=1,
+            n_blue=1,
+            n_orange=1,
+            seed=args.seed,
+            frameskip=args.frameskip,
+            max_ticks=args.max_ticks,
+            normalize=True,
+            synchronize=True,
+            reset_state_provider=reset_sampler,
+            discrete_actions=True,
+        )
+        blue, blue_metadata = load_difo_checkpoint(blue_path, base)
+        orange, orange_metadata = load_difo_checkpoint(orange_path, base)
+        require_compatible_difo(blue_metadata, orange_metadata)
+        observation = base.reset()
+        blue_score = orange_score = 0
+        round_number = 1
+        tick = 0
+        next_step = time.perf_counter()
+
+        while not state.stop.is_set():
+            pending = state.take_match()
+            if pending is not None:
+                try:
+                    next_blue, next_blue_metadata = load_difo_checkpoint(
+                        pending[0], base
+                    )
+                    next_orange, next_orange_metadata = load_difo_checkpoint(
+                        pending[1], base
+                    )
+                    require_compatible_difo(
+                        next_blue_metadata, next_orange_metadata
+                    )
+                except Exception as error:
+                    state.publish({"error": f"{type(error).__name__}: {error}"})
+                else:
+                    blue_path, orange_path = pending
+                    blue, orange = next_blue, next_orange
+                    blue_metadata = next_blue_metadata
+                    orange_metadata = next_orange_metadata
+                    state.reset.set()
+
+            if state.reset.is_set():
+                state.reset.clear()
+                observation = base.reset()
+                blue_score = orange_score = 0
+                round_number = 1
+                tick = 0
+
+            with th.inference_mode():
+                blue_output = blue.act(observation[:1], deterministic=True)
+                orange_output = orange.act(observation[1:], deterministic=True)
+                action = th.cat((blue_output.action, orange_output.action))
+            observation, reward, terminated, truncated, _ = base.step(action)
+            tick += args.frameskip
+
+            goal = int(reward[0].item())
+            blue_score += max(goal, 0)
+            orange_score += max(-goal, 0)
+            if (terminated | truncated).any():
+                round_number += 1
+                tick = 0
+
+            state.publish(render_frame(
+                raw_state(base),
+                registry.directory,
+                blue_path,
+                orange_path,
+                blue_score,
+                orange_score,
+                round_number,
+                tick,
+            ))
+            next_step += args.frameskip / 120.0
+            delay = next_step - time.perf_counter()
+            if delay > 0:
+                state.stop.wait(delay)
+            else:
+                next_step = time.perf_counter()
+    except Exception as error:
+        state.publish({"error": f"{type(error).__name__}: {error}"})
+    finally:
+        if base is not None:
+            base.close()
+
+
 def simulate(
     state: SpectatorState,
     registry: CheckpointRegistry,
@@ -386,7 +537,12 @@ def simulate(
     args: argparse.Namespace,
 ) -> None:
     try:
-        _simulate_pulse(state, registry, blue_path, orange_path, args)
+        if checkpoint_kind(blue_path) != checkpoint_kind(orange_path):
+            raise ValueError("cannot mix PULSE and DIFO checkpoints")
+        if checkpoint_kind(blue_path) == "difo":
+            _simulate_difo(state, registry, blue_path, orange_path, args)
+        else:
+            _simulate_pulse(state, registry, blue_path, orange_path, args)
     except Exception as error:
         state.publish({"error": f"{type(error).__name__}: {error}"})
 

@@ -29,6 +29,22 @@ class SelfPlayCheckpointWatcherTest(unittest.TestCase):
             self.assertEqual(listed[0].step, 123)
             self.assertEqual(registry.resolve(listed[0].relative_path), checkpoint)
 
+    def test_registry_discovers_nested_difo_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "difo-run"
+            run.mkdir()
+            checkpoint = run / "difo_000000000032.pt"
+            checkpoint.touch()
+            registry = CheckpointRegistry(root)
+
+            listed = registry.list()
+
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0].step, 32)
+            self.assertEqual(listed[0].kind, "difo")
+            self.assertEqual(registry.resolve(listed[0].relative_path), checkpoint)
+
     def test_registry_ignores_other_checkpoint_kinds(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -85,6 +101,37 @@ class SelfPlayCheckpointWatcherTest(unittest.TestCase):
 
         pulse.assert_called_once()
         state.publish.assert_not_called()
+
+    def test_simulation_uses_the_difo_pipeline(self):
+        state = SimpleNamespace(publish=MagicMock())
+        registry = SimpleNamespace()
+
+        with patch("watch_checkpoints._simulate_difo") as difo:
+            simulate(
+                state,
+                registry,
+                Path("difo_000000000001.pt"),
+                Path("difo_000000000001.pt"),
+                SimpleNamespace(),
+            )
+
+        difo.assert_called_once()
+        state.publish.assert_not_called()
+
+    def test_simulation_rejects_mixed_checkpoint_kinds(self):
+        state = SimpleNamespace(publish=MagicMock())
+        registry = SimpleNamespace()
+
+        simulate(
+            state,
+            registry,
+            Path("self_play_000000000001.pt"),
+            Path("difo_000000000001.pt"),
+            SimpleNamespace(),
+        )
+
+        state.publish.assert_called_once()
+        self.assertIn("mix", state.publish.call_args.args[0]["error"])
 
     def test_simulation_publishes_pipeline_errors(self):
         state = SimpleNamespace(publish=MagicMock())
