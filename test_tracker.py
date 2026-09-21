@@ -774,13 +774,36 @@ class TrackerTest(unittest.TestCase):
         )
         reward = TrackingReward(replays)
 
-        before_release = reward(
+        matched = reward(
             self._tracking_context(CARLObservation.from_tensor(target_tensor, 1))
         )
-        after_release = reward(self._tracking_context(missed_ball))
+        missed = reward(self._tracking_context(missed_ball))
 
-        th.testing.assert_close(before_release, th.ones((1, 1)))
-        self.assertLess(after_release.item(), 1e-3)
+        th.testing.assert_close(matched, th.full((1, 1), 0.4))
+        self.assertLess(missed.item(), 1e-3)
+
+    def test_car_position_reward_is_dropped_after_release(self):
+        target_tensor = th.zeros((1, GOAL_STATE_SIZE))
+        target = CARLObservation.from_tensor(target_tensor, 1)
+        observation = CARLObservation.from_tensor(target_tensor, 1)
+        pending = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+            current_ego_touch=lambda offset=0: th.tensor([False]),
+        )
+        released = SimpleNamespace(
+            device=th.device("cpu"),
+            current=lambda: target,
+            origin=lambda: th.zeros((1, GOAL_STATE_SIZE)),
+            current_ego_touch=lambda offset=0: th.tensor([True]),
+        )
+
+        before = TrackingReward(pending)(self._tracking_context(observation))
+        after = TrackingReward(released)(self._tracking_context(observation))
+
+        th.testing.assert_close(before, th.ones((1, 1)))
+        th.testing.assert_close(after, th.full((1, 1), 0.4))
 
     def test_tracking_progress_is_signed_and_does_not_reward_oscillation(self):
         target_tensor = th.zeros((1, GOAL_STATE_SIZE))

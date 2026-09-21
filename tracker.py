@@ -783,6 +783,11 @@ class TrackingReward:
         angular_velocity_mse = angular_velocity_error.square().sum(-1)
 
         car_position_score = th.exp(-self.car_scale * car_position_mse)
+        car_position_score = th.where(
+            self._ball_tracking_active,
+            th.zeros_like(car_position_score),
+            car_position_score,
+        )
         rotation_score = th.exp(-10.0 * rotation_mse)
         velocity_score = th.exp(-0.1 * velocity_mse)
         angular_velocity_score = th.exp(-0.1 * angular_velocity_mse)
