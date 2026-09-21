@@ -2199,7 +2199,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-sim", type=int, default=256)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
-    parser.add_argument("--no-touch-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--no-touch-timeout-seconds", type=float, default=16.0)
     parser.add_argument("--balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--minimum-remaining-frames", type=int, default=32)
     parser.add_argument("--rollout", type=int, default=32)
