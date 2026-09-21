@@ -1,17 +1,21 @@
 import unittest
 
+from pathlib import Path
 from types import SimpleNamespace
 
+import gymnasium as gym
 import torch as th
 
 from jarl.data.batch import TensorBatch
 
+import difo
 from difo import (
     AGENT_CONT_DIM,
     EDGE_CONT_DIM,
     GOAL_CENTER_Y,
     GOAL_CENTER_Z,
     PAIR_TARGET_DIM,
+    ContactTrackingEnv,
     DIFOReward,
     DIFOUpdate,
     DIFOTransitionCapture,
@@ -21,6 +25,7 @@ from difo import (
     InteractionGraph,
     InteractionGraphEncoder,
     bounded_distance_gate,
+    build_policy,
     build_transition,
     build_transition_graph,
     entities_from_observation,
@@ -37,6 +42,13 @@ from difo import (
 
 N_CARS = 2
 OBS_WIDTH = observation_width(N_CARS)
+
+
+class AllValidActionCodec:
+    action_shape = (7,)
+
+    def mask(self, state: th.Tensor) -> th.Tensor:
+        return th.ones((*state.shape[:-1], 18), dtype=th.bool, device=state.device)
 
 
 def random_observation(count: int, scale: float = 0.2) -> th.Tensor:
@@ -533,6 +545,100 @@ class PerturbationTest(unittest.TestCase):
         self.assertTrue(th.equal(perturbed.edge_mask, graph.edge_mask))
         difference = (perturbed.node_cont - graph.node_cont).abs().mean()
         self.assertGreater(float(difference), 0.0)
+
+
+class ContactTrackingEnvTest(unittest.TestCase):
+    def _env(self):
+        contacts = th.tensor([[True, False], [False, True]])
+
+        class FakeInner:
+            def get_transition_state(self):
+                return "capsule"
+
+        class FakeCarl:
+            _env = FakeInner()
+            n_envs = 4
+            n_sim = 2
+            n_cars = 2
+            device = th.device("cpu")
+            single_observation_space = gym.spaces.Box(
+                -1.0, 1.0, (OBS_WIDTH,), dtype="float32"
+            )
+            observation_space = single_observation_space
+            single_action_space = gym.spaces.MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
+            action_space = single_action_space
+            action_codec = None
+
+            def _carl_state(self, capsule):
+                return SimpleNamespace(car_ball_touches=contacts)
+
+            def step(self, action):
+                return (
+                    th.zeros(4, OBS_WIDTH),
+                    th.zeros(4),
+                    th.zeros(4, dtype=th.bool),
+                    th.zeros(4, dtype=th.bool),
+                    {},
+                )
+
+            def close(self):
+                return None
+
+        return ContactTrackingEnv(FakeCarl())
+
+    def test_records_contacts_from_the_last_transition(self):
+        env = self._env()
+        self.assertIsNone(env.last_car_ball_touches)
+        env.step(th.zeros(4, 7))
+        self.assertTrue(
+            th.equal(
+                env.last_car_ball_touches,
+                th.tensor([[True, False], [False, True]]),
+            )
+        )
+        capture = DIFOTransitionCapture(env)
+        record = capture(SimpleNamespace(observation=th.zeros(4, OBS_WIDTH)))
+        self.assertTrue(
+            th.equal(
+                record["difo_touch_self"],
+                th.tensor([True, False, False, True]),
+            )
+        )
+
+
+class RawPolicyTest(unittest.TestCase):
+    def _env(self):
+        class FakeEnv:
+            single_observation_space = gym.spaces.Box(
+                -1.0, 1.0, (OBS_WIDTH,), dtype="float32"
+            )
+            single_action_space = gym.spaces.MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
+            device = "cpu"
+            action_codec = AllValidActionCodec()
+
+        return FakeEnv()
+
+    def test_builds_and_samples_factorized_actions(self):
+        env = self._env()
+        policy = build_policy(env, 16, [16], {"n_cars": N_CARS, "layers": 1})
+        observation = random_observation(6)
+        output = policy.act(observation)
+        self.assertEqual(output.action.shape, (6, 7))
+        self.assertEqual(output.log_prob.shape, (6,))
+        evaluation = policy.evaluate_actions(observation, output.action)
+        self.assertEqual(evaluation.log_prob.shape, (6,))
+        self.assertEqual(evaluation.entropy.shape, (6,))
+
+
+class NoPulseDependencyTest(unittest.TestCase):
+    def test_source_has_no_pulse_or_distill_imports(self):
+        source = Path(difo.__file__).read_text()
+        self.assertNotIn("from pulse", source)
+        self.assertNotIn("import pulse", source)
+        self.assertNotIn("from distill", source)
+        self.assertNotIn("import distill", source)
+        self.assertNotIn("FrozenPulseController", source)
+        self.assertNotIn("PulseLatentEnv", source)
 
 
 if __name__ == "__main__":

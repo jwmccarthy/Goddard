@@ -1,9 +1,8 @@
-"""Graph-conditioned DIFO self-play.
+"""Graph-conditioned DIFO self-play from scratch.
 
-This is the DIFO counterpart to ``pulse.py``. It keeps the frozen PULSE
-action layer and self-play matchmaker, but replaces the plain MLP actor and
-critic with interaction-graph networks and augments the environment reward
-with a two-level diffusion discriminator:
+Trains a policy directly in the environment's native discrete control space
+(no distillation checkpoint, no action labels) with two diffusion
+discriminators providing imitation rewards:
 
 * a **global** joint-transition DIFO over the whole agent/ball transition;
 * a **pair** agent-ball DIFO with shared parameters, evaluated once per
@@ -23,11 +22,11 @@ a discriminator:
 
     D = sigmoid(lambda * (L_agent - L_expert))
 
-whose GAIL reward ``r = log(1 + exp(logit))`` is added to the environment
-reward. Expert transitions are sampled from replays with the same
-``delta_t`` distribution as policy transitions so timing cannot leak. Policy
-learning is MAPPO: a shared graph-conditioned actor with a centralized graph
-critic.
+whose GAIL reward ``r = log(1 + exp(logit))`` is added to (or replaces) the
+environment reward. Expert transitions are sampled from state-only replays
+with the same ``delta_t`` distribution as policy transitions so timing
+cannot leak. Policy learning is MAPPO: a shared graph-conditioned
+multi-categorical actor with a centralized graph critic.
 """
 
 import argparse
@@ -48,9 +47,10 @@ from carl.gymnasium import CARLTorchVectorEnv
 from jarl.collect import (
     LogProbCapture,
     SelfPlayMatchmaker,
+    SelfPlayRunner,
     SnapshotPool,
 )
-from jarl.collect.capture import CaptureBase
+from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.data.batch import TensorBatch
 from jarl.envs import DatasetResetSampler
 from jarl.learn import Algorithm, OptimizerStep, PPOConfig, PPOLoss, Update
@@ -58,22 +58,12 @@ from jarl.log.logger import Logger
 from jarl.modules import MLP, orthogonal_init
 from jarl.modules.encoder.base import Encoder
 from jarl.modules.operator import Critic
+from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
 from jarl.sample import RolloutMinibatches
 from jarl.store.rollout import Rollout, RolloutBuffer
 from jarl.transform import GAE
 
-from distill import ACTION_FORMAT
-from pulse import (
-    CriticValueCapture,
-    DiagnosticSelfPlayRunner,
-    FrozenPulseController,
-    PulseLatentEnv,
-    TrainableGaussianPolicy,
-    baseline_opponent_ids,
-    file_sha256,
-    primitive_discount,
-)
 from replay_resets import load_demonstration_reset_dataset
 from rewards import AnnealedNextoReward, nexto_shaping_scale
 from tracker import (
@@ -1029,22 +1019,40 @@ class ExpertTransitionBuffer:
         return entities, next_entities, delta_t
 
 
-class DifoPulseLatentEnv(PulseLatentEnv):
-    """PULSE latent environment that also exposes the last transition contacts."""
+class ContactTrackingEnv:
+    """Delegate to CARL while recording the last transition's ball contacts."""
 
-    def __init__(self, env, controller: FrozenPulseController) -> None:
-        super().__init__(env, controller)
+    def __init__(self, env: CARLTorchVectorEnv) -> None:
+        self.env = env
+        self.n_envs = env.n_envs
+        self.n_sim = env.n_sim
+        self.n_cars = env.n_cars
+        self.device = env.device
+        self.single_observation_space = env.single_observation_space
+        self.observation_space = env.observation_space
+        self.single_action_space = env.single_action_space
+        self.action_space = env.action_space
+        self.action_codec = env.action_codec
         self.last_car_ball_touches: th.Tensor | None = None
 
-    def step(self, residual: th.Tensor):
-        result = super().step(residual)
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        result = self.env.step(action)
         state = self.env._carl_state(self.env._env.get_transition_state())
         self.last_car_ball_touches = state.car_ball_touches.detach()
         return result
 
+    def action_mask(self, observation: th.Tensor) -> th.Tensor:
+        return self.env.action_mask(observation)
+
+    def close(self) -> None:
+        return self.env.close()
+
 
 class DIFOTransitionCapture(CaptureBase):
-    def __init__(self, env: DifoPulseLatentEnv) -> None:
+    def __init__(self, env: ContactTrackingEnv) -> None:
         self.env = env
 
     def _capture(self, context) -> dict[str, th.Tensor]:
@@ -1358,6 +1366,159 @@ class DIFOReward:
         return batch.replace_fields(reward=reward)
 
 
+def primitive_discount(frameskip: int, half_life_seconds: float) -> float:
+    """Per-step discount given the physics frame skip and a half-life."""
+    if frameskip <= 0 or not math.isfinite(half_life_seconds) or half_life_seconds <= 0:
+        raise ValueError("frameskip and half_life_seconds must be positive")
+    return math.exp(
+        -math.log(2.0) * frameskip / (TICKS_PER_SECOND * half_life_seconds)
+    )
+
+
+def baseline_opponent_ids(pool: SnapshotPool, count: int) -> tuple[int, ...]:
+    if count < 1:
+        raise ValueError("historical policy count must be positive")
+    recent = tuple(snapshot for snapshot in pool.select_ids(count) if snapshot != 0)
+    if count == 1:
+        return (0,)
+    return (0, *recent[-(count - 1):])
+
+
+class CriticValueCapture(CaptureBase):
+    def __init__(self, critic: Critic) -> None:
+        self.critic = critic
+
+    @th.no_grad()
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        next_observation = th.as_tensor(
+            context.env_step.next_obs,
+            device=context.observation.device,
+        )
+        return {
+            "baseline_value": self.critic.value(context.observation),
+            "baseline_next_value": self.critic.value(next_observation),
+        }
+
+
+class DiagnosticSelfPlayRunner(SelfPlayRunner):
+    """Self-play runner that tracks gameplay diagnostics for logging."""
+
+    def __init__(self, *args, gameplay_reward: AnnealedNextoReward | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gameplay_reward = gameplay_reward
+        self._diagnostics: dict[str, th.Tensor] | None = None
+
+    def reset(self):
+        observation = super().reset()
+        self._diagnostics = {
+            name: th.zeros((), dtype=th.float32, device=self.env.device)
+            for name in (
+                "steps",
+                "touches",
+                "goals_for",
+                "goals_against",
+                "episodes",
+                "timeouts",
+                "baseline_episodes",
+                "baseline_wins",
+            )
+        }
+        return observation
+
+    def step(self):
+        env_step = super().step()
+        self._record_diagnostics(env_step)
+        return env_step
+
+    def after_update(self, timesteps: int) -> None:
+        if self.opponent_pool is None or not self.opponent_pool.ready(timesteps):
+            return
+        self.opponent_pool.add(
+            self.snapshot_policy,
+            timesteps,
+            protected_ids=(0,),
+        )
+        self.matchmaker.set_historical_ids(
+            baseline_opponent_ids(self.opponent_pool, self.historical_policies)
+        )
+        remapped = self.matchmaker.remap_stale_opponents()
+        if self.state is not None:
+            keep = (~remapped).view(-1, *(1,) * (self.state.ndim - 1))
+            self.state = self.state * keep
+
+    def _baseline_mask(self) -> th.Tensor:
+        baseline_matches = (
+            self.matchmaker.opponent_ids.view(
+                self.matchmaker.num_matches,
+                self.matchmaker.players_per_match,
+            )
+            .eq(0)
+            .any(-1)
+        )
+        return baseline_matches.repeat_interleave(self.matchmaker.players_per_match)
+
+    def _record_diagnostics(self, env_step) -> None:
+        if self.gameplay_reward is None or self._diagnostics is None:
+            return
+        touches = self.gameplay_reward.last_touches
+        score = self.gameplay_reward.last_score_for_actor
+        if touches is None or score is None:
+            return
+
+        learner = self.matchmaker.learner_mask
+        done = th.as_tensor(env_step.done, dtype=th.bool, device=self.env.device)
+        no_touch_timeout = self.gameplay_reward.last_no_touch_timeout
+        if no_touch_timeout is None:
+            return
+        no_touch_timeout = no_touch_timeout.repeat_interleave(
+            self.matchmaker.players_per_match
+        )
+        score = score.reshape(-1)
+        touches = touches.reshape(-1)
+        baseline = learner & self._baseline_mask()
+
+        self._diagnostics["steps"] += learner.sum()
+        self._diagnostics["touches"] += (touches & learner).sum()
+        self._diagnostics["goals_for"] += ((score > 0) & learner).sum()
+        self._diagnostics["goals_against"] += ((score < 0) & learner).sum()
+        self._diagnostics["episodes"] += (done & learner).sum()
+        self._diagnostics["timeouts"] += (no_touch_timeout & learner).sum()
+        self._diagnostics["baseline_episodes"] += (done & baseline).sum()
+        self._diagnostics["baseline_wins"] += ((score > 0) & baseline).sum()
+
+    def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
+        if self._diagnostics is None:
+            return {}
+        metrics = {}
+        steps = self._diagnostics["steps"]
+        if steps.item() > 0:
+            metrics |= {
+                "touches_per_1000_steps": self._diagnostics["touches"] / steps * 1000,
+                "goals_for_per_1000_steps": self._diagnostics["goals_for"] / steps * 1000,
+                "goals_against_per_1000_steps": self._diagnostics["goals_against"] / steps * 1000,
+            }
+            for name in ("steps", "touches", "goals_for", "goals_against"):
+                self._diagnostics[name].zero_()
+
+        episodes = self._diagnostics["episodes"]
+        if episodes.item() > 0:
+            metrics["timeout_fraction"] = self._diagnostics["timeouts"] / episodes
+            self._diagnostics["episodes"].zero_()
+            self._diagnostics["timeouts"].zero_()
+
+        baseline_episodes = self._diagnostics["baseline_episodes"]
+        if baseline_episodes.item() > 0:
+            metrics["baseline_win_rate"] = (
+                self._diagnostics["baseline_wins"] / baseline_episodes
+            )
+            self._diagnostics["baseline_episodes"].zero_()
+            self._diagnostics["baseline_wins"].zero_()
+
+        return {
+            "Gameplay": {name: value.item() for name, value in metrics.items()}
+        } if metrics else {}
+
+
 class DIFOCheckpoints:
     def __init__(
         self,
@@ -1371,7 +1532,6 @@ class DIFOCheckpoints:
         optimizer: th.optim.Optimizer,
         difo_optimizer: th.optim.Optimizer,
         buffer: RolloutBuffer,
-        controller: FrozenPulseController,
         args: argparse.Namespace,
         initial_step: int = 0,
     ) -> None:
@@ -1385,30 +1545,12 @@ class DIFOCheckpoints:
         self.optimizer = optimizer
         self.difo_optimizer = difo_optimizer
         self.buffer = buffer
-        self.controller = controller
         self.args = args
         self.step = initial_step
         self.next_step = initial_step + interval
         directory.mkdir(parents=True, exist_ok=True)
         for path in directory.glob("difo_*.pt.tmp"):
             path.unlink()
-        self.distill_sha256 = file_sha256(args.distill_checkpoint)
-        source = th.load(
-            args.distill_checkpoint, map_location="cpu", weights_only=True
-        )
-        artifact = directory / "frozen_pulse.pt"
-        temporary = artifact.with_suffix(".pt.tmp")
-        th.save(
-            {
-                "prior": controller.prior.state_dict(),
-                "decoder": controller.decoder.state_dict(),
-                "config": source["config"],
-                "sha256": self.distill_sha256,
-            },
-            temporary,
-        )
-        temporary.replace(artifact)
-        self.pulse_sha256 = file_sha256(artifact)
 
     def ready(self, step: int) -> bool:
         self.step = step
@@ -1428,10 +1570,6 @@ class DIFOCheckpoints:
             "pair_difo": self.pair_difo.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "difo_optimizer": self.difo_optimizer.state_dict(),
-            "distill_checkpoint": str(self.args.distill_checkpoint),
-            "distill_sha256": self.distill_sha256,
-            "pulse_artifact": "frozen_pulse.pt",
-            "pulse_sha256": self.pulse_sha256,
             "config": serialized_config(self.args),
         }
         path = self.directory / f"difo_{step:012d}.pt"
@@ -1446,30 +1584,26 @@ class DIFOCheckpoints:
 
 def build_policy(
     env,
-    exploration_std: float,
     feature_size: int,
     hidden: list[int],
     graph_config: dict,
-) -> TrainableGaussianPolicy:
-    return TrainableGaussianPolicy(
+) -> MultiCategoricalPolicy:
+    return MultiCategoricalPolicy(
         foot=InteractionGraphEncoder(feature_size=feature_size, **graph_config),
         body=MLP(dims=list(hidden), func=nn.ReLU),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=0.01)),
-        std=exploration_std,
+        action_codec=env.action_codec,
     ).build(env).to(env.device)
 
 
 def build_policy_and_critic(
     env,
-    exploration_std: float,
     feature_size: int,
     policy_hidden: list[int],
     critic_hidden: list[int],
     graph_config: dict,
 ):
-    policy = build_policy(
-        env, exploration_std, feature_size, policy_hidden, graph_config
-    )
+    policy = build_policy(env, feature_size, policy_hidden, graph_config)
     critic = Critic(
         foot=InteractionGraphEncoder(feature_size=feature_size, **graph_config),
         body=MLP(dims=list(critic_hidden), func=nn.ReLU),
@@ -1482,7 +1616,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a graph-conditioned DIFO policy with Rocket League self-play."
     )
-    parser.add_argument("--distill-checkpoint", type=Path, required=True)
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--n-sim", type=int, default=256)
     parser.add_argument("--frameskip", type=int, default=4)
@@ -1499,9 +1632,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-hidden", type=int, nargs="+", default=[512, 512])
     parser.add_argument("--critic-hidden", type=int, nargs="+", default=[512, 512])
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--exploration-std", type=float, default=0.22)
-    parser.add_argument("--entropy-coef", type=float, default=0.001)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--current-fraction", type=float, default=0.5)
     parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
@@ -1557,7 +1689,6 @@ def validate_args(args: argparse.Namespace) -> None:
         "epochs",
         "feature_size",
         "lr",
-        "exploration_std",
         "max_grad_norm",
         "snapshot_interval",
         "snapshot_pool_size",
@@ -1624,16 +1755,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--difo-perturbation must be in [0, 1)")
     if not args.difo_delta_rows or min(args.difo_delta_rows) < 1:
         raise ValueError("--difo-delta-rows must be positive")
-    if not args.distill_checkpoint.is_file():
-        raise FileNotFoundError(args.distill_checkpoint)
     if not args.replay_dir.is_dir():
         raise FileNotFoundError(args.replay_dir)
 
 
 def serialized_config(args: argparse.Namespace) -> dict[str, object]:
     return {
-        "action_format": ACTION_FORMAT,
-    } | {
         name: str(value) if isinstance(value, Path) else value
         for name, value in vars(args).items()
     }
@@ -1683,14 +1810,7 @@ def main() -> None:
         seed=args.seed,
     )
     base_env.reset_state_provider = reset_sampler
-    controller = FrozenPulseController.load(
-        args.distill_checkpoint,
-        base_env.action_codec,
-        base_env.device,
-        frame_skip=args.frameskip,
-        bf16=args.bf16,
-    )
-    env = DifoPulseLatentEnv(base_env, controller)
+    env = ContactTrackingEnv(base_env)
 
     expert_replays = ExpertGoalStates(
         str(args.replay_dir),
@@ -1717,7 +1837,6 @@ def main() -> None:
     }
     policy, critic = build_policy_and_critic(
         env,
-        args.exploration_std,
         args.feature_size,
         args.policy_hidden,
         args.critic_hidden,
@@ -1885,7 +2004,6 @@ def main() -> None:
         ppo_optimizer,
         difo_optimizer,
         buffer,
-        controller,
         args,
     )
     checkpoints.save(0, force=True)
