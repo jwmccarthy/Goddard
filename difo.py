@@ -1428,6 +1428,19 @@ def primitive_discount(frameskip: int, half_life_seconds: float) -> float:
     )
 
 
+def resolve_gamma(
+    gamma: float | None,
+    frameskip: int,
+    half_life_seconds: float,
+) -> float:
+    """Explicit discount factor if set, otherwise derived from the half-life."""
+    return (
+        primitive_discount(frameskip, half_life_seconds)
+        if gamma is None
+        else gamma
+    )
+
+
 def reward_scales(
     mode: str,
     goal_scale: float,
@@ -1701,6 +1714,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--discount-half-life-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=None,
+        help="discount factor; overrides --discount-half-life-seconds when set",
+    )
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--feature-size", type=int, default=512)
@@ -1879,7 +1898,9 @@ def main() -> None:
     th.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    gamma = primitive_discount(args.frameskip, args.discount_half_life_seconds)
+    gamma = resolve_gamma(
+        args.gamma, args.frameskip, args.discount_half_life_seconds
+    )
     goal_scale, shaping_scale, touch_scale, no_touch_penalty = reward_scales(
         args.reward_mode,
         args.goal_reward_scale,
