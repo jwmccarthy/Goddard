@@ -270,7 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward-mode",
         choices=("both", "seer", "nexto"),
-        default="both",
+        default="seer",
         help="which hand-designed reward families to sum",
     )
     parser.add_argument("--seer-touch-scale", type=float, default=0.05)
