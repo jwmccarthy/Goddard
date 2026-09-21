@@ -29,6 +29,7 @@ from difo import (
     build_policy,
     build_transition,
     build_transition_graph,
+    combine_gated_rows,
     entities_from_observation,
     entities_from_replay_state,
     gather_pairs,
@@ -301,6 +302,18 @@ def make_graph_data(count: int = 8, seed: int = 0):
 
 
 class GraphDIFOTest(unittest.TestCase):
+    def test_gated_combine_balances_datasets(self):
+        row = th.tensor([1.0, 1.0, 3.0, 3.0])
+        is_expert = th.tensor([1.0, 1.0, 0.0, 0.0])
+        gate = th.tensor([1.0, 1.0, 1e-3, 1e-3])
+        loss = combine_gated_rows(row, gate, is_expert)
+        self.assertAlmostEqual(float(loss), 2.0, places=5)
+        plain = float((gate * row).sum() / gate.sum())
+        self.assertLess(plain, 1.1)
+        self.assertAlmostEqual(
+            float(combine_gated_rows(row, None, is_expert)), 2.0, places=5
+        )
+
     def _modules(self, target_dim: int, condition_dim: int, **kwargs):
         return GraphDIFO(
             InteractionGraph(feature_dim=16, layers=1),

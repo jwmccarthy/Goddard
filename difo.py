@@ -794,6 +794,29 @@ class TransitionDenoiser(nn.Module):
         return self.model(th.cat((noisy, embedding), dim=-1))
 
 
+def combine_gated_rows(
+    row: th.Tensor,
+    gate: th.Tensor | None,
+    is_expert: th.Tensor,
+) -> th.Tensor:
+    """Average per-row losses with balanced expert/agent gate mass.
+
+    A plain ``sum(g * row) / sum(g)`` lets one dataset dominate whenever its
+    gates are larger on average (expert transitions are near the ball far
+    more often than early policy transitions), which stops the agent half of
+    the batch from contributing and turns the discriminator into an
+    unopposed expert autoencoder. Normalizing each dataset separately keeps
+    both sides adversarial while still prioritizing interacting rows.
+    """
+    if gate is None:
+        return row.mean()
+    expert_weight = gate * is_expert
+    agent_weight = gate * (1.0 - is_expert)
+    expert_term = (expert_weight * row).sum() / expert_weight.sum().clamp_min(1e-6)
+    agent_term = (agent_weight * row).sum() / agent_weight.sum().clamp_min(1e-6)
+    return 0.5 * (expert_term + agent_term)
+
+
 class GraphDIFO(nn.Module):
     """Diffusion discriminator over graph transitions and transition deltas."""
 
@@ -906,8 +929,7 @@ class GraphDIFO(nn.Module):
             + agent_loss * (~expert_mask) * self.agent_mse_weight
         )
         row = self.mse_weight * mse + self.bce_weight * bce
-        weight = th.ones_like(row) if gate is None else gate
-        loss = (weight * row).sum() / weight.sum().clamp_min(1e-6)
+        loss = combine_gated_rows(row, gate, is_expert)
         zero = th.zeros((), device=loss.device)
         metrics = {
             "loss": loss.detach(),
@@ -924,6 +946,12 @@ class GraphDIFO(nn.Module):
             else zero,
             "agent_accuracy": (logits[agent_mask] <= 0).float().mean().detach()
             if agent_mask.any()
+            else zero,
+            "expert_gate": gate[expert_mask].mean().detach()
+            if gate is not None and expert_mask.any()
+            else zero,
+            "agent_gate": gate[agent_mask].mean().detach()
+            if gate is not None and agent_mask.any()
             else zero,
         }
         return loss, metrics
@@ -1138,6 +1166,8 @@ class DIFOUpdate:
             "agent_loss": 0.0,
             "expert_accuracy": 0.0,
             "agent_accuracy": 0.0,
+            "expert_gate": 0.0,
+            "agent_gate": 0.0,
         }
         return {
             "global_" + name: value for name, value in zeros.items()
@@ -2162,6 +2192,8 @@ def main() -> None:
         ("DIFO", "pair_agent_loss", "pair agent loss", ".4f"),
         ("DIFO", "pair_expert_accuracy", "pair expert acc", ".3f"),
         ("DIFO", "pair_agent_accuracy", "pair agent acc", ".3f"),
+        ("DIFO", "pair_expert_gate", "pair expert gate", ".3f"),
+        ("DIFO", "pair_agent_gate", "pair agent gate", ".3f"),
         ("DIFOReward", "global_reward", "DIFO global reward", ".3f"),
         ("DIFOReward", "pair_reward", "DIFO pair reward", ".3f"),
         ("DIFOReward", "gated_pair_reward", "DIFO gated pair", ".3f"),
