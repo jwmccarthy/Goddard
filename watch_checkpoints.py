@@ -374,10 +374,10 @@ def _simulate_pulse(
 
             with th.inference_mode():
                 blue_output = blue.act(
-                    observation[:1], blue_state, deterministic=True
+                    observation[:1], blue_state, deterministic=not args.sample
                 )
                 orange_output = orange.act(
-                    observation[1:], orange_state, deterministic=True
+                    observation[1:], orange_state, deterministic=not args.sample
                 )
                 blue_state = blue_output.next_state
                 orange_state = orange_output.next_state
@@ -529,8 +529,8 @@ def _simulate_difo(
                 tick = 0
 
             with th.inference_mode():
-                blue_output = blue.act(observation[:1], deterministic=True)
-                orange_output = orange.act(observation[1:], deterministic=True)
+                blue_output = blue.act(observation[:1], deterministic=not args.sample)
+                orange_output = orange.act(observation[1:], deterministic=not args.sample)
                 action = th.cat((blue_output.action, orange_output.action))
             observation, reward, terminated, truncated, _ = base.step(action)
             tick += args.frameskip
@@ -671,10 +671,10 @@ def _simulate_basic(
 
             with th.inference_mode():
                 blue_output = blue.act(
-                    observation[:1], blue_state, deterministic=True
+                    observation[:1], blue_state, deterministic=not args.sample
                 )
                 orange_output = orange.act(
-                    observation[1:], orange_state, deterministic=True
+                    observation[1:], orange_state, deterministic=not args.sample
                 )
                 blue_state = blue_output.next_state
                 orange_state = orange_output.next_state
@@ -845,6 +845,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
+    parser.add_argument("--sample", action="store_true")
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
     if (args.blue is None) != (args.orange is None):
