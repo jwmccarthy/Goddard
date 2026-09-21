@@ -26,7 +26,9 @@ whose GAIL reward ``r = log(1 + exp(logit))`` is combined with the task
 reward. ``--reward-mode`` selects that task reward: the full Nexto shaping
 reward (``nexto``), the goal difference only (``goals``), or nothing
 (``imitation``); ``--difo-reward-combine`` selects ``task * (1 + r)``
-(default) or ``task + r``. Expert transitions are sampled from state-only
+(default) or ``task + r``, with the multiplier optionally floored by
+``--difo-reward-multiplier-min`` (default 0) so the task-reward sign is
+preserved. Expert transitions are sampled from state-only
 replays with the same ``delta_t`` distribution as policy transitions so
 timing cannot leak. Policy learning is MAPPO: a shared graph-conditioned
 multi-categorical actor with a centralized graph critic.
@@ -1304,11 +1306,14 @@ class DIFOReward:
         normalize: bool = True,
         normalize_clip: float = 10.0,
         combine: str = "multiply",
+        multiplier_min: float | None = 0.0,
     ) -> None:
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("DIFO pair reward weight must be non-negative")
         if combine not in ("add", "multiply"):
             raise ValueError(f"unknown DIFO reward combination: {combine}")
+        if multiplier_min is not None and not math.isfinite(multiplier_min):
+            raise ValueError("DIFO reward multiplier floor must be finite")
         self.global_difo = global_difo
         self.pair_difo = pair_difo
         self.beta = beta
@@ -1321,6 +1326,7 @@ class DIFOReward:
         self.normalize = normalize
         self.normalize_clip = normalize_clip
         self.combine = combine
+        self.multiplier_min = multiplier_min
         self._metrics: dict[str, float] = {}
 
     def metrics(self) -> dict[str, dict[str, float]]:
@@ -1381,8 +1387,15 @@ class DIFOReward:
         raw = global_reward + self.beta * gate * pair_rewards[:, 0]
         intrinsic = self.scale * self._normalize(raw, selected, done)
         task = batch["reward"]
+        multiplier = 1.0 + intrinsic.reshape(*leading)
+        clamped_fraction = 0.0
         if self.combine == "multiply":
-            reward = task * (1.0 + intrinsic.reshape(*leading))
+            if self.multiplier_min is not None:
+                clamped_fraction = float(
+                    (multiplier < self.multiplier_min).float().mean()
+                )
+                multiplier = multiplier.clamp_min(self.multiplier_min)
+            reward = task * multiplier
         else:
             reward = task + intrinsic.reshape(*leading)
         interacting = (gate > 0.5).float().mean()
@@ -1398,9 +1411,10 @@ class DIFOReward:
             else 0.0,
             "intrinsic_reward": float(intrinsic.mean()),
             "task_reward": float(task.mean()),
-            "reward_multiplier": float((1.0 + intrinsic).mean())
+            "reward_multiplier": float(multiplier.mean())
             if self.combine == "multiply"
             else 1.0,
+            "multiplier_clamped_fraction": clamped_fraction,
         }
         return batch.replace_fields(reward=reward)
 
@@ -1729,6 +1743,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--difo-reward-multiplier-min",
+        type=float,
+        default=0.0,
+        help=(
+            "lower bound on the multiplicative factor so task-reward signs "
+            "are preserved; pass a very negative value to disable"
+        ),
+    )
+    parser.add_argument(
         "--reward-mode",
         choices=("nexto", "goals", "imitation"),
         default="nexto",
@@ -2052,6 +2075,7 @@ def main() -> None:
         normalize=args.difo_reward_normalize,
         normalize_clip=args.difo_reward_clip,
         combine=reward_transform_combine,
+        multiplier_min=args.difo_reward_multiplier_min,
     )
     update = Update(
         transforms=(
@@ -2125,6 +2149,7 @@ def main() -> None:
         ("DIFOReward", "intrinsic_reward", "DIFO intrinsic", ".3f"),
         ("DIFOReward", "task_reward", "task reward", ".3f"),
         ("DIFOReward", "reward_multiplier", "DIFO multiplier", ".3f"),
+        ("DIFOReward", "multiplier_clamped_fraction", "DIFO clamp frac", ".3f"),
         ("MAPPO", "policy_loss", "policy loss", ".4f"),
         ("MAPPO", "critic_loss", "critic loss", ".4f"),
         ("MAPPO", "approx_kl", "approx KL", ".4f"),

@@ -557,11 +557,60 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
             combine="multiply",
         )
         multiplied = multiplicative(rollout, None)
+        multiplier = (1.0 + intrinsic).clamp_min(0.0)
+        self.assertTrue(
+            th.allclose(multiplied["reward"], rollout["reward"] * multiplier)
+        )
+        metrics = multiplicative.metrics()["DIFOReward"]
+        self.assertAlmostEqual(metrics["reward_multiplier"], float(multiplier.mean()))
+        self.assertGreaterEqual(metrics["multiplier_clamped_fraction"], 0.0)
+
+    def test_multiplier_floor_preserves_task_reward_sign(self):
+        global_difo, pair_difo = self._models()
+        rollout = self._rollout(done=False).replace_fields(
+            reward=th.full((6, 3), -10.0)
+        )
+        transform = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            combine="multiply",
+            multiplier_min=0.0,
+        )
+        out = transform(rollout, None)
+        self.assertTrue(bool((out["reward"] <= 0).all()))
+        self.assertFalse(bool((out["reward"] > 0).any()))
+
+    def test_multiplier_floor_can_be_disabled(self):
+        global_difo, pair_difo = self._models()
+        rollout = self._rollout(steps=32, envs=4)
+        th.manual_seed(99)
+        additive = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            combine="add",
+        )
+        intrinsic = additive(rollout, None)["reward"] - rollout["reward"]
+        self.assertLess(float(intrinsic.min()), -1.0)
+        th.manual_seed(99)
+        unclamped = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            multiplier_min=None,
+        )
+        out = unclamped(rollout, None)
         expected = rollout["reward"] * (1.0 + intrinsic)
-        self.assertTrue(th.allclose(multiplied["reward"], expected))
+        self.assertTrue(th.allclose(out["reward"], expected))
         self.assertEqual(
-            multiplicative.metrics()["DIFOReward"]["reward_multiplier"],
-            float((1.0 + intrinsic).mean()),
+            unclamped.metrics()["DIFOReward"]["multiplier_clamped_fraction"], 0.0
         )
 
     def test_multiply_vanishes_without_task_reward(self):
@@ -594,6 +643,7 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
             n_cars=N_CARS,
             frame_skip=4,
             normalize=True,
+            combine="add",
         )
         rollout = self._rollout(done=False)
         out = transform(rollout, None)
@@ -612,6 +662,7 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
             n_cars=N_CARS,
             frame_skip=4,
             normalize=False,
+            combine="add",
         )
         rollout = self._rollout(done=False)
         out = transform(rollout, None)
