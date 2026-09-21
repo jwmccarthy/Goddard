@@ -2225,7 +2225,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-interval", type=int, default=10_000_000)
     parser.add_argument("--snapshot-pool-size", type=int, default=16)
     parser.add_argument("--historical-policies", type=int, default=4)
-    parser.add_argument("--demonstration-reset-fraction", type=float, default=0.5)
+    parser.add_argument("--demonstration-reset-fraction", type=float, default=0.7)
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
     parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
     parser.add_argument("--shaping-anneal-fraction", type=float, default=0.5)
