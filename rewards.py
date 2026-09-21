@@ -559,12 +559,21 @@ class DifferentialReward(AnnealedNextoReward):
 
 
 class SeerNextoReward(AnnealedNextoReward):
-    """The full Seer table plus Nexto progress terms, deduplicated once.
+    """One unified reward: Seer minimal shaping plus the Seer/Nexto table.
 
-    The Seer thesis weights and ``NextoRewardWeights`` are the same sixteen
-    level terms, so they are counted once here. Nexto's progress, touch and
-    flip-reset terms are kept as-is, and the only Seer terms Nexto lacks are
-    added: opponent-centered ball-goal progress and touch-gated gravity lift.
+    Every behavior is rewarded exactly once. The Seer/Nexto level table
+    (distance, facing, alignment, closest, possession, boost, demo, kickoff,
+    velocity, win probability) comes from ``NextoRewardWeights``; the Seer
+    minimal terms replace their duplicated progress/touch/flip counterparts
+    in that table:
+
+    * goal scoring: ``goal_scale`` (+ Nexto goal speed/distance bonuses)
+    * ball-goal progress: Seer opponent-centered linear progress
+    * player-ball progress: Seer linear progress
+    * touch: Seer touch + touch-induced ball dv, Nexto aerial touch
+    * ball height and gravity: Seer touch-gated progress + gravity lift
+      (Nexto's duplicate level terms are disabled)
+    * flip reset: Seer's event (Nexto's duplicate disabled)
     """
 
     def __init__(
@@ -574,54 +583,113 @@ class SeerNextoReward(AnnealedNextoReward):
         frameskip: int = 4,
         shaping_scale: float = 1.0,
         goal_scale: float = 10.0,
-        touch_scale: float = 0.0,
+        touch_scale: float = 0.05,
+        ball_velocity_scale: float = 0.05,
+        flip_reset_scale: float = 1.0,
+        ball_goal_progress_scale: float = 1.0,
+        player_ball_progress_scale: float = 0.1,
+        ball_height_progress_scale: float = 0.1,
+        gravity_lift_scale: float = 0.1,
         no_touch_penalty: float = 1.0,
         no_touch_timeout_steps: int | None = None,
         weights: NextoRewardWeights = NextoRewardWeights(),
-        centered_goal_progress_scale: float = 1.0,
-        gravity_lift_scale: float = 0.1,
     ) -> None:
         super().__init__(
             n_blue,
             n_orange,
             shaping_scale=shaping_scale,
             goal_scale=goal_scale,
-            touch_scale=touch_scale,
+            touch_scale=0.0,
             no_touch_penalty=no_touch_penalty,
             no_touch_timeout_steps=no_touch_timeout_steps,
-            weights=replace(weights, ball_goal_progress=0.0, ball_touch=0.0),
+            weights=replace(
+                weights,
+                ball_goal_progress=0.0,
+                ball_touch=0.0,
+                player_ball_progress=0.0,
+                flip_reset=0.0,
+                touch_acceleration=0.0,
+                ball_height=0.0,
+                ball_velocity=0.0,
+            ),
         )
         self.dt = frameskip / 120.0
-        self.centered_goal_progress_scale = centered_goal_progress_scale
-        self.gravity_lift_scale = gravity_lift_scale
+        self.seer_touch_scale = touch_scale
+        self.seer_ball_velocity_scale = ball_velocity_scale
+        self.seer_flip_reset_scale = flip_reset_scale
+        self.seer_ball_goal_progress_scale = ball_goal_progress_scale
+        self.seer_player_ball_progress_scale = player_ball_progress_scale
+        self.seer_ball_height_progress_scale = ball_height_progress_scale
+        self.seer_gravity_lift_scale = gravity_lift_scale
 
     def __call__(self, context: RewardContext) -> th.Tensor:
         reward = super().__call__(context)
         current = context.current
         previous = context.previous
+        touches = current.car_ball_touches
         team_sign = current.team_sign[None, :]
         ball = current.ball_position[:, None, :]
         previous_ball = previous.ball_position[:, None, :]
+        velocity_change = (
+            current.ball_velocity - previous.ball_velocity
+        ).norm(dim=-1, keepdim=True) / BALL_MAX_SPEED
+
         opponent_goal = th.zeros_like(current.car_position)
         opponent_goal[..., 1] = team_sign * GOAL_Y
-        progress = (
+        goal_progress = (
             (opponent_goal - previous_ball).norm(dim=-1)
             - (opponent_goal - ball).norm(dim=-1)
         ) / BALL_MAX_SPEED
-        progress = progress - progress.mean(dim=-1, keepdim=True)
+        goal_progress = goal_progress - goal_progress.mean(dim=-1, keepdim=True)
+
+        player_ball_progress = (
+            (previous_ball - previous.car_position).norm(dim=-1)
+            - (ball - current.car_position).norm(dim=-1)
+        ) / CAR_MAX_SPEED
+        ball_height_progress = (
+            current.ball_position[:, 2] - previous.ball_position[:, 2]
+        )[:, None] / CEILING_Z
         expected_height = (
             previous.ball_position[:, 2]
             + previous.ball_velocity[:, 2] * self.dt
             - 0.5 * GRAVITY_Z * self.dt**2
         )
-        lift = (
+        gravity_lift = (
             current.ball_position[:, 2] - expected_height
         )[:, None] / CEILING_Z
-        last_touch = self._last_touch.float()
-        return reward + self.shaping_scale * (
-            self.centered_goal_progress_scale * progress
-            + self.gravity_lift_scale * last_touch * lift
+
+        previously_spent_flip = (
+            previous.car_has_flipped | previous.car_has_double_jumped
         )
+        flip_available = ~(
+            current.car_has_flipped | current.car_has_double_jumped
+        )
+        car_to_ball = ball - current.car_position
+        underside_alignment = (
+            car_to_ball
+            / car_to_ball.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            * -current.car_up
+        ).sum(dim=-1)
+        flip_reset = (
+            touches
+            & previously_spent_flip
+            & flip_available
+            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
+            & car_to_ball.norm(dim=-1).lt(2.0 * BALL_RADIUS)
+            & underside_alignment.gt(0.9)
+        ).float()
+
+        last_touch = self._last_touch.float()
+        extras = (
+            self.seer_touch_scale * touches
+            + self.seer_ball_velocity_scale * touches * velocity_change
+            + self.seer_flip_reset_scale * flip_reset
+            + self.seer_ball_goal_progress_scale * goal_progress
+            + self.seer_player_ball_progress_scale * player_ball_progress
+            + self.seer_ball_height_progress_scale * last_touch * ball_height_progress
+            + self.seer_gravity_lift_scale * last_touch * gravity_lift
+        )
+        return reward + extras
 
 
 def nexto_shaping_scale(

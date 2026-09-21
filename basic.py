@@ -280,9 +280,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seer-player-ball-progress-scale", type=float, default=0.1)
     parser.add_argument("--seer-ball-height-progress-scale", type=float, default=0.1)
     parser.add_argument("--seer-gravity-lift-scale", type=float, default=0.1)
-    parser.add_argument(
-        "--seer-centered-goal-progress-scale", type=float, default=1.0
-    )
     parser.add_argument("--seer-goal-scale", type=float, default=10.0)
     parser.add_argument("--nexto-shaping-scale", type=float, default=1.0)
     parser.add_argument("--nexto-goal-scale", type=float, default=0.0)
@@ -367,7 +364,6 @@ def validate_args(args: argparse.Namespace) -> None:
         "seer_player_ball_progress_scale",
         "seer_ball_height_progress_scale",
         "seer_gravity_lift_scale",
-        "seer_centered_goal_progress_scale",
         "seer_goal_scale",
         "nexto_shaping_scale",
         "nexto_goal_scale",
@@ -438,11 +434,15 @@ def build_rewards(args: argparse.Namespace) -> tuple:
                 frameskip=args.frameskip,
                 shaping_scale=args.nexto_shaping_scale,
                 goal_scale=args.seer_goal_scale,
-                touch_scale=0.0,
+                touch_scale=args.seer_touch_scale,
+                ball_velocity_scale=args.seer_ball_velocity_scale,
+                flip_reset_scale=args.seer_flip_reset_scale,
+                ball_goal_progress_scale=args.seer_ball_goal_progress_scale,
+                player_ball_progress_scale=args.seer_player_ball_progress_scale,
+                ball_height_progress_scale=args.seer_ball_height_progress_scale,
+                gravity_lift_scale=args.seer_gravity_lift_scale,
                 no_touch_penalty=0.0,
                 no_touch_timeout_steps=None,
-                centered_goal_progress_scale=args.seer_centered_goal_progress_scale,
-                gravity_lift_scale=args.seer_gravity_lift_scale,
             ),
         )
     reward_funcs = []
