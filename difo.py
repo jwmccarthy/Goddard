@@ -29,7 +29,10 @@ reward (``nexto``), the goal difference only (``goals``), or nothing
 ``task * m + additive * r`` where ``m`` is a bounded discriminator gate in
 ``[gate_min, 1]`` and ``r`` is the zero-mean/unit-std discriminator reward,
 so imitation stays first-class even when the gate is flat. ``gate``,
-``add`` and ``multiply`` remain available. Expert transitions are sampled
+``add`` and ``multiply`` remain available. The task reward is crossfaded
+into that combined reward linearly over training (``DIFOReward/anneal``):
+task-only at the start, 50/50 at half of ``--timesteps``, and the DIFO
+hybrid taking over by the end. Expert transitions are sampled
 from state-only
 replays with the same ``delta_t`` distribution as policy transitions so
 timing cannot leak. Policy learning is MAPPO: a shared graph-conditioned
@@ -66,7 +69,13 @@ from jarl.modules import MLP, orthogonal_init
 from jarl.modules.encoder.base import Encoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
-from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
+from jarl.runtime import (
+    LinearSchedule,
+    OnPolicySchedule,
+    ScheduledValue,
+    Trainer,
+    ValueScheduler,
+)
 from jarl.sample import RolloutMinibatches
 from jarl.store.rollout import Rollout, RolloutBuffer
 from jarl.transform import GAE
@@ -1386,7 +1395,8 @@ class DIFOReward:
         combine: str = "hybrid",
         multiplier_min: float | None = 0.0,
         gate_min: float = 0.25,
-        additive: float = 0.25,
+        additive: float = 0.05,
+        anneal: float = 1.0,
     ) -> None:
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("DIFO pair reward weight must be non-negative")
@@ -1400,6 +1410,8 @@ class DIFOReward:
             raise ValueError("DIFO reward gate floor must be in [0, 1)")
         if not math.isfinite(additive) or additive < 0:
             raise ValueError("DIFO additive reward weight must be non-negative")
+        if not 0.0 <= anneal <= 1.0:
+            raise ValueError("DIFO reward anneal must be in [0, 1]")
         self.global_difo = global_difo
         self.pair_difo = pair_difo
         self.beta = beta
@@ -1415,6 +1427,7 @@ class DIFOReward:
         self.multiplier_min = multiplier_min
         self.gate_min = gate_min
         self.additive = additive
+        self.anneal = anneal
         self._metrics: dict[str, float] = {}
 
     def metrics(self) -> dict[str, dict[str, float]]:
@@ -1488,9 +1501,9 @@ class DIFOReward:
             multiplier = th.where(
                 done, th.ones_like(multiplier), multiplier
             )
-            reward = task * multiplier.reshape(*leading)
+            combined = task * multiplier.reshape(*leading)
             if self.combine == "hybrid":
-                reward = reward + self.additive * intrinsic.reshape(*leading)
+                combined = combined + self.additive * intrinsic.reshape(*leading)
         elif self.combine == "multiply":
             multiplier = 1.0 + intrinsic
             if self.multiplier_min is not None:
@@ -1498,10 +1511,11 @@ class DIFOReward:
                     (multiplier < self.multiplier_min).float().mean()
                 )
                 multiplier = multiplier.clamp_min(self.multiplier_min)
-            reward = task * multiplier.reshape(*leading)
+            combined = task * multiplier.reshape(*leading)
         else:
             multiplier = th.ones_like(task)
-            reward = task + intrinsic.reshape(*leading)
+            combined = task + intrinsic.reshape(*leading)
+        reward = (1.0 - self.anneal) * task + self.anneal * combined
         interacting = (gate > 0.5).float().mean()
         if self.combine == "add":
             intrinsic_component = intrinsic.mean()
@@ -1527,6 +1541,7 @@ class DIFOReward:
             "task_reward": float(task.mean()),
             "reward_multiplier": float(multiplier.mean()),
             "multiplier_clamped_fraction": clamped_fraction,
+            "anneal": float(self.anneal),
         }
         return batch.replace_fields(reward=reward)
 
@@ -2534,6 +2549,12 @@ def main() -> None:
         ),
         section="MAPPO",
     )
+    difo_anneal = ScheduledValue.attribute(
+        "difo_anneal",
+        difo_reward,
+        "anneal",
+        LinearSchedule(0.0, 1.0),
+    )
     value_scheduler = (
         ValueScheduler(
             ScheduledValue.attribute(
@@ -2546,10 +2567,11 @@ def main() -> None:
                     max(1, round(args.timesteps * args.shaping_anneal_fraction)),
                 ),
             ),
+            difo_anneal,
             section="Reward",
         )
         if args.reward_mode == "nexto"
-        else None
+        else ValueScheduler(difo_anneal, section="Reward")
     )
     checkpoints = DIFOCheckpoints(
         args.checkpoint_dir / run_id,
@@ -2590,6 +2612,8 @@ def main() -> None:
         ("DIFOReward", "task_reward", "task reward", ".3f"),
         ("DIFOReward", "reward_multiplier", "DIFO multiplier", ".3f"),
         ("DIFOReward", "multiplier_clamped_fraction", "DIFO clamp frac", ".3f"),
+        ("DIFOReward", "anneal", "DIFO anneal", ".3f"),
+        ("Reward", "difo_anneal", "DIFO anneal", ".3f"),
         ("MAPPO", "policy_loss", "policy loss", ".4f"),
         ("MAPPO", "critic_loss", "critic loss", ".4f"),
         ("MAPPO", "approx_kl", "approx KL", ".4f"),

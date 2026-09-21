@@ -706,6 +706,33 @@ class DIFOUpdateAndRewardTest(unittest.TestCase):
             th.allclose(hybrid_reward, gated_reward + 0.3 * intrinsic)
         )
 
+    def test_anneal_crossfades_task_into_combined_reward(self):
+        global_difo, pair_difo = self._models()
+        rollout = self._rollout(done=False)
+        transform = DIFOReward(
+            global_difo,
+            pair_difo,
+            beta=0.5,
+            n_cars=N_CARS,
+            frame_skip=4,
+            combine="hybrid",
+            additive=0.3,
+        )
+        th.manual_seed(31)
+        transform.anneal = 0.0
+        task_only = transform(rollout, None)["reward"]
+        th.manual_seed(31)
+        transform.anneal = 1.0
+        full = transform(rollout, None)["reward"]
+        th.manual_seed(31)
+        transform.anneal = 0.5
+        half = transform(rollout, None)["reward"]
+        self.assertTrue(th.allclose(task_only, rollout["reward"]))
+        self.assertTrue(th.allclose(half, 0.5 * task_only + 0.5 * full))
+        self.assertEqual(
+            transform.metrics()["DIFOReward"]["anneal"], 0.5
+        )
+
     def test_gate_multiplier_bounds_on_rollout(self):
         global_difo, pair_difo = self._models()
         transform = DIFOReward(
