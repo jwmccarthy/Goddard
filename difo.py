@@ -70,7 +70,11 @@ from jarl.store.rollout import Rollout, RolloutBuffer
 from jarl.transform import GAE
 
 from replay_resets import load_demonstration_reset_dataset
-from rewards import AnnealedNextoReward, nexto_shaping_scale
+from rewards import (
+    AnnealedNextoReward,
+    DifferentialReward,
+    nexto_shaping_scale,
+)
 from tracker import (
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
@@ -1826,11 +1830,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reward-mode",
-        choices=("nexto", "goals", "imitation"),
-        default="nexto",
+        choices=("differential", "nexto", "goals", "imitation"),
+        default="differential",
         help=(
-            "task reward added to the DIFO reward: full Nexto shaping, goal "
-            "difference only, or no task reward"
+            "task reward added to the DIFO reward: differential progress "
+            "terms, full Nexto shaping, goal difference only, or no task "
+            "reward"
         ),
     )
     parser.add_argument("--difo-diffusion-steps", type=int, default=100)
@@ -1955,25 +1960,36 @@ def main() -> None:
     gamma = resolve_gamma(
         args.gamma, args.frameskip, args.discount_half_life_seconds
     )
-    goal_scale, shaping_scale, touch_scale, no_touch_penalty = reward_scales(
-        args.reward_mode,
-        args.goal_reward_scale,
-        args.nexto_shaping_scale,
-        args.touch_reward_scale,
-        args.no_touch_penalty,
+    no_touch_timeout_steps = math.ceil(
+        args.no_touch_timeout_seconds * TICKS_PER_SECOND / args.frameskip
     )
-
-    reward = AnnealedNextoReward(
-        1,
-        1,
-        shaping_scale=shaping_scale,
-        goal_scale=goal_scale,
-        touch_scale=touch_scale,
-        no_touch_penalty=no_touch_penalty,
-        no_touch_timeout_steps=math.ceil(
-            args.no_touch_timeout_seconds * TICKS_PER_SECOND / args.frameskip
-        ),
-    )
+    if args.reward_mode == "differential":
+        reward = DifferentialReward(
+            1,
+            1,
+            shaping_scale=args.nexto_shaping_scale,
+            goal_scale=args.goal_reward_scale,
+            touch_scale=args.touch_reward_scale,
+            no_touch_penalty=args.no_touch_penalty,
+            no_touch_timeout_steps=no_touch_timeout_steps,
+        )
+    else:
+        goal_scale, shaping_scale, touch_scale, no_touch_penalty = reward_scales(
+            args.reward_mode,
+            args.goal_reward_scale,
+            args.nexto_shaping_scale,
+            args.touch_reward_scale,
+            args.no_touch_penalty,
+        )
+        reward = AnnealedNextoReward(
+            1,
+            1,
+            shaping_scale=shaping_scale,
+            goal_scale=goal_scale,
+            touch_scale=touch_scale,
+            no_touch_penalty=no_touch_penalty,
+            no_touch_timeout_steps=no_touch_timeout_steps,
+        )
     base_env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=1,
@@ -2176,18 +2192,22 @@ def main() -> None:
         ),
         section="MAPPO",
     )
-    value_scheduler = ValueScheduler(
-        ScheduledValue.attribute(
-            "nexto_shaping_scale",
-            reward,
-            "shaping_scale",
-            lambda progress: nexto_shaping_scale(
-                round(progress * args.timesteps),
-                shaping_scale,
-                max(1, round(args.timesteps * args.shaping_anneal_fraction)),
+    value_scheduler = (
+        ValueScheduler(
+            ScheduledValue.attribute(
+                "nexto_shaping_scale",
+                reward,
+                "shaping_scale",
+                lambda progress: nexto_shaping_scale(
+                    round(progress * args.timesteps),
+                    args.nexto_shaping_scale,
+                    max(1, round(args.timesteps * args.shaping_anneal_fraction)),
+                ),
             ),
-        ),
-        section="Reward",
+            section="Reward",
+        )
+        if args.reward_mode == "nexto"
+        else None
     )
     checkpoints = DIFOCheckpoints(
         args.checkpoint_dir / run_id,

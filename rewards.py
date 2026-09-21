@@ -52,6 +52,23 @@ class NextoRewardWeights:
     win_probability: float = 10.0
 
 
+@dataclass(frozen=True)
+class DifferentialRewardWeights:
+    ball_goal_progress: float = 5.0
+    own_goal_clearance: float = 2.5
+    ball_height_progress: float = 1.0
+    ball_speed_progress: float = 1.0
+    ball_goal_velocity: float = 1.0
+    player_ball_progress: float = 0.75
+    alignment_progress: float = 0.5
+    boost_gain: float = 1.0
+    boost_loss: float = 0.5
+    demo: float = 5.0
+    touch_acceleration: float = 0.25
+    aerial_touch: float = 1.0
+    flip_reset: float = 10.0
+
+
 class AnnealedNextoReward:
     """Permanent weighted goals plus annealable shaping from the Nexto reward."""
 
@@ -332,6 +349,174 @@ class AnnealedNextoReward:
     @classmethod
     def _cosine(cls, left: th.Tensor, right: th.Tensor) -> th.Tensor:
         return (cls._unit(left) * cls._unit(right)).sum(dim=-1)
+class DifferentialReward(AnnealedNextoReward):
+    """Dense differential reward.
+
+    Every shaping term is a change between the previous and current state
+    (progress toward the opponent goal, ball height/speed gained, closing on
+    the ball, alignment, boost, touches) instead of an absolute level, so the
+    signal is exactly the part that PPO's advantage normalization preserves.
+    Only the genuine win-lose terms are opponent-relative: goals are already
+    signed by team, and demoing subtracts from the opponent. Shared progress
+    (ball moved toward a goal, gained height or speed) is earned by both
+    sides rather than canceled.
+    """
+
+    def __init__(
+        self,
+        n_blue: int,
+        n_orange: int,
+        shaping_scale: float = 1.0,
+        goal_scale: float = 10.0,
+        touch_scale: float = 0.1,
+        no_touch_penalty: float = 1.0,
+        no_touch_timeout_steps: int | None = None,
+        weights: DifferentialRewardWeights = DifferentialRewardWeights(),
+    ) -> None:
+        super().__init__(
+            n_blue,
+            n_orange,
+            shaping_scale=shaping_scale,
+            goal_scale=goal_scale,
+            touch_scale=touch_scale,
+            no_touch_penalty=no_touch_penalty,
+            no_touch_timeout_steps=no_touch_timeout_steps,
+            weights=weights,
+        )
+
+    def __call__(self, context: RewardContext) -> th.Tensor:
+        current = context.current
+        previous = context.previous
+        self._ensure_state(current.raw.shape[0], current.raw.device)
+
+        team_sign = current.team_sign[None, :]
+        score_for_actor = context.events.score_delta[:, None] * team_sign
+        ball_position = current.ball_position[:, None, :]
+        previous_ball_position = previous.ball_position[:, None, :]
+        ball_velocity = current.ball_velocity[:, None, :]
+        previous_ball_velocity = previous.ball_velocity[:, None, :]
+        car_to_ball = ball_position - current.car_position
+        previous_car_to_ball = previous_ball_position - previous.car_position
+        distance_to_ball = car_to_ball.norm(dim=-1)
+        previous_distance_to_ball = previous_car_to_ball.norm(dim=-1)
+
+        opponent_goal = th.zeros_like(current.car_position)
+        opponent_goal[..., 1] = team_sign * GOAL_Y
+        own_goal = opponent_goal.clone()
+        own_goal[..., 1].neg_()
+        ball_to_goal = opponent_goal - ball_position
+        previous_ball_to_goal = opponent_goal - previous_ball_position
+        ball_to_own_goal = own_goal - ball_position
+        previous_ball_to_own_goal = own_goal - previous_ball_position
+
+        ball_goal_progress = (
+            th.exp(-ball_to_goal.norm(dim=-1) / 1410.0)
+            - th.exp(-previous_ball_to_goal.norm(dim=-1) / 1410.0)
+        )
+        own_goal_clearance = (
+            th.exp(-previous_ball_to_own_goal.norm(dim=-1) / 1410.0)
+            - th.exp(-ball_to_own_goal.norm(dim=-1) / 1410.0)
+        )
+        ball_height_progress = (
+            ball_position[..., 2] - previous_ball_position[..., 2]
+        ) / CEILING_Z
+        ball_speed_progress = (
+            ball_velocity.norm(dim=-1) - previous_ball_velocity.norm(dim=-1)
+        ) / BALL_MAX_SPEED
+        ball_goal_velocity = (
+            (ball_velocity * self._unit(ball_to_goal)).sum(dim=-1)
+            - (previous_ball_velocity * self._unit(previous_ball_to_goal)).sum(
+                dim=-1
+            )
+        ) / BALL_MAX_SPEED
+        player_ball_progress = (
+            th.exp(-distance_to_ball / 1410.0)
+            - th.exp(-previous_distance_to_ball / 1410.0)
+        )
+
+        alignment = 0.5 * (
+            self._cosine(car_to_ball, current.car_position - own_goal)
+            + self._cosine(-car_to_ball, opponent_goal - current.car_position)
+        )
+        previous_alignment = 0.5 * (
+            self._cosine(previous_car_to_ball, previous.car_position - own_goal)
+            + self._cosine(
+                -previous_car_to_ball, opponent_goal - previous.car_position
+            )
+        )
+        alignment_progress = alignment - previous_alignment
+
+        boost_current = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
+        boost_previous = (previous.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
+        boost_difference = boost_current - boost_previous
+        boost_gain = boost_difference.clamp_min(0.0)
+        boost_loss = (-boost_difference).clamp_min(0.0) * (
+            1.0 - current.car_position[..., 2] / GOAL_HEIGHT
+        ).clamp(0.0, 1.0)
+
+        newly_demoed = current.car_demoed & ~previous.car_demoed
+        demo = (
+            self._opponent_team_mean(newly_demoed.float()) - newly_demoed.float()
+        )
+
+        touches = current.car_ball_touches
+        touch_acceleration = touches * (
+            current.ball_velocity - previous.ball_velocity
+        ).norm(dim=-1, keepdim=True) / CAR_MAX_SPEED
+        aerial_touch = touches * (
+            ball_position[..., 2] / NEXTO_TOUCH_HEIGHT_SCALE
+        ).clamp_min(0.0)
+        previously_spent_flip = (
+            previous.car_has_flipped | previous.car_has_double_jumped
+        )
+        flip_available = ~(current.car_has_flipped | current.car_has_double_jumped)
+        flip_reset = (
+            touches
+            & previously_spent_flip
+            & flip_available
+            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
+            & car_to_ball.norm(dim=-1).lt(2.0 * BALL_RADIUS)
+            & self._cosine(car_to_ball, -current.car_up).gt(0.9)
+        ).float()
+
+        weights = self.weights
+        shaping = (
+            weights.ball_goal_progress * ball_goal_progress
+            + weights.own_goal_clearance * own_goal_clearance
+            + weights.ball_height_progress * ball_height_progress
+            + weights.ball_speed_progress * ball_speed_progress
+            + weights.ball_goal_velocity * ball_goal_velocity
+            + weights.player_ball_progress * player_ball_progress
+            + weights.alignment_progress * alignment_progress
+            + weights.boost_gain * boost_gain
+            - weights.boost_loss * boost_loss
+            + weights.demo * demo
+            + weights.touch_acceleration * touch_acceleration
+            + weights.aerial_touch * aerial_touch
+            + weights.flip_reset * flip_reset
+        ) / HISTORICAL_GOAL_WEIGHT
+
+        self.last_touches = touches
+        self.last_score_for_actor = score_for_actor
+        self._steps_since_touch += 1
+        self._steps_since_touch[touches.any(dim=-1)] = 0
+        if self.no_touch_timeout_steps is None:
+            self.last_no_touch_timeout = th.zeros_like(context.events.truncated)
+        else:
+            self.last_no_touch_timeout = (
+                context.events.truncated
+                & (self._steps_since_touch >= self.no_touch_timeout_steps)
+            )
+        self._steps_since_touch[context.events.done] = 0
+        timeout_penalty = self.last_no_touch_timeout[:, None] * self.no_touch_penalty
+        return (
+            self.goal_scale * score_for_actor
+            + self.touch_scale * touches
+            - timeout_penalty
+            + self.shaping_scale * shaping
+        )
+
+
 
 
 def nexto_shaping_scale(
@@ -345,4 +530,10 @@ def nexto_shaping_scale(
     return initial * (1.0 - fraction)
 
 
-__all__ = ["AnnealedNextoReward", "NextoRewardWeights", "nexto_shaping_scale"]
+__all__ = [
+    "AnnealedNextoReward",
+    "DifferentialReward",
+    "DifferentialRewardWeights",
+    "NextoRewardWeights",
+    "nexto_shaping_scale",
+]
