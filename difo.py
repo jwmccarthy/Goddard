@@ -72,7 +72,12 @@ from jarl.transform import GAE
 from replay_resets import load_demonstration_reset_dataset
 from rewards import (
     AnnealedNextoReward,
-    DifferentialReward,
+    BALL_RADIUS,
+    CEILING_Z,
+    DifferentialRewardWeights,
+    GOAL_HEIGHT,
+    HISTORICAL_GOAL_WEIGHT,
+    NEXTO_TOUCH_HEIGHT_SCALE,
     nexto_shaping_scale,
 )
 from tracker import (
@@ -112,6 +117,10 @@ def goal_offset(n_cars: int) -> int:
     return CARS_OFFSET + CAR_STATE_SIZE * n_cars + 68 + 6 * n_cars
 
 
+def ego_ball_offset(n_cars: int) -> int:
+    return CARS_OFFSET + CAR_STATE_SIZE * n_cars + 68
+
+
 def global_target_dim(n_cars: int) -> int:
     return AGENT_CONT_DIM * n_cars + BALL_CONT_DIM
 
@@ -128,6 +137,31 @@ def bounded_distance_gate(
     if sigma <= 0 or power <= 0:
         raise ValueError("gate sigma and power must be positive")
     return 1.0 / (1.0 + (distance.clamp_min(0.0) / sigma).pow(power))
+
+
+def _unit(value: th.Tensor) -> th.Tensor:
+    return value / value.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def _cosine(left: th.Tensor, right: th.Tensor) -> th.Tensor:
+    return (_unit(left) * _unit(right)).sum(dim=-1)
+
+
+def _progress(previous_distance: th.Tensor, current_distance: th.Tensor) -> th.Tensor:
+    return th.exp(-current_distance / 1410.0) - th.exp(-previous_distance / 1410.0)
+
+
+def _alignment(
+    car_to_ball: th.Tensor,
+    own_goal: th.Tensor,
+    opponent_goal: th.Tensor,
+) -> th.Tensor:
+    car_minus_own = -car_to_ball - own_goal
+    opponent_minus_car = opponent_goal + car_to_ball
+    return 0.5 * (
+        _cosine(car_to_ball, car_minus_own)
+        + _cosine(-car_to_ball, opponent_minus_car)
+    )
 
 
 @dataclass
@@ -1059,7 +1093,7 @@ class ExpertTransitionBuffer:
 
 
 class ContactTrackingEnv:
-    """Delegate to CARL while recording the last transition's ball contacts."""
+    """Delegate to CARL while recording the last transition's events."""
 
     def __init__(self, env: CARLTorchVectorEnv) -> None:
         self.env = env
@@ -1073,6 +1107,7 @@ class ContactTrackingEnv:
         self.action_space = env.action_space
         self.action_codec = env.action_codec
         self.last_car_ball_touches: th.Tensor | None = None
+        self.last_score_delta: th.Tensor | None = None
 
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
@@ -1081,6 +1116,9 @@ class ContactTrackingEnv:
         result = self.env.step(action)
         state = self.env._carl_state(self.env._env.get_transition_state())
         self.last_car_ball_touches = state.car_ball_touches.detach()
+        self.last_score_delta = self.env._tensor(
+            self.env._env.get_rewards(), copy=True
+        )
         return result
 
     def action_mask(self, observation: th.Tensor) -> th.Tensor:
@@ -1091,21 +1129,35 @@ class ContactTrackingEnv:
 
 
 class DIFOTransitionCapture(CaptureBase):
-    def __init__(self, env: ContactTrackingEnv) -> None:
+    def __init__(self, env: ContactTrackingEnv, n_blue: int = 1) -> None:
         self.env = env
+        self.n_blue = n_blue
 
     def _capture(self, context) -> dict[str, th.Tensor]:
         observation = context.observation
+        device = observation.device
+        count = observation.shape[0]
+        n_cars = getattr(self.env, "n_cars", 2)
         touches = self.env.last_car_ball_touches
         if touches is None:
-            contact = th.zeros(
-                observation.shape[0],
-                dtype=th.bool,
-                device=observation.device,
-            )
+            contact = th.zeros(count, dtype=th.bool, device=device)
         else:
-            contact = touches.reshape(-1).to(observation.device).bool()
-        return {"difo_touch_self": contact}
+            contact = touches.reshape(-1).to(device).bool()
+            n_cars = touches.shape[-1]
+        score = getattr(self.env, "last_score_delta", None)
+        if score is None:
+            score_delta = th.zeros(count, device=device)
+        else:
+            score_delta = (
+                score.to(device).repeat_interleave(n_cars).float()
+            )
+        car_index = th.arange(count, device=device) % n_cars
+        team_sign = th.where(car_index < self.n_blue, 1.0, -1.0)
+        return {
+            "difo_touch_self": contact,
+            "difo_score_delta": score_delta,
+            "difo_team_sign": team_sign,
+        }
 
 
 class DIFOUpdate:
@@ -1658,6 +1710,256 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         } if metrics else {}
 
 
+class BatchedDiagnosticSelfPlayRunner(DiagnosticSelfPlayRunner):
+    """Diagnostics for runs whose task reward is computed post-collection."""
+
+    def __init__(
+        self,
+        *args,
+        n_blue: int = 1,
+        n_cars: int = 2,
+        no_touch_timeout_steps: int | None = None,
+        **kwargs,
+    ) -> None:
+        kwargs.pop("gameplay_reward", None)
+        super().__init__(*args, gameplay_reward=None, **kwargs)
+        self.n_blue = n_blue
+        self.n_cars = n_cars
+        self.no_touch_timeout_steps = no_touch_timeout_steps
+        self._touch_steps: th.Tensor | None = None
+
+    def reset(self):
+        observation = super().reset()
+        self._touch_steps = th.zeros(
+            self.env.n_sim, dtype=th.long, device=self.env.device
+        )
+        return observation
+
+    def _record_diagnostics(self, env_step) -> None:
+        if self._diagnostics is None or self._touch_steps is None:
+            return
+        touches = self.env.last_car_ball_touches
+        score = self.env.last_score_delta
+        if touches is None or score is None:
+            return
+        n_cars = touches.shape[-1]
+        touch = touches.reshape(-1)
+        score = score.repeat_interleave(n_cars)
+        car_index = th.arange(touch.shape[0], device=touch.device) % n_cars
+        team_sign = th.where(car_index < self.n_blue, 1.0, -1.0)
+        score_for_actor = (score * team_sign).reshape(-1)
+
+        done = th.as_tensor(env_step.done, dtype=th.bool, device=self.env.device)
+        truncated = th.as_tensor(
+            env_step.truncated, dtype=th.bool, device=self.env.device
+        )
+        self._touch_steps += 1
+        self._touch_steps[touches.any(dim=-1)] = 0
+        if self.no_touch_timeout_steps is None:
+            timeout = th.zeros_like(done)
+        else:
+            simulation_timeout = truncated.reshape(-1, n_cars).all(dim=-1) & (
+                self._touch_steps >= self.no_touch_timeout_steps
+            )
+            timeout = simulation_timeout.repeat_interleave(n_cars)
+        self._touch_steps[
+            done.reshape(-1, n_cars).any(dim=-1)
+        ] = 0
+
+        learner = self.matchmaker.learner_mask
+        baseline = learner & self._baseline_mask()
+        self._diagnostics["steps"] += learner.sum()
+        self._diagnostics["touches"] += (touch & learner).sum()
+        self._diagnostics["goals_for"] += ((score_for_actor > 0) & learner).sum()
+        self._diagnostics["goals_against"] += (
+            (score_for_actor < 0) & learner
+        ).sum()
+        self._diagnostics["episodes"] += (done & learner).sum()
+        self._diagnostics["timeouts"] += (timeout & learner).sum()
+        self._diagnostics["baseline_episodes"] += (done & baseline).sum()
+        self._diagnostics["baseline_wins"] += (
+            (score_for_actor > 0) & baseline
+        ).sum()
+
+
+class DifferentialRewardTransform:
+    """Batched task reward for a collected rollout.
+
+    The differential reward is a transition function, so every row is scored
+    from its own ``observation``/``next_obs`` pair in one vectorized pass
+    after collection instead of inside every environment step. Observations
+    are ego-frame and team-relative, which is enough for every term (goal
+    progress, clearance, height/speed gains, alignment, boost, touches,
+    demos, flip resets); only the no-touch timeout needs a sequential scan
+    over the rollout.
+    """
+
+    def __init__(
+        self,
+        n_cars: int,
+        goal_scale: float = 10.0,
+        touch_scale: float = 0.1,
+        no_touch_penalty: float = 1.0,
+        no_touch_timeout_steps: int | None = None,
+        shaping_scale: float = 1.0,
+        weights: DifferentialRewardWeights = DifferentialRewardWeights(),
+    ) -> None:
+        self.n_cars = n_cars
+        self.goal_scale = goal_scale
+        self.touch_scale = touch_scale
+        self.no_touch_penalty = no_touch_penalty
+        self.no_touch_timeout_steps = no_touch_timeout_steps
+        self.shaping_scale = shaping_scale
+        self.weights = weights
+
+    @th.no_grad()
+    def __call__(self, batch: TensorBatch, context) -> TensorBatch:
+        observation = batch["observation"]
+        next_observation = batch["next_obs"]
+        time_steps, num_envs = observation.shape[:2]
+        obs = observation.reshape(-1, observation.shape[-1])
+        nxt = next_observation.reshape(-1, next_observation.shape[-1])
+        scale = th.tensor(POSITION_SCALE, device=obs.device)
+        double_scale = 2.0 * scale
+
+        ball = obs[:, 0:3] * scale
+        next_ball = nxt[:, 0:3] * scale
+        ball_velocity = obs[:, 3:6] * BALL_MAX_SPEED
+        next_ball_velocity = nxt[:, 3:6] * BALL_MAX_SPEED
+
+        goals = goal_offset(self.n_cars)
+        opponent_goal = obs[:, goals : goals + 3] * double_scale
+        own_goal = obs[:, goals + 3 : goals + 6] * double_scale
+        next_opponent_goal = nxt[:, goals : goals + 3] * double_scale
+        next_own_goal = nxt[:, goals + 3 : goals + 6] * double_scale
+        opponent_distance = opponent_goal.norm(dim=-1)
+        own_distance = own_goal.norm(dim=-1)
+
+        relative = ego_ball_offset(self.n_cars)
+        car_to_ball = obs[:, relative : relative + 3] * double_scale
+        next_car_to_ball = nxt[:, relative : relative + 3] * double_scale
+        car_ball_distance = car_to_ball.norm(dim=-1)
+        next_car_ball_distance = next_car_to_ball.norm(dim=-1)
+
+        ego = obs[:, CARS_OFFSET : CARS_OFFSET + CAR_STATE_SIZE]
+        next_ego = nxt[:, CARS_OFFSET : CARS_OFFSET + CAR_STATE_SIZE]
+
+        ball_goal_progress = _progress(
+            opponent_distance, next_opponent_goal.norm(dim=-1)
+        )
+        own_goal_clearance = _progress(
+            own_distance, next_own_goal.norm(dim=-1)
+        )
+        player_ball_progress = _progress(
+            car_ball_distance, next_car_ball_distance
+        )
+        ball_height_progress = (next_ball[:, 2] - ball[:, 2]) / CEILING_Z
+        ball_speed_progress = (
+            next_ball_velocity.norm(dim=-1) - ball_velocity.norm(dim=-1)
+        ) / BALL_MAX_SPEED
+        ball_goal_velocity = (
+            (next_ball_velocity * _unit(next_opponent_goal)).sum(dim=-1)
+            - (ball_velocity * _unit(opponent_goal)).sum(dim=-1)
+        ) / BALL_MAX_SPEED
+        alignment_progress = _alignment(
+            next_car_to_ball, next_own_goal, next_opponent_goal
+        ) - _alignment(car_to_ball, own_goal, opponent_goal)
+
+        boost_current = (next_ego[:, 15] / 100.0).clamp(0.0, 1.0).sqrt()
+        boost_previous = (ego[:, 15] / 100.0).clamp(0.0, 1.0).sqrt()
+        boost_difference = boost_current - boost_previous
+        boost_gain = boost_difference.clamp_min(0.0)
+        boost_loss = (-boost_difference).clamp_min(0.0) * (
+            1.0 - next_ego[:, 2] * POSITION_SCALE[2] / GOAL_HEIGHT
+        ).clamp(0.0, 1.0)
+
+        newly_demoed = (next_ego[:, 17] > 0.5) & ~(ego[:, 17] > 0.5)
+        grouped = newly_demoed.view(-1, self.n_cars)
+        if self.n_cars == 2:
+            demo = (
+                grouped.flip(1).float() - grouped.float()
+            ).reshape(-1)
+        else:
+            opponent_mean = (
+                grouped.sum(dim=-1, keepdim=True) - grouped
+            ) / (self.n_cars - 1)
+            demo = (opponent_mean - grouped).reshape(-1)
+
+        touched = batch["difo_touch_self"].reshape(-1).bool()
+        touch_acceleration = touched.float() * (
+            next_ball_velocity - ball_velocity
+        ).norm(dim=-1) / CAR_MAX_SPEED
+        aerial_touch = touched.float() * (
+            next_ball[:, 2] / NEXTO_TOUCH_HEIGHT_SCALE
+        ).clamp_min(0.0)
+        spent_flip = (ego[:, 18] > 0.5) | (ego[:, 19] > 0.5)
+        flip_available = ~(
+            (next_ego[:, 18] > 0.5) | (next_ego[:, 19] > 0.5)
+        )
+        car_up = next_ego[:, 12:15]
+        flip_reset = (
+            touched
+            & spent_flip
+            & flip_available
+            & (next_ball[:, 2] > 3.0 * BALL_RADIUS)
+            & (next_car_ball_distance < 2.0 * BALL_RADIUS)
+            & (_cosine(next_car_to_ball, -car_up) > 0.9)
+        ).float()
+
+        weights = self.weights
+        shaping = (
+            weights.ball_goal_progress * ball_goal_progress
+            + weights.own_goal_clearance * own_goal_clearance
+            + weights.ball_height_progress * ball_height_progress
+            + weights.ball_speed_progress * ball_speed_progress
+            + weights.ball_goal_velocity * ball_goal_velocity
+            + weights.player_ball_progress * player_ball_progress
+            + weights.alignment_progress * alignment_progress
+            + weights.boost_gain * boost_gain
+            - weights.boost_loss * boost_loss
+            + weights.demo * demo
+            + weights.touch_acceleration * touch_acceleration
+            + weights.aerial_touch * aerial_touch
+            + weights.flip_reset * flip_reset
+        ) / HISTORICAL_GOAL_WEIGHT
+        done = (batch["terminated"] | batch["truncated"]).reshape(-1)
+        shaping = th.where(done, th.zeros_like(shaping), shaping)
+        score_for_actor = (
+            batch["difo_score_delta"].reshape(-1)
+            * batch["difo_team_sign"].reshape(-1)
+        )
+        reward = (
+            self.goal_scale * score_for_actor
+            + self.touch_scale * touched.float()
+            - self.no_touch_penalty * self._timeout_penalty(batch)
+            + self.shaping_scale * shaping
+        )
+        return batch.replace_fields(reward=reward.reshape(time_steps, num_envs))
+
+    def _timeout_penalty(self, batch: TensorBatch) -> th.Tensor:
+        terminated = batch["terminated"].shape
+        timeout = th.zeros(terminated, dtype=th.bool, device=batch["terminated"].device)
+        if self.no_touch_timeout_steps is None:
+            return timeout.reshape(-1).float()
+        touched = batch["difo_touch_self"].bool()
+        done = batch["terminated"] | batch["truncated"]
+        truncated = batch["truncated"].bool()
+        steps = th.zeros(
+            touched.shape[1], dtype=th.long, device=touched.device
+        )
+        collected = []
+        for index in range(touched.shape[0]):
+            steps = steps + 1
+            steps = th.where(touched[index], th.zeros_like(steps), steps)
+            collected.append(
+                truncated[index] & (steps >= self.no_touch_timeout_steps)
+            )
+            steps = th.where(done[index], th.zeros_like(steps), steps)
+        if not collected:
+            return timeout.reshape(-1).float()
+        return th.stack(collected, dim=0).reshape(-1).float()
+
+
 class DIFOCheckpoints:
     def __init__(
         self,
@@ -1964,16 +2266,17 @@ def main() -> None:
         args.no_touch_timeout_seconds * TICKS_PER_SECOND / args.frameskip
     )
     if args.reward_mode == "differential":
-        reward = DifferentialReward(
-            1,
-            1,
-            shaping_scale=args.nexto_shaping_scale,
+        reward = None
+        task_reward = DifferentialRewardTransform(
+            n_cars=2,
             goal_scale=args.goal_reward_scale,
             touch_scale=args.touch_reward_scale,
             no_touch_penalty=args.no_touch_penalty,
             no_touch_timeout_steps=no_touch_timeout_steps,
+            shaping_scale=args.nexto_shaping_scale,
         )
     else:
+        task_reward = None
         goal_scale, shaping_scale, touch_scale, no_touch_penalty = reward_scales(
             args.reward_mode,
             args.goal_reward_scale,
@@ -1999,7 +2302,7 @@ def main() -> None:
         max_ticks=args.max_ticks,
         no_touch_timeout_seconds=args.no_touch_timeout_seconds,
         normalize=True,
-        reward_funcs=(reward,),
+        reward_funcs=(reward,) if reward is not None else None,
         discrete_actions=True,
     )
     reset_dataset = load_demonstration_reset_dataset(
@@ -2116,7 +2419,12 @@ def main() -> None:
         device=env.device,
         copy_on_finish=False,
     )
-    runner = DiagnosticSelfPlayRunner(
+    runner_type = (
+        BatchedDiagnosticSelfPlayRunner
+        if task_reward is not None
+        else DiagnosticSelfPlayRunner
+    )
+    runner = runner_type(
         env,
         policy,
         buffer,
@@ -2129,7 +2437,15 @@ def main() -> None:
             CriticValueCapture(critic),
             DIFOTransitionCapture(env),
         ),
-        gameplay_reward=reward,
+        **(
+            {
+                "n_blue": 1,
+                "n_cars": n_cars,
+                "no_touch_timeout_steps": no_touch_timeout_steps,
+            }
+            if task_reward is not None
+            else {"gameplay_reward": reward}
+        ),
     )
 
     difo_update = DIFOUpdate(
@@ -2171,6 +2487,7 @@ def main() -> None:
     )
     update = Update(
         transforms=(
+            *((task_reward,) if task_reward is not None else ()),
             difo_reward,
             GAE(gamma=gamma, lambda_=args.gae_lambda),
         ),

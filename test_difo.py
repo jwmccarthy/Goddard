@@ -8,6 +8,8 @@ import torch as th
 
 from jarl.data.batch import TensorBatch
 
+from rewards import DifferentialRewardWeights
+
 import difo
 from difo import (
     AGENT_CONT_DIM,
@@ -20,6 +22,7 @@ from difo import (
     DIFOReward,
     DIFOUpdate,
     DIFOTransitionCapture,
+    DifferentialRewardTransform,
     ExpertTransitionBuffer,
     GaussianDiffusion,
     GraphDIFO,
@@ -30,12 +33,14 @@ from difo import (
     build_transition,
     build_transition_graph,
     discriminator_probability,
+    ego_ball_offset,
     entities_from_observation,
     entities_from_replay_state,
     gather_pairs,
     gate_multiplier,
     global_target,
     global_target_dim,
+    goal_offset,
     observation_width,
     pair_target,
     perturb_graph,
@@ -797,6 +802,9 @@ class ContactTrackingEnvTest(unittest.TestCase):
             def get_transition_state(self):
                 return "capsule"
 
+            def get_rewards(self):
+                return "rewards"
+
         class FakeCarl:
             _env = FakeInner()
             n_envs = 4
@@ -813,6 +821,9 @@ class ContactTrackingEnvTest(unittest.TestCase):
 
             def _carl_state(self, capsule):
                 return SimpleNamespace(car_ball_touches=contacts)
+
+            def _tensor(self, capsule, copy=True):
+                return th.tensor([0.0, 1.0])
 
             def step(self, action):
                 return (
@@ -881,6 +892,100 @@ class NoPulseDependencyTest(unittest.TestCase):
         self.assertNotIn("import distill", source)
         self.assertNotIn("FrozenPulseController", source)
         self.assertNotIn("PulseLatentEnv", source)
+
+
+def make_task_batch(time_steps: int = 2, num_envs: int = 2) -> TensorBatch:
+    return TensorBatch(
+        {
+            "observation": th.zeros(time_steps, num_envs, OBS_WIDTH),
+            "next_obs": th.zeros(time_steps, num_envs, OBS_WIDTH),
+            "difo_touch_self": th.zeros(time_steps, num_envs, dtype=th.bool),
+            "difo_score_delta": th.zeros(time_steps, num_envs),
+            "difo_team_sign": th.tensor([[1.0, -1.0]])
+            .expand(time_steps, num_envs)
+            .contiguous(),
+            "terminated": th.zeros(time_steps, num_envs, dtype=th.bool),
+            "truncated": th.zeros(time_steps, num_envs, dtype=th.bool),
+            "reward": th.zeros(time_steps, num_envs),
+            "learner_mask": th.ones(time_steps, num_envs, dtype=th.bool),
+            "action": th.zeros(time_steps, num_envs, 7, dtype=th.long),
+            "old_log_prob": th.zeros(time_steps, num_envs),
+        }
+    )
+
+
+def only_weights(**overrides) -> DifferentialRewardWeights:
+    values = {
+        "ball_goal_progress": 0.0,
+        "own_goal_clearance": 0.0,
+        "ball_height_progress": 0.0,
+        "ball_speed_progress": 0.0,
+        "ball_goal_velocity": 0.0,
+        "player_ball_progress": 0.0,
+        "alignment_progress": 0.0,
+        "boost_gain": 0.0,
+        "boost_loss": 0.0,
+        "demo": 0.0,
+        "touch_acceleration": 0.0,
+        "aerial_touch": 0.0,
+        "flip_reset": 0.0,
+    }
+    values.update(overrides)
+    return DifferentialRewardWeights(**values)
+
+
+class DifferentialRewardTransformTest(unittest.TestCase):
+    def test_goal_and_touch_terms(self):
+        transform = DifferentialRewardTransform(2, shaping_scale=0.0)
+        batch = make_task_batch().replace_fields(
+            difo_score_delta=th.tensor([[0.0, 0.0], [1.0, 1.0]]),
+            difo_touch_self=th.tensor([[True, False], [False, False]]),
+        )
+        out = transform(batch, None)
+        th.testing.assert_close(out["reward"][0], th.tensor([0.1, 0.0]))
+        th.testing.assert_close(out["reward"][1], th.tensor([10.0, -10.0]))
+
+    def test_ball_goal_progress_is_batched(self):
+        transform = DifferentialRewardTransform(
+            2, shaping_scale=1.0, weights=only_weights(ball_goal_progress=5.0)
+        )
+        batch = make_task_batch()
+        goals = goal_offset(2)
+        observation = batch["observation"].clone()
+        next_observation = batch["next_obs"].clone()
+        observation[:, :, goals + 1] = 1000.0 / 12000.0
+        next_observation[:, :, goals + 1] = 500.0 / 12000.0
+        batch = batch.replace_fields(
+            observation=observation, next_obs=next_observation
+        )
+        out = transform(batch, None)
+        self.assertTrue(bool((out["reward"] > 0).all()))
+
+    def test_ball_height_progress_is_batched(self):
+        transform = DifferentialRewardTransform(
+            2, shaping_scale=1.0, weights=only_weights(ball_height_progress=1.0)
+        )
+        batch = make_task_batch()
+        observation = batch["observation"].clone()
+        next_observation = batch["next_obs"].clone()
+        observation[:, :, 2] = 100.0 / 2076.0
+        next_observation[:, :, 2] = 300.0 / 2076.0
+        batch = batch.replace_fields(
+            observation=observation, next_obs=next_observation
+        )
+        out = transform(batch, None)
+        self.assertTrue(bool((out["reward"] > 0).all()))
+
+    def test_no_touch_timeout_penalty(self):
+        transform = DifferentialRewardTransform(
+            2, shaping_scale=0.0, no_touch_timeout_steps=1
+        )
+        batch = make_task_batch().replace_fields(
+            truncated=th.tensor([[False, False], [True, True]])
+        )
+        out = transform(batch, None)
+        th.testing.assert_close(out["reward"][0], th.zeros(2))
+        th.testing.assert_close(out["reward"][1], th.full((2,), -1.0))
 
 
 if __name__ == "__main__":
