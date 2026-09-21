@@ -494,7 +494,7 @@ class DifferentialReward(AnnealedNextoReward):
             + weights.touch_acceleration * touch_acceleration
             + weights.aerial_touch * aerial_touch
             + weights.flip_reset * flip_reset
-        ) / HISTORICAL_GOAL_WEIGHT
+        )
 
         self.last_touches = touches
         self.last_score_for_actor = score_for_actor

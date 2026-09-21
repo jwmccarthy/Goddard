@@ -78,7 +78,6 @@ from rewards import (
     CEILING_Z,
     DifferentialRewardWeights,
     GOAL_HEIGHT,
-    HISTORICAL_GOAL_WEIGHT,
     NEXTO_TOUCH_HEIGHT_SCALE,
     nexto_shaping_scale,
 )
@@ -1933,7 +1932,7 @@ class DifferentialRewardTransform:
             + weights.touch_acceleration * touch_acceleration
             + weights.aerial_touch * aerial_touch
             + weights.flip_reset * flip_reset
-        ) / HISTORICAL_GOAL_WEIGHT
+        ) * self.shaping_scale
         done = (batch["terminated"] | batch["truncated"]).reshape(-1)
         shaping = th.where(done, th.zeros_like(shaping), shaping)
         score_for_actor = (
@@ -1944,7 +1943,7 @@ class DifferentialRewardTransform:
             self.goal_scale * score_for_actor
             + self.touch_scale * touched.float()
             - self.no_touch_penalty * self._timeout_penalty(batch)
-            + self.shaping_scale * shaping
+            + shaping
         )
         return batch.replace_fields(reward=reward.reshape(time_steps, num_envs))
 
@@ -2130,8 +2129,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--difo-reward-additive",
         type=float,
-        default=0.25,
+        default=0.05,
         help="additive discriminator weight in hybrid mode",
+    )
+    parser.add_argument(
+        "--task-reward-scale",
+        type=float,
+        default=1.0,
+        help="scale applied to the differential task shaping",
     )
     parser.add_argument(
         "--difo-reward-gate-min",
@@ -2239,6 +2244,8 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ("touch_reward_scale", "no_touch_penalty"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    if not math.isfinite(args.task_reward_scale) or args.task_reward_scale < 0:
+        raise ValueError("--task-reward-scale must be finite and nonnegative")
     if args.historical_policies >= args.snapshot_pool_size:
         raise ValueError("--historical-policies must be smaller than the snapshot pool")
     for name in ("difo_sigma", "difo_gate_power", "difo_lambda", "difo_reward_clip"):
@@ -2292,7 +2299,7 @@ def main() -> None:
             touch_scale=args.touch_reward_scale,
             no_touch_penalty=args.no_touch_penalty,
             no_touch_timeout_steps=no_touch_timeout_steps,
-            shaping_scale=args.nexto_shaping_scale,
+            shaping_scale=args.task_reward_scale,
         )
     else:
         task_reward = None

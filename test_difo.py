@@ -989,6 +989,25 @@ class DifferentialRewardTransformTest(unittest.TestCase):
         out = transform(batch, None)
         self.assertTrue(bool((out["reward"] > 0).all()))
 
+    def test_task_reward_scale_multiplies_shaping(self):
+        batch = make_task_batch()
+        goals = goal_offset(2)
+        observation = batch["observation"].clone()
+        next_observation = batch["next_obs"].clone()
+        observation[:, :, goals + 1] = 1000.0 / 12000.0
+        next_observation[:, :, goals + 1] = 500.0 / 12000.0
+        batch = batch.replace_fields(
+            observation=observation, next_obs=next_observation
+        )
+        weights = only_weights(ball_goal_progress=5.0)
+        base = DifferentialRewardTransform(
+            2, shaping_scale=1.0, weights=weights
+        )(batch, None)["reward"]
+        scaled = DifferentialRewardTransform(
+            2, shaping_scale=2.0, weights=weights
+        )(batch, None)["reward"]
+        self.assertTrue(th.allclose(scaled, 2.0 * base))
+
     def test_ball_height_progress_is_batched(self):
         transform = DifferentialRewardTransform(
             2, shaping_scale=1.0, weights=only_weights(ball_height_progress=1.0)
