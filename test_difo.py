@@ -45,6 +45,7 @@ from difo import (
     pair_target,
     perturb_graph,
     position_scale,
+    reset_eligible_mask,
     reward_scales,
     TransitionDenoiser,
 )
@@ -75,6 +76,7 @@ def random_observation(count: int, scale: float = 0.2) -> th.Tensor:
 def make_replay_buffer(
     segment_lengths: tuple[int, ...] = (20, 30, 10),
     delta_rows: tuple[int, ...] = (1, 2),
+    exclude_reset_starts: bool = False,
 ) -> ExpertTransitionBuffer:
     lengths = th.tensor(segment_lengths)
     offsets = th.cat((th.zeros(1, dtype=th.long), lengths.cumsum(0)))
@@ -90,6 +92,7 @@ def make_replay_buffer(
         ),
         delta_rows=delta_rows,
         seed=0,
+        exclude_reset_starts=exclude_reset_starts,
     )
 
 
@@ -280,6 +283,37 @@ class ExpertTransitionBufferTest(unittest.TestCase):
         ball_world = entities.ball_position * scale
         expected = (own_goal_world - ball_world) / (2.0 * scale)
         self.assertTrue(th.allclose(entities.own_goal_relative, expected))
+
+    def test_excludes_reset_eligible_starts(self):
+        total = 24
+        states = th.zeros(total, 71)
+        rows = th.arange(total)
+        ineligible = rows % 3 != 0
+        for base in (9, 50):
+            cars = states[:, base : base + 21]
+            cars[..., 16] = 1.0
+            cars[ineligible, 17] = 1.0
+        buffer = make_replay_buffer(
+            segment_lengths=(12, 12), exclude_reset_starts=True
+        )
+        buffer.states = states
+        weights = buffer._start_weights()
+        eligible = reset_eligible_mask(states, 4)
+        self.assertTrue(bool(eligible.any()))
+        self.assertTrue(bool((weights[eligible] == 0).all()))
+        self.assertTrue(bool((weights[~eligible] > 0).all()))
+
+    def test_raises_when_every_start_is_reset_eligible(self):
+        total = 24
+        states = th.zeros(total, 71)
+        states[:, 9:30][..., 16] = 1.0
+        states[:, 50:71][..., 16] = 1.0
+        buffer = make_replay_buffer(
+            segment_lengths=(12, 12), exclude_reset_starts=True
+        )
+        buffer.states = states
+        with self.assertRaises(RuntimeError):
+            buffer.sample(4, 1)
 
     def test_raises_when_no_segment_is_long_enough(self):
         buffer = make_replay_buffer(segment_lengths=(2, 3))

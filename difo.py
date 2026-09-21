@@ -81,6 +81,7 @@ from jarl.store.rollout import Rollout, RolloutBuffer
 from jarl.transform import GAE
 
 from replay_resets import load_demonstration_reset_dataset
+from replay_safety import infer_unsafe_start_mask
 from rewards import (
     AnnealedNextoReward,
     BALL_RADIUS,
@@ -1027,6 +1028,27 @@ class GraphDIFO(nn.Module):
         return -F.logsigmoid(-logits)
 
 
+def reset_eligible_mask(rows: th.Tensor, frame_skip: int) -> th.Tensor:
+    """Rows that ``replay_resets`` would use to initialize self-play states.
+
+    Mirrors ``load_demonstration_reset_dataset``: both cars grounded and free
+    of demo/flip/boost flags, and not an unsafe split-impulse start.
+    """
+    ego = rows[:, CARS_OFFSET : CARS_OFFSET + CAR_STATE_SIZE]
+    opponent = rows[
+        :,
+        OPPONENT_STATE_INDEX : OPPONENT_STATE_INDEX + CAR_STATE_SIZE,
+    ]
+    cars = th.stack((ego, opponent), dim=1)
+    grounded = (cars[..., 16] > 0.5).all(dim=-1)
+    clear = ~(cars[..., 17:21] > 0.5).any(dim=(-2, -1))
+    unsafe = infer_unsafe_start_mask(
+        (rows[:, 3:6] * BALL_MAX_SPEED).detach().cpu().numpy(), frame_skip
+    )
+    unsafe = th.as_tensor(unsafe, dtype=th.bool, device=rows.device)
+    return grounded & clear & ~unsafe
+
+
 class ExpertTransitionBuffer:
     """Random expert (s_t, s_{t + k}) transitions from parsed replays."""
 
@@ -1035,6 +1057,7 @@ class ExpertTransitionBuffer:
         replays: ExpertGoalStates,
         delta_rows: tuple[int, ...] = (1,),
         seed: int = 0,
+        exclude_reset_starts: bool = True,
     ) -> None:
         self.states = replays._replays
         self.offsets = replays._offsets.to(th.long)
@@ -1044,6 +1067,9 @@ class ExpertTransitionBuffer:
         if not rows or rows[0] < 1:
             raise ValueError("expert delta rows must be positive")
         self.delta_rows = rows
+        self.exclude_reset_starts = exclude_reset_starts
+        self._row_weights: th.Tensor | None = None
+        self._segment_end: th.Tensor | None = None
         self.generator = th.Generator(device=self.states.device)
         self.generator.manual_seed(int(seed))
 
@@ -1054,6 +1080,36 @@ class ExpertTransitionBuffer:
     @property
     def n_demos(self) -> int:
         return self.offsets.shape[0] - 1
+
+    def _start_weights(self) -> th.Tensor:
+        if self._row_weights is not None:
+            return self._row_weights
+        device = self.states.device
+        lengths = self.offsets[1:] - self.offsets[:-1]
+        demo = th.repeat_interleave(
+            th.arange(self.n_demos, device=device), lengths
+        )
+        allowed = th.ones(
+            self.states.shape[0], dtype=th.bool, device=device
+        )
+        if self.exclude_reset_starts:
+            allowed = ~reset_eligible_mask(self.states, self.frame_skip)
+        counts = th.zeros(
+            self.n_demos, dtype=th.long, device=device
+        ).scatter_add_(0, demo, allowed.long())
+        weights = th.where(
+            allowed,
+            self.probabilities[demo] / counts[demo].clamp_min(1),
+            th.zeros((), device=device),
+        )
+        total = weights.sum()
+        if total <= 0:
+            raise RuntimeError(
+                "no expert starts remain outside the reset states"
+            )
+        self._row_weights = weights / total
+        self._segment_end = th.repeat_interleave(self.offsets[1:], lengths)
+        return self._row_weights
 
     def sample(
         self,
@@ -1068,26 +1124,22 @@ class ExpertTransitionBuffer:
         generator = generator if generator is not None else self.generator
         device = self.states.device
         lengths = self.offsets[1:] - self.offsets[:-1]
-        eligible = lengths > delta_rows
-        if not eligible.any():
+        if int(lengths.max()) <= delta_rows:
             raise RuntimeError("no replay segment is long enough for the transition")
-        probabilities = th.where(
-            eligible, self.probabilities, th.zeros_like(self.probabilities)
+        weights = self._start_weights()
+        row = th.multinomial(
+            weights, count, replacement=True, generator=generator
         )
-        total = probabilities.sum()
-        probabilities = (
-            probabilities / total
-            if total > 0
-            else eligible.float() / eligible.sum()
-        )
-        demo = th.multinomial(
-            probabilities, count, replacement=True, generator=generator
-        )
-        span = (lengths[demo] - delta_rows).clamp_min(1)
-        local = (
-            th.rand(count, device=device, generator=generator) * span.float()
-        ).long().clamp_max(span - 1)
-        row = self.offsets[demo] + local
+        for _ in range(16):
+            too_far = row + delta_rows >= self._segment_end[row]
+            if not too_far.any():
+                break
+            redrawn = th.multinomial(
+                weights, count, replacement=True, generator=generator
+            )
+            row = th.where(too_far, redrawn, row)
+        if bool((row + delta_rows >= self._segment_end[row]).any()):
+            raise RuntimeError("expert sampling found no in-segment transition")
         rows = self.states[row]
         rows_next = self.states[row + delta_rows]
         touch = rows[:, EXPERT_TOUCH_INDEX] > 0.5
@@ -2173,6 +2225,15 @@ def parse_args() -> argparse.Namespace:
         help="zero-mean/unit-std the DIFO intrinsic reward over learner steps",
     )
     parser.add_argument(
+        "--difo-exclude-reset-starts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "exclude expert transitions starting from states the self-play "
+            "resetter can initialize episodes with"
+        ),
+    )
+    parser.add_argument(
         "--difo-reward-combine",
         choices=("hybrid", "gate", "add", "multiply"),
         default="hybrid",
@@ -2416,6 +2477,7 @@ def main() -> None:
         expert_replays,
         delta_rows=tuple(args.difo_delta_rows),
         seed=args.seed,
+        exclude_reset_starts=args.difo_exclude_reset_starts,
     )
 
     n_cars = base_env.n_cars
