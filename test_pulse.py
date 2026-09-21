@@ -19,7 +19,7 @@ from jarl.store.rollout import RolloutBuffer
 from rewards import AnnealedNextoReward, nexto_shaping_scale
 from tracker import CONTROL_STATE_SIZE
 
-from self_play import (
+from pulse import (
     FrozenPulseController,
     PulseLatentEnv,
     SelfPlayCheckpoints,

@@ -20,7 +20,7 @@ from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
 from replay_resets import load_demonstration_reset_dataset
-from self_play import (
+from pulse import (
     FrozenPulseController,
     PulseLatentEnv,
     build_policy,

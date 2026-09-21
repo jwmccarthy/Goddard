@@ -1,3 +1,10 @@
+"""PULSE latent-policy self-play.
+
+Trains a feed-forward Gaussian policy as a residual on top of the frozen
+PULSE prior and decoder (the former ``self_play.py``). The graph-conditioned
+DIFO variant lives in ``difo.py``.
+"""
+
 import argparse
 import hashlib
 import math
