@@ -619,6 +619,21 @@ def main(algorithm: str = "ppo") -> None:
         )
         logger = Logger(log_dir=str(run_dir))
 
+        for section, key, label, format_spec in (
+            ("PPO", "policy_loss", "policy loss", ".4f"),
+            ("PPO", "critic_loss", "critic loss", ".4f"),
+            ("PPO", "entropy", "entropy", ".3f"),
+            ("PPO", "approx_kl", "approx KL", ".4f"),
+            ("episode", "current_reward", "current reward", ".3f"),
+            ("episode", "historical_reward", "historical reward", ".3f"),
+            ("Schedule", "learning_rate", "learning rate", ".2e"),
+            ("Schedule", "entropy_coef", "entropy coef", ".4f"),
+            ("Schedule", "gamma", "gamma", ".5f"),
+            ("Schedule", "discount_half_life", "discount half-life", ".1f"),
+            ("Schedule", "goal_score_weight", "goal weight", ".2f"),
+        ):
+            logger.register_progress_metric(section, key, label, format_spec)
+
         training_checkpointer = TrainingCheckpointer(
             checkpoint_dir / "training_latest.pt",
             **training_objects,
