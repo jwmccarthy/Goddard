@@ -39,7 +39,11 @@ CAR_OFFSET = (13.8757, 0.0, 20.755)
 
 
 def checkpoint_kind(path: Path) -> str:
-    if path.match("basic_*.pt"):
+    if (
+        path.match("basic_*.pt")
+        or path.match("policy_*.pt")
+        or path.name == "training_latest.pt"
+    ):
         return "basic"
     if path.match("difo_*.pt"):
         return "difo"
@@ -73,14 +77,19 @@ class CheckpointRegistry:
         paths = list(self.directory.rglob("self_play_*.pt"))
         paths += list(self.directory.rglob("difo_*.pt"))
         paths += list(self.directory.rglob("basic_*.pt"))
+        paths += list(self.directory.rglob("policy_*.pt"))
+        paths += list(self.directory.rglob("training_latest.pt"))
         for path in paths:
             try:
                 resolved = path.resolve(strict=True)
-                step = resolved.stem.rsplit("_", 1)[-1]
+                try:
+                    step = int(resolved.stem.rsplit("_", 1)[-1])
+                except ValueError:
+                    step = 0
                 checkpoints.append(CheckpointMetadata(
                     resolved,
                     resolved.relative_to(self.directory).as_posix(),
-                    int(step),
+                    step,
                     resolved.stat().st_mtime_ns,
                     checkpoint_kind(resolved),
                 ))
@@ -119,6 +128,8 @@ class CheckpointRegistry:
                 path.match("self_play_*.pt")
                 or path.match("difo_*.pt")
                 or path.match("basic_*.pt")
+                or path.match("policy_*.pt")
+                or path.name == "training_latest.pt"
             )
         ):
             raise ValueError("invalid checkpoint path")
@@ -485,10 +496,10 @@ def _simulate_difo(
             discrete_actions=True,
         )
         blue, blue_metadata = load_difo_checkpoint(
-            blue_path, base, args.frameskip
+            blue_path, base, args.frameskip, args.hidden_size
         )
         orange, orange_metadata = load_difo_checkpoint(
-            orange_path, base, args.frameskip
+            orange_path, base, args.frameskip, args.hidden_size
         )
         require_compatible_difo(blue_metadata, orange_metadata)
         observation = base.reset()
@@ -566,19 +577,31 @@ def _simulate_difo(
 
 
 def load_basic_checkpoint(
-    path: Path, env: CARLTorchVectorEnv, frameskip: int | None = None
+    path: Path,
+    env: CARLTorchVectorEnv,
+    frameskip: int | None = None,
+    hidden_size: int = 256,
 ):
     payload = th.load(path, map_location="cpu", weights_only=True)
-    config = payload["config"]
-    if frameskip is not None and int(config.get("frameskip", frameskip)) != frameskip:
-        raise ValueError(
-            f"checkpoint was trained at frameskip {config['frameskip']}, "
-            f"watching at {frameskip}; pass --frameskip {config['frameskip']}"
-        )
-    hidden = int(config["policy_hidden"])
+    config = payload.get("config", {}) if isinstance(payload, dict) else {}
+    if isinstance(payload, dict) and "modules" in payload:
+        policy_state = payload["modules"].get("policy", payload["modules"].get("actor"))
+    elif isinstance(payload, dict) and "policy" in payload:
+        policy_state = payload["policy"]
+    else:
+        policy_state = payload
+    if policy_state is None:
+        raise ValueError("checkpoint does not contain a policy state dict")
+    if frameskip is not None and "frameskip" in config:
+        if int(config["frameskip"]) != frameskip:
+            raise ValueError(
+                f"checkpoint was trained at frameskip {config['frameskip']}, "
+                f"watching at {frameskip}; pass --frameskip {config['frameskip']}"
+            )
+    hidden = int(config.get("policy_hidden", config.get("hidden_size", hidden_size)))
     recurrent = bool(config.get("recurrent", True))
     policy = build_basic_policy(env, hidden, recurrent)
-    policy.load_state_dict(payload["policy"])
+    policy.load_state_dict(policy_state)
     return policy.eval().requires_grad_(False), {
         "signature": (hidden, recurrent)
     }
@@ -622,10 +645,10 @@ def _simulate_basic(
             discrete_actions=True,
         )
         blue, blue_metadata = load_basic_checkpoint(
-            blue_path, base, args.frameskip
+            blue_path, base, args.frameskip, args.hidden_size
         )
         orange, orange_metadata = load_basic_checkpoint(
-            orange_path, base, args.frameskip
+            orange_path, base, args.frameskip, args.hidden_size
         )
         require_compatible_basic(blue_metadata, orange_metadata)
         observation = base.reset()
@@ -840,6 +863,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blue")
     parser.add_argument("--orange")
     parser.add_argument("--frameskip", type=int, default=4)
+    parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--max-ticks", type=int, default=4096)
     parser.add_argument("--reset-state-limit", type=int, default=100_000)
     parser.add_argument("--seed", type=int, default=0)
