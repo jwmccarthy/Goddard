@@ -194,6 +194,22 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     )
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)
+    # Recent-script aliases (same destinations, hidden from help).
+    parser.add_argument("--replay-dir", dest="replay_dataset", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--n-sim", dest="num_simulations", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--no-touch-timeout-seconds", dest="no_touch_timeout", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--rollout", dest="rollout_steps", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--batch-size", dest="minibatch_size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--lr", dest="learning_rate", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--lr-end-factor", dest="learning_rate_end_factor", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--timesteps", dest="total_timesteps", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--current-fraction", dest="self_play_current", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--snapshot-pool-size", dest="opponent_pool_size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--log-dir", dest="tensorboard_dir", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--replay-reset-fraction", dest="replay_reset_probability", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--demonstration-reset-fraction", dest="replay_reset_probability", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--policy-hidden", dest="hidden_size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--critic-hidden", dest="hidden_size", type=int, default=argparse.SUPPRESS)
     return parser.parse_args()
 
 
