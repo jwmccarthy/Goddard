@@ -3,7 +3,12 @@ import unittest
 import torch as th
 
 from carl.gymnasium.state import CarlEvents, CarlState, RewardContext
-from rewards import DifferentialReward, DifferentialRewardWeights
+from rewards import (
+    DifferentialReward,
+    DifferentialRewardWeights,
+    SeerReward,
+    SeerRewardWeights,
+)
 
 
 TEAM_SIGN = th.tensor([1.0, -1.0])
@@ -19,6 +24,16 @@ def zero_weights(**overrides) -> DifferentialRewardWeights:
     )
 
 
+def zero_seer_weights(**overrides) -> SeerRewardWeights:
+    return SeerRewardWeights(
+        **{
+            name: 0.0
+            for name in SeerRewardWeights.__dataclass_fields__
+        }
+        | overrides
+    )
+
+
 def make_context(
     ball_y: float = 0.0,
     ball_z: float = 100.0,
@@ -26,7 +41,7 @@ def make_context(
     previous_ball_z: float = 100.0,
     ball_speed: float = 0.0,
     previous_ball_speed: float = 0.0,
-    touched_car: int | None = None,
+    touched_car: int | tuple[int, ...] | None = None,
     demoed_car: int | None = None,
     score_delta: int = 0,
     truncated: bool = False,
@@ -42,7 +57,8 @@ def make_context(
     current_raw[:, 2] = ball_z
     current_raw[:, 4] = ball_speed
     if touched_car is not None:
-        current_raw[:, 9 + 22 * touched_car + 21] = 1.0
+        for car in (touched_car,) if isinstance(touched_car, int) else touched_car:
+            current_raw[:, 9 + 22 * car + 21] = 1.0
     if demoed_car is not None:
         current_raw[:, 9 + 22 * demoed_car + 17] = 1.0
     previous = CarlState(previous_raw, 2, th.empty((0, 3)), TEAM_SIGN)
@@ -112,6 +128,63 @@ class DifferentialRewardTest(unittest.TestCase):
         reward = DifferentialReward(1, 1, shaping_scale=0.0, no_touch_timeout_steps=1)
         th.testing.assert_close(
             reward(make_context(truncated=True)), th.tensor([[-1.0, -1.0]])
+        )
+
+
+class SeerRewardTest(unittest.TestCase):
+    def test_goals_and_win_probability_remain_zero_sum(self):
+        reward = SeerReward(
+            1, 1, normalize=False,
+            weights=zero_seer_weights(
+                goal_scored=10.0, goal_speed_bonus=2.5,
+                goal_distance_bonus=2.5, goal_time_bonus=1.0,
+                win_probability=10.0,
+            ),
+        )
+        value = reward(make_context(score_delta=1, previous_ball_speed=1000.0))
+
+        self.assertGreater(float(value[0, 0]), 20.0)
+        th.testing.assert_close(value[0, 0], -value[0, 1])
+
+    def test_touch_shaping_is_local_even_with_default_normalization(self):
+        context = make_context(touched_car=0, ball_speed=2300.0)
+        weights = zero_seer_weights(touch_acceleration=1.0)
+
+        raw = SeerReward(1, 1, normalize=False, weights=weights)(context)
+        th.testing.assert_close(raw, th.tensor([[1.0, 0.0]]))
+
+        normalized = SeerReward(1, 1, weights=weights)(context)
+        self.assertGreater(float(normalized[0, 0]), 0.0)
+        th.testing.assert_close(normalized[0, 1], th.tensor(0.0))
+
+    def test_both_cars_can_earn_shaping_at_once(self):
+        reward = SeerReward(
+            1, 1, normalize=False,
+            weights=zero_seer_weights(touch_acceleration=1.0),
+        )
+        value = reward(make_context(touched_car=(0, 1), ball_speed=2300.0))
+
+        th.testing.assert_close(value, th.ones((1, 2)))
+
+    def test_goal_and_touch_shaping_remain_distinct(self):
+        reward = SeerReward(
+            1, 1, normalize=False,
+            weights=zero_seer_weights(goal_scored=10.0, touch_acceleration=1.0),
+        )
+
+        th.testing.assert_close(
+            reward(make_context(score_delta=1, touched_car=0, ball_speed=2300.0)),
+            th.tensor([[11.0, -10.0]]),
+        )
+
+    def test_demo_rewards_behavior_without_penalizing_victim(self):
+        reward = SeerReward(
+            1, 1, normalize=False,
+            weights=zero_seer_weights(demo=5.0),
+        )
+
+        th.testing.assert_close(
+            reward(make_context(demoed_car=1)), th.tensor([[5.0, 0.0]])
         )
 
 
