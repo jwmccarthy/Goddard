@@ -732,20 +732,20 @@ class SeerRewardWeights:
     player_ball_progress: float = 0.75
     alignment_progress:   float = 0.5
     touch_acceleration:   float = 0.25
-    aerial_touch:         float = 0.0
+    aerial_touch:         float = 1.0
     angular_velocity:     float = 0.01
     flip_reset:           float = 10.0
     touch_grass:          float = 0.005
     win_probability:      float = 10.0
     goal_time_bonus:      float = 1.0
     air_dribble_start:    float = 0.5
-    air_dribble_setup:    float = 0.5
-    air_dribble_contact:  float = 0.5
+    air_dribble_setup:    float = 0.0
+    air_dribble_contact:  float = 0.0
     air_dribble_progress: float = 1.0
     air_dribble_complete: float = 1.0
-    air_dribble_goal_scale: float = 10.0
-    kickoff_first_touch:   float = 0.25
-    kickoff_side_change:   float = 0.5
+    air_dribble_goal_scale: float = 0.0
+    kickoff_first_touch:   float = 0.0
+    kickoff_side_change:   float = 0.0
 
 
 class SeerReward:

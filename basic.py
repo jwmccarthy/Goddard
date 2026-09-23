@@ -365,6 +365,123 @@ def build_policy_loss(
     raise ValueError(f"unknown policy optimization algorithm: {algorithm}")
 
 
+class DiagnosticSelfPlayRunner(SelfPlayRunner):
+    """Self-play runner that also tracks gameplay diagnostics for logging.
+
+    Gameplay statistics (touches, goals for/against, no-touch timeouts) are
+    read straight from the CARL environment's transition buffer after every
+    step, so the reward function is left untouched.
+    """
+
+    def __init__(
+        self,
+        *args,
+        n_blue: int = 1,
+        no_touch_timeout_steps: int | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.n_blue = n_blue
+        self.no_touch_timeout_steps = no_touch_timeout_steps
+        self._diagnostics: dict[str, torch.Tensor] | None = None
+        self._touch_steps: torch.Tensor | None = None
+
+    def reset(self):
+        observation = super().reset()
+        self._diagnostics = {
+            name: torch.zeros((), dtype=torch.float32, device=self.env.device)
+            for name in (
+                "steps",
+                "touches",
+                "goals_for",
+                "goals_against",
+                "episodes",
+                "timeouts",
+            )
+        }
+        self._touch_steps = torch.zeros(
+            self.env.n_sim, dtype=torch.long, device=self.env.device
+        )
+        return observation
+
+    def step(self):
+        env_step = super().step()
+        self._record_diagnostics(env_step)
+        return env_step
+
+    def _record_diagnostics(self, env_step) -> None:
+        if self._diagnostics is None or self._touch_steps is None:
+            return
+
+        transition = self.env._carl_state(
+            self.env._env.get_transition_state()
+        )
+        touches = transition.car_ball_touches
+        score = self.env._tensor(self.env._env.get_rewards(), copy=True)
+        n_cars = touches.shape[-1]
+
+        touch = touches.reshape(-1)
+        score = score.repeat_interleave(n_cars)
+        car_index = torch.arange(touch.shape[0], device=touch.device) % n_cars
+        team_sign = torch.where(car_index < self.n_blue, 1.0, -1.0)
+        score_for_actor = score * team_sign
+
+        done = torch.as_tensor(
+            env_step.done, dtype=torch.bool, device=self.env.device
+        )
+        truncated = torch.as_tensor(
+            env_step.truncated, dtype=torch.bool, device=self.env.device
+        )
+
+        self._touch_steps += 1
+        self._touch_steps[touches.any(dim=-1)] = 0
+        if self.no_touch_timeout_steps is None:
+            timeout = torch.zeros_like(done)
+        else:
+            simulation_timeout = truncated.reshape(-1, n_cars).all(dim=-1) & (
+                self._touch_steps >= self.no_touch_timeout_steps
+            )
+            timeout = simulation_timeout.repeat_interleave(n_cars)
+        self._touch_steps[done.reshape(-1, n_cars).any(dim=-1)] = 0
+
+        learner = self.matchmaker.learner_mask
+        self._diagnostics["steps"] += learner.sum()
+        self._diagnostics["touches"] += (touch & learner).sum()
+        self._diagnostics["goals_for"] += ((score_for_actor > 0) & learner).sum()
+        self._diagnostics["goals_against"] += (
+            (score_for_actor < 0) & learner
+        ).sum()
+        self._diagnostics["episodes"] += (done & learner).sum()
+        self._diagnostics["timeouts"] += (timeout & learner).sum()
+
+    def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
+        if self._diagnostics is None:
+            return {}
+
+        metrics: dict[str, torch.Tensor] = {}
+        steps = self._diagnostics["steps"]
+        if steps.item() > 0:
+            metrics |= {
+                "touches_per_1000_steps": self._diagnostics["touches"] / steps * 1000,
+                "goals_for_per_1000_steps": self._diagnostics["goals_for"] / steps * 1000,
+                "goals_against_per_1000_steps": self._diagnostics["goals_against"] / steps * 1000,
+            }
+            for name in ("steps", "touches", "goals_for", "goals_against"):
+                self._diagnostics[name].zero_()
+
+        episodes = self._diagnostics["episodes"]
+        if episodes.item() > 0:
+            metrics["timeout_fraction"] = self._diagnostics["timeouts"] / episodes
+            self._diagnostics["episodes"].zero_()
+            self._diagnostics["timeouts"].zero_()
+
+        return (
+            {"Gameplay": {name: value.item() for name, value in metrics.items()}}
+            if metrics
+            else {}
+        )
+
+
 def build_ppo(
     environment: CARLTorchVectorEnv,
     policy,
@@ -404,7 +521,10 @@ def build_ppo(
         device=environment.device,
         seed=arguments.seed,
     )
-    runner = SelfPlayRunner(
+    no_touch_timeout_steps = math.ceil(
+        arguments.no_touch_timeout * 120.0 / arguments.frameskip
+    )
+    runner = DiagnosticSelfPlayRunner(
         env=environment,
         policy=policy,
         buffer=rollout,
@@ -417,6 +537,8 @@ def build_ppo(
             RecurrentStateCapture(),
             RecurrentCriticCapture(critic),
         ),
+        n_blue=arguments.n_blue,
+        no_touch_timeout_steps=no_touch_timeout_steps,
     )
 
     policy_optimizer = Adam(policy.parameters(), lr=arguments.learning_rate)
@@ -626,6 +748,10 @@ def main(algorithm: str = "ppo") -> None:
             ("PPO", "approx_kl", "approx KL", ".4f"),
             ("episode", "current_reward", "current reward", ".3f"),
             ("episode", "historical_reward", "historical reward", ".3f"),
+            ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
+            ("Gameplay", "goals_for_per_1000_steps", "goals for/1k", ".3f"),
+            ("Gameplay", "goals_against_per_1000_steps", "goals against/1k", ".3f"),
+            ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
             ("Schedule", "learning_rate", "learning rate", ".2e"),
             ("Schedule", "entropy_coef", "entropy coef", ".4f"),
             ("Schedule", "gamma", "gamma", ".5f"),
@@ -638,6 +764,13 @@ def main(algorithm: str = "ppo") -> None:
             checkpoint_dir / "training_latest.pt",
             **training_objects,
         )
+
+        def update_callback(trainer: Trainer) -> None:
+            training_checkpointer(trainer)
+            metrics = runner.diagnostic_metrics()
+            if metrics:
+                trainer.logger.update(metrics, step=trainer.clock.env_steps)
+
         trainer = Trainer(
             runner,
             rollout,
@@ -646,7 +779,7 @@ def main(algorithm: str = "ppo") -> None:
             logger=logger,
             checkpoint=None,
             value_scheduler=value_scheduler,
-            update_callback=training_checkpointer,
+            update_callback=update_callback,
         )
         if arguments.resume_checkpoint is not None:
             trainer.clock = training_checkpointer.load(

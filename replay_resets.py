@@ -59,18 +59,20 @@ def load_demonstration_reset_dataset(
                 source[:, 3:6] * BALL_MAX_SPEED, frame_skip
             )
 
-        cars = source[:, 9:51].reshape(-1, 2, 21)
         invalid = source[:, -4:].astype(bool).any(axis=-1)
-        stable = cars[..., 16].astype(bool).all(axis=-1)
-        stable &= ~cars[..., 17:21].astype(bool).any(axis=(-2, -1))
-        eligible = np.flatnonzero(~unsafe & ~invalid & stable)
+        # Keep the full pro-play distribution (aerials, boosting, flips) like the
+        # July-31 pipeline; only drop unsafe/invalid frames. The previous
+        # ``stable`` filter required both cars grounded and non-mechanical, which
+        # stripped exactly the aerial/contest states needed to learn
+        # catches/flicks/aerials.
+        eligible = np.flatnonzero(~unsafe & ~invalid)
         if len(eligible):
             if quota is not None and len(eligible) > quota:
                 eligible = random.choice(eligible, size=quota, replace=False)
             rows.append(np.asarray(source[eligible, :51], dtype=np.float32))
 
     if not rows:
-        raise ValueError(f"no safe grounded 1v1 states found in {replay_dir}")
+        raise ValueError(f"no valid 1v1 states found in {replay_dir}")
 
     states = np.concatenate(rows)
     if limit is not None and len(states) > limit:
