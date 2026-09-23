@@ -4,6 +4,23 @@ import numpy as np
 BALL_DRAG = 0.03
 BALL_GRAVITY = 650.0
 UNSAFE_IMPULSE_SPEED = 400.0
+GOAL_EXCLUSION_SECONDS = 5.0
+TICKS_PER_SECOND = 120
+
+
+def pre_goal_start_mask(
+    n_frames: int,
+    frame_skip: int,
+    goal_tick: float,
+    first_tick: float = 0.0,
+) -> np.ndarray:
+    """Mark sampled starts in the five seconds immediately before a goal."""
+    if frame_skip < 1:
+        raise ValueError("frame skip must be positive")
+    ticks = first_tick + np.arange(n_frames) * frame_skip
+    return (ticks > goal_tick - GOAL_EXCLUSION_SECONDS * TICKS_PER_SECOND) & (
+        ticks <= goal_tick
+    )
 
 
 def _with_guard_rows(rows: np.ndarray) -> np.ndarray:

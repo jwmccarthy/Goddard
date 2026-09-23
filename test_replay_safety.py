@@ -5,11 +5,18 @@ import numpy as np
 from replay_safety import (
     infer_unsafe_start_mask,
     nearest_safe_start_map,
+    pre_goal_start_mask,
     source_unsafe_start_mask,
 )
 
 
 class ReplaySafetyTest(unittest.TestCase):
+    def test_pre_goal_window_keeps_frame_exactly_five_seconds_before_goal(self):
+        np.testing.assert_array_equal(
+            pre_goal_start_mask(11, 120, goal_tick=1200),
+            [False] * 6 + [True] * 5,
+        )
+
     def test_source_collision_marks_blended_row_and_neighbors(self):
         ticks = np.array([0.0, 4.2, 8.4])
         velocity = np.array([

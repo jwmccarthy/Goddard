@@ -327,6 +327,7 @@ class SelfPlayTest(unittest.TestCase):
                 path.with_suffix(".unsafe-starts.npz"),
                 unsafe=np.zeros(3, dtype=bool),
                 frame_skip=4,
+                pre_goal=np.zeros(3, dtype=bool),
             )
 
             dataset = load_demonstration_reset_dataset(
@@ -354,6 +355,7 @@ class SelfPlayTest(unittest.TestCase):
                 path.with_suffix(".unsafe-starts.npz"),
                 unsafe=np.zeros(2, dtype=bool),
                 frame_skip=4,
+                pre_goal=np.zeros(2, dtype=bool),
             )
 
             dataset = load_demonstration_reset_dataset(Path(directory), "cpu")
@@ -376,6 +378,7 @@ class SelfPlayTest(unittest.TestCase):
                 path.with_suffix(".unsafe-starts.npz"),
                 unsafe=np.zeros(2, dtype=bool),
                 frame_skip=4,
+                pre_goal=np.zeros(2, dtype=bool),
             )
 
             dataset = load_demonstration_reset_dataset(

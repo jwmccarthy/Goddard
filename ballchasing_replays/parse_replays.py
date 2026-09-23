@@ -14,7 +14,7 @@ from rlgym.rocket_league.api import Car, PhysicsObject
 from rlgym_tools.rocket_league.replays.convert import replay_to_rlgym
 from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay, process_replay
 from rlgym_tools.rocket_league.replays.replay_frame import ReplayFrame
-from replay_safety import source_unsafe_start_mask
+from replay_safety import pre_goal_start_mask, source_unsafe_start_mask
 
 
 NORM_POS = np.array([4108, 6000, 2076])
@@ -40,7 +40,7 @@ MAX_REPLAY_ANGULAR_VELOCITY_ERROR = 4.0
 MAX_REPLAY_QUATERNION_ERROR = 0.05
 INTERNAL_STATE_SIZE = 19
 EVENT_FEATURES = 4
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -96,7 +96,11 @@ def _get_active_frames(
     bounds = [
         (
             times[period["start_frame"]],
-            times[period.get("goal_frame") or period["end_frame"]]
+            times[
+                period["goal_frame"]
+                if period.get("goal_frame") is not None
+                else period["end_frame"]
+            ]
         )
         for period in periods
     ]
@@ -435,6 +439,7 @@ def _parse(
 
     first = next(frames[0][0] for frames in active_frames if frames)
     ego_ids = list(first.state.cars.keys())
+    times = replay.game_df["time"].to_numpy() * 120.0
 
     if pov_players is not None:
         selected = set(pov_players)
@@ -515,6 +520,15 @@ def _parse(
             if not np.isfinite(obs).all():
                 continue
 
+            goal_frame = replay.analyzer["gameplay_periods"][i].get("goal_frame")
+            pre_goal = (
+                pre_goal_start_mask(
+                    len(obs), frame_skip, times[goal_frame], ticks[0]
+                )
+                if goal_frame is not None
+                else np.zeros(len(obs), dtype=bool)
+            )
+
             output = output_dir / f"{ego_id}-{i}-{name}"
             np.save(output.with_suffix(".npy"), obs)
             np.savez_compressed(
@@ -526,6 +540,7 @@ def _parse(
                 output.with_suffix(".unsafe-starts.npz"),
                 unsafe=unsafe_starts,
                 frame_skip=frame_skip,
+                pre_goal=pre_goal,
             )
             written += 1
 

@@ -1,4 +1,5 @@
 import math
+import re
 
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import torch as th
 from jarl.data import TensorBatch, TensorDataset
 
 from physics_utils import forward_up_to_quat
-from replay_safety import infer_unsafe_start_mask
+from replay_safety import infer_unsafe_start_mask, pre_goal_start_mask
 from tracker import (
     BALL_MAX_ANG_SPEED,
     BALL_MAX_SPEED,
@@ -17,6 +18,17 @@ from tracker import (
     CAR_MAX_SPEED,
     POSITION_SCALE,
 )
+
+
+def _sampled_frame_skip(path: Path, fallback: int) -> int:
+    """Read the parse marker when an older replay has no safety sidecar."""
+    replay_name = path.stem.split("-", 2)[-1]
+    skips = set()
+    for marker in path.parent.glob(f".{replay_name}.v*-fs*.complete"):
+        match = re.search(r"-fs(\d+)(?:-pov-[^.]+)?\.complete$", marker.name)
+        if match:
+            skips.add(int(match.group(1)))
+    return skips.pop() if len(skips) == 1 else fallback
 
 
 def load_demonstration_reset_dataset(
@@ -43,21 +55,36 @@ def load_demonstration_reset_dataset(
     for path in paths:
         source = np.load(path, mmap_mode="r")
         unsafe_path = path.with_suffix(".unsafe-starts.npz")
+        sampled_frame_skip = frame_skip
+        pre_goal = None
         if unsafe_path.is_file():
             with np.load(unsafe_path) as stored:
                 unsafe = np.asarray(stored["unsafe"], dtype=bool)
-                stored_skip = int(stored.get("frame_skip", frame_skip))
-            if require_frame_skip_match and stored_skip != frame_skip:
+                sampled_frame_skip = int(stored.get("frame_skip", frame_skip))
+                if "pre_goal" in stored:
+                    pre_goal = np.asarray(stored["pre_goal"], dtype=bool)
+            if require_frame_skip_match and sampled_frame_skip != frame_skip:
                 raise ValueError(
                     f"unsafe-start mask for {path.name} uses frame skip "
-                    f"{stored_skip}, expected {frame_skip}"
+                    f"{sampled_frame_skip}, expected {frame_skip}"
                 )
             if unsafe.shape != (len(source),):
                 raise ValueError(f"unsafe-start mask for {path.name} has wrong shape")
         else:
+            sampled_frame_skip = _sampled_frame_skip(path, frame_skip)
             unsafe = infer_unsafe_start_mask(
-                source[:, 3:6] * BALL_MAX_SPEED, frame_skip
+                source[:, 3:6] * BALL_MAX_SPEED, sampled_frame_skip
             )
+
+        if pre_goal is None:
+            # Older parsed replays lack goal annotations. Conservatively treat
+            # every segment end as a goal, using its sampled (not training) skip.
+            pre_goal = pre_goal_start_mask(
+                len(source), sampled_frame_skip,
+                (len(source) - 1) * sampled_frame_skip,
+            )
+        if pre_goal.shape != (len(source),):
+            raise ValueError(f"pre-goal mask for {path.name} has wrong shape")
 
         invalid = source[:, -4:].astype(bool).any(axis=-1)
         # Keep the full pro-play distribution (aerials, boosting, flips) like the
@@ -65,7 +92,7 @@ def load_demonstration_reset_dataset(
         # ``stable`` filter required both cars grounded and non-mechanical, which
         # stripped exactly the aerial/contest states needed to learn
         # catches/flicks/aerials.
-        eligible = np.flatnonzero(~unsafe & ~invalid)
+        eligible = np.flatnonzero(~unsafe & ~invalid & ~pre_goal)
         if len(eligible):
             if quota is not None and len(eligible) > quota:
                 eligible = random.choice(eligible, size=quota, replace=False)
