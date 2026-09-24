@@ -59,7 +59,7 @@ class GameplayDiagnosticsTest(unittest.TestCase):
             return SimpleNamespace(
                 done=torch.tensor([True, True]),
                 truncated=torch.tensor([False, False]),
-                info={"seer/aggregate/zero_sum": [1.0]},
+                info={"seer/aggregate/outcome_adjusted": [1.0]},
             )
 
         with patch.object(SelfPlayRunner, "step", rematch_then_return_step):
@@ -71,7 +71,7 @@ class GameplayDiagnosticsTest(unittest.TestCase):
              "goals_against": 0.0, "episodes": 1.0, "timeouts": 0.0},
         )
         self.assertEqual(
-            runner.diagnostic_metrics()["Seer"]["aggregate/zero_sum"],
+            runner.diagnostic_metrics()["Seer"]["aggregate/outcome_adjusted"],
             1.0,
         )
 

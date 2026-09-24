@@ -187,7 +187,7 @@ class SeerRewardTest(unittest.TestCase):
         context.current.raw[0, 9 + 16] = 1.0
 
         reward = SeerReward(1, 1, normalize=False)
-        th.testing.assert_close(reward(context), th.tensor([[0.005, -0.005]]))
+        th.testing.assert_close(reward(context), th.tensor([[0.005, 0.0]]))
 
     def test_default_occupancy_weights_do_not_pay_for_stationary_possession(self):
         context = make_context(
@@ -204,44 +204,54 @@ class SeerRewardTest(unittest.TestCase):
 
         th.testing.assert_close(reward(context), th.zeros((1, 2)))
 
-    def test_full_opponent_subtraction_of_touch_shaping_for_both_sides(self):
+    def test_touch_shaping_is_local_for_both_sides(self):
         weights = zero_seer_weights(touch_acceleration=1.0)
         reward = SeerReward(1, 1, normalize=False, weights=weights)
         th.testing.assert_close(
             reward(make_context(touched_car=0, ball_speed=2300.0)),
-            th.tensor([[1.0, -1.0]]),
+            th.tensor([[1.0, 0.0]]),
         )
         th.testing.assert_close(
             reward(make_context(touched_car=1, ball_speed=2300.0)),
-            th.tensor([[-1.0, 1.0]]),
+            th.tensor([[0.0, 1.0]]),
         )
         th.testing.assert_close(
             reward(make_context(touched_car=(0, 1), ball_speed=2300.0)),
-            th.zeros((1, 2)),
+            th.ones((1, 2)),
         )
 
-    def test_full_opponent_team_mean_in_two_vs_two(self):
+    def test_shaping_stays_local_in_two_vs_two(self):
         reward = SeerReward(
             2, 2, normalize=False,
             weights=zero_seer_weights(touch_acceleration=1.0),
         )
         th.testing.assert_close(
             reward(make_context(n_blue=2, n_orange=2, touched_car=0, ball_speed=2300.0)),
-            th.tensor([[1.0, 0.0, -0.5, -0.5]]),
+            th.tensor([[1.0, 0.0, 0.0, 0.0]]),
         )
         th.testing.assert_close(
             reward(make_context(n_blue=2, n_orange=2, touched_car=2, ball_speed=2300.0)),
-            th.tensor([[-0.5, -0.5, 1.0, 0.0]]),
+            th.tensor([[0.0, 0.0, 1.0, 0.0]]),
         )
 
-    def test_goal_and_touch_shaping_are_both_opponent_subtracted(self):
+    def test_goals_are_opponent_subtracted_in_two_vs_two(self):
+        reward = SeerReward(
+            2, 2, normalize=False,
+            weights=zero_seer_weights(goal_scored=10.0),
+        )
+        th.testing.assert_close(
+            reward(make_context(n_blue=2, n_orange=2, score_delta=1)),
+            th.tensor([[10.0, 10.0, -10.0, -10.0]]),
+        )
+
+    def test_goal_competes_while_touch_shaping_stays_local(self):
         reward = SeerReward(
             1, 1, normalize=False,
             weights=zero_seer_weights(goal_scored=10.0, touch_acceleration=1.0),
         )
         th.testing.assert_close(
             reward(make_context(score_delta=1, touched_car=0, ball_speed=2300.0)),
-            th.tensor([[11.0, -11.0]]),
+            th.tensor([[11.0, -10.0]]),
         )
 
     def test_demo_uses_half_opponent_minus_self_before_zero_sum(self):
@@ -309,7 +319,7 @@ class SeerRewardTest(unittest.TestCase):
         )
         th.testing.assert_close(goal, no_goal)
         self.assertLess(float(goal[0, 0]), 0.0)
-        th.testing.assert_close(goal[0, 0], -goal[0, 1])
+        self.assertGreater(float(goal[0, 1]), 0.0)
 
     def test_ball_touch_only_pays_on_forward_progress(self):
         weights = zero_seer_weights(ball_touch=1.0)
@@ -320,7 +330,7 @@ class SeerRewardTest(unittest.TestCase):
             make_context(ball_y=-500.0, touched_car=0)
         )
         self.assertGreater(float(forward[0, 0]), 0.0)
-        th.testing.assert_close(forward[0, 0], -forward[0, 1])
+        th.testing.assert_close(forward[0, 1], th.tensor(0.0))
         th.testing.assert_close(backward, th.zeros((1, 2)))
 
     def test_flip_reset_and_aerial_touch(self):
@@ -332,7 +342,7 @@ class SeerRewardTest(unittest.TestCase):
             weights=zero_seer_weights(flip_reset=10.0, aerial_touch=1.0),
         )
         expected = 10.0 + 500.0 / 2250.0
-        th.testing.assert_close(reward(context), th.tensor([[expected, -expected]]))
+        th.testing.assert_close(reward(context), th.tensor([[expected, 0.0]]))
 
     def test_short_air_dribble_starts_and_pays_for_positive_progress(self):
         reward = SeerReward(
@@ -345,7 +355,7 @@ class SeerRewardTest(unittest.TestCase):
         ))
         air_height = (400.0 - 2 * BALL_RADIUS) / (CEILING_Z - 2 * BALL_RADIUS)
         expected_start = 0.5 * air_height + 100.0 / (CEILING_Z - 2 * BALL_RADIUS) + 0.1
-        th.testing.assert_close(start, th.tensor([[expected_start, -expected_start]]))
+        th.testing.assert_close(start, th.tensor([[expected_start, 0.0]]))
 
         steady = reward(make_context(
             ball_z=400.0, previous_ball_z=400.0,
@@ -360,7 +370,7 @@ class SeerRewardTest(unittest.TestCase):
             car_z=300.0, episode_ticks=16,
         ))
         expected_rising = 50.0 / (CEILING_Z - 2 * BALL_RADIUS)
-        th.testing.assert_close(rising, th.tensor([[expected_rising, -expected_rising]]))
+        th.testing.assert_close(rising, th.tensor([[expected_rising, 0.0]]))
 
         expired = reward(make_context(
             ball_z=500.0, previous_ball_z=450.0,
@@ -385,7 +395,7 @@ class SeerRewardTest(unittest.TestCase):
             ball_y=700.0, previous_ball_y=0.0, ball_z=100.0,
             previous_ball_z=420.0, car_z=300.0, episode_ticks=16,
         )
-        th.testing.assert_close(reward(landing), th.tensor([[1.0, -1.0]]))
+        th.testing.assert_close(reward(landing), th.tensor([[1.0, 0.0]]))
         th.testing.assert_close(reward(landing), th.zeros((1, 2)))
 
     def test_short_air_dribble_does_not_start_along_wall(self):
@@ -405,29 +415,39 @@ class SeerRewardTest(unittest.TestCase):
         for _ in range(35):
             th.testing.assert_close(reward(make_context()), th.zeros((1, 2)))
 
-    def test_normalization_centers_using_running_variance(self):
+    def test_normalization_scales_without_centering(self):
         reward = SeerReward(1, 1)
         th.testing.assert_close(
             reward._normalize(th.tensor([[0.0, 2.0]])),
-            th.tensor([[-1.0, 1.0]]),
+            th.tensor([[0.0, math.sqrt(2.0)]]),
         )
         th.testing.assert_close(
             reward._normalize(th.tensor([[0.0, 4.0]])),
-            th.tensor([[-1.5, 2.5]]) / math.sqrt(2.75),
+            th.tensor([[0.0, 4.0]]) / math.sqrt(5.0),
         )
         self.assertEqual(reward._count, 4)
 
-    def test_default_normalization_keeps_opponent_rewards_opposite(self):
+    def test_default_normalization_preserves_local_shaping(self):
         reward = SeerReward(
             1, 1, weights=zero_seer_weights(touch_acceleration=1.0)
         )
         th.testing.assert_close(
             reward(make_context(touched_car=0, ball_speed=2300.0)),
-            th.tensor([[1.0, -1.0]]),
+            th.tensor([[math.sqrt(2.0), 0.0]]),
         )
         th.testing.assert_close(
             reward(make_context(touched_car=1, ball_speed=4600.0)),
-            th.tensor([[-2.0, 2.0]]) / math.sqrt(2.5),
+            th.tensor([[0.0, 2.0]]) / math.sqrt(1.25),
+        )
+
+    def test_competitive_goals_remain_opposite_with_default_normalization(self):
+        reward = SeerReward(
+            1, 1,
+            weights=zero_seer_weights(goal_scored=10.0, touch_acceleration=1.0),
+        )
+        th.testing.assert_close(
+            reward(make_context(score_delta=1, touched_car=0, ball_speed=2300.0)),
+            th.tensor([[11.0, -10.0]]) / math.sqrt(110.5),
         )
 
     def test_public_scales_keep_goal_reward_separate_from_shaping(self):
@@ -436,7 +456,7 @@ class SeerRewardTest(unittest.TestCase):
             weights=zero_seer_weights(goal_scored=10.0, touch_acceleration=1.0),
         )
         context = make_context(score_delta=1, touched_car=0, ball_speed=2300.0)
-        th.testing.assert_close(reward(context), th.tensor([[11.0, -11.0]]))
+        th.testing.assert_close(reward(context), th.tensor([[11.0, -10.0]]))
         reward.set_shaping_scale(0.0)
         th.testing.assert_close(reward(context), th.tensor([[10.0, -10.0]]))
         reward.set_goal_scored_weight(7.0)
@@ -446,7 +466,7 @@ class SeerRewardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             reward.set_goal_scored_weight(0.0)
 
-    def test_diagnostics_report_per_episode_means_and_zero_sum(self):
+    def test_diagnostics_report_per_episode_means_and_outcome_adjusted_reward(self):
         reward = SeerReward(
             1, 1, normalize=False, log_diagnostics=True,
             weights=zero_seer_weights(touch_acceleration=1.0),
@@ -459,12 +479,12 @@ class SeerRewardTest(unittest.TestCase):
         for name in ("seer/component/touch_acceleration", "seer/aggregate/raw"):
             self.assertAlmostEqual(info[name][0], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(info[name][1], 2.0 / 3.0, places=6)
-        for name in ("seer/aggregate/zero_sum", "seer/aggregate/normalized"):
-            self.assertAlmostEqual(info[name][0], -1.0 / 3.0, places=6)
-            self.assertAlmostEqual(info[name][1], 1.0 / 3.0, places=6)
+        for name in ("seer/aggregate/outcome_adjusted", "seer/aggregate/normalized"):
+            self.assertAlmostEqual(info[name][0], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(info[name][1], 2.0 / 3.0, places=6)
         self.assertAlmostEqual(info["seer/scale/raw"][0], math.sqrt(1.0 / 3.0), places=6)
-        self.assertAlmostEqual(info["seer/scale/zero_sum"][0], math.sqrt(5.0 / 3.0), places=6)
-        self.assertNotIn("seer/aggregate/outcome_adjusted", info)
+        self.assertAlmostEqual(info["seer/scale/outcome_adjusted"][0], math.sqrt(1.0 / 3.0), places=6)
+        self.assertNotIn("seer/aggregate/zero_sum", info)
 
 
 if __name__ == "__main__":

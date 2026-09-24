@@ -1076,15 +1076,25 @@ class SeerReward:
 
         components = self._scale_components(components)
         raw_reward = sum(components.values())
-        zero_sum_reward = self._zero_sum(raw_reward)
-        reward = zero_sum_reward
+        competitive_reward = sum(
+            components[name]
+            for name in (
+                "goal_scored", "goal_speed_bonus", "goal_distance_bonus",
+                "demo", "win_probability",
+            )
+        )
+        outcome_adjusted_reward = raw_reward - self._opponent_team_mean(
+            competitive_reward
+        )
+        reward = outcome_adjusted_reward
 
         if self.normalize:
             reward = self._normalize(reward)
 
         info = (
             self._diagnostics(
-                components, raw_reward, zero_sum_reward, reward, context.events.done
+                components, raw_reward, outcome_adjusted_reward, reward,
+                context.events.done,
             )
             if self.log_diagnostics
             else {}
@@ -1148,13 +1158,13 @@ class SeerReward:
         self,
         components: dict[str, torch.Tensor],
         raw:        torch.Tensor,
-        zero_sum:   torch.Tensor,
+        outcome_adjusted: torch.Tensor,
         normalized: torch.Tensor,
         done:       torch.Tensor,
     ) -> dict[str, list[float]]:
         names = tuple(components)
         values = torch.stack(tuple(components.values()), dim=-1)
-        aggregates = torch.stack((raw, zero_sum, normalized), dim=-1)
+        aggregates = torch.stack((raw, outcome_adjusted, normalized), dim=-1)
 
         if self._diagnostic_sums is None:
             shape = (*raw.shape, len(names) + 3)
@@ -1190,7 +1200,7 @@ class SeerReward:
             for index, name in enumerate(names)
         }
 
-        for index, name in enumerate(("raw", "zero_sum", "normalized")):
+        for index, name in enumerate(("raw", "outcome_adjusted", "normalized")):
             info[f"seer/aggregate/{name}"] = means[:, len(names) + index].cpu().tolist()
             info[f"seer/scale/{name}"] = rms[:, index].cpu().tolist()
 
@@ -1211,9 +1221,6 @@ class SeerReward:
             dim=-1,
         )
 
-    def _zero_sum(self, reward: torch.Tensor) -> torch.Tensor:
-        return reward - self._opponent_team_mean(reward)
-
     def _normalize(self, reward: torch.Tensor) -> torch.Tensor:
         batch_count = reward.numel()
         batch_mean = reward.mean()
@@ -1233,7 +1240,7 @@ class SeerReward:
             self._variance = (first + second + correction) / total
             self._count = total
 
-        return (reward - self._mean) / self._variance.clamp_min(1e-8).sqrt()
+        return reward / (self._variance + self._mean.square()).clamp_min(1e-8).sqrt()
 
     @staticmethod
     def _unit(value: torch.Tensor) -> torch.Tensor:

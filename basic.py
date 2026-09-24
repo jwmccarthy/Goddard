@@ -429,7 +429,7 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
 
     reward_metric_keys = (
         "seer/aggregate/raw",
-        "seer/aggregate/zero_sum",
+        "seer/aggregate/outcome_adjusted",
         "seer/aggregate/normalized",
         "seer/component/goal_scored",
         "seer/component/win_probability",
@@ -567,7 +567,9 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         self._reward_diagnostics.clear()
         reward = self.transition_reward
         if reward is not None and reward.normalize and reward._count:
-            seer["normalizer_std"] = reward._variance.clamp_min(1e-8).sqrt().item()
+            seer["normalizer_rms"] = (
+                reward._variance + reward._mean.square()
+            ).clamp_min(1e-8).sqrt().item()
         if seer:
             report["Seer"] = seer
         return report
@@ -844,8 +846,8 @@ def main(algorithm: str = "ppo") -> None:
             ("PPO", "optimizer_minibatches", "minibatches", ".0f"),
             ("episode", "current_reward", "current reward", ".3f"),
             ("episode", "historical_reward", "historical reward", ".3f"),
-            ("Seer", "aggregate/zero_sum", "raw reward", ".3f"),
-            ("Seer", "normalizer_std", "reward std", ".3f"),
+            ("Seer", "aggregate/outcome_adjusted", "raw reward", ".3f"),
+            ("Seer", "normalizer_rms", "reward RMS", ".3f"),
             ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
             ("Gameplay", "goals_for_per_1000_steps", "goals for/1k", ".3f"),
             ("Gameplay", "goals_against_per_1000_steps", "goals against/1k", ".3f"),
