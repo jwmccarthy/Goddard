@@ -52,6 +52,20 @@ from rewards import SeerReward
 from replay_resets import load_demonstration_reset_dataset
 
 
+class DiagnosticSeerReward(SeerReward):
+    """Keep transition events available after CARL autoresets finished games."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.last_touches: torch.Tensor | None = None
+        self.last_score_delta: torch.Tensor | None = None
+
+    def __call__(self, context):
+        self.last_touches = context.current.car_ball_touches.detach().clone()
+        self.last_score_delta = context.events.score_delta.detach().clone()
+        return super().__call__(context)
+
+
 class SyntheticMatchResetProvider:
     def __init__(self, provider) -> None:
         self.provider = provider
@@ -80,6 +94,45 @@ class SyntheticMatchResetProvider:
             episode_ticks=elapsed.to(torch.int32),
         )
         return state
+
+
+class KLLimitedUpdate(Update):
+    """Stop PPO minibatches when the on-policy ratio has drifted too far."""
+
+    def __init__(self, *, target_kl: float, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.target_kl = target_kl
+        self._early_stopped = False
+        self._stop_kl = 0.0
+        self._minibatches = 0
+
+    def _process_minibatches(self, batch):
+        totals = {}
+        self._minibatches = 0
+        self._early_stopped = False
+        self._stop_kl = 0.0
+        for sample in self.sampler(batch):
+            output = self._normalize_loss_output(self.loss(sample))
+            kl = self._to_float(output.metrics["approx_kl"])
+            if not math.isfinite(kl):
+                raise RuntimeError("non-finite PPO approximate KL")
+            if kl > self.target_kl:
+                self._early_stopped = True
+                self._stop_kl = kl
+                break
+            self.optimizer_step(output.loss)
+            self._accumulate_metrics(totals, output.metrics)
+            self._minibatches += 1
+        return totals, self._minibatches
+
+    def update(self, experience):
+        metrics = super().update(experience)
+        metrics[self.section].update(
+            kl_early_stop=float(self._early_stopped),
+            kl_stop_value=self._stop_kl,
+            optimizer_minibatches=float(self._minibatches),
+        )
+        return metrics
 
 
 from training_checkpoint import TrainingCheckpointer
@@ -153,6 +206,7 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
         help="use BF16 autocast for PPO updates",
     )
     parser.add_argument("--epochs",                     type=int,   default=32)
+    parser.add_argument("--target-kl",                  type=float, default=0.02)
     parser.add_argument("--entropy-coef",               type=float, default=0.01)
     parser.add_argument("--entropy-coef-end",           type=float, default=0.005)
     parser.add_argument("--self-play-current",          type=float, default=0.8)
@@ -227,6 +281,7 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "minibatch-size":         arguments.minibatch_size,
         "learning-rate":          arguments.learning_rate,
         "epochs":                 arguments.epochs,
+        "target-kl":              arguments.target_kl,
         "reward-scale":           arguments.reward_scale,
         "discount-half-life":     arguments.discount_half_life,
         "discount-half-life-end": arguments.discount_half_life_end,
@@ -368,23 +423,37 @@ def build_policy_loss(
 class DiagnosticSelfPlayRunner(SelfPlayRunner):
     """Self-play runner that also tracks gameplay diagnostics for logging.
 
-    Gameplay statistics (touches, goals for/against, no-touch timeouts) are
-    read straight from the CARL environment's transition buffer after every
-    step, so the reward function is left untouched.
+    The reward callback captures touches and scores before CARL autoresets
+    finished games; the learner mask is captured before the league rematches.
     """
+
+    reward_metric_keys = (
+        "seer/aggregate/raw",
+        "seer/aggregate/zero_sum",
+        "seer/aggregate/normalized",
+        "seer/component/goal_scored",
+        "seer/component/win_probability",
+        "seer/component/boost_gain",
+        "seer/component/player_ball_progress",
+        "seer/component/touch_acceleration",
+        "seer/component/aerial_touch",
+    )
 
     def __init__(
         self,
         *args,
         n_blue: int = 1,
         no_touch_timeout_steps: int | None = None,
+        transition_reward: DiagnosticSeerReward | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.n_blue = n_blue
         self.no_touch_timeout_steps = no_touch_timeout_steps
+        self.transition_reward = transition_reward
         self._diagnostics: dict[str, torch.Tensor] | None = None
         self._touch_steps: torch.Tensor | None = None
+        self._reward_diagnostics: dict[str, tuple[float, int]] = {}
 
     def reset(self):
         observation = super().reset()
@@ -402,22 +471,33 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         self._touch_steps = torch.zeros(
             self.env.n_sim, dtype=torch.long, device=self.env.device
         )
+        self._reward_diagnostics.clear()
         return observation
 
     def step(self):
+        learner_mask = self.matchmaker.learner_mask.clone()
         env_step = super().step()
-        self._record_diagnostics(env_step)
+        self._record_diagnostics(env_step, learner_mask)
+        for name in self.reward_metric_keys:
+            values = env_step.info.get(name, ())
+            if values:
+                total, count = self._reward_diagnostics.get(name, (0.0, 0))
+                self._reward_diagnostics[name] = total + sum(values), count + len(values)
         return env_step
 
-    def _record_diagnostics(self, env_step) -> None:
+    def _record_diagnostics(self, env_step, learner_mask: torch.Tensor) -> None:
         if self._diagnostics is None or self._touch_steps is None:
             return
 
-        transition = self.env._carl_state(
-            self.env._env.get_transition_state()
-        )
-        touches = transition.car_ball_touches
-        score = self.env._tensor(self.env._env.get_rewards(), copy=True)
+        reward = self.transition_reward
+        if (
+            reward is None
+            or reward.last_touches is None
+            or reward.last_score_delta is None
+        ):
+            raise RuntimeError("transition diagnostics require a recorded reward")
+        touches = reward.last_touches
+        score = reward.last_score_delta
         n_cars = touches.shape[-1]
 
         touch = touches.reshape(-1)
@@ -444,7 +524,7 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
             timeout = simulation_timeout.repeat_interleave(n_cars)
         self._touch_steps[done.reshape(-1, n_cars).any(dim=-1)] = 0
 
-        learner = self.matchmaker.learner_mask
+        learner = learner_mask
         self._diagnostics["steps"] += learner.sum()
         self._diagnostics["touches"] += (touch & learner).sum()
         self._diagnostics["goals_for"] += ((score_for_actor > 0) & learner).sum()
@@ -475,18 +555,29 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
             self._diagnostics["episodes"].zero_()
             self._diagnostics["timeouts"].zero_()
 
-        return (
-            {"Gameplay": {name: value.item() for name, value in metrics.items()}}
-            if metrics
-            else {}
-        )
+        report = {}
+        if metrics:
+            report["Gameplay"] = {
+                name: value.item() for name, value in metrics.items()
+            }
+        seer = {
+            name.removeprefix("seer/"): total / count
+            for name, (total, count) in self._reward_diagnostics.items()
+        }
+        self._reward_diagnostics.clear()
+        reward = self.transition_reward
+        if reward is not None and reward.normalize and reward._count:
+            seer["normalizer_std"] = reward._variance.clamp_min(1e-8).sqrt().item()
+        if seer:
+            report["Seer"] = seer
+        return report
 
 
 def build_ppo(
     environment: CARLTorchVectorEnv,
     policy,
     critic,
-    reward_function: SeerReward,
+    reward_function: DiagnosticSeerReward,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
     algorithm: str = "ppo",
@@ -539,6 +630,7 @@ def build_ppo(
         ),
         n_blue=arguments.n_blue,
         no_touch_timeout_steps=no_touch_timeout_steps,
+        transition_reward=reward_function,
     )
 
     policy_optimizer = Adam(policy.parameters(), lr=arguments.learning_rate)
@@ -555,7 +647,9 @@ def build_ppo(
         arguments.entropy_coef,
         arguments.bf16,
     )
-    update = Update(
+    update_type = KLLimitedUpdate if algorithm == "ppo" else Update
+    update = update_type(
+        **({"target_kl": arguments.target_kl} if algorithm == "ppo" else {}),
         transforms=(
             TeamSpirit(
                 num_matches=environment.n_sim,
@@ -705,7 +799,7 @@ def main(algorithm: str = "ppo") -> None:
         discrete_actions=True,
     )
     reward_function = environment.register_reward(
-        SeerReward(
+        DiagnosticSeerReward(
             n_blue=arguments.n_blue,
             n_orange=arguments.n_orange,
             normalize=arguments.normalize_rewards,
@@ -746,8 +840,12 @@ def main(algorithm: str = "ppo") -> None:
             ("PPO", "critic_loss", "critic loss", ".4f"),
             ("PPO", "entropy", "entropy", ".3f"),
             ("PPO", "approx_kl", "approx KL", ".4f"),
+            ("PPO", "kl_early_stop", "KL stop", ".0f"),
+            ("PPO", "optimizer_minibatches", "minibatches", ".0f"),
             ("episode", "current_reward", "current reward", ".3f"),
             ("episode", "historical_reward", "historical reward", ".3f"),
+            ("Seer", "aggregate/zero_sum", "raw reward", ".3f"),
+            ("Seer", "normalizer_std", "reward std", ".3f"),
             ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
             ("Gameplay", "goals_for_per_1000_steps", "goals for/1k", ".3f"),
             ("Gameplay", "goals_against_per_1000_steps", "goals against/1k", ".3f"),
