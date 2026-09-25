@@ -5,12 +5,22 @@ from unittest.mock import patch
 
 import torch
 
+import basic
 from basic import DiagnosticSeerReward, DiagnosticSelfPlayRunner
 from basic import KLLimitedUpdate
 from jarl.collect import SelfPlayRunner
 from jarl.data import TensorBatch
 from jarl.learn.update import LossOutput
 from rewards import SeerReward
+
+
+class TrainingDefaultsTest(unittest.TestCase):
+    def test_seer_training_uses_long_episodes_and_replay_starts(self):
+        with patch("sys.argv", ["basic.py"]):
+            arguments = basic.parse_arguments()
+        self.assertEqual(arguments.no_touch_timeout, 30.0)
+        self.assertEqual(arguments.max_ticks, 36_000)
+        self.assertEqual(arguments.replay_reset_probability, 0.7)
 
 
 class GameplayDiagnosticsTest(unittest.TestCase):
@@ -59,7 +69,7 @@ class GameplayDiagnosticsTest(unittest.TestCase):
             return SimpleNamespace(
                 done=torch.tensor([True, True]),
                 truncated=torch.tensor([False, False]),
-                info={"seer/aggregate/outcome_adjusted": [1.0]},
+                info={"seer/aggregate/zero_sum": [1.0]},
             )
 
         with patch.object(SelfPlayRunner, "step", rematch_then_return_step):
@@ -71,7 +81,7 @@ class GameplayDiagnosticsTest(unittest.TestCase):
              "goals_against": 0.0, "episodes": 1.0, "timeouts": 0.0},
         )
         self.assertEqual(
-            runner.diagnostic_metrics()["Seer"]["aggregate/outcome_adjusted"],
+            runner.diagnostic_metrics()["Seer"]["aggregate/zero_sum"],
             1.0,
         )
 

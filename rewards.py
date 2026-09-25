@@ -238,7 +238,11 @@ class AnnealedNextoReward:
         velocity_player_ball = (
             self._unit(current.car_velocity) * direction_to_ball
         ).sum(dim=-1)
-        kickoff = velocity_player_ball * ball_position[..., :2].norm(dim=-1).lt(1.0)
+        kickoff = (
+            velocity_player_ball
+            * ball_position[..., :2].norm(dim=-1).lt(1.0)
+            * context.episode_ticks[:, None].lt(120)
+        )
         velocity = (current.car_velocity.norm(dim=-1) / CAR_MAX_SPEED).clamp_max(1.0)
         forward_velocity = (
             current.car_forward * current.car_velocity
@@ -713,21 +717,21 @@ class SeerRewardWeights:
     boost_gain:           float = 1.0
     boost_loss:           float = 0.5
     ball_touch:           float = 0.0
-    ball_height:          float = 0.0
-    ball_velocity:        float = 0.0
+    ball_height:          float = 0.00025
+    ball_velocity:        float = 0.00025
     demo:                 float = 5.0
-    distance_player_ball: float = 0.0
-    distance_ball_goal:   float = 0.0
-    facing_ball:          float = 0.0
-    align_ball_goal:      float = 0.0
-    closest_to_ball:      float = 0.0
-    touched_last:         float = 0.0
-    behind_ball:          float = 0.0
-    velocity_player_ball: float = 0.0
-    kickoff:              float = 0.0
-    velocity:             float = 0.0
-    boost_amount:         float = 0.0
-    forward_velocity:     float = 0.0
+    distance_player_ball: float = 0.0025
+    distance_ball_goal:   float = 0.0025
+    facing_ball:          float = 0.000625
+    align_ball_goal:      float = 0.0025
+    closest_to_ball:      float = 0.00125
+    touched_last:         float = 0.00025
+    behind_ball:          float = 0.00125
+    velocity_player_ball: float = 0.00125
+    kickoff:              float = 0.1
+    velocity:             float = 0.000625
+    boost_amount:         float = 0.00125
+    forward_velocity:     float = 0.0015
     ball_goal_progress:   float = 5.0
     player_ball_progress: float = 0.75
     alignment_progress:   float = 0.5
@@ -737,13 +741,18 @@ class SeerRewardWeights:
     flip_reset:           float = 10.0
     touch_grass:          float = 0.005
     win_probability:      float = 10.0
-    goal_time_bonus:      float = 1.0
-    air_dribble_start:    float = 0.5
-    air_dribble_progress: float = 1.0
-    air_dribble_complete: float = 1.0
+    # Later experiments remain available explicitly without changing the
+    # successful f7cab81 reward's default behavior.
+    kickoff_touch:        float = 0.0
+    goal_time_bonus:      float = 0.0
+    air_dribble_start:    float = 0.0
+    air_dribble_progress: float = 0.0
+    air_dribble_complete: float = 0.0
 
 
 class SeerReward:
+    """The July 31 f7cab81 zero-sum reward, with later experiments opt-in."""
+
     def __init__(
         self,
         n_blue:          int,
@@ -751,13 +760,19 @@ class SeerReward:
         normalize:       bool = True,
         log_diagnostics: bool = False,
         weights:         SeerRewardWeights = SeerRewardWeights(),
+        zero_sum_shaping: bool = True,
+        kickoff_window_ticks: int | None = None,
     ) -> None:
+        if kickoff_window_ticks is not None and kickoff_window_ticks < 1:
+            raise ValueError("kickoff window must be positive")
         self.n_blue = n_blue
         self.n_orange = n_orange
         self.n_cars = n_blue + n_orange
         self.normalize = normalize
         self.log_diagnostics = log_diagnostics
         self.weights = weights
+        self.zero_sum_shaping = zero_sum_shaping
+        self.kickoff_window_ticks = kickoff_window_ticks
         self.shaping_scale = 1.0
         self._touch_decay = None
         self._last_touch = None
@@ -894,50 +909,55 @@ class SeerReward:
             - torch.exp(-previous_ball_to_goal.norm(dim=-1) / BALL_MAX_SPEED)
         )
 
-        # Track short air-dribble sequences. Rewards require new contacts or
-        # positive state changes, so stable airborne states do not pay.
-        new_air_touch = touches & ~previous_touches
-        car_airborne = ~current.car_on_ground & current.car_position[..., 2].gt(
-            1.5 * BALL_RADIUS
-        )
-        ball_airborne = ball_position[..., 2].gt(2.0 * BALL_RADIUS)
-        wall_clearance = torch.minimum(
-            (SIDE_WALL_X - ball_position[..., 0].abs()) / SIDE_WALL_X,
-            (BACK_WALL_Y - ball_position[..., 1].abs()) / BACK_WALL_Y,
-        ).clamp(0.0, 1.0)
-        air_height = (
-            (ball_position[..., 2] - 2.0 * BALL_RADIUS)
-            / (CEILING_Z - 2.0 * BALL_RADIUS)
-        ).clamp(0.0, 1.0)
-        air_start = new_air_touch & car_airborne & ball_airborne & wall_clearance.gt(0.1)
-        self._air_active |= air_start
-        self._air_contacts += air_start.to(self._air_contacts.dtype)
-        self._air_last_touch_tick = torch.where(
-            new_air_touch, context.episode_ticks[:, None], self._air_last_touch_tick
-        )
-        air_timeout = context.episode_ticks[:, None] - self._air_last_touch_tick > 30
-        air_invalid = (~ball_airborne) | current.car_on_ground | wall_clearance.lt(0.02)
-        air_sequence = self._air_active & ~air_invalid & ~air_timeout
-        previous_height = (
-            (previous_ball_position[..., 2] - 2.0 * BALL_RADIUS)
-            / (CEILING_Z - 2.0 * BALL_RADIUS)
-        ).clamp(0.0, 1.0)
-        air_height_progress = (air_height - previous_height).clamp_min(0.0)
-        air_lift = (
-            (current.ball_velocity[:, 2] - previous.ball_velocity[:, 2])[:, None]
-            / CAR_MAX_SPEED
-        ).clamp_min(0.0)
-        air_dribble_start = air_start.float() * air_height * wall_clearance
-        air_dribble_progress = air_sequence.float() * (
-            air_height_progress + ball_goal_progress.clamp_min(0.0) + air_lift
-        )
-        air_dribble_complete = (
-            self._air_active & (self._air_contacts >= 2)
-            & (air_height_progress + ball_goal_progress).gt(0.01)
-            & (air_invalid | air_timeout)
-        ).float()
-        self._air_active &= ~air_invalid & ~air_timeout
-        self._air_contacts *= self._air_active.to(self._air_contacts.dtype)
+        if any((self.weights.air_dribble_start, self.weights.air_dribble_progress,
+                self.weights.air_dribble_complete)):
+            # Optional later reward experiment; f7cab81 does not pay for this.
+            new_air_touch = touches & ~previous_touches
+            car_airborne = ~current.car_on_ground & current.car_position[..., 2].gt(
+                1.5 * BALL_RADIUS
+            )
+            ball_airborne = ball_position[..., 2].gt(2.0 * BALL_RADIUS)
+            wall_clearance = torch.minimum(
+                (SIDE_WALL_X - ball_position[..., 0].abs()) / SIDE_WALL_X,
+                (BACK_WALL_Y - ball_position[..., 1].abs()) / BACK_WALL_Y,
+            ).clamp(0.0, 1.0)
+            air_height = (
+                (ball_position[..., 2] - 2.0 * BALL_RADIUS)
+                / (CEILING_Z - 2.0 * BALL_RADIUS)
+            ).clamp(0.0, 1.0)
+            air_start = new_air_touch & car_airborne & ball_airborne & wall_clearance.gt(0.1)
+            self._air_active |= air_start
+            self._air_contacts += air_start.to(self._air_contacts.dtype)
+            self._air_last_touch_tick = torch.where(
+                new_air_touch, context.episode_ticks[:, None], self._air_last_touch_tick
+            )
+            air_timeout = context.episode_ticks[:, None] - self._air_last_touch_tick > 30
+            air_invalid = (~ball_airborne) | current.car_on_ground | wall_clearance.lt(0.02)
+            air_sequence = self._air_active & ~air_invalid & ~air_timeout
+            previous_height = (
+                (previous_ball_position[..., 2] - 2.0 * BALL_RADIUS)
+                / (CEILING_Z - 2.0 * BALL_RADIUS)
+            ).clamp(0.0, 1.0)
+            air_height_progress = (air_height - previous_height).clamp_min(0.0)
+            air_lift = (
+                (current.ball_velocity[:, 2] - previous.ball_velocity[:, 2])[:, None]
+                / CAR_MAX_SPEED
+            ).clamp_min(0.0)
+            air_dribble_start = air_start.float() * air_height * wall_clearance
+            air_dribble_progress = air_sequence.float() * (
+                air_height_progress + ball_goal_progress.clamp_min(0.0) + air_lift
+            )
+            air_dribble_complete = (
+                self._air_active & (self._air_contacts >= 2)
+                & (air_height_progress + ball_goal_progress).gt(0.01)
+                & (air_invalid | air_timeout)
+            ).float()
+            self._air_active &= ~air_invalid & ~air_timeout
+            self._air_contacts *= self._air_active.to(self._air_contacts.dtype)
+        else:
+            air_dribble_start = air_dribble_progress = air_dribble_complete = torch.zeros_like(
+                ball_goal_progress
+            )
         previous_car_to_ball = previous_ball_position - previous.car_position
         player_ball_progress = (
             torch.exp(-distance_to_ball / 1410.0)
@@ -1025,6 +1045,13 @@ class SeerReward:
             self._unit(current.car_velocity) * direction_to_ball
         ).sum(dim=-1)
         kickoff = velocity_player_ball * ball_position[..., :2].norm(dim=-1).lt(1.0)
+        if self.kickoff_window_ticks is not None:
+            kickoff = kickoff * context.episode_ticks[:, None].lt(
+                self.kickoff_window_ticks
+            )
+        kickoff_touch = (touches & ~previous_touches).float() * (
+            context.episode_ticks[:, None].lt(600)
+        )
         velocity = (current.car_velocity.norm(dim=-1) / CAR_MAX_SPEED).clamp_max(1.0)
         boost_amount = boost_current
         forward_velocity = (current.car_forward * current.car_velocity).sum(
@@ -1057,6 +1084,7 @@ class SeerReward:
             "behind_ball":          weights.behind_ball * behind_ball,
             "velocity_player_ball": weights.velocity_player_ball * velocity_player_ball,
             "kickoff":              weights.kickoff * kickoff,
+            "kickoff_touch":        weights.kickoff_touch * kickoff_touch,
             "velocity":             weights.velocity * velocity,
             "boost_amount":         weights.boost_amount * boost_amount,
             "forward_velocity":     weights.forward_velocity * forward_velocity,
@@ -1076,25 +1104,28 @@ class SeerReward:
 
         components = self._scale_components(components)
         raw_reward = sum(components.values())
-        competitive_reward = sum(
-            components[name]
-            for name in (
-                "goal_scored", "goal_speed_bonus", "goal_distance_bonus",
-                "demo", "win_probability",
+        if self.zero_sum_shaping:
+            opponent_reward = raw_reward
+        else:
+            # Explicit opt-in for the later local-shaping experiment.
+            opponent_reward = sum(
+                components[name]
+                for name in (
+                    "goal_scored", "goal_speed_bonus", "goal_distance_bonus",
+                    "demo", "win_probability",
+                )
             )
-        )
-        outcome_adjusted_reward = raw_reward - self._opponent_team_mean(
-            competitive_reward
-        )
-        reward = outcome_adjusted_reward
+        adjusted_reward = raw_reward - self._opponent_team_mean(opponent_reward)
+        reward = adjusted_reward
 
         if self.normalize:
             reward = self._normalize(reward)
 
         info = (
             self._diagnostics(
-                components, raw_reward, outcome_adjusted_reward, reward,
+                components, raw_reward, adjusted_reward, reward,
                 context.events.done,
+                "zero_sum" if self.zero_sum_shaping else "outcome_adjusted",
             )
             if self.log_diagnostics
             else {}
@@ -1158,13 +1189,14 @@ class SeerReward:
         self,
         components: dict[str, torch.Tensor],
         raw:        torch.Tensor,
-        outcome_adjusted: torch.Tensor,
+        adjusted:   torch.Tensor,
         normalized: torch.Tensor,
         done:       torch.Tensor,
+        adjusted_name: str,
     ) -> dict[str, list[float]]:
         names = tuple(components)
         values = torch.stack(tuple(components.values()), dim=-1)
-        aggregates = torch.stack((raw, outcome_adjusted, normalized), dim=-1)
+        aggregates = torch.stack((raw, adjusted, normalized), dim=-1)
 
         if self._diagnostic_sums is None:
             shape = (*raw.shape, len(names) + 3)
@@ -1200,7 +1232,7 @@ class SeerReward:
             for index, name in enumerate(names)
         }
 
-        for index, name in enumerate(("raw", "outcome_adjusted", "normalized")):
+        for index, name in enumerate(("raw", adjusted_name, "normalized")):
             info[f"seer/aggregate/{name}"] = means[:, len(names) + index].cpu().tolist()
             info[f"seer/scale/{name}"] = rms[:, index].cpu().tolist()
 
@@ -1240,7 +1272,9 @@ class SeerReward:
             self._variance = (first + second + correction) / total
             self._count = total
 
-        return reward / (self._variance + self._mean.square()).clamp_min(1e-8).sqrt()
+        if not self.zero_sum_shaping:
+            return reward / (self._variance + self._mean.square()).clamp_min(1e-8).sqrt()
+        return (reward - self._mean) / self._variance.clamp_min(1e-8).sqrt()
 
     @staticmethod
     def _unit(value: torch.Tensor) -> torch.Tensor:

@@ -10,3 +10,4 @@ runs/
 # Replay datasets can contain tens of thousands of large files.
 **/*replays/*
 !**/*replays/*.py
+parsed_replays/
