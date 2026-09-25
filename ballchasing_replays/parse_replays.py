@@ -5,7 +5,6 @@ import json
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import List
 from concurrent.futures import ProcessPoolExecutor
 from rich.progress import Progress
 
@@ -40,7 +39,7 @@ MAX_REPLAY_ANGULAR_VELOCITY_ERROR = 4.0
 MAX_REPLAY_QUATERNION_ERROR = 0.05
 INTERNAL_STATE_SIZE = 19
 EVENT_FEATURES = 4
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -79,9 +78,9 @@ def _valid_replay(replay: ParsedReplay) -> bool:
     active = [players.get(str(player_id)) for player_id in replay.player_dfs]
     delta = replay.game_df["delta"].to_numpy()
     return (
-        len(active) in (2, 4, 6)
+        len(active) == 2
         and all(player is not None for player in active)
-        and sum(bool(player["is_orange"]) for player in active) == len(active) // 2
+        and sum(bool(player["is_orange"]) for player in active) == 1
         and np.isfinite(delta).all()
         and np.isfinite(replay.game_df["time"]).all()
         and 25 < 1 / delta.mean() < 35
@@ -90,7 +89,7 @@ def _valid_replay(replay: ParsedReplay) -> bool:
 
 def _get_active_frames(
     replay: ParsedReplay,
-) -> List[list[tuple[ReplayFrame, dict]]]:
+) -> list[list[tuple[ReplayFrame, dict]]]:
     times = replay.game_df["time"].to_numpy() * 120.0
     periods = replay.analyzer["gameplay_periods"]
     bounds = [
@@ -255,7 +254,6 @@ def _resample_observations(
     ticks:        np.ndarray,
     observations: np.ndarray,
     tick_skip:    int,
-    n_cars:       int,
 ) -> np.ndarray:
     ticks, unique = np.unique(ticks, return_index=True)
     observations = observations[unique].copy()
@@ -264,8 +262,7 @@ def _resample_observations(
         return observations.astype(np.float32, copy=False)
 
     physics = [(0, NORM_BALL_VEL, None)] + [
-        (9 + 21 * index, NORM_CAR_VEL, NORM_CAR_ANG)
-        for index in range(n_cars)
+        (9 + 21 * index, NORM_CAR_VEL, NORM_CAR_ANG) for index in range(2)
     ]
 
     for start, velocity_scale, angular_scale in physics:
@@ -321,7 +318,7 @@ def _resample_observations(
 
     discrete = []
 
-    for index in range(n_cars):
+    for index in range(2):
         car_start = 9 + 21 * index
         discrete.extend(range(car_start + 16, car_start + 21))
 
@@ -331,10 +328,10 @@ def _resample_observations(
         up -= np.sum(up * forward, axis=-1, keepdims=True) * forward
         up /= np.linalg.norm(up, axis=-1, keepdims=True).clip(1e-8)
 
-    boost_start = 9 + 21 * n_cars
+    boost_start = 51
     discrete.extend(range(boost_start, boost_start + len(BOOST_PAD_POSITIONS)))
 
-    internal_start = 83 + 27 * n_cars
+    internal_start = 137
     internal_discrete = (0, 3, 4, 5, 7, 8, 9, 11, 17)
     discrete.extend(internal_start + field for field in internal_discrete)
 
@@ -347,38 +344,6 @@ def _resample_observations(
         resampled[target, -EVENT_FEATURES + event] = 1
 
     return resampled.astype(np.float32, copy=False)
-
-
-def _resample_actions(
-    ticks: np.ndarray,
-    actions: np.ndarray,
-    tick_skip: int,
-) -> np.ndarray:
-    ticks, unique = np.unique(ticks, return_index=True)
-    actions = actions[unique]
-    target_ticks = ticks[0] + np.arange(
-        int((ticks[-1] - ticks[0]) // tick_skip) + 1
-    ) * tick_skip
-    source = np.searchsorted(ticks, target_ticks, side="right") - 1
-    return actions[source.clip(0)].astype(np.float32, copy=False)
-
-
-def _project_carl_actions(actions: np.ndarray) -> np.ndarray:
-    axes = np.asarray([0.0, -1.0, 1.0], dtype=np.float32)
-    horizontal_error = (
-        (axes[:, None] - actions[:, 1]) ** 2
-        + (axes[:, None] - actions[:, 3]) ** 2
-    )
-
-    projected = np.empty((len(actions), 7), dtype=np.int32)
-    projected[:, 0] = horizontal_error.argmin(axis=0)
-    projected[:, 1] = np.abs(axes[:, None] - actions[:, 2]).argmin(axis=0)
-    projected[:, 2] = np.abs(axes[:, None] - actions[:, 0]).argmin(axis=0)
-    projected[:, 3] = actions[:, 7] >= 0.5
-    projected[:, 4] = actions[:, 6] >= 0.5
-    projected[:, 5] = np.abs(axes[:, None] - actions[:, 4]).argmin(axis=0)
-    projected[:, 6] = actions[:, 5] >= 0.5
-    return projected
 
 
 def _mark_discontinuities(
@@ -455,17 +420,11 @@ def _parse(
 
     for ego_id in ego_ids:
         ego = first.state.cars[ego_id]
-        teammates = [
-            car_id
-            for car_id, car in first.state.cars.items()
-            if car.team_num == ego.team_num and car_id != ego_id
-        ]
-        opponents = [
-            car_id
-            for car_id, car in first.state.cars.items()
+        opponent_id = next(
+            car_id for car_id, car in first.state.cars.items()
             if car.team_num != ego.team_num
-        ]
-        car_ids = [ego_id, *teammates, *opponents]
+        )
+        car_ids = [ego_id, opponent_id]
 
         for i, samples in enumerate(active_frames):
             if not samples:
@@ -484,12 +443,6 @@ def _parse(
                 _build_observation(f, car_ids)
                 for f, _ in samples
             ]).astype(np.float32, copy=False)
-            actions = np.stack([
-                np.asarray(f.actions[ego_id], dtype=np.float32)
-                for f, _ in samples
-            ])
-            if actions.ndim != 2 or actions.shape[1] != 8:
-                continue
             corrections = np.asarray([
                 _large_replay_correction(errors.get(ego_id))
                 for _, errors in samples
@@ -509,9 +462,7 @@ def _parse(
                 ticks,
                 observations,
                 frame_skip,
-                len(car_ids),
             )
-            actions = _resample_actions(ticks, actions, frame_skip)
 
             obs = _mark_discontinuities(
                 observations,
@@ -531,11 +482,6 @@ def _parse(
 
             output = output_dir / f"{ego_id}-{i}-{name}"
             np.save(output.with_suffix(".npy"), obs)
-            np.savez_compressed(
-                output.with_suffix(".actions.npz"),
-                raw=actions,
-                carl=_project_carl_actions(actions),
-            )
             np.savez_compressed(
                 output.with_suffix(".unsafe-starts.npz"),
                 unsafe=unsafe_starts,
@@ -584,8 +530,6 @@ def _parse_path(
                 return path.name, "filtered"
 
             for existing in output_dir.glob(f"*{path.stem}.npy"):
-                existing.unlink()
-            for existing in output_dir.glob(f"*{path.stem}.actions.npz"):
                 existing.unlink()
             for existing in output_dir.glob(f"*{path.stem}.unsafe-starts.npz"):
                 existing.unlink()

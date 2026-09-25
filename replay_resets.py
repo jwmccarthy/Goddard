@@ -10,14 +10,14 @@ from jarl.data import TensorBatch, TensorDataset
 
 from physics_utils import forward_up_to_quat
 from replay_safety import infer_unsafe_start_mask, pre_goal_start_mask
-from tracker import (
-    BALL_MAX_ANG_SPEED,
-    BALL_MAX_SPEED,
-    BOOST_MAX,
-    CAR_MAX_ANG_SPEED,
-    CAR_MAX_SPEED,
-    POSITION_SCALE,
-)
+
+
+POSITION_SCALE = (4108.0, 6000.0, 2076.0)
+BALL_MAX_SPEED = 6000.0
+BALL_MAX_ANG_SPEED = 6.0
+CAR_MAX_SPEED = 2300.0
+CAR_MAX_ANG_SPEED = 5.5
+BOOST_MAX = 100.0
 
 
 # parse_replays.py's 1v1 layout: ball(9), two cars(2 * 21), pads(68),
@@ -167,11 +167,7 @@ def load_demonstration_reset_dataset(
             raise ValueError(f"pre-goal mask for {path.name} has wrong shape")
 
         invalid = source[:, -4:].astype(bool).any(axis=-1)
-        # Keep the full pro-play distribution (aerials, boosting, flips) like the
-        # July-31 pipeline; only drop unsafe/invalid frames. The previous
-        # ``stable`` filter required both cars grounded and non-mechanical, which
-        # stripped exactly the aerial/contest states needed to learn
-        # catches/flicks/aerials.
+        # Retain aerial, boost, and flip states while excluding unsafe frames.
         eligible = np.flatnonzero(~unsafe & ~invalid & ~pre_goal)
         if len(eligible):
             if quota is not None and len(eligible) > quota:

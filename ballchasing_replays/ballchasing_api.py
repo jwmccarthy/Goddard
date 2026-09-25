@@ -1,4 +1,3 @@
-import os
 import time
 import requests
 
@@ -148,12 +147,6 @@ class BallchasingClient:
 
         return replays
 
-    def find_replays(self, **params: Any) -> list[str]:
-        return [
-            replay["id"]
-            for replay in self.find_replay_entries(**params)
-        ]
-
     def download_replays(
         self,
         replay_ids: list[str],
@@ -197,19 +190,3 @@ class BallchasingClient:
 
         if unavailable:
             print(f"Unavailable replay files: {unavailable}")
-
-
-if __name__ == "__main__":
-    client = BallchasingClient(
-        os.environ["BALLCHASING_TOKEN"]
-    )
-
-    print("Finding replays...")
-
-    replay_ids = client.find_replays(
-        playlist="ranked-duels",
-        min_rank="supersonic-legend",
-        pro="true",
-    )
-
-    client.download_replays(replay_ids, "./ballchasing_replays/replays")

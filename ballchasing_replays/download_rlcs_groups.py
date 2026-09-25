@@ -32,7 +32,6 @@ class Root:
     group_id: str
     mode: str
     event: str
-    region: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,10 +45,7 @@ class ReplaySelection:
     game_number: int
 
 
-ROOTS = (
-    Root("1v1-events-q0z69hlqmt", "1v1", "RLCS 2026 1v1 Events"),
-    Root("2v2-events-gnz7nvaem1", "2v2", "RLCS 2026 2v2 Events"),
-)
+ROOT = Root("1v1-events-q0z69hlqmt", "1v1", "RLCS 2026 1v1 Events")
 
 
 def sanitize(value: Any, fallback: str = "unknown", limit: int = 48) -> str:
@@ -112,34 +108,30 @@ def descendant_leaves(
 
 def select_replays(
     client: BallchasingClient,
-) -> tuple[dict[str, ReplaySelection], dict[str, int], dict[str, set[str]]]:
+) -> tuple[dict[str, ReplaySelection], int]:
     occurrences: list[ReplaySelection] = []
-    discovered = {root.mode: 0 for root in ROOTS}
-    unique_by_mode = {root.mode: set() for root in ROOTS}
+    discovered = 0
 
-    for root in ROOTS:
-        for leaf, path in descendant_leaves(client, root):
-            if not any("playoff" in component.lower() for component in path):
-                continue
-            entries = client.find_replay_entries(
-                group=leaf["id"], count=200, sort_by="replay-date", sort_dir="asc"
-            )
-            entries.sort(key=lambda replay: (replay.get("date", ""), replay["id"].lower()))
-            discovered[root.mode] += len(entries)
-            for game_number, replay in enumerate(entries, 1):
-                replay_id = replay["id"].lower()
-                unique_by_mode[root.mode].add(replay_id)
-                occurrences.append(
-                    ReplaySelection(
-                        replay=replay,
-                        mode=root.mode,
-                        region=root.region or infer_region(path),
-                        event_path=path[:-1] or path,
-                        series=path[-1],
-                        leaf_id=leaf["id"],
-                        game_number=game_number,
-                    )
+    for leaf, path in descendant_leaves(client, ROOT):
+        if not any("playoff" in component.lower() for component in path):
+            continue
+        entries = client.find_replay_entries(
+            group=leaf["id"], count=200, sort_by="replay-date", sort_dir="asc"
+        )
+        entries.sort(key=lambda replay: (replay.get("date", ""), replay["id"].lower()))
+        discovered += len(entries)
+        for game_number, replay in enumerate(entries, 1):
+            occurrences.append(
+                ReplaySelection(
+                    replay=replay,
+                    mode=ROOT.mode,
+                    region=infer_region(path),
+                    event_path=path[:-1] or path,
+                    series=path[-1],
+                    leaf_id=leaf["id"],
+                    game_number=game_number,
                 )
+            )
 
     # A replay can appear below overlapping or accidentally duplicated groups.
     occurrences.sort(
@@ -156,7 +148,7 @@ def select_replays(
     selected: dict[str, ReplaySelection] = {}
     for occurrence in occurrences:
         selected.setdefault(occurrence.replay["id"].lower(), occurrence)
-    return selected, discovered, unique_by_mode
+    return selected, discovered
 
 
 def replay_filename(selection: ReplaySelection) -> str:
@@ -215,18 +207,11 @@ def main() -> None:
     }
 
     client = BallchasingClient(os.environ["BALLCHASING_TOKEN"])
-    selected, discovered, unique_by_mode = select_replays(client)
+    selected, discovered = select_replays(client)
     new_ids = sorted(set(selected) - existing)
-    new_by_mode = {mode: 0 for mode in discovered}
-    for replay_id in new_ids:
-        new_by_mode[selected[replay_id].mode] += 1
-
-    for mode in ("1v1", "2v2"):
-        print(
-            f"{mode}: discovered={discovered[mode]} "
-            f"deduped={len(unique_by_mode[mode])} new={new_by_mode[mode]}"
-        )
-    print(f"total: deduped={len(selected)} new={len(new_ids)}")
+    print(
+        f"1v1: discovered={discovered} deduped={len(selected)} new={len(new_ids)}"
+    )
 
     try:
         client.download_replays(new_ids, replay_dir)

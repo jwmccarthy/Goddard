@@ -83,19 +83,3 @@ def infer_unsafe_start_mask(
     unsafe[1:-1] |= split_impulse
 
     return _with_guard_rows(unsafe)
-
-
-def nearest_safe_start_map(unsafe: np.ndarray) -> np.ndarray:
-    if unsafe.ndim != 1 or len(unsafe) < 2:
-        raise ValueError("unsafe-start mask must be one-dimensional with at least two rows")
-
-    safe = np.flatnonzero(~unsafe[:-1])
-    if len(safe) == 0:
-        raise ValueError("demonstration has no safe start rows")
-
-    rows = np.arange(len(unsafe))
-    right_slot = np.searchsorted(safe, rows).clip(max=len(safe) - 1)
-    left_slot = (right_slot - 1).clip(min=0)
-    left = safe[left_slot]
-    right = safe[right_slot]
-    return np.where(rows - left <= right - rows, left, right)

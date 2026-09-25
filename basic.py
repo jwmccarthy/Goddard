@@ -2,7 +2,6 @@ import argparse
 import math
 from dataclasses import replace
 from datetime import datetime
-from functools import partial
 from pathlib import Path
 
 import torch
@@ -25,8 +24,6 @@ from jarl.learn import (
     OptimizerStep,
     PPOConfig,
     PPOLoss,
-    SPOConfig,
-    SPOLoss,
     Update,
 )
 from jarl.log.logger import Logger
@@ -48,11 +45,12 @@ from jarl.sample import RecurrentRolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
-from rewards import SeerReward
+from reward_spec import RewardSpec
 from replay_resets import load_demonstration_reset_dataset
+from training_checkpoint import TrainingCheckpointer
 
 
-class DiagnosticSeerReward(SeerReward):
+class DiagnosticRewardSpec(RewardSpec):
     """Keep transition events available after CARL autoresets finished games."""
 
     def __init__(self, *args, **kwargs) -> None:
@@ -135,55 +133,28 @@ class KLLimitedUpdate(Update):
         return metrics
 
 
-from training_checkpoint import TrainingCheckpointer
-
-from jarl.modules.operator import Critic as _Critic
-from jarl.modules.policy import MultiCategoricalPolicy as _MCP
-
-if not hasattr(_MCP, "build_composed"):
+if not hasattr(MultiCategoricalPolicy, "build_composed"):
     def _mcp_build_composed(self, env, in_dim):
         self._build_head(in_dim, self._configure_actions(env))
         self.built = True
         return self
 
-    _MCP.build_composed = _mcp_build_composed
+    MultiCategoricalPolicy.build_composed = _mcp_build_composed
 
-if not hasattr(_Critic, "build_composed"):
+if not hasattr(Critic, "build_composed"):
     def _critic_build_composed(self, env, in_dim):
         self._build_shared_head(in_dim)
         self.built = True
         return self
 
-    _Critic.build_composed = _critic_build_composed
-
-from jarl.modules.operator import Critic as _Critic
-from jarl.modules.policy import MultiCategoricalPolicy as _MCP
-
-if not hasattr(_MCP, "build_composed"):
-    def _mcp_build_composed(self, env, in_dim):
-        self._build_head(in_dim, self._configure_actions(env))
-        self.built = True
-        return self
-
-    _MCP.build_composed = _mcp_build_composed
-
-if not hasattr(_Critic, "build_composed"):
-    def _critic_build_composed(self, env, in_dim):
-        self._build_shared_head(in_dim)
-        self.built = True
-        return self
-
-    _Critic.build_composed = _critic_build_composed
+    Critic.build_composed = _critic_build_composed
 
 
-
-def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=f"Train a {algorithm.upper()} Rocket League agent"
+        description="Train a BASIC Rocket League agent"
     )
     parser.add_argument("--num-simulations",            type=int,   default=1024)
-    parser.add_argument("--n-blue",                     type=int,   default=1)
-    parser.add_argument("--n-orange",                   type=int,   default=1)
     parser.add_argument("--frameskip",                  type=int,   default=8)
     parser.add_argument("--max-ticks",                  type=int,   default=36_000)
     parser.add_argument(
@@ -248,30 +219,12 @@ def parse_arguments(algorithm: str = "ppo") -> argparse.Namespace:
     )
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)
-    # Recent-script aliases (same destinations, hidden from help).
-    parser.add_argument("--replay-dir", dest="replay_dataset", type=Path, default=argparse.SUPPRESS)
-    parser.add_argument("--n-sim", dest="num_simulations", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--no-touch-timeout-seconds", dest="no_touch_timeout", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--rollout", dest="rollout_steps", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--batch-size", dest="minibatch_size", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--lr", dest="learning_rate", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--lr-end-factor", dest="learning_rate_end_factor", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--timesteps", dest="total_timesteps", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--current-fraction", dest="self_play_current", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--snapshot-pool-size", dest="opponent_pool_size", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--log-dir", dest="tensorboard_dir", type=Path, default=argparse.SUPPRESS)
-    parser.add_argument("--replay-reset-fraction", dest="replay_reset_probability", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--demonstration-reset-fraction", dest="replay_reset_probability", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--policy-hidden", dest="hidden_size", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--critic-hidden", dest="hidden_size", type=int, default=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def validate_arguments(arguments: argparse.Namespace) -> None:
     positive = {
         "num-simulations":        arguments.num_simulations,
-        "n-blue":                 arguments.n_blue,
-        "n-orange":               arguments.n_orange,
         "frameskip":              arguments.frameskip,
         "max-ticks":              arguments.max_ticks,
         "rollout-steps":          arguments.rollout_steps,
@@ -336,8 +289,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         not math.isfinite(arguments.gamma) or not 0.0 < arguments.gamma <= 1.0
     ):
         raise ValueError("gamma must be in (0, 1]")
-    if arguments.n_blue != 1 or arguments.n_orange != 1:
-        raise ValueError("The replay dataset currently supports only 1v1 training")
     if not arguments.replay_dataset.is_dir():
         raise ValueError(f"Replay dataset does not exist: {arguments.replay_dataset}")
     if (
@@ -353,16 +304,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise RuntimeError("--bf16 requires a CUDA device with BF16 support")
     if not math.isfinite(arguments.no_touch_timeout) or arguments.no_touch_timeout <= 0:
         raise ValueError("no-touch-timeout must be positive and finite")
-
-
-def build_policy(env, hidden_size: int, recurrent: bool = True):
-    """Compatibility entry point for the checkpoint viewer."""
-    from types import SimpleNamespace
-
-    policy, _ = build_policy_and_critic(
-        env, SimpleNamespace(hidden_size=hidden_size)
-    )
-    return policy
 
 
 def build_policy_and_critic(
@@ -399,25 +340,16 @@ def build_policy_and_critic(
 
 
 def build_policy_loss(
-    algorithm: str,
     policy,
     critic,
     entropy_coef: float,
     bf16: bool = False,
 ):
-    if algorithm == "ppo":
-        return PPOLoss(
-            policy,
-            critic,
-            PPOConfig(clip=0.2, entropy_coef=entropy_coef, bf16=bf16),
-        )
-    if algorithm == "spo":
-        return SPOLoss(
-            policy,
-            critic,
-            SPOConfig(ratio_epsilon=0.2, entropy_coef=entropy_coef),
-        )
-    raise ValueError(f"unknown policy optimization algorithm: {algorithm}")
+    return PPOLoss(
+        policy,
+        critic,
+        PPOConfig(clip=0.2, entropy_coef=entropy_coef, bf16=bf16),
+    )
 
 
 class DiagnosticSelfPlayRunner(SelfPlayRunner):
@@ -428,28 +360,25 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
     """
 
     reward_metric_keys = (
-        "seer/aggregate/raw",
-        "seer/aggregate/zero_sum",
-        "seer/aggregate/outcome_adjusted",
-        "seer/aggregate/normalized",
-        "seer/component/goal_scored",
-        "seer/component/win_probability",
-        "seer/component/boost_gain",
-        "seer/component/player_ball_progress",
-        "seer/component/touch_acceleration",
-        "seer/component/aerial_touch",
+        "reward_spec/aggregate/raw",
+        "reward_spec/aggregate/zero_sum",
+        "reward_spec/aggregate/normalized",
+        "reward_spec/component/goal_scored",
+        "reward_spec/component/win_probability",
+        "reward_spec/component/boost_gain",
+        "reward_spec/component/player_ball_progress",
+        "reward_spec/component/touch_acceleration",
+        "reward_spec/component/aerial_touch",
     )
 
     def __init__(
         self,
         *args,
-        n_blue: int = 1,
-        no_touch_timeout_steps: int | None = None,
-        transition_reward: DiagnosticSeerReward | None = None,
+        no_touch_timeout_steps: int,
+        transition_reward: DiagnosticRewardSpec | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.n_blue = n_blue
         self.no_touch_timeout_steps = no_touch_timeout_steps
         self.transition_reward = transition_reward
         self._diagnostics: dict[str, torch.Tensor] | None = None
@@ -504,7 +433,7 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         touch = touches.reshape(-1)
         score = score.repeat_interleave(n_cars)
         car_index = torch.arange(touch.shape[0], device=touch.device) % n_cars
-        team_sign = torch.where(car_index < self.n_blue, 1.0, -1.0)
+        team_sign = torch.where(car_index == 0, 1.0, -1.0)
         score_for_actor = score * team_sign
 
         done = torch.as_tensor(
@@ -516,13 +445,10 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
 
         self._touch_steps += 1
         self._touch_steps[touches.any(dim=-1)] = 0
-        if self.no_touch_timeout_steps is None:
-            timeout = torch.zeros_like(done)
-        else:
-            simulation_timeout = truncated.reshape(-1, n_cars).all(dim=-1) & (
-                self._touch_steps >= self.no_touch_timeout_steps
-            )
-            timeout = simulation_timeout.repeat_interleave(n_cars)
+        simulation_timeout = truncated.reshape(-1, n_cars).all(dim=-1) & (
+            self._touch_steps >= self.no_touch_timeout_steps
+        )
+        timeout = simulation_timeout.repeat_interleave(n_cars)
         self._touch_steps[done.reshape(-1, n_cars).any(dim=-1)] = 0
 
         learner = learner_mask
@@ -561,19 +487,18 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
             report["Gameplay"] = {
                 name: value.item() for name, value in metrics.items()
             }
-        seer = {
-            name.removeprefix("seer/"): total / count
+        reward_metrics = {
+            name.removeprefix("reward_spec/"): total / count
             for name, (total, count) in self._reward_diagnostics.items()
         }
         self._reward_diagnostics.clear()
         reward = self.transition_reward
         if reward is not None and reward.normalize and reward._count:
-            variance = reward._variance
-            if not reward.zero_sum_shaping:
-                variance = variance + reward._mean.square()
-            seer["normalizer_rms"] = variance.clamp_min(1e-8).sqrt().item()
-        if seer:
-            report["Seer"] = seer
+            reward_metrics["normalizer_rms"] = (
+                reward._variance.clamp_min(1e-8).sqrt().item()
+            )
+        if reward_metrics:
+            report["RewardSpec"] = reward_metrics
         return report
 
 
@@ -581,10 +506,9 @@ def build_ppo(
     environment: CARLTorchVectorEnv,
     policy,
     critic,
-    reward_function: DiagnosticSeerReward,
+    reward_function: DiagnosticRewardSpec,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
-    algorithm: str = "ppo",
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler, dict]:
     rollout = RolloutBuffer(
         horizon=arguments.rollout_steps,
@@ -610,7 +534,7 @@ def build_ppo(
     )
     matchmaker = SelfPlayMatchmaker(
         num_matches=environment.n_sim,
-        team_sizes=(arguments.n_blue, arguments.n_orange),
+        team_sizes=(1, 1),
         current_fraction=arguments.self_play_current,
         historical_ids=opponent_pool.select_ids(arguments.historical_policies),
         device=environment.device,
@@ -632,7 +556,6 @@ def build_ppo(
             RecurrentStateCapture(),
             RecurrentCriticCapture(critic),
         ),
-        n_blue=arguments.n_blue,
         no_touch_timeout_steps=no_touch_timeout_steps,
         transition_reward=reward_function,
     )
@@ -645,19 +568,17 @@ def build_ppo(
     )
     gae = GAE(gamma=initial_gamma, lambda_=arguments.gae_lambda)
     policy_loss = build_policy_loss(
-        algorithm,
         policy,
         critic,
         arguments.entropy_coef,
         arguments.bf16,
     )
-    update_type = KLLimitedUpdate if algorithm == "ppo" else Update
-    update = update_type(
-        **({"target_kl": arguments.target_kl} if algorithm == "ppo" else {}),
+    update = KLLimitedUpdate(
+        target_kl=arguments.target_kl,
         transforms=(
             TeamSpirit(
                 num_matches=environment.n_sim,
-                team_sizes=(arguments.n_blue, arguments.n_orange),
+                team_sizes=(1, 1),
                 spirit=arguments.team_spirit,
             ),
             gae,
@@ -690,7 +611,7 @@ def build_ppo(
                 max_grad_norm=0.5,
             ),
         ),
-        section=algorithm.upper(),
+        section="PPO",
     )
     learning_rate = LinearSchedule(
         arguments.learning_rate,
@@ -763,13 +684,12 @@ def build_ppo(
     }
 
 
-def main(algorithm: str = "ppo") -> None:
-    arguments = parse_arguments(algorithm)
+def main() -> None:
+    arguments = parse_arguments()
     validate_arguments(arguments)
     torch.manual_seed(arguments.seed)
-    prefix = "goddard" if algorithm == "ppo" else f"goddard-{algorithm}"
     run_id = arguments.run_name or datetime.now().strftime(
-        f"{prefix}-%Y%m%d-%H%M%S"
+        "goddard-%Y%m%d-%H%M%S"
     )
     run_dir = arguments.tensorboard_dir / run_id
     checkpoint_dir = arguments.checkpoint_dir / run_id
@@ -790,8 +710,8 @@ def main(algorithm: str = "ppo") -> None:
     reset_sampler = SyntheticMatchResetProvider(reset_sampler)
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
-        n_blue=arguments.n_blue,
-        n_orange=arguments.n_orange,
+        n_blue=1,
+        n_orange=1,
         seed=arguments.seed,
         frameskip=arguments.frameskip,
         max_ticks=arguments.max_ticks,
@@ -803,14 +723,11 @@ def main(algorithm: str = "ppo") -> None:
         discrete_actions=True,
     )
     reward_function = environment.register_reward(
-        DiagnosticSeerReward(
-            n_blue=arguments.n_blue,
-            n_orange=arguments.n_orange,
+        DiagnosticRewardSpec(
             normalize=arguments.normalize_rewards,
             log_diagnostics=True,
         )
     )
-    evaluator = None
     try:
         if arguments.total_timesteps < environment.n_envs:
             raise ValueError(
@@ -835,7 +752,6 @@ def main(algorithm: str = "ppo") -> None:
             reward_function,
             arguments,
             checkpoint_dir,
-            algorithm,
         )
         logger = Logger(log_dir=str(run_dir))
 
@@ -848,8 +764,8 @@ def main(algorithm: str = "ppo") -> None:
             ("PPO", "optimizer_minibatches", "minibatches", ".0f"),
             ("episode", "current_reward", "current reward", ".3f"),
             ("episode", "historical_reward", "historical reward", ".3f"),
-            ("Seer", "aggregate/zero_sum", "raw reward", ".3f"),
-            ("Seer", "normalizer_rms", "reward RMS", ".3f"),
+            ("RewardSpec", "aggregate/zero_sum", "raw reward", ".3f"),
+            ("RewardSpec", "normalizer_rms", "reward RMS", ".3f"),
             ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
             ("Gameplay", "goals_for_per_1000_steps", "goals for/1k", ".3f"),
             ("Gameplay", "goals_against_per_1000_steps", "goals against/1k", ".3f"),
@@ -892,8 +808,6 @@ def main(algorithm: str = "ppo") -> None:
         training_checkpointer(trainer)
         torch.save(policy.state_dict(), checkpoint_dir / "actor_critic_final.pt")
     finally:
-        if evaluator is not None:
-            evaluator.close()
         environment.close()
 
 
