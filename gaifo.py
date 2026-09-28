@@ -1,6 +1,6 @@
 import argparse
 import math
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -36,7 +36,14 @@ from jarl.modules import GRU, MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
-from jarl.runtime import Clock, OnPolicySchedule, Trainer
+from jarl.runtime import (
+    Clock,
+    LinearSchedule,
+    OnPolicySchedule,
+    ScheduledValue,
+    Trainer,
+    ValueScheduler,
+)
 from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
@@ -1892,6 +1899,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--lambda", type=float, default=0.95, dest="lambda_", metavar="LAMBDA"
     )
     parser.add_argument("--entropy", type=float, default=0.01)
+    parser.add_argument(
+        "--entropy-end", type=float, default=None,
+        help="linearly anneal --entropy to this value over --timesteps (default: constant)",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--policy-hidden", type=int, default=256)
     parser.add_argument("--critic-hidden", type=int, default=256)
@@ -2006,6 +2017,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--lambda must be in [0, 1]")
     if not math.isfinite(args.entropy) or args.entropy < 0.0:
         raise ValueError("--entropy must be non-negative")
+    if args.entropy_end is not None and (
+        not math.isfinite(args.entropy_end) or args.entropy_end < 0.0
+    ):
+        raise ValueError("--entropy-end must be finite and non-negative")
     if not math.isfinite(args.max_grad_norm) or args.max_grad_norm <= 0.0:
         raise ValueError("--max-grad-norm must be positive")
     if not math.isfinite(args.ppo_clip) or args.ppo_clip <= 0.0:
@@ -2140,6 +2155,22 @@ def build_ppo_sampler(args):
             epochs=args.ppo_epochs,
         )
     return RolloutMinibatches(args.ppo_batch, args.ppo_epochs)
+
+
+def build_entropy_scheduler(
+    args: argparse.Namespace, ppo_loss: PPOLoss
+) -> ValueScheduler | None:
+    if args.entropy_end is None:
+        return None
+
+    def set_entropy_coef(value: float) -> None:
+        ppo_loss.config = replace(ppo_loss.config, entropy_coef=value)
+
+    return ValueScheduler(ScheduledValue(
+        "entropy_coef",
+        LinearSchedule(args.entropy, args.entropy_end),
+        set_entropy_coef,
+    ))
 
 
 def main() -> None:
@@ -2282,6 +2313,17 @@ def main() -> None:
         microbatch_size=args.discriminator_microbatch,
     )
 
+    ppo_loss = PPOLoss(
+        policy,
+        critic,
+        PPOConfig(
+            clip=args.ppo_clip,
+            value_clip=args.value_clip,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy,
+            normalize_advantage=True,
+        ),
+    )
     ppo_update = Update(
         transforms=(
             DualTimescaleSceneDiscriminatorReward(
@@ -2303,23 +2345,14 @@ def main() -> None:
             SelectPPOFields(recurrent=args.gru),
         ),
         sampler=build_ppo_sampler(args),
-        loss=PPOLoss(
-            policy,
-            critic,
-            PPOConfig(
-                clip=args.ppo_clip,
-                value_clip=args.value_clip,
-                value_coef=args.value_coef,
-                entropy_coef=args.entropy,
-                normalize_advantage=True,
-            ),
-        ),
+        loss=ppo_loss,
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(policy, policy_optimizer, max_grad_norm=args.max_grad_norm),
             OptimizerStep(critic, critic_optimizer, max_grad_norm=args.max_grad_norm),
         ),
         section="PPO",
     )
+    value_scheduler = build_entropy_scheduler(args, ppo_loss)
 
     learner = Algorithm(short_discriminator_update, long_discriminator_update, ppo_update)
 
@@ -2353,6 +2386,10 @@ def main() -> None:
         ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
     ):
         logger.register_progress_metric(section, key, label, fmt)
+    if value_scheduler is not None:
+        logger.register_progress_metric(
+            "Schedule", "entropy_coef", "entropy coef", ".4f"
+        )
 
     checkpoints = GAIFOCheckpoints(
         args.checkpoint_dir / run_id,
@@ -2382,6 +2419,7 @@ def main() -> None:
         OnPolicySchedule(),
         logger=logger,
         checkpoint=checkpoints,
+        value_scheduler=value_scheduler,
         update_callback=update_callback,
     )
     if restored_clock is not None:

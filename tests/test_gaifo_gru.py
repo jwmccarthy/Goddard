@@ -169,6 +169,8 @@ class GAIFOGruTests(unittest.TestCase):
                 args.ppo_lr = 1e-3
                 args.discriminator_lr = 1e-3
                 args.replay_dir = Path("parsed_replays")
+                args.entropy = 0.01
+                args.entropy_end = 0.002 if gru else None
 
                 modules = {
                     "policy": build_policy(self.env, args),
@@ -196,9 +198,10 @@ class GAIFOGruTests(unittest.TestCase):
                 path = Path(directory) / "gaifo_000000000008.pt"
 
                 if not gru:
-                    # Existing MLP checkpoints predate the --gru flag.
+                    # Existing MLP checkpoints predate these optional flags.
                     legacy = th.load(path, map_location="cpu", weights_only=True)
                     del legacy["config"]["gru"]
+                    del legacy["config"]["entropy_end"]
                     th.save(legacy, path)
 
                 payload = load_resume_checkpoint(path)
@@ -213,6 +216,7 @@ class GAIFOGruTests(unittest.TestCase):
                     parsed, resumed = parse_args()
                 self.assertIsNotNone(resumed)
                 self.assertEqual(parsed.gru, gru)
+                self.assertEqual(parsed.entropy_end, args.entropy_end)
                 validate_resume_args(parsed, resumed)
 
                 parsed.gru = not gru
