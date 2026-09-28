@@ -1,5 +1,6 @@
 import argparse
 import math
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +10,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from carl.gymnasium import CARLTorchVectorEnv
-from jarl.collect import CaptureContext, CriticCapture, LogProbCapture, Runner
+from carl.gymnasium.state import RewardContext
+from jarl.collect import (
+    CaptureContext,
+    CriticCapture,
+    LogProbCapture,
+    RecurrentCriticCapture,
+    RecurrentStateCapture,
+    Runner,
+)
 from jarl.collect.capture import CaptureBase
 from jarl.data import TensorBatch, TensorDataset
 from jarl.envs import DatasetResetSampler
@@ -23,21 +32,23 @@ from jarl.learn import (
     Update,
 )
 from jarl.log.logger import Logger
-from jarl.modules import MLP, orthogonal_init
+from jarl.modules import GRU, MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import MultiCategoricalPolicy
-from jarl.runtime import OnPolicySchedule, Trainer
-from jarl.sample import RolloutMinibatches
+from jarl.runtime import Clock, OnPolicySchedule, Trainer
+from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
 from physics_utils import forward_up_to_quat
+from replay_resets import _sampled_frame_skip
 
 
 SCENE_SIZE = 51
 GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v3"
+GAIFO_GRU_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-gru"
 BALL_SIZE = 9
 CAR_SIZE = 21
 N_CARS = 2
@@ -233,6 +244,67 @@ def extract_scene_observations(
     if observation.shape[-1] < SCENE_SIZE:
         raise ValueError(f"actor observations require at least {SCENE_SIZE} features")
     return observation[..., :SCENE_SIZE].contiguous()
+
+
+class GameplayDiagnostics:
+    """Count both policies' gameplay events before CARL auto-resets finished games."""
+
+    def __init__(self, n_sim: int, device: th.device, no_touch_timeout_steps: int) -> None:
+        self.no_touch_timeout_steps = no_touch_timeout_steps
+        self.touch_steps = th.zeros(n_sim, dtype=th.long, device=device)
+        self.counts = {
+            name: th.zeros((), dtype=th.float32, device=device)
+            for name in (
+                "steps",
+                "touches",
+                "goals_for",
+                "goals_against",
+                "episodes",
+                "timeouts",
+            )
+        }
+
+    def __call__(self, context: RewardContext) -> th.Tensor:
+        touches = context.current.car_ball_touches
+        score_for_actor = context.events.score_delta[:, None] * context.current.team_sign
+
+        self.touch_steps += 1
+        self.touch_steps[touches.any(dim=-1)] = 0
+        timeout = context.events.truncated & (
+            self.touch_steps >= self.no_touch_timeout_steps
+        )
+        self.touch_steps[context.events.done] = 0
+
+        self.counts["steps"] += touches.numel()
+        self.counts["touches"] += touches.sum()
+        self.counts["goals_for"] += (score_for_actor > 0).sum()
+        self.counts["goals_against"] += (score_for_actor < 0).sum()
+        self.counts["episodes"] += context.events.done.sum() * N_CARS
+        self.counts["timeouts"] += timeout.sum() * N_CARS
+
+        # GAIFO's imitation reward is computed separately; preserve CARL's
+        # default goal-only reward for episode statistics and rollout records.
+        return score_for_actor
+
+    def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
+        metrics = {}
+        steps = self.counts["steps"].item()
+        if steps > 0:
+            metrics.update({
+                "touches_per_1000_steps": self.counts["touches"].item() / steps * 1000,
+                "goals_for_per_1000_steps": self.counts["goals_for"].item() / steps * 1000,
+                "goals_against_per_1000_steps": self.counts["goals_against"].item() / steps * 1000,
+            })
+            for name in ("steps", "touches", "goals_for", "goals_against"):
+                self.counts[name].zero_()
+
+        episodes = self.counts["episodes"].item()
+        if episodes > 0:
+            metrics["timeout_fraction"] = self.counts["timeouts"].item() / episodes
+            self.counts["episodes"].zero_()
+            self.counts["timeouts"].zero_()
+
+        return {"Gameplay": metrics} if metrics else {}
 
 
 class SceneWindowCapture(CaptureBase):
@@ -458,10 +530,11 @@ class ExpertSceneDataset:
             path = group[0]
             if frame_skip is not None:
                 metadata_path = path.with_suffix(".unsafe-starts.npz")
-                if not metadata_path.is_file():
-                    raise ValueError(f"missing frame-skip metadata for {path.name}")
-                with np.load(metadata_path) as metadata:
-                    stored_frame_skip = int(metadata.get("frame_skip", -1))
+                if metadata_path.is_file():
+                    with np.load(metadata_path) as metadata:
+                        stored_frame_skip = int(metadata.get("frame_skip", -1))
+                else:
+                    stored_frame_skip = _sampled_frame_skip(path, frame_skip)
             stored = np.load(path, mmap_mode="r")
             source = np.array(
                 stored[:, :SCENE_SIZE], dtype=np.float32, copy=True
@@ -491,12 +564,13 @@ class ExpertSceneDataset:
                     opponent_metadata_path = opponent_path.with_suffix(
                         ".unsafe-starts.npz"
                     )
-                    if not opponent_metadata_path.is_file():
-                        raise ValueError(
-                            f"missing frame-skip metadata for {opponent_path.name}"
+                    if opponent_metadata_path.is_file():
+                        with np.load(opponent_metadata_path) as metadata:
+                            opponent_frame_skip = int(metadata.get("frame_skip", -1))
+                    else:
+                        opponent_frame_skip = _sampled_frame_skip(
+                            opponent_path, frame_skip
                         )
-                    with np.load(opponent_metadata_path) as metadata:
-                        opponent_frame_skip = int(metadata.get("frame_skip", -1))
                     if opponent_frame_skip != stored_frame_skip:
                         raise ValueError(f"paired POV cadence differs for {path.name}")
             if frame_skip is not None:
@@ -1084,13 +1158,50 @@ class SceneGAIFOMinibatches:
                 self._epoch_callback()
 
 
+def train_discriminator_minibatch(
+    sample: TensorBatch,
+    discriminator: SceneDiscriminator,
+    optimizer: th.optim.Optimizer,
+    loss: SceneDiscriminatorLoss,
+    microbatch_size: int,
+    max_grad_norm: float,
+) -> dict[str, th.Tensor]:
+    """Accumulate one balanced effective batch without a full-batch GRU graph."""
+    if microbatch_size < 1:
+        raise ValueError("discriminator microbatch size must be positive")
+    windows = sample["window"]
+    labels = sample["is_agent"]
+    n_agent = len(windows) // 2
+    if n_agent < 1 or len(windows) != 2 * n_agent or len(labels) != len(windows):
+        raise ValueError("discriminator batch must have equal agent and expert halves")
+
+    optimizer.zero_grad(set_to_none=True)
+    metrics: dict[str, th.Tensor] = {}
+    for start in range(0, n_agent, microbatch_size):
+        stop = min(start + microbatch_size, n_agent)
+        chunk = TensorBatch({
+            "window": th.cat((windows[start:stop], windows[n_agent + start:n_agent + stop])),
+            "is_agent": th.cat((labels[start:stop], labels[n_agent + start:n_agent + stop])),
+        })
+        output = loss(chunk)
+        fraction = (stop - start) / n_agent
+        (output.loss * fraction).backward()
+        for name, value in output.metrics.items():
+            metrics[name] = metrics.get(name, 0.0) + value.detach() * fraction
+        del output, chunk
+
+    th.nn.utils.clip_grad_norm_(discriminator.parameters(), max_grad_norm)
+    optimizer.step()
+    return metrics
+
+
 class DualTimescaleSceneDiscriminatorReward:
-    """Combine independent short and long discriminator rewards into one reward.
+    """Combine short/long imitation rewards with each actor's goal reward.
 
     Both discriminators are scored, normalized, and clamped independently with
     the existing negative-logit logic. Invalid long entries remain zero so they
-    never mask short-valid PPO transitions. The learner mask is the short
-    validity mask.
+    never mask short-valid PPO transitions. Goal transitions are also learnable
+    when they happen before the short window has enough history.
     """
 
     def __init__(
@@ -1101,6 +1212,7 @@ class DualTimescaleSceneDiscriminatorReward:
         short_trajectory_length: int,
         long_trajectory_length: int,
         long_reward_weight: float,
+        goal_reward_weight: float = 1.0,
         batch_size: int = 16_384,
         max_magnitude: float = 10.0,
     ) -> None:
@@ -1110,12 +1222,15 @@ class DualTimescaleSceneDiscriminatorReward:
             raise ValueError("reward max magnitude must be positive")
         if not math.isfinite(long_reward_weight) or long_reward_weight < 0.0:
             raise ValueError("long reward weight must be non-negative")
+        if not math.isfinite(goal_reward_weight) or goal_reward_weight < 0.0:
+            raise ValueError("goal reward weight must be non-negative")
         self.short_discriminator = short_discriminator
         self.long_discriminator = long_discriminator
         self.noise_std = noise_std
         self.short_trajectory_length = short_trajectory_length
         self.long_trajectory_length = long_trajectory_length
         self.long_reward_weight = long_reward_weight
+        self.goal_reward_weight = goal_reward_weight
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
 
@@ -1179,21 +1294,27 @@ class DualTimescaleSceneDiscriminatorReward:
 
         combined = short_scores + self.long_reward_weight * long_scores
         imitation_reward = combined.clamp(-self.max_magnitude, self.max_magnitude)
+        goal_reward = batch["reward"].to(dtype) * self.goal_reward_weight
+        if goal_reward.shape != imitation_reward.shape:
+            raise ValueError("goal rewards must match the actor rollout shape")
 
         result = batch.with_fields(
             short_imitation_reward=short_scores,
             long_imitation_reward=long_scores,
             imitation_reward=imitation_reward,
+            goal_reward=goal_reward,
+            training_reward=imitation_reward + goal_reward,
         )
+        learner_mask = short_valid | goal_reward.ne(0)
         if "learner_mask" in result:
             return result.replace_fields(
-                learner_mask=result["learner_mask"].bool() & short_valid
+                learner_mask=result["learner_mask"].bool() & learner_mask
             )
-        return result.with_fields(learner_mask=short_valid)
+        return result.with_fields(learner_mask=learner_mask)
 
 
 class SelectPPOFields:
-    """Drop large discriminator-only tensors before PPO flattens the rollout."""
+    """Drop large discriminator-only tensors before PPO sampling."""
 
     FIELDS = (
         "observation",
@@ -1204,11 +1325,20 @@ class SelectPPOFields:
         "returns",
         "learner_mask",
     )
+    RECURRENT_FIELDS = FIELDS + (
+        "policy_state",
+        "critic_state",
+        "terminated",
+        "truncated",
+    )
+
+    def __init__(self, recurrent: bool = False) -> None:
+        self.fields = self.RECURRENT_FIELDS if recurrent else self.FIELDS
 
     def __call__(
         self, batch: TensorBatch, context: PrepareContext
     ) -> TensorBatch:
-        return batch.select(*self.FIELDS)
+        return batch.select(*self.fields)
 
 
 class AdaptiveDiscriminatorUpdate:
@@ -1241,6 +1371,7 @@ class AdaptiveDiscriminatorUpdate:
         section: str = "Discriminator",
         require_valid: bool = True,
         update_interval: int = 1,
+        microbatch_size: int = 1_024,
     ) -> None:
         if heldout_size < 0:
             raise ValueError("heldout size must be non-negative")
@@ -1252,6 +1383,8 @@ class AdaptiveDiscriminatorUpdate:
             raise ValueError("max gradient norm must be positive")
         if update_interval < 1:
             raise ValueError("update interval must be positive")
+        if microbatch_size < 1:
+            raise ValueError("microbatch size must be positive")
         self.expert = expert
         self.history = history
         self.batch_size = batch_size
@@ -1270,6 +1403,7 @@ class AdaptiveDiscriminatorUpdate:
         self.section = section
         self.require_valid = require_valid
         self.update_interval = update_interval
+        self.microbatch_size = microbatch_size
         self._progress_callback = None
         self._heldout_sim: th.Tensor | None = None
         self._has_updated = False
@@ -1340,17 +1474,13 @@ class AdaptiveDiscriminatorUpdate:
                 callback.start(self.epochs, self.section)
             try:
                 for sample in sampler.sample_windows(flat_windows, train_indices):
-                    output = self.loss(sample)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    output.loss.backward()
-                    th.nn.utils.clip_grad_norm_(
-                        self.discriminator.parameters(), self.max_grad_norm
+                    minibatch_metrics = train_discriminator_minibatch(
+                        sample, self.discriminator, self.optimizer, self.loss,
+                        self.microbatch_size, self.max_grad_norm,
                     )
-                    self.optimizer.step()
 
-                    for key, value in output.metrics.items():
-                        detached = value.detach() if isinstance(value, th.Tensor) else value
-                        metric_totals[key] = metric_totals.get(key, 0.0) + detached
+                    for key, value in minibatch_metrics.items():
+                        metric_totals[key] = metric_totals.get(key, 0.0) + value
                     minibatch_count += 1
 
                     evaluation = self._evaluate(heldout_generated)
@@ -1460,8 +1590,8 @@ class AdaptiveDiscriminatorUpdate:
 
         with th.no_grad():
             self.discriminator.eval()
-            for start in range(0, n, self.batch_size):
-                stop = min(start + self.batch_size, n)
+            for start in range(0, n, self.microbatch_size):
+                stop = min(start + self.microbatch_size, n)
                 generated = heldout_generated[gen_indices[start:stop]]
                 expert = self.expert.sample_heldout(
                     stop - start, heldout_generated.device
@@ -1532,6 +1662,7 @@ class GAIFOCheckpoints:
         self.args = args
         self.step = 0
         self.next_step = 0
+        self.clock: Clock | None = None
         self.directory.mkdir(parents=True, exist_ok=True)
         for path in self.directory.glob("gaifo_*.pt.tmp"):
             path.unlink()
@@ -1555,7 +1686,9 @@ class GAIFOCheckpoints:
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
             "config": {
-                "architecture": GAIFO_ARCHITECTURE,
+                "architecture": (
+                    GAIFO_GRU_ARCHITECTURE if self.args.gru else GAIFO_ARCHITECTURE
+                ),
                 **{
                     name: str(value) if isinstance(value, Path) else value
                     for name, value in vars(self.args).items()
@@ -1568,6 +1701,10 @@ class GAIFOCheckpoints:
             payload["long_discriminator_optimizer"] = (
                 self.long_discriminator_optimizer.state_dict()
             )
+        if self.clock is not None:
+            payload["clock"] = asdict(self.clock)
+            payload["torch_rng_state"] = th.get_rng_state()
+            payload["cuda_rng_state"] = th.cuda.get_rng_state_all()
         path = self.directory / f"gaifo_{step:012d}.pt"
         temporary = path.with_suffix(".pt.tmp")
         th.save(payload, temporary)
@@ -1580,11 +1717,124 @@ class GAIFOCheckpoints:
         self.next_step = step + self.interval
 
 
-def parse_args() -> argparse.Namespace:
+def load_resume_checkpoint(path: Path) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(f"GAIFO checkpoint not found: {path}")
+    payload = th.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("config"), dict):
+        raise ValueError(f"invalid GAIFO checkpoint: {path}")
+    config = payload["config"]
+    architecture = config.get("architecture")
+    if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+        raise ValueError(f"incompatible GAIFO architecture in {path}")
+    if config.get("gru", False) != (architecture == GAIFO_GRU_ARCHITECTURE):
+        raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
+    step = payload.get("step")
+    if type(step) is not int or step < 0:
+        raise ValueError(f"checkpoint has an invalid training step: {path}")
+    for name in ("n_sim", "rollout"):
+        if type(config.get(name)) is not int or config[name] < 1:
+            raise ValueError(f"checkpoint has an invalid {name}: {path}")
+    if step % (config["n_sim"] * N_CARS):
+        raise ValueError(f"checkpoint step is not a complete vector step: {path}")
+    required = (
+        "policy", "critic", "discriminator", "long_discriminator",
+        "policy_optimizer", "critic_optimizer", "discriminator_optimizer",
+        "long_discriminator_optimizer",
+    )
+    missing = [name for name in required if name not in payload]
+    if missing:
+        raise ValueError(f"checkpoint is missing {', '.join(missing)}: {path}")
+    if "clock" in payload:
+        try:
+            clock = Clock(**payload["clock"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"checkpoint has an invalid training clock: {path}") from error
+        if clock.env_steps != step:
+            raise ValueError(f"checkpoint clock does not match step {step}: {path}")
+    return payload
+
+
+def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None:
+    if payload is None:
+        return
+    step = payload["step"]
+    if args.timesteps <= step:
+        raise ValueError(
+            f"--timesteps must exceed checkpoint step {step:,}; "
+            "it is the total target, not additional steps"
+        )
+    config = payload["config"]
+    if args.gru != config.get("gru", False):
+        raise ValueError(
+            "--gru must match the checkpoint architecture when resuming; "
+            "start a new run to change policy/critic architecture"
+        )
+    for name in (
+        "frameskip", "trajectory_length", "policy_hidden", "critic_hidden",
+        "discriminator_hidden", "frame_embedding", "temporal_hidden",
+    ):
+        if getattr(args, name) != config.get(name):
+            raise ValueError(
+                f"--{name.replace('_', '-')} must match the checkpoint "
+                f"({config.get(name)}) when resuming"
+            )
+
+
+def restore_training_checkpoint(
+    payload: dict,
+    args: argparse.Namespace,
+    modules: dict[str, nn.Module],
+    optimizers: dict[str, th.optim.Optimizer],
+) -> Clock:
+    for name, module in modules.items():
+        module.load_state_dict(payload[name])
+    for name, optimizer in optimizers.items():
+        optimizer.load_state_dict(payload[f"{name}_optimizer"])
+        learning_rate = (
+            args.discriminator_lr if "discriminator" in name else args.ppo_lr
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
+
+    if "torch_rng_state" in payload:
+        th.set_rng_state(payload["torch_rng_state"].cpu())
+    if "cuda_rng_state" in payload:
+        th.cuda.set_rng_state_all(payload["cuda_rng_state"])
+
+    if "clock" in payload:
+        return Clock(**payload["clock"])
+    config = payload["config"]
+    vector_steps = payload["step"] // (config["n_sim"] * N_CARS)
+    return Clock(
+        vector_steps=vector_steps,
+        env_steps=payload["step"],
+        learner_updates=math.ceil(vector_steps / config["rollout"]),
+    )
+
+
+def parse_args() -> tuple[argparse.Namespace, dict | None]:
+    resume_parser = argparse.ArgumentParser(add_help=False)
+    resume_parser.add_argument("--resume-checkpoint", type=Path)
+    preliminary, _ = resume_parser.parse_known_args()
+    resume = (
+        load_resume_checkpoint(preliminary.resume_checkpoint)
+        if preliminary.resume_checkpoint is not None else None
+    )
+
     parser = argparse.ArgumentParser(
         description="GAIfO imitation learning for 1v1 Rocket League via CARL and JARL."
     )
-    parser.add_argument("--replay-dir", type=Path, required=True)
+    parser.add_argument(
+        "--resume-checkpoint", type=Path,
+        help="restore a GAIFO checkpoint into a new training run",
+    )
+    parser.add_argument(
+        "--replay-dir",
+        type=Path,
+        required=resume is None,
+        help="1v1 replay folder or its parent containing pro_1v1_fs4",
+    )
     parser.add_argument("--n-sim", type=int, default=16_384)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
@@ -1594,12 +1844,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-trajectory-seconds", type=float, default=5.0)
     parser.add_argument("--long-trajectory-length", type=int, default=16)
     parser.add_argument("--long-reward-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--goal-reward-weight", type=float, default=1.0,
+        help="scale the +/-1 goal reward per actor (0 disables it)",
+    )
     parser.add_argument("--long-history-capacity", type=int, default=65_536)
     parser.add_argument("--long-history-add-size", type=int, default=4_096)
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--replay-reset-fraction", type=float, default=0.70)
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
-    parser.add_argument("--discriminator-batch", type=int, default=16_384)
+    parser.add_argument(
+        "--discriminator-batch", type=int, default=16_384,
+        help="agent windows per optimizer step (plus equally many expert windows)",
+    )
+    parser.add_argument(
+        "--discriminator-microbatch", type=int, default=1_024,
+        help="agent windows per GRU chunk; accumulates one discriminator optimizer step per effective batch",
+    )
     parser.add_argument("--discriminator-epochs", type=int, default=1)
     parser.add_argument("--discriminator-update-interval", type=int, default=4)
     parser.add_argument("--discriminator-lr", type=float, default=3e-4)
@@ -1614,6 +1875,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-max-magnitude", type=float, default=10.0)
     parser.add_argument("--ppo-batch", type=int, default=16_384)
     parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument(
+        "--gru", action=argparse.BooleanOptionalAction, default=False,
+        help="use GRU policy and critic with recurrent PPO (default: MLP)",
+    )
+    parser.add_argument(
+        "--sequence-length", type=int, default=16,
+        help="steps per recurrent PPO training sequence when --gru is enabled",
+    )
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
     parser.add_argument("--ppo-clip", type=float, default=0.2)
     parser.add_argument("--value-clip", type=float, default=0.2)
@@ -1626,27 +1895,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--policy-hidden", type=int, default=256)
     parser.add_argument("--critic-hidden", type=int, default=256)
-    parser.add_argument("--timesteps", type=int, default=2_000_000_000)
+    parser.add_argument(
+        "--timesteps", type=int, default=2_000_000_000,
+        help="total target environment steps, including checkpoint steps",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/gaifo"))
     parser.add_argument("--checkpoint-interval", type=int, default=10_000_000)
     parser.add_argument("--checkpoint-keep", type=int, default=5)
-    return parser.parse_args()
+    if resume is not None:
+        options = {action.dest for action in parser._actions}
+        inherited = {
+            name: Path(value) if name in {"replay_dir", "log_dir", "checkpoint_dir"}
+            else value
+            for name, value in resume["config"].items()
+            if name in options and name != "resume_checkpoint"
+        }
+        parser.set_defaults(**inherited)
+    args = parser.parse_args()
+    if args.replay_dir is None:
+        parser.error("--replay-dir is required when it is absent from the checkpoint")
+    return args, resume
 
 
 def validate_args(args: argparse.Namespace) -> None:
     if not args.replay_dir.is_dir():
         raise FileNotFoundError(args.replay_dir)
 
+    replay_dir = args.replay_dir
+    if not next(replay_dir.glob("*.npy"), None):
+        for name in (f"pro_1v1_fs{args.frameskip}", "pro_1v1_fs4"):
+            candidate = replay_dir / name
+            if candidate.is_dir():
+                replay_dir = candidate
+                break
+
     found_1v1 = False
-    for path in args.replay_dir.glob("*.npy"):
+    for path in replay_dir.glob("*.npy"):
         source = np.load(path, mmap_mode="r")
         if source.ndim == 2 and source.shape[1] == 161:
             found_1v1 = True
             break
     if not found_1v1:
         raise FileNotFoundError(f"no 1v1 replay files in {args.replay_dir}")
+    if replay_dir != args.replay_dir:
+        print(f"Using 1v1 replays from {replay_dir}")
+        args.replay_dir = replay_dir
 
     positive = (
         "n_sim",
@@ -1658,6 +1953,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "long_history_capacity",
         "long_history_add_size",
         "discriminator_batch",
+        "discriminator_microbatch",
         "discriminator_epochs",
         "discriminator_update_interval",
         "discriminator_hidden",
@@ -1666,6 +1962,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "temporal_hidden",
         "ppo_batch",
         "ppo_epochs",
+        "sequence_length",
         "policy_hidden",
         "critic_hidden",
         "timesteps",
@@ -1733,6 +2030,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--long-trajectory-seconds must be finite and positive")
     if not math.isfinite(args.long_reward_weight) or args.long_reward_weight < 0.0:
         raise ValueError("--long-reward-weight must be finite and non-negative")
+    if not math.isfinite(args.goal_reward_weight) or args.goal_reward_weight < 0.0:
+        raise ValueError("--goal-reward-weight must be finite and non-negative")
     if args.long_history_add_size > args.long_history_capacity:
         raise ValueError(
             "--long-history-add-size must not exceed --long-history-capacity"
@@ -1767,6 +2066,11 @@ def validate_args(args: argparse.Namespace) -> None:
     n_envs = args.n_sim * 2
     if args.ppo_batch > args.rollout * n_envs:
         raise ValueError("--ppo-batch must fit the rollout size")
+    if args.gru:
+        if args.rollout % args.sequence_length:
+            raise ValueError("--rollout must be divisible by --sequence-length")
+        if args.ppo_batch % args.sequence_length:
+            raise ValueError("--ppo-batch must be divisible by --sequence-length")
 
 
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
@@ -1786,7 +2090,10 @@ def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
 def build_policy(env, args: argparse.Namespace) -> MultiCategoricalPolicy:
     return MultiCategoricalPolicy(
         foot=LinearEncoder(args.policy_hidden, func=nn.ReLU),
-        body=MLP(dims=[args.policy_hidden], func=nn.ReLU),
+        body=(
+            GRU(hidden_size=args.policy_hidden) if args.gru
+            else MLP(dims=[args.policy_hidden], func=nn.ReLU)
+        ),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=0.01)),
         action_codec=env.action_codec,
     ).build(env).to(env.device)
@@ -1795,7 +2102,10 @@ def build_policy(env, args: argparse.Namespace) -> MultiCategoricalPolicy:
 def build_critic(env, args: argparse.Namespace) -> Critic:
     return Critic(
         foot=LinearEncoder(args.critic_hidden, func=nn.ReLU),
-        body=MLP(dims=[args.critic_hidden], func=nn.ReLU),
+        body=(
+            GRU(hidden_size=args.critic_hidden) if args.gru
+            else MLP(dims=[args.critic_hidden], func=nn.ReLU)
+        ),
         head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
     ).build(env).to(env.device)
 
@@ -1808,13 +2118,43 @@ def build_discriminator(args: argparse.Namespace) -> SceneDiscriminator:
     )
 
 
+def build_runner(env, policy, critic, buffer, args, long_offsets) -> Runner:
+    captures = [LogProbCapture()]
+    if args.gru:
+        captures.extend((RecurrentStateCapture(), RecurrentCriticCapture(critic)))
+    else:
+        captures.append(CriticCapture(critic))
+    captures.append(SceneWindowCapture(
+        args.trajectory_length,
+        long_span=int(long_offsets[-1]),
+        long_sample_offsets=long_offsets,
+    ))
+    return Runner(env, policy, buffer, captures=captures)
+
+
+def build_ppo_sampler(args):
+    if args.gru:
+        return RecurrentRolloutMinibatches(
+            sequence_length=args.sequence_length,
+            sequences_per_batch=args.ppo_batch // args.sequence_length,
+            epochs=args.ppo_epochs,
+        )
+    return RolloutMinibatches(args.ppo_batch, args.ppo_epochs)
+
+
 def main() -> None:
-    args = parse_args()
+    args, resume = parse_args()
+    validate_resume_args(args, resume)
     validate_args(args)
     th.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     env = build_env(args)
+    gameplay = env.register_reward(GameplayDiagnostics(
+        env.n_sim,
+        env.device,
+        math.ceil(args.no_touch_timeout * 120.0 / args.frameskip),
+    ))
     policy = build_policy(env, args)
     critic = build_critic(env, args)
     short_discriminator = build_discriminator(args).to(env.device)
@@ -1874,24 +2214,29 @@ def main() -> None:
     long_discriminator_optimizer = th.optim.Adam(
         long_discriminator.parameters(), lr=args.discriminator_lr
     )
+    restored_clock = None
+    if resume is not None:
+        restored_clock = restore_training_checkpoint(
+            resume,
+            args,
+            {
+                "policy": policy,
+                "critic": critic,
+                "discriminator": short_discriminator,
+                "long_discriminator": long_discriminator,
+            },
+            {
+                "policy": policy_optimizer,
+                "critic": critic_optimizer,
+                "discriminator": short_discriminator_optimizer,
+                "long_discriminator": long_discriminator_optimizer,
+            },
+        )
 
     buffer = RolloutBuffer(
         args.rollout, env.n_envs, env.device, copy_on_finish=False
     )
-    runner = Runner(
-        env,
-        policy,
-        buffer,
-        captures=(
-            LogProbCapture(),
-            CriticCapture(critic),
-            SceneWindowCapture(
-                args.trajectory_length,
-                long_span=int(long_offsets[-1]),
-                long_sample_offsets=long_offsets,
-            ),
-        ),
-    )
+    runner = build_runner(env, policy, critic, buffer, args, long_offsets)
 
     short_discriminator_update = AdaptiveDiscriminatorUpdate(
         expert=expert,
@@ -1912,6 +2257,7 @@ def main() -> None:
         section="ShortDiscriminator",
         require_valid=True,
         update_interval=args.discriminator_update_interval,
+        microbatch_size=args.discriminator_microbatch,
     )
 
     long_discriminator_update = AdaptiveDiscriminatorUpdate(
@@ -1933,6 +2279,7 @@ def main() -> None:
         section="LongDiscriminator",
         require_valid=False,
         update_interval=args.discriminator_update_interval,
+        microbatch_size=args.discriminator_microbatch,
     )
 
     ppo_update = Update(
@@ -1944,17 +2291,18 @@ def main() -> None:
                 short_trajectory_length=args.trajectory_length,
                 long_trajectory_length=args.long_trajectory_length,
                 long_reward_weight=args.long_reward_weight,
-                batch_size=args.discriminator_batch,
+                goal_reward_weight=args.goal_reward_weight,
+                batch_size=args.discriminator_microbatch,
                 max_magnitude=args.reward_max_magnitude,
             ),
             GAE(
                 gamma=args.gamma,
                 lambda_=args.lambda_,
-                reward_field="imitation_reward",
+                reward_field="training_reward",
             ),
-            SelectPPOFields(),
+            SelectPPOFields(recurrent=args.gru),
         ),
-        sampler=RolloutMinibatches(args.ppo_batch, args.ppo_epochs),
+        sampler=build_ppo_sampler(args),
         loss=PPOLoss(
             policy,
             critic,
@@ -1999,6 +2347,10 @@ def main() -> None:
         ("PPO", "policy_loss", "policy loss", ".4f"),
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "entropy", "entropy", ".3f"),
+        ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
+        ("Gameplay", "goals_for_per_1000_steps", "goals for/1k", ".3f"),
+        ("Gameplay", "goals_against_per_1000_steps", "goals against/1k", ".3f"),
+        ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
     ):
         logger.register_progress_metric(section, key, label, fmt)
 
@@ -2018,6 +2370,11 @@ def main() -> None:
         long_discriminator_optimizer=long_discriminator_optimizer,
     )
 
+    def update_callback(trainer: Trainer) -> None:
+        metrics = gameplay.diagnostic_metrics()
+        if metrics:
+            trainer.logger.update(metrics, step=trainer.clock.env_steps)
+
     trainer = Trainer(
         runner,
         buffer,
@@ -2025,10 +2382,18 @@ def main() -> None:
         OnPolicySchedule(),
         logger=logger,
         checkpoint=checkpoints,
+        update_callback=update_callback,
     )
+    if restored_clock is not None:
+        trainer.clock = restored_clock
+        print(
+            f"Resuming {args.resume_checkpoint} at {trainer.clock.env_steps:,} "
+            f"steps in new run {run_id}"
+        )
+    checkpoints.clock = trainer.clock
 
     try:
-        checkpoints.save(0, force=True)
+        checkpoints.save(trainer.clock.env_steps, force=True)
         trainer.run(args.timesteps)
         checkpoints.save(trainer.clock.env_steps, force=True)
     finally:

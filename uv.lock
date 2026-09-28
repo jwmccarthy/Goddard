@@ -25,28 +25,13 @@ wheels = [
 [[package]]
 name = "carl"
 version = "0.1.0"
-source = { directory = "../CARL" }
+source = { git = "https://github.com/jwmccarthy/CARL.git?rev=6362f59f1b426ebb05df1345d270eaa37c53ddd9#6362f59f1b426ebb05df1345d270eaa37c53ddd9" }
 
 [package.optional-dependencies]
 gymnasium = [
     { name = "gymnasium" },
     { name = "numpy" },
     { name = "torch" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "gymnasium", marker = "extra == 'gymnasium'", specifier = ">=1.0" },
-    { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux' and extra == 'jax'", specifier = ">=0.4.30" },
-    { name = "numpy", marker = "extra == 'gymnasium'", specifier = ">=1.24" },
-    { name = "torch", marker = "extra == 'gymnasium'", specifier = ">=2.0" },
-]
-provides-extras = ["gymnasium", "jax"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "black", specifier = ">=24.0" },
-    { name = "ruff", specifier = ">=0.6" },
 ]
 
 [[package]]
@@ -286,9 +271,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "carl", extras = ["gymnasium"], directory = "../CARL" },
+    { name = "carl", extras = ["gymnasium"], git = "https://github.com/jwmccarthy/CARL.git?rev=6362f59f1b426ebb05df1345d270eaa37c53ddd9" },
     { name = "dotenv", specifier = ">=0.9.9" },
-    { name = "jarl", directory = "../JARL" },
+    { name = "jarl", git = "https://github.com/jwmccarthy/JARL.git?rev=8759825fa8e063121378e14bb32002364dc4e2a3" },
     { name = "numba", specifier = ">=0.67.0" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pandas", specifier = ">=2.3.3" },
@@ -381,7 +366,7 @@ wheels = [
 [[package]]
 name = "jarl"
 version = "0.1.0"
-source = { directory = "../JARL" }
+source = { git = "https://github.com/jwmccarthy/JARL.git?rev=8759825fa8e063121378e14bb32002364dc4e2a3#8759825fa8e063121378e14bb32002364dc4e2a3" }
 dependencies = [
     { name = "gymnasium" },
     { name = "numpy" },
@@ -389,18 +374,6 @@ dependencies = [
     { name = "torch" },
     { name = "trueskill" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "gymnasium", specifier = ">=1.0" },
-    { name = "gymnasium", extras = ["box2d"], marker = "extra == 'examples'", specifier = ">=1.0" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "rich", specifier = ">=14.0" },
-    { name = "tensorboard", marker = "extra == 'logging'", specifier = ">=2.0" },
-    { name = "torch", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "trueskill", specifier = ">=0.4.5" },
-]
-provides-extras = ["examples", "logging"]
 
 [[package]]
 name = "jinja2"
