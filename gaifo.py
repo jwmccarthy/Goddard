@@ -67,6 +67,9 @@ INTERNAL_STATE_START = 137
 INTERNAL_STATE_SIZE = 19
 POSITION_SCALE = (4108.0, 6000.0, 2076.0)
 BALL_MAX_SPEED = 6000.0
+BALL_RADIUS = 91.25
+GOAL_Y = 5124.25
+GOAL_HEIGHT = 642.775
 BALL_MAX_ANG_SPEED = 6.0
 CAR_MAX_SPEED = 2300.0
 CAR_MAX_ANG_SPEED = 5.5
@@ -253,17 +256,66 @@ def extract_scene_observations(
     return observation[..., :SCENE_SIZE].contiguous()
 
 
+def advanced_touch_events(
+    context: RewardContext,
+) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    """Score high, goal-directed touch impulses and airborne flip resets."""
+    current = context.current
+    previous = context.previous
+    touches = current.car_ball_touches
+    ball_to_car = current.ball_position[:, None, :] - current.car_position
+    ball_height = current.ball_position[:, None, 2]
+    car_height = current.car_position[..., 2]
+
+    aerial = (
+        touches
+        & ~current.car_on_ground
+        & car_height.gt(2.0 * BALL_RADIUS)
+        & ball_height.gt(GOAL_HEIGHT)
+    )
+    opponent_goal = th.zeros_like(current.car_position)
+    opponent_goal[..., 1] = current.team_sign * GOAL_Y
+    opponent_goal[..., 2] = GOAL_HEIGHT / 2.0
+    toward_goal = F.normalize(
+        opponent_goal - current.ball_position[:, None, :], dim=-1, eps=1e-6
+    )
+    ball_velocity_change = (
+        current.ball_velocity - previous.ball_velocity
+    )[:, None, :]
+    aerial_score = aerial.to(current.raw.dtype) * (
+        (ball_velocity_change * toward_goal).sum(dim=-1) / CAR_MAX_SPEED
+    ).clamp(0.0, 1.0)
+
+    spent_flip = previous.car_has_flipped | previous.car_has_double_jumped
+    flip_available = ~(current.car_has_flipped | current.car_has_double_jumped)
+    flip_reset = (
+        touches
+        & spent_flip
+        & flip_available
+        & car_height.gt(3.0 * BALL_RADIUS)
+        & ball_to_car.square().sum(dim=-1).lt((2.0 * BALL_RADIUS) ** 2)
+        & F.cosine_similarity(
+            ball_to_car, -current.car_up, dim=-1, eps=1e-6
+        ).gt(0.9)
+    )
+    return aerial_score, aerial, flip_reset
+
+
 class GameplayDiagnostics:
-    """Count both policies' gameplay events before CARL auto-resets finished games."""
+    """Record physical events and goal-only episode rewards before CARL auto-resets."""
 
     def __init__(self, n_sim: int, device: th.device, no_touch_timeout_steps: int) -> None:
         self.no_touch_timeout_steps = no_touch_timeout_steps
         self.touch_steps = th.zeros(n_sim, dtype=th.long, device=device)
+        self.last_aerial_touch_score = th.zeros(n_sim * N_CARS, device=device)
+        self.last_flip_reset = th.zeros(n_sim * N_CARS, device=device)
         self.counts = {
             name: th.zeros((), dtype=th.float32, device=device)
             for name in (
                 "steps",
                 "touches",
+                "aerial_touches",
+                "flip_resets",
                 "goals_for",
                 "goals_against",
                 "episodes",
@@ -271,9 +323,18 @@ class GameplayDiagnostics:
             )
         }
 
+    @th.no_grad()
     def __call__(self, context: RewardContext) -> th.Tensor:
         touches = context.current.car_ball_touches
         score_for_actor = context.events.score_delta[:, None] * context.current.team_sign
+        aerial_score, aerial, flip_reset = advanced_touch_events(context)
+        self.last_aerial_touch_score = (
+            aerial_score - aerial_score.flip(dims=(-1,))
+        ).reshape(-1)
+        flip_reset_score = flip_reset.to(aerial_score.dtype)
+        self.last_flip_reset = (
+            flip_reset_score - flip_reset_score.flip(dims=(-1,))
+        ).reshape(-1)
 
         self.touch_steps += 1
         self.touch_steps[touches.any(dim=-1)] = 0
@@ -284,6 +345,8 @@ class GameplayDiagnostics:
 
         self.counts["steps"] += touches.numel()
         self.counts["touches"] += touches.sum()
+        self.counts["aerial_touches"] += aerial.sum()
+        self.counts["flip_resets"] += flip_reset.sum()
         self.counts["goals_for"] += (score_for_actor > 0).sum()
         self.counts["goals_against"] += (score_for_actor < 0).sum()
         self.counts["episodes"] += context.events.done.sum() * N_CARS
@@ -299,10 +362,15 @@ class GameplayDiagnostics:
         if steps > 0:
             metrics.update({
                 "touches_per_1000_steps": self.counts["touches"].item() / steps * 1000,
+                "aerial_touches_per_1000_steps": self.counts["aerial_touches"].item() / steps * 1000,
+                "flip_resets_per_1000_steps": self.counts["flip_resets"].item() / steps * 1000,
                 "goals_for_per_1000_steps": self.counts["goals_for"].item() / steps * 1000,
                 "goals_against_per_1000_steps": self.counts["goals_against"].item() / steps * 1000,
             })
-            for name in ("steps", "touches", "goals_for", "goals_against"):
+            for name in (
+                "steps", "touches", "aerial_touches", "flip_resets",
+                "goals_for", "goals_against",
+            ):
                 self.counts[name].zero_()
 
         episodes = self.counts["episodes"].item()
@@ -312,6 +380,19 @@ class GameplayDiagnostics:
             self.counts["timeouts"].zero_()
 
         return {"Gameplay": metrics} if metrics else {}
+
+
+class AdvancedTouchCapture(CaptureBase):
+    """Keep physical touch rewards separate from CARL's goal-only episode return."""
+
+    def __init__(self, gameplay: GameplayDiagnostics) -> None:
+        self.gameplay = gameplay
+
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        return {
+            "aerial_touch_score": self.gameplay.last_aerial_touch_score,
+            "flip_reset_event": self.gameplay.last_flip_reset,
+        }
 
 
 class SceneWindowCapture(CaptureBase):
@@ -1203,12 +1284,11 @@ def train_discriminator_minibatch(
 
 
 class DualTimescaleSceneDiscriminatorReward:
-    """Combine short/long imitation rewards with each actor's goal reward.
+    """Combine imitation, goal, and physical touch rewards per actor.
 
     Both discriminators are scored, normalized, and clamped independently with
-    the existing negative-logit logic. Invalid long entries remain zero so they
-    never mask short-valid PPO transitions. Goal transitions are also learnable
-    when they happen before the short window has enough history.
+    the existing negative-logit logic. Physical bonuses are zero-sum in 1v1;
+    goal and touch transitions remain learnable before imitation windows are valid.
     """
 
     def __init__(
@@ -1220,6 +1300,8 @@ class DualTimescaleSceneDiscriminatorReward:
         long_trajectory_length: int,
         long_reward_weight: float,
         goal_reward_weight: float = 1.0,
+        aerial_touch_reward_weight: float = 0.0,
+        flip_reset_reward_weight: float = 0.0,
         batch_size: int = 16_384,
         max_magnitude: float = 10.0,
     ) -> None:
@@ -1231,6 +1313,10 @@ class DualTimescaleSceneDiscriminatorReward:
             raise ValueError("long reward weight must be non-negative")
         if not math.isfinite(goal_reward_weight) or goal_reward_weight < 0.0:
             raise ValueError("goal reward weight must be non-negative")
+        if not math.isfinite(aerial_touch_reward_weight) or aerial_touch_reward_weight < 0.0:
+            raise ValueError("aerial touch reward weight must be non-negative")
+        if not math.isfinite(flip_reset_reward_weight) or flip_reset_reward_weight < 0.0:
+            raise ValueError("flip reset reward weight must be non-negative")
         self.short_discriminator = short_discriminator
         self.long_discriminator = long_discriminator
         self.noise_std = noise_std
@@ -1238,8 +1324,23 @@ class DualTimescaleSceneDiscriminatorReward:
         self.long_trajectory_length = long_trajectory_length
         self.long_reward_weight = long_reward_weight
         self.goal_reward_weight = goal_reward_weight
+        self.aerial_touch_reward_weight = aerial_touch_reward_weight
+        self.flip_reset_reward_weight = flip_reset_reward_weight
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
+
+    @staticmethod
+    def _event_reward(
+        batch: TensorBatch, name: str, weight: float, reference: th.Tensor
+    ) -> th.Tensor:
+        score = batch.get(name)
+        if score is None:
+            if weight:
+                raise ValueError(f"missing {name} with nonzero reward weight")
+            return th.zeros_like(reference)
+        if score.shape != reference.shape:
+            raise ValueError(f"{name} must match the actor rollout shape")
+        return score.to(reference.dtype) * weight
 
     def _score_windows(
         self,
@@ -1304,15 +1405,30 @@ class DualTimescaleSceneDiscriminatorReward:
         goal_reward = batch["reward"].to(dtype) * self.goal_reward_weight
         if goal_reward.shape != imitation_reward.shape:
             raise ValueError("goal rewards must match the actor rollout shape")
+        aerial_touch_reward = self._event_reward(
+            batch, "aerial_touch_score", self.aerial_touch_reward_weight,
+            imitation_reward,
+        )
+        flip_reset_reward = self._event_reward(
+            batch, "flip_reset_event", self.flip_reset_reward_weight,
+            imitation_reward,
+        )
 
         result = batch.with_fields(
             short_imitation_reward=short_scores,
             long_imitation_reward=long_scores,
             imitation_reward=imitation_reward,
             goal_reward=goal_reward,
-            training_reward=imitation_reward + goal_reward,
+            aerial_touch_reward=aerial_touch_reward,
+            flip_reset_reward=flip_reset_reward,
+            training_reward=(
+                imitation_reward + goal_reward + aerial_touch_reward + flip_reset_reward
+            ),
         )
-        learner_mask = short_valid | goal_reward.ne(0)
+        learner_mask = (
+            short_valid | goal_reward.ne(0) | aerial_touch_reward.ne(0)
+            | flip_reset_reward.ne(0)
+        )
         if "learner_mask" in result:
             return result.replace_fields(
                 learner_mask=result["learner_mask"].bool() & learner_mask
@@ -1855,6 +1971,14 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--goal-reward-weight", type=float, default=1.0,
         help="scale the +/-1 goal reward per actor (0 disables it)",
     )
+    parser.add_argument(
+        "--aerial-touch-reward-weight", type=float, default=0.5,
+        help="reward positive ball-velocity change toward goal on airborne touches above goal height (0 disables it)",
+    )
+    parser.add_argument(
+        "--flip-reset-reward-weight", type=float, default=1.0,
+        help="reward a spent flip returning on an underside ball touch (0 disables it)",
+    )
     parser.add_argument("--long-history-capacity", type=int, default=65_536)
     parser.add_argument("--long-history-add-size", type=int, default=4_096)
     parser.add_argument("--expert-frame-limit", type=int, default=None)
@@ -2047,6 +2171,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--long-reward-weight must be finite and non-negative")
     if not math.isfinite(args.goal_reward_weight) or args.goal_reward_weight < 0.0:
         raise ValueError("--goal-reward-weight must be finite and non-negative")
+    if (
+        not math.isfinite(args.aerial_touch_reward_weight)
+        or args.aerial_touch_reward_weight < 0.0
+    ):
+        raise ValueError("--aerial-touch-reward-weight must be finite and non-negative")
+    if (
+        not math.isfinite(args.flip_reset_reward_weight)
+        or args.flip_reset_reward_weight < 0.0
+    ):
+        raise ValueError("--flip-reset-reward-weight must be finite and non-negative")
     if args.long_history_add_size > args.long_history_capacity:
         raise ValueError(
             "--long-history-add-size must not exceed --long-history-capacity"
@@ -2133,12 +2267,17 @@ def build_discriminator(args: argparse.Namespace) -> SceneDiscriminator:
     )
 
 
-def build_runner(env, policy, critic, buffer, args, long_offsets) -> Runner:
+def build_runner(
+    env, policy, critic, buffer, args, long_offsets,
+    gameplay: GameplayDiagnostics | None = None,
+) -> Runner:
     captures = [LogProbCapture()]
     if args.gru:
         captures.extend((RecurrentStateCapture(), RecurrentCriticCapture(critic)))
     else:
         captures.append(CriticCapture(critic))
+    if gameplay is not None:
+        captures.append(AdvancedTouchCapture(gameplay))
     captures.append(SceneWindowCapture(
         args.trajectory_length,
         long_span=int(long_offsets[-1]),
@@ -2267,7 +2406,7 @@ def main() -> None:
     buffer = RolloutBuffer(
         args.rollout, env.n_envs, env.device, copy_on_finish=False
     )
-    runner = build_runner(env, policy, critic, buffer, args, long_offsets)
+    runner = build_runner(env, policy, critic, buffer, args, long_offsets, gameplay)
 
     short_discriminator_update = AdaptiveDiscriminatorUpdate(
         expert=expert,
@@ -2334,6 +2473,8 @@ def main() -> None:
                 long_trajectory_length=args.long_trajectory_length,
                 long_reward_weight=args.long_reward_weight,
                 goal_reward_weight=args.goal_reward_weight,
+                aerial_touch_reward_weight=args.aerial_touch_reward_weight,
+                flip_reset_reward_weight=args.flip_reset_reward_weight,
                 batch_size=args.discriminator_microbatch,
                 max_magnitude=args.reward_max_magnitude,
             ),
@@ -2381,6 +2522,8 @@ def main() -> None:
         ("PPO", "critic_loss", "critic loss", ".4f"),
         ("PPO", "entropy", "entropy", ".3f"),
         ("Gameplay", "touches_per_1000_steps", "touches/1k", ".3f"),
+        ("Gameplay", "aerial_touches_per_1000_steps", "aerial/1k", ".3f"),
+        ("Gameplay", "flip_resets_per_1000_steps", "flip resets/1k", ".3f"),
         ("Gameplay", "goals_for_per_1000_steps", "goals for/1k", ".3f"),
         ("Gameplay", "goals_against_per_1000_steps", "goals against/1k", ".3f"),
         ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
