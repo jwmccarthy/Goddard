@@ -85,7 +85,7 @@ class GAIFOGruTests(unittest.TestCase):
 
                 buffer = RolloutBuffer(args.rollout, self.env.n_envs, self.env.device)
                 runner = build_runner(
-                    self.env, policy, critic, buffer, args, np.array([0, 1, 2])
+                    self.env, policy, critic, buffer, args
                 )
                 runner.reset()
                 for step in range(args.rollout):
@@ -96,6 +96,8 @@ class GAIFOGruTests(unittest.TestCase):
                         th.testing.assert_close(runner.state, th.zeros_like(runner.state))
 
                 steps = buffer.finish().steps
+                self.assertEqual(steps["scene_window"].shape[-2:], (2, 51))
+                self.assertNotIn("long_scene_window", steps)
                 if gru:
                     th.testing.assert_close(
                         steps["policy_state"][2],
@@ -176,7 +178,6 @@ class GAIFOGruTests(unittest.TestCase):
                     "policy": build_policy(self.env, args),
                     "critic": build_critic(self.env, args),
                     "discriminator": th.nn.Linear(3, 1),
-                    "long_discriminator": th.nn.Linear(3, 1),
                 }
                 optimizers = {
                     name: th.optim.Adam(module.parameters(), lr=args.ppo_lr)
@@ -188,18 +189,25 @@ class GAIFOGruTests(unittest.TestCase):
                     modules["policy"], modules["critic"], modules["discriminator"],
                     optimizers["policy"], optimizers["critic"],
                     optimizers["discriminator"], buffer, args,
-                    long_discriminator=modules["long_discriminator"],
-                    long_discriminator_optimizer=optimizers["long_discriminator"],
                 )
                 checkpointer.clock = Clock(
                     vector_steps=4, env_steps=8, learner_updates=1
                 )
                 checkpointer.save(8, force=True)
                 path = Path(directory) / "gaifo_000000000008.pt"
+                single = th.load(path, map_location="cpu", weights_only=True)
+                self.assertNotIn("long_discriminator", single)
+                self.assertNotIn("long_discriminator_optimizer", single)
 
                 if not gru:
-                    # Existing MLP checkpoints predate these optional flags.
-                    legacy = th.load(path, map_location="cpu", weights_only=True)
+                    # Older dual-discriminator MLP checkpoints keep their short weights.
+                    legacy = single
+                    legacy["long_discriminator"] = th.nn.Linear(3, 1).state_dict()
+                    legacy["long_discriminator_optimizer"] = th.optim.Adam(
+                        th.nn.Linear(3, 1).parameters()
+                    ).state_dict()
+                    legacy["config"]["long_trajectory_seconds"] = 5.0
+                    legacy["config"]["long_trajectory_length"] = 16
                     del legacy["config"]["gru"]
                     del legacy["config"]["entropy_end"]
                     th.save(legacy, path)
@@ -228,7 +236,6 @@ class GAIFOGruTests(unittest.TestCase):
                     "policy": build_policy(self.env, parsed),
                     "critic": build_critic(self.env, parsed),
                     "discriminator": th.nn.Linear(3, 1),
-                    "long_discriminator": th.nn.Linear(3, 1),
                 }
                 restored_optimizers = {
                     name: th.optim.Adam(module.parameters(), lr=parsed.ppo_lr)

@@ -15,8 +15,8 @@ from carl.gymnasium.state import (
 )
 from gaifo import (
     AdvancedTouchCapture,
-    DualTimescaleSceneDiscriminatorReward,
     GameplayDiagnostics,
+    SceneDiscriminatorReward,
     advanced_touch_events,
     parse_args,
 )
@@ -28,6 +28,11 @@ from reward_spec import CAR_MAX_SPEED, GOAL_HEIGHT, GOAL_Y
 class ZeroDiscriminator(th.nn.Module):
     def forward(self, windows):
         return th.zeros(len(windows), device=windows.device)
+
+
+class PositionDiscriminator(th.nn.Module):
+    def forward(self, windows):
+        return windows[:, -1, 0]
 
 
 def touch_context() -> RewardContext:
@@ -122,17 +127,12 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             "reward": goal_only.reshape(1, 8),
             "scene_window": th.zeros(1, 8, 2, 51),
             "scene_window_valid": th.zeros(1, 8, dtype=th.bool),
-            "long_scene_window": th.zeros(1, 8, 2, 51),
-            "long_scene_window_valid": th.zeros(1, 8, dtype=th.bool),
             **{name: value.unsqueeze(0) for name, value in captured.items()},
         })
-        transform = DualTimescaleSceneDiscriminatorReward(
-            short_discriminator=ZeroDiscriminator(),
-            long_discriminator=ZeroDiscriminator(),
+        transform = SceneDiscriminatorReward(
+            discriminator=ZeroDiscriminator(),
             noise_std=0.0,
-            short_trajectory_length=2,
-            long_trajectory_length=2,
-            long_reward_weight=0.5,
+            trajectory_length=2,
             goal_reward_weight=3.0,
             aerial_touch_reward_weight=0.5,
             flip_reset_reward_weight=1.0,
@@ -160,6 +160,30 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         # Continuing ball contact cannot award a second flip reset.
         gameplay(replace(context, previous=context.current))
         self.assertFalse(gameplay.last_flip_reset.any())
+
+    def test_short_window_reward_and_terminal_event_on_invalid_window(self):
+        windows = th.zeros(1, 4, 2, 51)
+        windows[0, :, -1, 0] = th.tensor([-2.0, 0.0, 3.0, 0.0])
+        batch = TensorBatch({
+            "observation": th.zeros(1, 4, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.tensor([[True, False, True, False]]),
+            "reward": th.tensor([[0.0, 0.0, 0.0, 2.0]]),
+        })
+        reward = SceneDiscriminatorReward(
+            PositionDiscriminator(), noise_std=0.0, trajectory_length=2,
+            batch_size=1,
+        )(batch, PrepareContext())
+        th.testing.assert_close(
+            reward["imitation_reward"], th.tensor([[1.0, 0.0, -1.0, 0.0]])
+        )
+        th.testing.assert_close(
+            reward["training_reward"], th.tensor([[1.0, 0.0, -1.0, 2.0]])
+        )
+        th.testing.assert_close(
+            reward["learner_mask"], th.tensor([[True, False, True, True]])
+        )
+        self.assertNotIn("long_imitation_reward", reward)
 
     def test_aerial_bonus_requires_height_and_goalward_acceleration(self):
         context = touch_context()
