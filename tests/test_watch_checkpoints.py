@@ -1,14 +1,16 @@
 import argparse
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch as th
 from gymnasium.spaces import Box, MultiDiscrete
 
 from gaifo import GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, build_policy
-from watch_checkpoints import load_policy_checkpoint
+from watch_checkpoints import load_policy_checkpoint, parse_args
 
 
 class FakeEnv:
@@ -19,6 +21,18 @@ class FakeEnv:
 
 
 class WatchGAIFOCheckpointsTests(unittest.TestCase):
+    def test_policy_width_flag_keeps_legacy_spelling(self):
+        with patch.object(sys, "argv", [
+            "watch_checkpoints.py", "--policy-hidden", "16",
+        ]):
+            canonical = parse_args()
+        with patch.object(sys, "argv", [
+            "watch_checkpoints.py", "--hidden-size", "16",
+        ]):
+            legacy = parse_args()
+        self.assertEqual(vars(canonical), vars(legacy))
+        self.assertEqual(canonical.hidden_size, 16)
+
     def test_load_and_play_mlp_and_gru(self):
         th.manual_seed(0)
         env = FakeEnv()

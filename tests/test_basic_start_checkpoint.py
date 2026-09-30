@@ -138,8 +138,45 @@ class BasicStartingCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mutually exclusive"):
                 configure_starting_checkpoint(args)
             args = checkpoint_args(start=path, hidden=32)
-            with self.assertRaisesRegex(ValueError, "--hidden-size"):
+            with self.assertRaisesRegex(ValueError, "--policy-hidden"):
                 configure_starting_checkpoint(args)
+
+    def test_gaifo_style_flags_accept_legacy_basic_spellings(self):
+        aliases = (
+            ("--n-sim", "--num-simulations", "12"),
+            ("--rollout", "--rollout-steps", "32"),
+            ("--policy-hidden", "--hidden-size", "64"),
+            ("--timesteps", "--total-timesteps", "256"),
+            ("--ppo-batch", "--minibatch-size", "32"),
+            ("--ppo-lr", "--learning-rate", "0.0002"),
+            ("--ppo-lr-end-factor", "--learning-rate-end-factor", "0.75"),
+            ("--ppo-epochs", "--epochs", "3"),
+            ("--entropy", "--entropy-coef", "0.02"),
+            ("--entropy-end", "--entropy-coef-end", "0.01"),
+            ("--lambda", "--gae-lambda", "0.95"),
+            ("--log-dir", "--tensorboard-dir", "/tmp/opencode/logs"),
+            ("--replay-dir", "--replay-dataset", "parsed_replays"),
+            ("--replay-reset-fraction", "--replay-reset-probability", "0.4"),
+        )
+
+        def parse(spelling):
+            flags = [part for names in aliases for part in (names[spelling], names[2])]
+            with patch.object(sys, "argv", ["basic.py", *flags]):
+                return parse_arguments()
+
+        canonical, legacy = parse(0), parse(1)
+        self.assertEqual(vars(canonical), vars(legacy))
+        self.assertEqual(canonical.hidden_size, 64)
+        self.assertEqual(canonical.learning_rate, 0.0002)
+        self.assertEqual(canonical.tensorboard_dir, Path("/tmp/opencode/logs"))
+        self.assertEqual(canonical.replay_dataset, Path("parsed_replays"))
+
+        with patch.object(sys, "argv", ["basic.py"]):
+            defaults = parse_arguments()
+        self.assertEqual(defaults.hidden_size, 256)
+        self.assertEqual(defaults.entropy_coef_end, 0.005)
+        self.assertEqual(defaults.learning_rate_end_factor, 0.5)
+        self.assertEqual(defaults.replay_reset_probability, 0.7)
 
     def test_start_kl_flag_defaults_and_validation(self):
         with patch.object(sys, "argv", ["basic.py", "--start-kl-coef", "0.3", "--sparse"]):

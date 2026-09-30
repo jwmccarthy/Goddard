@@ -590,7 +590,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse Rocket League replays.")
     parser.add_argument("--replay-dir", default="./ballchasing_replays/replays/")
     parser.add_argument("--output-dir", default="./ballchasing_replays/parsed_replays/")
-    parser.add_argument("--frame-skip", type=int, default=4)
+    parser.add_argument(
+        "--frameskip", "--frame-skip", dest="frame_skip",
+        type=int, default=4, metavar="FRAMESKIP",
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--pov-manifest")
     parser.add_argument("--replay-glob", default="*.replay")

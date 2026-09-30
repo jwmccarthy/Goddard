@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch BASIC or GAIFO checkpoints play a 1v1 match in the browser."""
+"""Watch BASIC, GAIFO or DIFO checkpoints play a 1v1 match in the browser."""
 
 import argparse
 import json
@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parent
 CAR_OFFSET = (13.8757, 0.0, 20.755)
 CHECKPOINT_PATTERNS = (
     "gaifo_*.pt",
+    "difo_*.pt",
     "training_latest.pt",
     "actor_critic_final.pt",
     "policy_*.pt",
@@ -40,7 +41,11 @@ CHECKPOINT_PATTERNS = (
 
 
 def checkpoint_kind(path: Path) -> str:
-    return "gaifo" if path.match("gaifo_*.pt") else "basic"
+    if path.match("gaifo_*.pt"):
+        return "gaifo"
+    if path.match("difo_*.pt"):
+        return "difo"
+    return "basic"
 
 
 def is_checkpoint(path: Path) -> bool:
@@ -98,7 +103,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no BASIC or GAIFO checkpoints found in {self.directory}"
+                f"no BASIC, GAIFO or DIFO checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -165,7 +170,9 @@ def load_policy_checkpoint(
         )
 
     kind = checkpoint_kind(path)
-    if kind == "gaifo":
+    if kind in ("gaifo", "difo"):
+        if kind == "difo" and config.get("algorithm") != "difo":
+            raise ValueError(f"unsupported DIFO checkpoint in {path}")
         architecture = config.get("architecture")
         if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
@@ -507,7 +514,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blue")
     parser.add_argument("--orange")
     parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument("--hidden-size", type=int)
+    parser.add_argument(
+        "--policy-hidden", "--hidden-size", dest="hidden_size",
+        type=int, metavar="POLICY_HIDDEN",
+    )
     parser.add_argument("--max-ticks", type=int, default=4096)
     parser.add_argument("--reset-state-limit", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0)

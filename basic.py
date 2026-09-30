@@ -150,7 +150,7 @@ def configure_starting_checkpoint(
             arguments.hidden_size = checkpoint.hidden_size
         elif arguments.hidden_size != checkpoint.hidden_size:
             raise ValueError(
-                f"--hidden-size must match checkpoint ({checkpoint.hidden_size})"
+                f"--policy-hidden must match checkpoint ({checkpoint.hidden_size})"
             )
         arguments.policy_architecture = checkpoint.architecture
 
@@ -347,7 +347,10 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a BASIC Rocket League agent"
     )
-    parser.add_argument("--num-simulations",            type=int,   default=1024)
+    parser.add_argument(
+        "--n-sim", "--num-simulations", dest="num_simulations",
+        type=int, default=1024, metavar="N_SIM",
+    )
     parser.add_argument("--frameskip",                  type=int,   default=8)
     parser.add_argument("--max-ticks",                  type=int,   default=36_000)
     parser.add_argument(
@@ -356,26 +359,52 @@ def parse_arguments() -> argparse.Namespace:
         default=30.0,
         help="end an episode after this many seconds without a ball touch",
     )
-    parser.add_argument("--rollout-steps",              type=int,   default=512)
+    parser.add_argument(
+        "--rollout", "--rollout-steps", dest="rollout_steps",
+        type=int, default=512, metavar="ROLLOUT",
+    )
     parser.add_argument("--sequence-length",            type=int,   default=16)
     parser.add_argument(
-        "--hidden-size", type=int, default=None,
-        help="policy and critic width (default: 256, inferred from a checkpoint)",
+        "--policy-hidden", "--hidden-size", dest="hidden_size",
+        type=int, default=None, metavar="POLICY_HIDDEN",
+        help="shared policy and critic width (default: 256, inferred from a checkpoint)",
     )
-    parser.add_argument("--total-timesteps",            type=int,   default=10_000_000_000)
-    parser.add_argument("--minibatch-size",             type=int,   default=65_536)
-    parser.add_argument("--learning-rate",              type=float, default=1e-5)
-    parser.add_argument("--learning-rate-end-factor",   type=float, default=0.5)
+    parser.add_argument(
+        "--timesteps", "--total-timesteps", dest="total_timesteps",
+        type=int, default=10_000_000_000, metavar="TIMESTEPS",
+    )
+    parser.add_argument(
+        "--ppo-batch", "--minibatch-size", dest="minibatch_size",
+        type=int, default=65_536, metavar="PPO_BATCH",
+    )
+    parser.add_argument(
+        "--ppo-lr", "--learning-rate", dest="learning_rate",
+        type=float, default=1e-5, metavar="PPO_LR",
+    )
+    parser.add_argument(
+        "--ppo-lr-end-factor", "--learning-rate-end-factor",
+        dest="learning_rate_end_factor", type=float, default=0.5,
+        metavar="PPO_LR_END_FACTOR",
+    )
     parser.add_argument(
         "--bf16",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="use BF16 autocast for PPO updates",
     )
-    parser.add_argument("--epochs",                     type=int,   default=32)
+    parser.add_argument(
+        "--ppo-epochs", "--epochs", dest="epochs", type=int, default=32,
+        metavar="PPO_EPOCHS",
+    )
     parser.add_argument("--target-kl",                  type=float, default=0.02)
-    parser.add_argument("--entropy-coef",               type=float, default=0.01)
-    parser.add_argument("--entropy-coef-end",           type=float, default=0.005)
+    parser.add_argument(
+        "--entropy", "--entropy-coef", dest="entropy_coef",
+        type=float, default=0.01, metavar="ENTROPY",
+    )
+    parser.add_argument(
+        "--entropy-end", "--entropy-coef-end", dest="entropy_coef_end",
+        type=float, default=0.005, metavar="ENTROPY_END",
+    )
     parser.add_argument("--self-play-current",          type=float, default=0.8)
     parser.add_argument("--snapshot-interval",          type=int,   default=16)
     parser.add_argument("--opponent-pool-size",         type=int,   default=8)
@@ -401,8 +430,14 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="constant discount override; disables the half-life schedule",
     )
-    parser.add_argument("--gae-lambda",                 type=float, default=0.99)
-    parser.add_argument("--tensorboard-dir",            type=Path,  default=Path("runs"))
+    parser.add_argument(
+        "--lambda", "--gae-lambda", dest="gae_lambda",
+        type=float, default=0.99, metavar="LAMBDA",
+    )
+    parser.add_argument(
+        "--log-dir", "--tensorboard-dir", dest="tensorboard_dir",
+        type=Path, default=Path("runs"), metavar="LOG_DIR",
+    )
     parser.add_argument("--checkpoint-dir",             type=Path,  default=Path("checkpoints"))
     parser.add_argument("--resume-checkpoint",          type=Path,  default=None)
     parser.add_argument(
@@ -414,11 +449,15 @@ def parse_arguments() -> argparse.Namespace:
         help="KL(reference || current) penalty; defaults to 0.1 with --start-checkpoint, 0 otherwise",
     )
     parser.add_argument(
-        "--replay-dataset",
-        type=Path,
-        default=Path("parsed_replays"),
+        "--replay-dir", "--replay-dataset", dest="replay_dataset",
+        type=Path, default=Path("parsed_replays"), metavar="REPLAY_DIR",
+        help="folder containing parsed replay reset states",
     )
-    parser.add_argument("--replay-reset-probability",   type=float, default=0.7)
+    parser.add_argument(
+        "--replay-reset-fraction", "--replay-reset-probability",
+        dest="replay_reset_probability", type=float, default=0.7,
+        metavar="REPLAY_RESET_FRACTION",
+    )
     parser.add_argument("--reset-state-limit",          type=int,   default=100_000)
     parser.add_argument(
         "--normalize",
@@ -439,23 +478,23 @@ def parse_arguments() -> argparse.Namespace:
 
 def validate_arguments(arguments: argparse.Namespace) -> None:
     positive = {
-        "num-simulations":        arguments.num_simulations,
+        "n-sim":                  arguments.num_simulations,
         "frameskip":              arguments.frameskip,
         "max-ticks":              arguments.max_ticks,
-        "rollout-steps":          arguments.rollout_steps,
+        "rollout":                arguments.rollout_steps,
         "sequence-length":        arguments.sequence_length,
-        "hidden-size":            arguments.hidden_size,
-        "total-timesteps":        arguments.total_timesteps,
-        "minibatch-size":         arguments.minibatch_size,
-        "learning-rate":          arguments.learning_rate,
-        "epochs":                 arguments.epochs,
+        "policy-hidden":          arguments.hidden_size,
+        "timesteps":              arguments.total_timesteps,
+        "ppo-batch":              arguments.minibatch_size,
+        "ppo-lr":                 arguments.learning_rate,
+        "ppo-epochs":             arguments.epochs,
         "target-kl":              arguments.target_kl,
         "reward-scale":           arguments.reward_scale,
         "discount-half-life":     arguments.discount_half_life,
         "discount-half-life-end": arguments.discount_half_life_end,
         "goal-score-weight":      arguments.goal_score_weight,
         "goal-score-weight-end":  arguments.goal_score_weight_end,
-        "gae-lambda":             arguments.gae_lambda,
+        "lambda":                 arguments.gae_lambda,
         "snapshot-interval":      arguments.snapshot_interval,
         "opponent-pool-size":     arguments.opponent_pool_size,
         "historical-policies":    arguments.historical_policies,
@@ -472,9 +511,9 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         != GAIFO_ARCHITECTURE
     ):
         if arguments.rollout_steps % arguments.sequence_length:
-            raise ValueError("rollout-steps must be divisible by sequence-length")
+            raise ValueError("--rollout must be divisible by --sequence-length")
         if arguments.minibatch_size % arguments.sequence_length:
-            raise ValueError("minibatch-size must be divisible by sequence-length")
+            raise ValueError("--ppo-batch must be divisible by --sequence-length")
     if arguments.opponent_pool_size < 3:
         raise ValueError("opponent-pool-size must be at least three")
     if arguments.historical_policies >= arguments.opponent_pool_size:
@@ -499,19 +538,19 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
     if not math.isfinite(arguments.learning_rate_end_factor) or not (
         0.0 < arguments.learning_rate_end_factor <= 1.0
     ):
-        raise ValueError("learning-rate-end-factor must be in (0, 1]")
+        raise ValueError("--ppo-lr-end-factor must be in (0, 1]")
     if not math.isfinite(arguments.replay_reset_probability) or not (
         0.0 <= arguments.replay_reset_probability <= 1.0
     ):
-        raise ValueError("replay-reset-probability must be between zero and one")
+        raise ValueError("--replay-reset-fraction must be between zero and one")
     if not math.isfinite(arguments.gae_lambda) or arguments.gae_lambda > 1.0:
-        raise ValueError("gae-lambda cannot exceed one")
+        raise ValueError("--lambda cannot exceed one")
     if arguments.gamma is not None and (
         not math.isfinite(arguments.gamma) or not 0.0 < arguments.gamma <= 1.0
     ):
         raise ValueError("gamma must be in (0, 1]")
     if not arguments.replay_dataset.is_dir():
-        raise ValueError(f"Replay dataset does not exist: {arguments.replay_dataset}")
+        raise ValueError(f"Replay directory does not exist: {arguments.replay_dataset}")
     if (
         arguments.resume_checkpoint is not None
         and not arguments.resume_checkpoint.is_file()
@@ -998,7 +1037,7 @@ def main() -> None:
     try:
         if arguments.total_timesteps < environment.n_envs:
             raise ValueError(
-                "total-timesteps must include at least one vector step "
+                "--timesteps must include at least one vector step "
                 f"({environment.n_envs:,} actor timesteps)"
             )
         policy, critic = build_policy_and_critic(
