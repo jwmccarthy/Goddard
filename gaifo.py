@@ -578,6 +578,7 @@ class ExpertSceneDataset:
         device: str | th.device = "cpu",
         heldout_size: int = 0,
         partition_span: int | None = None,
+        reject_discontinuities: bool = False,
     ) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
@@ -612,6 +613,8 @@ class ExpertSceneDataset:
 
         frames: list[th.Tensor] = []
         internal_states: list[th.Tensor] = []
+        invalid_frames: list[th.Tensor] = []
+        contact_frames: list[th.Tensor] = []
         lengths: list[int] = []
         total = 0
         for group in selected:
@@ -624,6 +627,12 @@ class ExpertSceneDataset:
                 else:
                     stored_frame_skip = _sampled_frame_skip(path, frame_skip)
             stored = np.load(path, mmap_mode="r")
+            if reject_discontinuities:
+                # The final two columns flag parser corrections and implausible
+                # physics jumps. The preceding columns are real touch/bump
+                # events and must remain in the motion prior's training data.
+                invalid = np.asarray(stored[:, -2:], dtype=bool).any(axis=-1)
+                contact = np.asarray(stored[:, -5:-2], dtype=bool).any(axis=-1)
             source = np.array(
                 stored[:, :SCENE_SIZE], dtype=np.float32, copy=True
             )
@@ -640,6 +649,9 @@ class ExpertSceneDataset:
                 opponent = np.load(opponent_path, mmap_mode="r")
                 if len(opponent) != len(stored):
                     raise ValueError(f"paired POV rows differ for {path.name}")
+                if reject_discontinuities:
+                    invalid |= np.asarray(opponent[:, -2:], dtype=bool).any(axis=-1)
+                    contact |= np.asarray(opponent[:, -5:-2], dtype=bool).any(axis=-1)
                 opponent_internal = np.array(
                     opponent[
                         :,
@@ -661,6 +673,14 @@ class ExpertSceneDataset:
                         )
                     if opponent_frame_skip != stored_frame_skip:
                         raise ValueError(f"paired POV cadence differs for {path.name}")
+            if reject_discontinuities and frame_skip is not None and stored_frame_skip != frame_skip:
+                left, right, _ = _resample_coordinates(
+                    len(stored), stored_frame_skip, frame_skip
+                )
+                invalid = invalid[left] | invalid[right]
+                event_prefix = np.pad(contact.astype(np.int64).cumsum(0), (1, 0))
+                previous_right = np.concatenate(([-1], right[:-1]))
+                contact = (event_prefix[right + 1] - event_prefix[previous_right + 1]) > 0
             if frame_skip is not None:
                 source = resample_scene(source, stored_frame_skip, frame_skip)
                 ego_internal = resample_internal_state(
@@ -676,8 +696,14 @@ class ExpertSceneDataset:
                     break
                 source = source[:keep]
                 internal = internal[:keep]
+                if reject_discontinuities:
+                    invalid = invalid[:keep]
+                    contact = contact[:keep]
             frames.append(th.from_numpy(source))
             internal_states.append(th.from_numpy(internal))
+            if reject_discontinuities:
+                invalid_frames.append(th.from_numpy(invalid.copy()))
+                contact_frames.append(th.from_numpy(contact.copy()))
             lengths.append(len(source))
             total += len(source)
             if limit is not None and total >= limit:
@@ -688,6 +714,9 @@ class ExpertSceneDataset:
 
         self.frames = th.cat(frames).to(device)
         self.internal_states = th.cat(internal_states).to(device)
+        self.contact_frames = (
+            th.cat(contact_frames).to(device) if reject_discontinuities else None
+        )
         self.lengths = lengths
         window_starts = []
         segment_window_starts = []
@@ -712,6 +741,19 @@ class ExpertSceneDataset:
         self.total_windows = len(self.window_starts)
 
         self._split_heldout(device, seed)
+        if reject_discontinuities:
+            invalid = th.cat(invalid_frames).to(device)
+            prefix = F.pad(invalid.long().cumsum(0), (1, 0))
+
+            def safe_starts(starts: th.Tensor) -> th.Tensor:
+                return starts[
+                    prefix[starts + self.trajectory_length] == prefix[starts]
+                ]
+
+            self.train_window_starts = safe_starts(self.train_window_starts)
+            self.heldout_window_starts = safe_starts(self.heldout_window_starts)
+            self.reset_indices = self.reset_indices[~invalid[self.reset_indices]]
+            self._build_partition_masks(device)
 
     def _split_heldout(self, device: str | th.device, seed: int) -> None:
         split_rng = th.Generator(device=device).manual_seed(seed)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch BASIC, GAIFO or DIFO checkpoints play a 1v1 match in the browser."""
+"""Watch BASIC, GAIFO, DIFO or SMP checkpoints play a 1v1 match in the browser."""
 
 import argparse
 import json
@@ -33,6 +33,7 @@ CAR_OFFSET = (13.8757, 0.0, 20.755)
 CHECKPOINT_PATTERNS = (
     "gaifo_*.pt",
     "difo_*.pt",
+    "smp_*.pt",
     "training_latest.pt",
     "actor_critic_final.pt",
     "policy_*.pt",
@@ -45,6 +46,8 @@ def checkpoint_kind(path: Path) -> str:
         return "gaifo"
     if path.match("difo_*.pt"):
         return "difo"
+    if path.match("smp_*.pt"):
+        return "smp"
     return "basic"
 
 
@@ -103,7 +106,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no BASIC, GAIFO or DIFO checkpoints found in {self.directory}"
+                f"no BASIC, GAIFO, DIFO or SMP checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -170,9 +173,9 @@ def load_policy_checkpoint(
         )
 
     kind = checkpoint_kind(path)
-    if kind in ("gaifo", "difo"):
-        if kind == "difo" and config.get("algorithm") != "difo":
-            raise ValueError(f"unsupported DIFO checkpoint in {path}")
+    if kind in ("gaifo", "difo", "smp"):
+        if kind in ("difo", "smp") and config.get("algorithm") != kind:
+            raise ValueError(f"unsupported {kind.upper()} checkpoint in {path}")
         architecture = config.get("architecture")
         if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
