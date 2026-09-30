@@ -96,6 +96,41 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "GRU setting"):
                 load_policy_checkpoint(path, env, 4, None)
 
+    def test_basic_checkpoints_started_from_gaifo_remain_watchable(self):
+        env = FakeEnv()
+        observation = th.randn(1, 51)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            for gru in (False, True):
+                with self.subTest(gru=gru):
+                    reference = build_policy(
+                        env, argparse.Namespace(policy_hidden=16, gru=gru)
+                    ).eval()
+                    architecture = (
+                        GAIFO_GRU_ARCHITECTURE if gru else GAIFO_ARCHITECTURE
+                    )
+                    path = Path(directory) / "training_latest.pt"
+                    th.save({
+                        "modules": {"policy": reference.state_dict()},
+                        "config": {
+                            "policy_architecture": architecture,
+                            "hidden_size": 16,
+                        },
+                    }, path)
+                    loaded, signature = load_policy_checkpoint(path, env, 4, None)
+                    self.assertEqual(signature, ("basic", 16, architecture))
+                    state = reference.initial_state(1)
+                    with th.no_grad():
+                        expected = reference.act(
+                            observation, state, deterministic=True
+                        )
+                        actual = loaded.act(
+                            observation, loaded.initial_state(1),
+                            deterministic=True,
+                        )
+                    th.testing.assert_close(actual.action, expected.action)
+                    if gru:
+                        th.testing.assert_close(actual.next_state, expected.next_state)
+
 
 if __name__ == "__main__":
     unittest.main()

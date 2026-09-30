@@ -1,15 +1,18 @@
 import argparse
+import copy
 import math
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.distributions import kl_divergence
 from torch.optim import Adam
 
 from carl.gymnasium import CARLTorchVectorEnv, REGULATION_TICKS
 from jarl.collect import (
+    CriticCapture,
     LogProbCapture,
     RecurrentStateCapture,
     RecurrentCriticCapture,
@@ -17,10 +20,12 @@ from jarl.collect import (
     SelfPlayRunner,
     SnapshotPool,
 )
+from jarl.collect.capture import CaptureBase, CaptureContext
 from jarl.envs import DatasetResetSampler
 from jarl.learn import (
     Algorithm,
     IndependentOptimizerSteps,
+    LossOutput,
     OptimizerStep,
     PPOConfig,
     PPOLoss,
@@ -41,13 +46,201 @@ from jarl.runtime import (
     Trainer,
     ValueScheduler,
 )
-from jarl.sample import RecurrentRolloutMinibatches
+from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
 from reward_spec import RewardSpec
 from replay_resets import load_demonstration_reset_dataset
 from training_checkpoint import TrainingCheckpointer
+from gaifo import (
+    GAIFO_ARCHITECTURE,
+    GAIFO_GRU_ARCHITECTURE,
+    build_critic as build_gaifo_critic,
+    build_policy as build_gaifo_policy,
+)
+
+
+BASIC_POLICY_ARCHITECTURE = "basic-gru-v1"
+DEFAULT_START_KL_COEF = 0.1
+
+
+@dataclass(frozen=True, eq=False)
+class PolicyCheckpoint:
+    architecture: str
+    hidden_size: int
+    state: dict[str, torch.Tensor]
+
+
+def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
+    """Recognize BASIC and GAIFO policies by weights, regardless of filename."""
+    if not isinstance(payload, dict):
+        raise ValueError(f"checkpoint is not a state dictionary: {path}")
+    if "modules" in payload:
+        modules = payload["modules"]
+        state = modules.get("policy") if isinstance(modules, dict) else None
+    elif "policy" in payload:
+        state = payload["policy"]
+    else:
+        state = payload
+    if not isinstance(state, dict):
+        raise ValueError(f"checkpoint has no policy weights: {path}")
+
+    foot = state.get("foot.model.0.weight")
+    if not isinstance(foot, torch.Tensor) or foot.ndim != 2:
+        raise ValueError(f"checkpoint has no supported policy encoder: {path}")
+    if "body.rnn.weight_ih_l0" in state:
+        architecture = (
+            BASIC_POLICY_ARCHITECTURE if "head.model.4.weight" in state
+            else GAIFO_GRU_ARCHITECTURE
+        )
+    elif "body.model.0.weight" in state:
+        architecture = GAIFO_ARCHITECTURE
+    else:
+        raise ValueError(f"unsupported policy architecture in {path}")
+    if architecture != BASIC_POLICY_ARCHITECTURE and "head.model.0.weight" not in state:
+        raise ValueError(f"unsupported policy head in {path}")
+
+    config = payload.get("config", {})
+    if not isinstance(config, dict):
+        raise ValueError(f"invalid checkpoint configuration in {path}")
+    saved_architecture = config.get("policy_architecture", config.get("architecture"))
+    if saved_architecture is not None and saved_architecture != architecture:
+        raise ValueError(f"checkpoint policy architecture does not match weights: {path}")
+    if "gru" in config and architecture in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+        if config["gru"] != (architecture == GAIFO_GRU_ARCHITECTURE):
+            raise ValueError(f"checkpoint GRU setting does not match architecture: {path}")
+    hidden_size = foot.shape[0]
+    saved_hidden = config.get("policy_hidden", config.get("hidden_size"))
+    if saved_hidden is not None and saved_hidden != hidden_size:
+        raise ValueError(f"checkpoint hidden size does not match weights: {path}")
+    return PolicyCheckpoint(architecture, hidden_size, state)
+
+
+def load_policy_checkpoint(path: Path) -> tuple[PolicyCheckpoint, dict]:
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint does not exist: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    return policy_checkpoint(payload, path), payload
+
+
+def configure_starting_checkpoint(
+    arguments: argparse.Namespace,
+) -> tuple[PolicyCheckpoint | None, bool]:
+    """Choose the source policy and retain KL settings across BASIC resumes."""
+    if arguments.start_checkpoint is not None and arguments.resume_checkpoint is not None:
+        raise ValueError("--start-checkpoint and --resume-checkpoint are mutually exclusive")
+
+    starting = None
+    resumed_reference = False
+    source = arguments.start_checkpoint or arguments.resume_checkpoint
+    if source is not None:
+        checkpoint, payload = load_policy_checkpoint(source)
+        if arguments.start_checkpoint is not None:
+            starting = checkpoint
+        else:
+            if "modules" not in payload or "optimizers" not in payload:
+                raise ValueError("--resume-checkpoint requires a BASIC training checkpoint")
+            stateful = payload.get("stateful", {})
+            if not isinstance(stateful, dict):
+                raise ValueError("invalid BASIC training checkpoint state")
+            resumed_reference = "start_policy" in stateful
+
+        if arguments.hidden_size is None:
+            arguments.hidden_size = checkpoint.hidden_size
+        elif arguments.hidden_size != checkpoint.hidden_size:
+            raise ValueError(
+                f"--hidden-size must match checkpoint ({checkpoint.hidden_size})"
+            )
+        arguments.policy_architecture = checkpoint.architecture
+
+        if arguments.start_kl_coef is None and resumed_reference:
+            arguments.start_kl_coef = payload.get("config", {}).get(
+                "start_kl_coef", DEFAULT_START_KL_COEF
+            )
+
+    if arguments.hidden_size is None:
+        arguments.hidden_size = 256
+    if source is None:
+        arguments.policy_architecture = BASIC_POLICY_ARCHITECTURE
+    if arguments.start_kl_coef is None:
+        arguments.start_kl_coef = (
+            DEFAULT_START_KL_COEF if starting is not None else 0.0
+        )
+    if arguments.start_kl_coef > 0 and starting is None and not resumed_reference:
+        raise ValueError("--start-kl-coef requires --start-checkpoint or a saved start policy")
+    if getattr(arguments, "sparse", None) is None:
+        arguments.sparse = (
+            bool(payload.get("config", {}).get("sparse", False))
+            if arguments.resume_checkpoint is not None else False
+        )
+    return starting, resumed_reference
+
+
+class ReferenceLogitsCapture(CaptureBase):
+    """Capture frozen policy logits for mask-aware KL during PPO updates."""
+
+    def __init__(self, policy: MultiCategoricalPolicy) -> None:
+        self.policy = policy
+        self.state: torch.Tensor | None = None
+
+    def reset(self, batch_size: int) -> None:
+        self.state = self.policy.initial_state(batch_size)
+
+    @torch.no_grad()
+    def _capture(self, context: CaptureContext) -> dict[str, torch.Tensor]:
+        features, next_state = self.policy.body_features(context.observation, self.state)
+        if next_state is not None:
+            done = torch.as_tensor(
+                context.env_step.done, dtype=torch.bool, device=next_state.device
+            )
+            self.state = next_state * (~done).view(
+                -1, *((1,) * (next_state.ndim - 1))
+            )
+        return {"reference_logits": self.policy.head(features)}
+
+
+class StartingPolicyKLLoss(PPOLoss):
+    """Regularize PPO toward the frozen starting action distribution."""
+
+    def __init__(self, policy, critic, config, coefficient: float) -> None:
+        super().__init__(policy, critic, config)
+        self.coefficient = coefficient
+
+    def __call__(self, sample) -> LossOutput:
+        # Reuse PPO's logits instead of running the recurrent learner a second time.
+        logits = []
+        hook = self.policy.head.register_forward_hook(
+            lambda _module, _inputs, output: logits.append(output)
+        )
+        try:
+            output = super().__call__(sample)
+        finally:
+            hook.remove()
+        if len(logits) != 1:
+            raise RuntimeError("PPO did not evaluate exactly one policy distribution")
+
+        batch, _, _, _, valid = self._unpack_sample(sample)
+        learner_logits = logits[0].float()
+        reference_logits = batch["reference_logits"].float()
+        if reference_logits.shape != learner_logits.shape:
+            raise ValueError("reference logits must match the policy's action space")
+        observation = batch["observation"]
+        reference = self.policy._factorized_distributions(reference_logits, observation)
+        learner = self.policy._factorized_distributions(learner_logits, observation)
+        start_kl = sum(
+            kl_divergence(original, current)
+            for original, current in zip(reference, learner)
+        )[valid].mean()
+        penalty = self.coefficient * start_kl
+        return LossOutput(
+            output.loss + penalty,
+            {
+                **output.metrics,
+                "start_kl": start_kl.detach(),
+                "start_kl_penalty": penalty.detach(),
+            },
+        )
 
 
 class DiagnosticRewardSpec(RewardSpec):
@@ -165,7 +358,10 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--rollout-steps",              type=int,   default=512)
     parser.add_argument("--sequence-length",            type=int,   default=16)
-    parser.add_argument("--hidden-size",                type=int,   default=256)
+    parser.add_argument(
+        "--hidden-size", type=int, default=None,
+        help="policy and critic width (default: 256, inferred from a checkpoint)",
+    )
     parser.add_argument("--total-timesteps",            type=int,   default=10_000_000_000)
     parser.add_argument("--minibatch-size",             type=int,   default=65_536)
     parser.add_argument("--learning-rate",              type=float, default=1e-5)
@@ -189,6 +385,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--goal-score-weight",          type=float, default=10.0)
     parser.add_argument("--goal-score-weight-end",      type=float, default=10.0)
     parser.add_argument(
+        "--sparse", action=argparse.BooleanOptionalAction, default=None,
+        help="focus rewards on goals, shots, air dribble setups, fast aerial approaches, high aerial touches and demos (inherited on resume)",
+    )
+    parser.add_argument(
         "--normalize-rewards",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -206,6 +406,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir",             type=Path,  default=Path("checkpoints"))
     parser.add_argument("--resume-checkpoint",          type=Path,  default=None)
     parser.add_argument(
+        "--start-checkpoint", type=Path, default=None,
+        help="start a new BASIC run from a BASIC or GAIFO policy (fresh critic and clock)",
+    )
+    parser.add_argument(
+        "--start-kl-coef", type=float, default=None,
+        help="KL(reference || current) penalty; defaults to 0.1 with --start-checkpoint, 0 otherwise",
+    )
+    parser.add_argument(
         "--replay-dataset",
         type=Path,
         default=Path("parsed_replays"),
@@ -219,7 +427,14 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)
-    return parser.parse_args()
+    arguments = parser.parse_args()
+    if (
+        arguments.hidden_size is None
+        and arguments.start_checkpoint is None
+        and arguments.resume_checkpoint is None
+    ):
+        arguments.hidden_size = 256
+    return arguments
 
 
 def validate_arguments(arguments: argparse.Namespace) -> None:
@@ -252,10 +467,14 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
     ]
     if invalid:
         raise ValueError(f"Arguments must be positive: {', '.join(invalid)}")
-    if arguments.rollout_steps % arguments.sequence_length:
-        raise ValueError("rollout-steps must be divisible by sequence-length")
-    if arguments.minibatch_size % arguments.sequence_length:
-        raise ValueError("minibatch-size must be divisible by sequence-length")
+    if (
+        getattr(arguments, "policy_architecture", BASIC_POLICY_ARCHITECTURE)
+        != GAIFO_ARCHITECTURE
+    ):
+        if arguments.rollout_steps % arguments.sequence_length:
+            raise ValueError("rollout-steps must be divisible by sequence-length")
+        if arguments.minibatch_size % arguments.sequence_length:
+            raise ValueError("minibatch-size must be divisible by sequence-length")
     if arguments.opponent_pool_size < 3:
         raise ValueError("opponent-pool-size must be at least three")
     if arguments.historical_policies >= arguments.opponent_pool_size:
@@ -275,6 +494,8 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         or arguments.entropy_coef_end < 0
     ):
         raise ValueError("entropy coefficients cannot be negative")
+    if not math.isfinite(arguments.start_kl_coef) or arguments.start_kl_coef < 0:
+        raise ValueError("--start-kl-coef must be finite and non-negative")
     if not math.isfinite(arguments.learning_rate_end_factor) or not (
         0.0 < arguments.learning_rate_end_factor <= 1.0
     ):
@@ -298,6 +519,11 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError(
             f"Resume checkpoint does not exist: {arguments.resume_checkpoint}"
         )
+    if (
+        arguments.start_checkpoint is not None
+        and not arguments.start_checkpoint.is_file()
+    ):
+        raise ValueError(f"Start checkpoint does not exist: {arguments.start_checkpoint}")
     if not torch.cuda.is_available():
         raise RuntimeError("CARL requires a CUDA-capable GPU")
     if arguments.bf16 and not torch.cuda.is_bf16_supported():
@@ -309,20 +535,33 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
 def build_policy_and_critic(
     environment: CARLTorchVectorEnv,
     arguments: argparse.Namespace,
+    architecture: str = BASIC_POLICY_ARCHITECTURE,
 ):
-    actor_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
-    actor_body = GRU(hidden_size=arguments.hidden_size).build(actor_head.feats)
-    actor = MultiCategoricalPolicy(
-        foot=actor_head,
-        body=actor_body,
-        head=MLP(
-            dims=[arguments.hidden_size, arguments.hidden_size // 2],
-            func=nn.LeakyReLU,
-            out_init_func=orthogonal_init(std=0.01),
-        ),
-        action_codec=environment.action_codec,
-    )
-    actor.build_composed(environment, actor_body.feats).to(environment.device)
+    if architecture in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+        gaifo_args = argparse.Namespace(
+            policy_hidden=arguments.hidden_size,
+            critic_hidden=arguments.hidden_size,
+            gru=architecture == GAIFO_GRU_ARCHITECTURE,
+        )
+        actor = build_gaifo_policy(environment, gaifo_args)
+        if architecture == GAIFO_ARCHITECTURE:
+            return actor, build_gaifo_critic(environment, gaifo_args)
+    elif architecture == BASIC_POLICY_ARCHITECTURE:
+        actor_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
+        actor_body = GRU(hidden_size=arguments.hidden_size).build(actor_head.feats)
+        actor = MultiCategoricalPolicy(
+            foot=actor_head,
+            body=actor_body,
+            head=MLP(
+                dims=[arguments.hidden_size, arguments.hidden_size // 2],
+                func=nn.LeakyReLU,
+                out_init_func=orthogonal_init(std=0.01),
+            ),
+            action_codec=environment.action_codec,
+        )
+        actor.build_composed(environment, actor_body.feats).to(environment.device)
+    else:
+        raise ValueError(f"unsupported starting policy architecture: {architecture}")
 
     critic_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
     critic_body = GRU(hidden_size=arguments.hidden_size).build(critic_head.feats)
@@ -344,12 +583,12 @@ def build_policy_loss(
     critic,
     entropy_coef: float,
     bf16: bool = False,
+    start_kl_coef: float = 0.0,
 ):
-    return PPOLoss(
-        policy,
-        critic,
-        PPOConfig(clip=0.2, entropy_coef=entropy_coef, bf16=bf16),
-    )
+    config = PPOConfig(clip=0.2, entropy_coef=entropy_coef, bf16=bf16)
+    if start_kl_coef:
+        return StartingPolicyKLLoss(policy, critic, config, start_kl_coef)
+    return PPOLoss(policy, critic, config)
 
 
 class DiagnosticSelfPlayRunner(SelfPlayRunner):
@@ -369,6 +608,10 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         "reward_spec/component/player_ball_progress",
         "reward_spec/component/touch_acceleration",
         "reward_spec/component/aerial_touch",
+        "reward_spec/component/shot",
+        "reward_spec/component/air_dribble_setup",
+        "reward_spec/component/car_velocity",
+        "reward_spec/component/demo",
     )
 
     def __init__(
@@ -509,7 +752,11 @@ def build_ppo(
     reward_function: DiagnosticRewardSpec,
     arguments: argparse.Namespace,
     checkpoint_dir: Path,
+    reference_policy: MultiCategoricalPolicy | None = None,
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler, dict]:
+    if arguments.start_kl_coef and reference_policy is None:
+        raise ValueError("KL penalty requires a frozen starting policy")
+    recurrent = policy.initial_state(1) is not None
     rollout = RolloutBuffer(
         horizon=arguments.rollout_steps,
         num_envs=environment.n_envs,
@@ -543,6 +790,14 @@ def build_ppo(
     no_touch_timeout_steps = math.ceil(
         arguments.no_touch_timeout * 120.0 / arguments.frameskip
     )
+    captures = [LogProbCapture()]
+    if recurrent:
+        captures.extend((RecurrentStateCapture(), RecurrentCriticCapture(critic)))
+    else:
+        captures.append(CriticCapture(critic))
+    if reference_policy is not None and arguments.start_kl_coef:
+        captures.append(ReferenceLogitsCapture(reference_policy))
+
     runner = DiagnosticSelfPlayRunner(
         env=environment,
         policy=policy,
@@ -551,11 +806,7 @@ def build_ppo(
         matchmaker=matchmaker,
         snapshot_policy=policy,
         historical_policies=arguments.historical_policies,
-        captures=(
-            LogProbCapture(),
-            RecurrentStateCapture(),
-            RecurrentCriticCapture(critic),
-        ),
+        captures=captures,
         no_touch_timeout_steps=no_touch_timeout_steps,
         transition_reward=reward_function,
     )
@@ -572,7 +823,25 @@ def build_ppo(
         critic,
         arguments.entropy_coef,
         arguments.bf16,
+        arguments.start_kl_coef,
     )
+    if recurrent:
+        fields = (
+            "observation", "action", "advantage", "old_log_prob",
+            "baseline_value", "returns",
+        )
+        if arguments.start_kl_coef:
+            fields += ("reference_logits",)
+        sampler = RecurrentRolloutMinibatches(
+            sequence_length=arguments.sequence_length,
+            sequences_per_batch=(
+                arguments.minibatch_size // arguments.sequence_length
+            ),
+            epochs=arguments.epochs,
+            fields=fields,
+        )
+    else:
+        sampler = RolloutMinibatches(arguments.minibatch_size, arguments.epochs)
     update = KLLimitedUpdate(
         target_kl=arguments.target_kl,
         transforms=(
@@ -583,21 +852,7 @@ def build_ppo(
             ),
             gae,
         ),
-        sampler=RecurrentRolloutMinibatches(
-            sequence_length=arguments.sequence_length,
-            sequences_per_batch=(
-                arguments.minibatch_size // arguments.sequence_length
-            ),
-            epochs=arguments.epochs,
-            fields=(
-                "observation",
-                "action",
-                "advantage",
-                "old_log_prob",
-                "baseline_value",
-                "returns",
-            ),
-        ),
+        sampler=sampler,
         loss=policy_loss,
         optimizer_step=IndependentOptimizerSteps(
             OptimizerStep(
@@ -681,11 +936,22 @@ def build_ppo(
             "policy": policy_optimizer,
             "critic": critic_optimizer,
         },
+        "stateful": (
+            {"start_policy": reference_policy}
+            if reference_policy is not None else {}
+        ),
+        "config": {
+            "policy_architecture": arguments.policy_architecture,
+            "hidden_size": arguments.hidden_size,
+            "start_kl_coef": arguments.start_kl_coef,
+            "sparse": arguments.sparse,
+        },
     }
 
 
 def main() -> None:
     arguments = parse_arguments()
+    starting, resumed_reference = configure_starting_checkpoint(arguments)
     validate_arguments(arguments)
     torch.manual_seed(arguments.seed)
     run_id = arguments.run_name or datetime.now().strftime(
@@ -726,6 +992,7 @@ def main() -> None:
         DiagnosticRewardSpec(
             normalize=arguments.normalize_rewards,
             log_diagnostics=True,
+            sparse=arguments.sparse,
         )
     )
     try:
@@ -734,17 +1001,28 @@ def main() -> None:
                 "total-timesteps must include at least one vector step "
                 f"({environment.n_envs:,} actor timesteps)"
             )
-        policy, critic = build_policy_and_critic(environment, arguments)
+        policy, critic = build_policy_and_critic(
+            environment, arguments, arguments.policy_architecture
+        )
         modules = {
             "policy": policy,
             "critic": critic,
         }
-        if arguments.resume_checkpoint is not None:
+        if starting is not None:
+            policy.load_state_dict(starting.state)
+        elif arguments.resume_checkpoint is not None:
             TrainingCheckpointer.load_modules(
                 arguments.resume_checkpoint,
                 modules,
                 environment.device,
             )
+        reference_policy = (
+            copy.deepcopy(policy).eval().requires_grad_(False)
+            if (starting is not None and arguments.start_kl_coef) or resumed_reference
+            else None
+        )
+        if reference_policy is not None and isinstance(reference_policy.body, GRU):
+            reference_policy.body.rnn.flatten_parameters()
         runner, rollout, learner, value_scheduler, training_objects = build_ppo(
             environment,
             policy,
@@ -752,6 +1030,7 @@ def main() -> None:
             reward_function,
             arguments,
             checkpoint_dir,
+            reference_policy,
         )
         logger = Logger(log_dir=str(run_dir))
 
@@ -777,6 +1056,11 @@ def main() -> None:
             ("Schedule", "goal_score_weight", "goal weight", ".2f"),
         ):
             logger.register_progress_metric(section, key, label, format_spec)
+        if arguments.start_kl_coef:
+            logger.register_progress_metric("PPO", "start_kl", "start KL", ".4f")
+            logger.register_progress_metric(
+                "PPO", "start_kl_penalty", "start penalty", ".4f"
+            )
 
         training_checkpointer = TrainingCheckpointer(
             checkpoint_dir / "training_latest.pt",

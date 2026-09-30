@@ -16,15 +16,18 @@ class TrainingCheckpointer:
         modules: dict[str, torch.nn.Module],
         optimizers: dict[str, torch.optim.Optimizer],
         stateful: dict[str, object] | None = None,
+        config: dict | None = None,
     ) -> None:
         self.path = path
         self.modules = modules
         self.optimizers = optimizers
         self.stateful = stateful or {}
+        self.config = config or {}
 
     def __call__(self, trainer) -> None:
         state = {
             "format_version": self.FORMAT_VERSION,
+            "config": self.config,
             "clock": asdict(trainer.clock),
             "modules": {
                 name: module.state_dict() for name, module in self.modules.items()

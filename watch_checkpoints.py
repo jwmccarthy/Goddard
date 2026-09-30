@@ -19,7 +19,7 @@ import torch as th
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
-from basic import build_policy_and_critic
+from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
 from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
@@ -178,29 +178,29 @@ def load_policy_checkpoint(
         )
         policy_state = payload["policy"]
     else:
-        if isinstance(payload, dict) and "modules" in payload:
-            policy_state = payload["modules"].get("policy")
-        elif isinstance(payload, dict) and "policy" in payload:
-            policy_state = payload["policy"]
-        else:
-            policy_state = payload
-        if not isinstance(policy_state, dict) or "foot.model.0.weight" not in policy_state:
-            raise ValueError(f"checkpoint does not contain a BASIC policy: {path}")
-        hidden = int(config.get(
-            "hidden_size",
-            config.get(
-                "policy_hidden",
-                hidden_size or policy_state["foot.model.0.weight"].shape[0],
-            ),
-        ))
-        policy, critic = build_policy_and_critic(
-            env, argparse.Namespace(hidden_size=hidden)
+        checkpoint = policy_checkpoint(payload, path)
+        policy_state = checkpoint.state
+        hidden = checkpoint.hidden_size
+        architecture = (
+            None if checkpoint.architecture == BASIC_POLICY_ARCHITECTURE
+            else checkpoint.architecture
         )
-        del critic
+        if architecture is None:
+            policy, _ = build_policy_and_critic(
+                env, argparse.Namespace(hidden_size=hidden)
+            )
+        else:
+            policy = build_gaifo_policy(
+                env,
+                argparse.Namespace(
+                    policy_hidden=hidden,
+                    gru=architecture == GAIFO_GRU_ARCHITECTURE,
+                ),
+            )
 
     policy.load_state_dict(policy_state)
     return policy.eval().requires_grad_(False), (
-        kind, hidden, architecture if kind == "gaifo" else None
+        kind, hidden, architecture
     )
 
 

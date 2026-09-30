@@ -1,4 +1,4 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 import torch
 
@@ -47,6 +47,23 @@ class RewardWeights:
     flip_reset:           float = 10.0
     touch_grass:          float = 0.005
     win_probability:      float = 10.0
+    shot:                 float = 0.0
+    air_dribble_setup:    float = 0.0
+    car_velocity:         float = 0.0
+
+    @classmethod
+    def sparse(cls) -> "RewardWeights":
+        """Keep only goals, demos, and deliberate airborne/shot-making behavior."""
+        values = {field.name: 0.0 for field in fields(cls)}
+        values.update(
+            goal_scored=10.0,
+            shot=2.0,
+            air_dribble_setup=1.0,
+            car_velocity=0.05,
+            aerial_touch=1.0,
+            demo=5.0,
+        )
+        return cls(**values)
 
 
 class RewardSpec:
@@ -56,11 +73,15 @@ class RewardSpec:
         self,
         normalize: bool = True,
         log_diagnostics: bool = False,
-        weights: RewardWeights = RewardWeights(),
+        weights: RewardWeights | None = None,
+        sparse: bool = False,
     ) -> None:
         self.normalize = normalize
         self.log_diagnostics = log_diagnostics
-        self.weights = weights
+        self.sparse = sparse
+        self.weights = weights if weights is not None else (
+            RewardWeights.sparse() if sparse else RewardWeights()
+        )
         self._last_touch = None
         self._count = 0
         self._mean = None
@@ -78,6 +99,10 @@ class RewardSpec:
         current = context.current
         previous = context.previous
         self._ensure_state(current.raw.shape[0], current.raw.device)
+        if self.sparse:
+            return self._finish_reward(
+                context, self._sparse_components(context)
+            )
 
         ball_position = current.ball_position[:, None, :]
         car_to_ball = ball_position - current.car_position
@@ -294,6 +319,96 @@ class RewardSpec:
             "win_probability":      weights.win_probability * win_probability_progress,
         }
 
+        return self._finish_reward(context, components)
+
+    def _sparse_components(self, context: RewardContext) -> dict[str, torch.Tensor]:
+        current = context.current
+        previous = context.previous
+        touches = current.car_ball_touches
+        team_sign = current.team_sign[None, :]
+        ball_position = current.ball_position[:, None, :]
+        car_to_ball = ball_position - current.car_position
+        ball_height = ball_position[..., 2]
+
+        opponent_goal = torch.zeros_like(current.car_position)
+        opponent_goal[..., 1] = team_sign * GOAL_Y
+        opponent_goal[..., 2] = GOAL_HEIGHT / 2.0
+        toward_goal = self._unit(opponent_goal - ball_position)
+        velocity_change = (
+            current.ball_velocity - previous.ball_velocity
+        )[:, None, :]
+        goalward_change = (velocity_change * toward_goal).sum(dim=-1)
+        goalward_velocity = (
+            current.ball_velocity[:, None, :] * toward_goal
+        ).sum(dim=-1)
+        goalward_impulse = (goalward_change / CAR_MAX_SPEED).clamp(0.0, 1.0)
+
+        shot = (
+            touches
+            & goalward_change.gt(0.15 * CAR_MAX_SPEED)
+            & goalward_velocity.gt(800.0)
+            & self._cosine(current.ball_velocity[:, None, :], toward_goal).gt(0.85)
+        )
+        aerial_touch = (
+            touches
+            & ~current.car_on_ground
+            & current.car_position[..., 2].gt(2.0 * BALL_RADIUS)
+            & ball_height.gt(GOAL_HEIGHT)
+            & goalward_change.gt(0.1 * CAR_MAX_SPEED)
+        )
+
+        vertical_change = (
+            current.ball_velocity[:, None, 2] - previous.ball_velocity[:, None, 2]
+        )
+        setup = (
+            touches
+            & ball_height.gt(BALL_RADIUS)
+            & ball_height.lt(GOAL_HEIGHT)
+            & previous.ball_velocity[:, None, 2].lt(250.0)
+            & current.ball_velocity[:, None, 2].gt(350.0)
+            & vertical_change.gt(300.0)
+            & (
+                team_sign * (ball_position[..., 1] - current.car_position[..., 1])
+            ).gt(BALL_RADIUS / 2.0)
+        )
+
+        approach_speed = (
+            current.car_velocity * self._unit(car_to_ball)
+        ).sum(dim=-1)
+        fast_approach = (
+            ~current.car_on_ground
+            & current.car_position[..., 2].gt(2.0 * BALL_RADIUS)
+            & ball_height.gt(GOAL_HEIGHT / 2.0)
+            & car_to_ball.norm(dim=-1).lt(1200.0)
+            & (
+                team_sign * (ball_position[..., 1] - current.car_position[..., 1])
+            ).gt(0)
+        )
+        car_velocity = fast_approach * (
+            (approach_speed / CAR_MAX_SPEED - 0.6) / 0.4
+        ).clamp(0.0, 1.0)
+
+        newly_demoed = current.car_demoed & ~previous.car_demoed
+        demo = 0.5 * (
+            self._opponent_team_mean(newly_demoed.float()) - newly_demoed.float()
+        )
+        weights = self.weights
+        return {
+            "goal_scored": weights.goal_scored * (
+                context.events.score_delta[:, None] * team_sign
+            ).clamp_min(0.0),
+            "shot": weights.shot * shot * goalward_impulse,
+            "air_dribble_setup": weights.air_dribble_setup * setup * (
+                vertical_change / CAR_MAX_SPEED
+            ).clamp(0.0, 1.0),
+            "car_velocity": weights.car_velocity * car_velocity,
+            "aerial_touch": weights.aerial_touch * aerial_touch * goalward_impulse,
+            "demo": weights.demo * demo,
+        }
+
+    def _finish_reward(
+        self, context: RewardContext, components: dict[str, torch.Tensor]
+    ) -> torch.Tensor | RewardResult:
         raw_reward = sum(components.values())
         adjusted_reward = raw_reward - self._opponent_team_mean(raw_reward)
         reward = self._normalize(adjusted_reward) if self.normalize else adjusted_reward
