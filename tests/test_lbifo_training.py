@@ -33,7 +33,7 @@ def make_replays(folder: Path, *, offset: float = 0) -> None:
     np.save(folder / "match-1.npy", values)
 
 
-def small_args(low: Path, pro: Path, reset: Path, root: Path) -> list[str]:
+def small_args(low: Path, pro: Path, reset: Path, root: Path, *, timesteps: int = 16) -> list[str]:
     return [
         "--pretrain-replay-dir", str(low),
         "--target-replay-dir", str(pro),
@@ -44,7 +44,7 @@ def small_args(low: Path, pro: Path, reset: Path, root: Path) -> list[str]:
         "--min-duration", "2", "--max-duration", "4", "--plan-horizon", "2",
         "--segment-steps", "8", "--expert-sequences", "3",
         "--calibration-windows", "2", "--prior-rounds", "2", "--prior-updates", "1",
-        "--prior-batch", "2", "--n-sim", "1", "--rollout", "4", "--timesteps", "16",
+        "--prior-batch", "2", "--n-sim", "1", "--rollout", "4", "--timesteps", str(timesteps),
         "--online-repr-updates", "1", "--online-prior-updates", "1",
         "--online-refit-interval", "1", "--online-value-updates", "1",
         "--skill-updates", "1", "--skill-batch", "4",
@@ -146,21 +146,24 @@ class LBIFOGpuSmokeTests(unittest.TestCase):
             root = Path(directory)
             for name, offset in (("lower", 0.0), ("pro", 0.01), ("resets", 0.02)):
                 make_replays(root / name, offset=offset)
-            flags = small_args(root / "lower", root / "pro", root / "resets", root)
+            # One simulation has two actors; neither requested budget is a multiple of two.
+            flags = small_args(root / "lower", root / "pro", root / "resets", root, timesteps=17)
             main(flags + ["--pretrain-only", "--device", "cpu", "--run-name", "pretrain"])
             main([
                 "--resume-checkpoint", str(root / "checkpoints" / "pretrain" / "pretrain_latest.pt"),
                 "--run-name", "test",
             ])
-            saved = load_resume_checkpoint(root / "checkpoints" / "test" / "lbifo_000000000016.pt")
-            self.assertEqual(saved["step"], 16)
+            saved = load_resume_checkpoint(root / "checkpoints" / "test" / "lbifo_000000000018.pt")
+            self.assertEqual(saved["step"], 18)
+            self.assertEqual(saved["config"]["timesteps"], 17)
             self.assertIn("policy", saved)
             self.assertIn("value", saved)
             self.assertNotIn("discriminator", saved)
-            main(["--resume-checkpoint", str(root / "checkpoints" / "test" / "lbifo_000000000016.pt"),
-                  "--timesteps", "24", "--run-name", "resume"])
+            main(["--resume-checkpoint", str(root / "checkpoints" / "test" / "lbifo_000000000018.pt"),
+                  "--timesteps", "23", "--run-name", "resume"])
             resumed = load_resume_checkpoint(root / "checkpoints" / "resume" / "lbifo_000000000024.pt")
             self.assertEqual(resumed["step"], 24)
+            self.assertEqual(resumed["config"]["timesteps"], 23)
 
 
 if __name__ == "__main__":

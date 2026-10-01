@@ -54,8 +54,10 @@ for simulator resets. `--external-reset-fraction 0` keeps all low-level starts
 on pro target states; `--no-replay-reset-dir` removes an inherited external
 reset pool on resume. Continue an online checkpoint with
 `--resume-checkpoint <run>/lbifo_000000000000.pt --timesteps NEW_TOTAL`;
-`--timesteps` is the total number of **joint CARL actor-steps**, not an
-additional-step count.
+`--timesteps` is the minimum total number of **joint CARL actor-steps**, not an
+additional-step count. The last CARL step runs all `2 * --n-sim` actors, so
+the saved step count can exceed the requested total by fewer than that many
+actor-steps; the requested total need not be divisible by the actor count.
 
 ## Method and controls
 

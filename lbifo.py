@@ -111,7 +111,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
     parser.add_argument("--rollout", type=int, default=32)
     parser.add_argument("--timesteps", type=int, default=10_000_000,
-                        help="total actor-steps of joint CARL reenactment after pretraining")
+                        help="minimum total CARL actor-steps after pretraining; the last joint step may overshoot")
     parser.add_argument("--representation-lr", type=float, default=3e-4)
     parser.add_argument("--mask-ratio", type=float, default=0.8)
     parser.add_argument("--mask-adjust-interval", type=int, default=500)
@@ -946,8 +946,6 @@ class LBIFOTrainer:
         try:
             if args.dynamics_pairs:
                 dynamics = DynamicsPairs(args.frameskip, args.seed + 2)
-            if args.timesteps % environment.n_envs:
-                raise ValueError("--timesteps must be divisible by the number of CARL actors")
             self.attach_policy(environment)
             if args.resume_checkpoint is not None:
                 self.restore(args.resume_checkpoint, restore_policy=True)
@@ -973,7 +971,8 @@ class LBIFOTrainer:
                   f"{len(external) if external else 0} independent reset-only states")
             self.recalibrate(1) if self.memory.trajectories else None
             while self.step < args.timesteps:
-                steps = min(args.rollout, (args.timesteps - self.step) // environment.n_envs)
+                remaining = args.timesteps - self.step
+                steps = min(args.rollout, (remaining + environment.n_envs - 1) // environment.n_envs)
                 observation, records, metrics = self.collect(
                     environment, provider, planner, observation, steps,
                 )
