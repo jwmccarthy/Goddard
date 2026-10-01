@@ -1,5 +1,7 @@
 """Dataset roles and pretraining; opt-in CARL end-to-end training smoke."""
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -10,7 +12,7 @@ import torch as th
 
 from carl.gymnasium import CARLActionCodec
 
-from lbifo import ReplaySources, load_resume_checkpoint, main, parse_args
+from lbifo import ReplaySources, load_resume_checkpoint, main, parse_args, sample_expert_chunks
 from lbifo_data import ExpertCorpus, PlaySequence
 from lbifo_dynamics import DynamicsPairs
 from lbifo_planning import SphericalPlanPrior
@@ -58,6 +60,54 @@ def small_args(low: Path, pro: Path, reset: Path, root: Path, *, timesteps: int 
 
 
 class ReplayRolesTests(unittest.TestCase):
+    def test_longer_defaults_fit_three_skills_and_allow_more_pretraining(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory) / "pro"
+            make_replays(folder)
+            flags = ["--pretrain-replay-dir", str(folder), "--pretrain-only", "--device", "cpu"]
+            args = parse_args(flags)
+            self.assertEqual((args.min_duration, args.max_duration, args.segment_steps,
+                              args.rollout, args.pretrain_updates), (30, 60, 180, 180, 30000))
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaises(SystemExit):
+                    parse_args(flags + ["--rollout", "64"])
+            self.assertIn("--rollout must fit a full policy plan", output.getvalue())
+
+    def test_expert_chunks_visit_distinct_replays_before_repeating_nonoverlapping_windows(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory) / "pro"
+            make_replays(folder)
+            rows = np.load(folder / "match-1.npy")
+            np.save(folder / "match-2.npy", rows)
+            np.save(folder / "match-3.npy", rows)
+            corpus = ExpertCorpus(folder, 2, 4, 4, 0, 0)
+            chunks = sample_expert_chunks(corpus, np.random.default_rng(7), 6, 8)
+            self.assertEqual(len(chunks), 6)
+            ends = np.cumsum(corpus.expert.lengths)
+            files = [int(np.searchsorted(ends, start, side="right")) for start, _ in chunks]
+            self.assertEqual(set(files[:3]), {0, 1, 2})
+            for file in set(files):
+                intervals = sorted((start, start + len(frames)) for (start, frames), source
+                                   in zip(chunks, files) if source == file)
+                self.assertTrue(all(left[1] <= right[0]
+                                    for left, right in zip(intervals[:-1], intervals[1:])))
+
+    def test_expert_chunks_skip_short_fragments_and_use_full_plan_remainders(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory) / "pro"
+            make_replays(folder)
+            path = folder / "match-1.npy"
+            rows = np.load(path)
+            extended = np.concatenate((rows, rows[:160]))
+            extended[65, -1] = 1  # A parser correction splits the safe spans.
+            np.save(path, extended)
+            corpus = ExpertCorpus(folder, 30, 60, 4, 0, 0)
+            chunks = sample_expert_chunks(corpus, np.random.default_rng(3), 3, 180, 3)
+            self.assertEqual(len(chunks), 2)
+            self.assertTrue(all(start > 65 and len(frames) >= 122 for start, frames in chunks))
+            intervals = sorted((start, start + len(frames)) for start, frames in chunks)
+            self.assertLessEqual(intervals[0][1], intervals[1][0])
+
     def test_pretraining_and_pro_only_targets_are_explicitly_separate(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -115,12 +165,87 @@ class ReplayRolesTests(unittest.TestCase):
                 self.assertFalse(args.segment_only)
                 self.assertEqual(args.device, "cuda")
 
+    def test_longer_skills_reuse_short_window_encoder_and_refit_duration_prior(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            for name in ("lower", "pro", "resets"):
+                make_replays(root / name)
+            flags = small_args(root / "lower", root / "pro", root / "resets", root)
+            main(flags + ["--pretrain-only", "--device", "cpu", "--run-name", "short"])
+            short = root / "checkpoints" / "short" / "pretrain_latest.pt"
+            main([
+                "--resume-checkpoint", str(short), "--pretrain-only", "--device", "cpu",
+                "--pretrain-updates", "3", "--min-duration", "4", "--max-duration", "8",
+                "--segment-steps", "16", "--rollout", "8", "--run-name", "long",
+            ])
+            long = root / "checkpoints" / "long" / "pretrain_latest.pt"
+            saved = load_resume_checkpoint(long)
+            self.assertEqual(saved["pretrain_step"], 3)
+            self.assertEqual((saved["config"]["min_duration"], saved["config"]["max_duration"]), (4, 8))
+            self.assertEqual(saved["prior"]["durations.2.weight"].shape[0], 5)
+            main(["--resume-checkpoint", str(long), "--segment-only", "--device", "cpu",
+                  "--run-name", "long-segmented"])
+            snapshot = load_resume_checkpoint(
+                root / "checkpoints" / "long-segmented" / "expert_segments.pt"
+            )
+            durations = [stop - start for ends in snapshot["target_boundaries"]
+                         for start, stop in zip(ends[:-1], ends[1:])]
+            self.assertTrue(durations)
+            self.assertTrue(all(4 <= duration <= 8 for duration in durations))
+            main(["--resume-checkpoint", str(root / "checkpoints" / "long-segmented"
+                                / "expert_segments.pt"), "--min-duration", "5", "--max-duration", "9",
+                  "--segment-steps", "18", "--rollout", "10", "--pretrain-updates", "4",
+                  "--segment-only", "--device", "cpu", "--run-name", "retuned"])
+            new_snapshot = load_resume_checkpoint(
+                root / "checkpoints" / "retuned" / "expert_segments.pt"
+            )
+            self.assertEqual(new_snapshot["pretrain_step"], 4)
+            self.assertTrue(all(5 <= stop - start <= 9
+                                for ends in new_snapshot["target_boundaries"]
+                                for start, stop in zip(ends[:-1], ends[1:])))
+            online = dict(new_snapshot, step=2)
+            path = root / "online.pt"
+            th.save(online, path)
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaises(SystemExit):
+                    parse_args(["--resume-checkpoint", str(path), "--min-duration", "6"])
+            self.assertIn("pre-online expert snapshot", output.getvalue())
+
 
 @unittest.skipUnless(
     os.environ.get("GODDARD_GPU_SMOKE") == "1" and th.cuda.is_available(),
     "opt-in CUDA/CARL LBIfO trainer smoke",
 )
 class LBIFOGpuSmokeTests(unittest.TestCase):
+    def test_second_scale_snapshot_and_full_plan_online_rollout(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            for name in ("lower", "pro", "resets"):
+                make_replays(root / name)
+            main(small_args(root / "lower", root / "pro", root / "resets", root) + [
+                "--min-duration", "30", "--max-duration", "60",
+                "--segment-steps", "180", "--expert-sequences", "1",
+                "--rollout", "180", "--plan-horizon", "3",
+                "--prior-rounds", "1", "--run-name", "macro", "--segment-only",
+            ])
+            snapshot = root / "checkpoints" / "macro" / "expert_segments.pt"
+            durations = [stop - start for bounds in load_resume_checkpoint(snapshot)["target_boundaries"]
+                         for start, stop in zip(bounds[:-1], bounds[1:])]
+            self.assertGreaterEqual(len(durations), 3)
+            self.assertTrue(all(30 <= duration <= 60 for duration in durations))
+            summary = ExpertSkillCatalog(snapshot).list()["duration_seconds"]
+            self.assertGreaterEqual(summary["min"], 1.0)
+            self.assertLessEqual(summary["max"], 2.0)
+            main(["--resume-checkpoint", str(snapshot), "--run-name", "macro-online",
+                  "--timesteps", "360", "--online-refit-interval", "1",
+                  "--no-dynamics-pairs", "--single-reenactments", "0"])
+            online = load_resume_checkpoint(
+                root / "checkpoints" / "macro-online" / "lbifo_000000000360.pt"
+            )
+            self.assertEqual(online["step"], 360)
+            self.assertTrue(online["policy_optimizer"]["state"])
+            self.assertTrue(online["skill_critic_optimizer"]["state"])
+
     def test_paired_kinematic_action_and_single_entity_reenactment(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory) / "pro"

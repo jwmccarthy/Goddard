@@ -82,6 +82,8 @@ class ExpertSkillWatcherTests(unittest.TestCase):
             listing = catalog.list()
             self.assertEqual(listing["step"], 16)
             self.assertEqual(listing["trajectory_count"], 4)
+            self.assertAlmostEqual(listing["duration_seconds"]["median"], 2 * 4 / 120)
+            self.assertTrue(all(skill["source_count"] == 1 for skill in listing["skills"]))
             self.assertEqual([item["start"] for item in catalog.trajectories], [0, 0, 2, 2])
             self.assertEqual([item["car"] for item in catalog.trajectories], [0, 1, 0, 1])
             matches = [item for skill in listing["skills"] for item in
@@ -107,6 +109,7 @@ class ExpertSkillWatcherTests(unittest.TestCase):
             self.assertEqual(segment["prefix_concentrations"][-1], segment["concentrations"])
             self.assertEqual(segment["scenes"], rows[2:5, :51].tolist())
             self.assertEqual(segment["source"]["native_rows"], [2, 3, 4])
+            self.assertEqual(segment["source_file"], "match-1.npy")
             self.assertEqual(segment["source"]["raw_frames"], rows[2:5].tolist())
             groups = feature_groups()
             self.assertEqual(sum(len(group["names"]) for group in groups), 161)
@@ -125,15 +128,33 @@ class ExpertSkillWatcherTests(unittest.TestCase):
             catalog = ExpertSkillCatalog(checkpoint, replays)
             self.assertEqual(len(catalog.trajectories), 4)
 
+    def test_skill_lists_independent_source_replays_before_more_clips_from_one_game(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            checkpoint, replays, rows = fixture(Path(directory))
+            np.save(replays / "match-2.npy", rows)
+            payload = th.load(checkpoint, weights_only=True)
+            payload["target_chunks"].append((8, payload["target_chunks"][0][1].clone()))
+            payload["target_boundaries"].append(payload["target_boundaries"][0])
+            th.save(payload, checkpoint)
+            catalog = ExpertSkillCatalog(checkpoint, replays)
+            group = catalog.group(catalog.list()["skills"][0]["id"])
+            self.assertEqual(group["source_count"], 2)
+            self.assertEqual({item["source_file"] for item in group["trajectories"][:2]},
+                             {"match-1.npy", "match-2.npy"})
+
     def test_missing_or_changed_replays_never_masquerade_as_the_saved_expert_skill(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             checkpoint, replays, rows = fixture(Path(directory))
             catalog = ExpertSkillCatalog(checkpoint, replays)
             rows[0, 0] = 100
             np.save(replays / "match-1.npy", rows)
+            changed = ExpertSkillCatalog(checkpoint, replays)
+            self.assertTrue(all(skill["source_count"] == 0 for skill in changed.list()["skills"]))
+            self.assertTrue(all("source_file" not in item for item in changed.trajectories))
             detail = catalog.detail(0)
             self.assertIn("do not match", detail["source_note"])
             self.assertNotIn("source", detail)
+            self.assertNotIn("source_file", detail)
             (replays / "match-1.npy").unlink()
             self.assertNotIn("source", catalog.detail(0))
             fallback = ExpertSkillCatalog(checkpoint).detail(0)
@@ -156,6 +177,19 @@ class ExpertSkillWatcherTests(unittest.TestCase):
             self.assertTrue(detail["source"]["resampled"])
             self.assertEqual([frame[85] for frame in detail["source"]["raw_frames"]],
                              rows[[0, 2, 4], 85].tolist())
+
+    def test_resampled_source_verification_uses_saved_offset_within_replay(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            checkpoint, replays, rows = fixture(Path(directory), native_frameskip=2)
+            payload = th.load(checkpoint, weights_only=True)
+            payload["target_chunks"] = [(
+                1, th.from_numpy(resample_scene(rows[:, :51], 2, 4)[1:4].copy()),
+            )]
+            payload["target_boundaries"] = [(0, 2)]
+            th.save(payload, checkpoint)
+            catalog = ExpertSkillCatalog(checkpoint, replays)
+            self.assertEqual(catalog.list()["skills"][0]["source_count"], 1)
+            self.assertEqual(catalog.detail(0)["source"]["native_rows"], [2, 4, 6])
 
     def test_read_only_http_api_lists_and_selects_expert_skills(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

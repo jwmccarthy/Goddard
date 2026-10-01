@@ -81,6 +81,53 @@ class ReplaySources:
         return cls(pretrain_dir, target_dir, reset_dir)
 
 
+def full_plan_steps(min_duration: int, max_duration: int, horizon: int) -> int:
+    """Force at least `horizon` segments under the allowed duration bounds."""
+    # Fewer segments could cover up to (horizon - 1) * max_duration steps.
+    return max(horizon * min_duration, (horizon - 1) * max_duration + 1)
+
+
+def sample_expert_chunks(
+    corpus: ExpertCorpus, rng: np.random.Generator, count: int, steps: int,
+    plan_horizon: int = 1,
+) -> list[tuple[int, th.Tensor]]:
+    """Draw full-plan, nonoverlapping excerpts, cycling through replays first."""
+    minimum = full_plan_steps(corpus.min_duration, corpus.max_duration, plan_horizon) + 1
+    if count < 1 or plan_horizon < 1 or steps + 1 < minimum:
+        raise ValueError("expert sample count must be positive and segment steps must fit a full plan")
+    offsets = np.cumsum([0, *corpus.expert.lengths]).tolist()
+    by_replay: dict[int, list[tuple[int, int]]] = {}
+    for span in corpus.train_spans:
+        if span.length < minimum:
+            continue
+        length = min(steps + 1, span.length)
+        blocks, remainder = divmod(span.length, length)
+        first = span.start + (int(rng.integers(remainder + 1)) if remainder < minimum else 0)
+        replay = bisect.bisect_right(offsets, span.start) - 1
+        by_replay.setdefault(replay, []).extend(
+            (first + block * length, length) for block in range(blocks)
+        )
+        if remainder >= minimum:
+            by_replay[replay].append((first + blocks * length, remainder))
+    if not by_replay:
+        raise ValueError(f"no pro replay has {minimum - 1} contiguous steps for a full "
+                         f"{plan_horizon}-skill plan")
+    for replay, candidates in by_replay.items():
+        order = rng.permutation(len(candidates))
+        by_replay[replay] = [candidates[index] for index in order]
+    chunks = []
+    while len(chunks) < count:
+        remaining = [replay for replay, candidates in by_replay.items() if candidates]
+        if not remaining:
+            break
+        for replay in rng.permutation(remaining):
+            start, length = by_replay[int(replay)].pop()
+            chunks.append((start, corpus.frames[start:start + length]))
+            if len(chunks) == count:
+                break
+    return chunks
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     peek = argparse.ArgumentParser(add_help=False)
     peek.add_argument("--resume-checkpoint", type=Path)
@@ -102,7 +149,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--segment-only", action=argparse.BooleanOptionalAction, default=False,
                         help="save expert_segments.pt after pro segmentation without starting CARL")
     parser.add_argument("--resume-checkpoint", type=Path)
-    parser.add_argument("--pretrain-updates", type=int, default=10_000)
+    parser.add_argument("--pretrain-updates", type=int, default=30_000)
     parser.add_argument("--pretrain-checkpoint-interval", type=int, default=1_000)
     parser.add_argument("--pretrain-batch", type=int, default=64)
     parser.add_argument("--pretrain-frame-limit", type=int)
@@ -112,15 +159,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=16)
     parser.add_argument("--prior-hidden", type=int, default=128)
     parser.add_argument("--policy-hidden", type=int, default=256)
-    parser.add_argument("--min-duration", type=int, default=4)
-    parser.add_argument("--max-duration", type=int, default=16)
+    parser.add_argument("--min-duration", type=int, default=30)
+    parser.add_argument("--max-duration", type=int, default=60)
     parser.add_argument("--plan-horizon", type=int, default=3)
     parser.add_argument("--replan-after", type=int, default=1)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--n-sim", type=int, default=64)
     parser.add_argument("--max-ticks", type=int, default=36_000)
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
-    parser.add_argument("--rollout", type=int, default=32)
+    parser.add_argument("--rollout", type=int, default=180)
     parser.add_argument("--timesteps", type=int, default=2_000_000_000,
                         help="minimum total CARL actor-steps after pretraining; the last joint step may overshoot")
     parser.add_argument("--representation-lr", type=float, default=3e-4)
@@ -136,7 +183,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prior-updates", type=int, default=200)
     parser.add_argument("--prior-batch", type=int, default=32)
     parser.add_argument("--expert-sequences", type=int, default=64)
-    parser.add_argument("--segment-steps", type=int, default=64)
+    parser.add_argument("--segment-steps", type=int, default=180)
     parser.add_argument("--calibration-windows", type=int, default=64)
     parser.add_argument("--prior-weight", type=float, default=0.3)
     parser.add_argument("--boundary-penalty", type=float, default=1.0)
@@ -194,6 +241,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             defaults["device"] = "cuda"
         parser.set_defaults(**defaults)
     args = parser.parse_args(argv)
+    args.rebuild_prior = saved is not None and any(
+        getattr(args, name) != saved["config"][name]
+        for name in ("min_duration", "max_duration")
+    )
+    if args.rebuild_prior and (saved["step"] or "policy" in saved):
+        parser.error("changing skill duration requires a pretraining or pre-online expert snapshot")
     if args.pretrain_only and args.segment_only:
         parser.error("--pretrain-only and --segment-only are separate training phases")
     if args.segment_only and saved is not None and saved["step"]:
@@ -219,8 +272,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.segment_steps < args.max_duration or args.rollout < args.min_duration:
-        parser.error("--segment-steps must fit --max-duration and --rollout must fit --min-duration")
+    minimum_expert_steps = max(args.max_duration, full_plan_steps(
+        args.min_duration, args.max_duration, args.plan_horizon,
+    ))
+    if (args.segment_steps < minimum_expert_steps
+        or args.rollout < args.plan_horizon * args.min_duration):
+        parser.error("--segment-steps must fit a full expert plan and --rollout must fit a full policy plan")
     if args.dynamics_pairs and args.dynamics_pair_batch < 2:
         parser.error("cross-dynamics contrastive pairs need --dynamics-pair-batch >= 2")
     if args.skill_batch < N_CARS:
@@ -274,7 +331,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if saved is not None:
         for name in (
             "frameskip", "latent_dim", "representation_hidden", "prior_hidden",
-            "policy_hidden", "min_duration", "max_duration", "plan_horizon",
+            "policy_hidden", "plan_horizon",
         ):
             if getattr(args, name) != saved["config"][name]:
                 parser.error(f"--{name.replace('_', '-')} must match the resumed checkpoint")
@@ -534,22 +591,13 @@ class LBIFOTrainer:
     def expert_chunks(self) -> list[tuple[int, th.Tensor]]:
         if self.target_corpus is None:
             raise ValueError("expert segments require the pro 1v1 target dataset")
-        spans = [span for span in self.target_corpus.train_spans
-                 if span.length > self.args.min_duration]
-        if not spans:
-            raise ValueError("no contiguous pro-level target segments exist")
-        length = self.args.segment_steps + 1
-        weights = np.asarray([
-            max(1, span.length - length + 1) for span in spans
-        ], dtype=np.float64)
-        weights /= weights.sum()
-        indices = self.rng.choice(len(spans), self.args.expert_sequences, p=weights)
-        chunks = []
-        for choice in indices:
-            span = spans[choice]
-            window = min(length, span.length)
-            start = int(self.rng.integers(span.start, span.end - window + 1))
-            chunks.append((start, self.target_corpus.frames[start:start + window]))
+        chunks = sample_expert_chunks(
+            self.target_corpus, self.rng, self.args.expert_sequences,
+            self.args.segment_steps, self.args.plan_horizon,
+        )
+        if len(chunks) < self.args.expert_sequences:
+            print(f"Only {len(chunks)} nonoverlapping pro excerpts available "
+                  f"(requested {self.args.expert_sequences}); not repeating adjacent skills")
         return chunks
 
     def fit_prior(
@@ -715,7 +763,7 @@ class LBIFOTrainer:
             "config": {
                 name: str(value) if isinstance(value, Path) else value
                 for name, value in vars(self.args).items()
-                if name not in ("resume_checkpoint", "pretrain_data_needed")
+                if name not in ("resume_checkpoint", "pretrain_data_needed", "rebuild_prior")
             },
             "step": self.step,
             "pretrain_step": self.pretrain_step,
@@ -771,12 +819,15 @@ class LBIFOTrainer:
         self.representation.load_state_dict(saved["representation"])
         self.ema.load_state_dict(saved["ema_encoder"])
         self.ema.temporal.flatten_parameters()
-        self.prior.load_state_dict(saved["prior"])
         self.repr_optimizer.load_state_dict(saved["representation_optimizer"])
-        self.prior_optimizer.load_state_dict(saved["prior_optimizer"])
         self.mask_ratio = float(saved.get("mask_ratio", self.args.mask_ratio))
-        self.calibration.mean = saved["calibration_mean"]
-        self.calibration.std = saved["calibration_std"]
+        if not self.args.rebuild_prior:
+            self.prior.load_state_dict(saved["prior"])
+            self.prior_optimizer.load_state_dict(saved["prior_optimizer"])
+            self.calibration.mean = saved["calibration_mean"]
+            self.calibration.std = saved["calibration_std"]
+        else:
+            print("Changed skill durations: reusing the encoder, rebuilding the duration prior and calibration")
         if restore_policy and "policy" in saved:
             self.policy.load_state_dict(saved["policy"])
             self.value.load_state_dict(saved["value"])
@@ -1218,7 +1269,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     resumed = (
         trainer.resume_targets(load_resume_checkpoint(args.resume_checkpoint))
-        if args.resume_checkpoint is not None else None
+        if args.resume_checkpoint is not None and not args.rebuild_prior else None
     )
     if resumed is None:
         chunks = trainer.segment_experts()

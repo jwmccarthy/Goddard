@@ -173,12 +173,13 @@ function inspect(selected) {
   outputs = [];
   prefixOutputs = [];
   const heading = document.createElement('h2');
-  heading.textContent = `Skill latent ${group.id + 1} · real expert trajectory`;
+  heading.textContent = `Skill latent ${group.id + 1} · sampled expert clip`;
   panel.appendChild(heading);
   const overview = document.createElement('div');
   overview.className = 'overview';
   const match = group.trajectories.find((item) => item.id === selected.id);
-  addStat(overview, 'Matching trajectory', `${group.trajectories.indexOf(match) + 1} / ${group.count}`);
+  addStat(overview, 'Matching clip', `${group.trajectories.indexOf(match) + 1} / ${group.count}`);
+  if (group.source_count !== null) addStat(overview, 'Distinct source replays', group.source_count);
   addStat(overview, 'Cosine to skill', match.cosine.toFixed(4));
   addStat(overview, 'Focal car', selected.car ? 'Orange' : 'Blue');
   addStat(overview, 'Sample / segment', `${selected.chunk + 1} / ${selected.segment + 1}`);
@@ -327,7 +328,7 @@ async function selectSkill(id) {
       const option = document.createElement('option');
       option.value = item.id;
       option.textContent = `${position + 1}/${selected.count} · ${item.car ? 'Orange' : 'Blue'} · ` +
-        `frames ${item.start}–${item.stop} · cosine ${item.cosine.toFixed(3)}`;
+        `${item.source_file || `sample ${item.chunk + 1}`} · frames ${item.start}–${item.stop} · cosine ${item.cosine.toFixed(3)}`;
       $('trajectorySelect').appendChild(option);
     });
     await selectTrajectory(selected.trajectories[0].id);
@@ -339,7 +340,8 @@ function filterSkills(preferredId = group?.id) {
   const search = $('skillSearch').value.trim().toLowerCase();
   $('skillSelect').replaceChildren();
   for (const item of allSkills) {
-    const text = `skill ${item.id + 1} · ${item.count} expert car trajectories`;
+    const text = `skill ${item.id + 1} · ${item.count} clips` +
+      (item.source_count === null ? '' : ` · ${item.source_count} replays`);
     if (!text.includes(search)) continue;
     const option = document.createElement('option');
     option.value = item.id;
@@ -428,7 +430,8 @@ async function loadSkills(previousLatent = null, initial = false) {
     allSkills = catalog.skills;
     $('similarity').value = catalog.similarity;
     $('similarityLabel').textContent = catalog.similarity.toFixed(3);
-    $('checkpoint').textContent = `${catalog.checkpoint} · ${catalog.trajectory_count} real expert car trajectories · ${allSkills.length} skill latents`;
+    $('checkpoint').textContent = `${catalog.checkpoint} · ${catalog.trajectory_count} sampled expert car clips · ` +
+      `${catalog.duration_seconds.min.toFixed(2)}–${catalog.duration_seconds.max.toFixed(2)} s · ${allSkills.length} skill latents`;
     const preferred = previousLatent && allSkills.length
       ? allSkills.reduce((best, item) => item.latent.reduce(
         (total, value, i) => total + value * previousLatent[i], 0) >

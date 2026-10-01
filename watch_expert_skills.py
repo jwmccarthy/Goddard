@@ -171,7 +171,8 @@ class ReplayIndex:
             original = np.where(alpha[local] < 0.5, left[local], right[local])
             reconstructed = resample_scene(
                 source[:, :SCENE_SIZE], source_file.frame_skip, self.frameskip,
-            )[local]
+                target_indices=local,
+            )
         if not np.allclose(reconstructed, scenes.numpy(), rtol=1e-5, atol=1e-5):
             raise ValueError("source replay scenes do not match this checkpoint's expert segment")
         return {
@@ -252,6 +253,22 @@ class ExpertSkillCatalog:
                     pass
         if replay_dir is not None:
             self.replays = ReplayIndex(replay_folder(replay_dir, self.frameskip), config)
+            matching = {}
+            for chunk_index, (offset, frames) in enumerate(chunks):
+                try:
+                    matching[chunk_index] = self.replays.rows(int(offset), frames)["file"]
+                except (OSError, ValueError):
+                    continue
+            for trajectory in self.trajectories:
+                file = matching.get(trajectory["chunk"])
+                if file is not None:
+                    trajectory["source_file"] = file
+
+    def source_count(self, members: list[tuple[int, float]] | tuple[tuple[int, float], ...]) -> int | None:
+        if self.replays is None:
+            return None
+        return len({self.trajectories[index].get("source_file") for index, _ in members
+                    if "source_file" in self.trajectories[index]})
 
     @lru_cache(maxsize=16)
     def groups(self, similarity: float) -> tuple[tuple[int, tuple[tuple[int, float], ...]], ...]:
@@ -260,11 +277,18 @@ class ExpertSkillCatalog:
 
     def list(self, similarity: float | None = None) -> dict:
         cutoff = self.default_similarity if similarity is None else similarity
+        durations = np.array([item["duration"] for item in self.trajectories])
         return {
             "checkpoint": self.checkpoint, "step": self.step, "frameskip": self.frameskip,
             "similarity": cutoff, "trajectory_count": len(self.trajectories),
+            "duration_seconds": {
+                "min": float(durations.min() * self.frameskip / 120),
+                "median": float(np.median(durations) * self.frameskip / 120),
+                "max": float(durations.max() * self.frameskip / 120),
+            },
             "skills": [{"id": anchor, "latent": self.trajectories[anchor]["latent"],
-                        "count": len(members)} for anchor, members in self.groups(cutoff)],
+                        "count": len(members), "source_count": self.source_count(members)}
+                       for anchor, members in self.groups(cutoff)],
         }
 
     def group(self, skill_id: int, similarity: float | None = None) -> dict:
@@ -272,9 +296,20 @@ class ExpertSkillCatalog:
         for anchor, members in self.groups(cutoff):
             if anchor == skill_id:
                 ranked = sorted(members, key=lambda item: (-item[1], item[0]))
+                if self.replays is not None:
+                    first, later, sources = [], [], set()
+                    for member in ranked:
+                        file = self.trajectories[member[0]].get("source_file")
+                        if file is not None and file not in sources:
+                            first.append(member)
+                            sources.add(file)
+                        else:
+                            later.append(member)
+                    ranked = first + later
                 return {
                     "id": anchor, "latent": self.trajectories[anchor]["latent"],
                     "similarity": cutoff, "count": len(ranked),
+                    "source_count": self.source_count(ranked),
                     "trajectories": [
                         {**self.trajectories[index], "cosine": cosine}
                         for index, cosine in ranked
@@ -302,6 +337,7 @@ class ExpertSkillCatalog:
             try:
                 result["source"] = self.replays.rows(result["start"], scenes)
             except (OSError, ValueError) as error:
+                result.pop("source_file", None)
                 result["source_note"] = str(error)
         return result
 
@@ -405,7 +441,7 @@ def main(argv: list[str] | None = None) -> None:
     server = ThreadingHTTPServer((args.host, args.port), make_handler(catalog, frontend, arena))
     url = f"http://{args.host}:{server.server_port}"
     print(f"Expert skill latents: {len(catalog.list()['skills'])} groups across "
-          f"{len(catalog.trajectories)} demonstrated car trajectories from {args.checkpoint}")
+          f"{len(catalog.trajectories)} sampled expert car clips from {args.checkpoint}")
     print(f"Viewer: {url}")
     if args.open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

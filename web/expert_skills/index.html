@@ -85,15 +85,15 @@
       <div class="eyebrow">Goddard / LBIfO</div>
       <h1>Expert skill explorer</h1>
       <p class="hint" id="checkpoint">Loading demonstrated skill latents…</p>
-      <label>Find skill latent<input id="skillSearch" type="search" placeholder="Skill ID or number of examples"></label>
+      <label>Find skill latent<input id="skillSearch" type="search" placeholder="Skill ID, clip or replay count"></label>
       <label class="similarity"><span>Minimum cosine match<output id="similarityLabel">0.90</output></span>
         <input id="similarity" type="range" min="0" max="1" step="any" value="0.90"></label>
       <label>Skill latent<select id="skillSelect" aria-label="Choose a skill latent"></select></label>
-      <label>Matching expert trajectory<select id="trajectorySelect" aria-label="Choose a matching expert trajectory"></select></label>
+      <label>Matching expert clip<select id="trajectorySelect" aria-label="Choose a matching expert clip"></select></label>
       <div class="clip-controls">
-        <button id="previousClip" title="Previous expert trajectory">← Trajectory</button>
-        <button id="nextClip" title="Next expert trajectory">Trajectory →</button>
-        <button id="playAll" title="Play matching expert trajectories in sequence">Play all</button>
+        <button id="previousClip" title="Previous expert clip">← Clip</button>
+        <button id="nextClip" title="Next expert clip">Clip →</button>
+        <button id="playAll" title="Play matching expert clips in sequence">Play all</button>
       </div>
       <div class="transport">
         <button id="previous" title="Previous frame (←)">←</button>
@@ -106,7 +106,7 @@
       <input id="scrub" type="range" min="0" max="0" value="0" aria-label="Replay frame">
       <div class="time"><span id="frameLabel">Frame —</span><span id="timeLabel">0.00 s</span></div>
     </div>
-    <div class="scroll" id="inspector" aria-live="polite"><p class="empty">Select a skill latent to browse its expert trajectories.</p></div>
+    <div class="scroll" id="inspector" aria-live="polite"><p class="empty">Select a skill latent to browse its sampled expert clips.</p></div>
   </aside>
   <script type="importmap">
     {"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}

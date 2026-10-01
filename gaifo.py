@@ -155,13 +155,17 @@ def resample_scene(
     scene: np.ndarray,
     source_frame_skip: int,
     target_frame_skip: int,
+    *, target_indices: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Resample normalized physical scenes onto the simulator's time cadence."""
+    """Resample normalized scenes, optionally only at selected target frames."""
     if len(scene) < 2 or source_frame_skip == target_frame_skip:
-        return np.asarray(scene, dtype=np.float32)
+        output = np.asarray(scene, dtype=np.float32)
+        return output if target_indices is None else output[target_indices]
     left, right, alpha = _resample_coordinates(
         len(scene), source_frame_skip, target_frame_skip
     )
+    if target_indices is not None:
+        left, right, alpha = left[target_indices], right[target_indices], alpha[target_indices]
     output = (
         scene[left] * (1.0 - alpha[:, None])
         + scene[right] * alpha[:, None]

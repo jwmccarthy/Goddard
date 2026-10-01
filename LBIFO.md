@@ -36,7 +36,7 @@ Pretrain a representation on broader play before starting pro-only skills:
 .venv/bin/python lbifo.py \
   --pretrain-replay-dir parsed_replays/ranked_1v1_fs4 \
   --pretrain-only \
-  --pretrain-updates 10000 \
+  --pretrain-updates 30000 \
   --checkpoint-dir checkpoints/lbifo
 ```
 
@@ -118,6 +118,44 @@ and plan value; the new tracking critic and policy optimizer start fresh.
   terminate the return early. `--replan-after` selects how many behaviors the
   saved viewer executes before requesting a new plan.
 
+At `--frameskip 4`, the default `--min-duration 30` and `--max-duration 60`
+allow one- to two-second expert behaviors. The 180-transition segmentation
+excerpt spans six seconds, and the 180-step CARL rollout can hold a complete
+three-skill plan even when each behavior lasts the maximum two seconds.
+Segmentation samples nonoverlapping excerpts long enough for a full plan,
+visiting distinct pro replay files before taking another excerpt from one
+replay. If the corpus contains fewer usable excerpts than `--expert-sequences`,
+the trainer reports the available count rather than duplicating the same
+action. Online rollouts shorter than `--plan-horizon * --min-duration`
+cannot supply complete multi-skill policy plans to the prior. Longer windows
+increase training and segmentation cost substantially.
+
+To reuse an older `pretrain_latest.pt` **or** `expert_segments.pt` with
+short-duration settings and continue its representation training on longer
+windows, run:
+
+```bash
+.venv/bin/python lbifo.py \
+  --resume-checkpoint checkpoints/lbifo/<old-run>/expert_segments.pt \
+  --pretrain-replay-dir parsed_replays/ranked_1v1_fs4 \
+  --pretrain-only --pretrain-updates 30000 \
+  --min-duration 30 --max-duration 60 --segment-steps 180 --rollout 180
+.venv/bin/python lbifo.py \
+  --resume-checkpoint checkpoints/lbifo/<new-pretrain>/pretrain_latest.pt \
+  --target-replay-dir parsed_replays/pro_1v1_fs4 --segment-only
+```
+
+`--pretrain-updates` is the **total** number of updates, so it must exceed the
+old checkpoint's `pretrain_step` to train on longer windows. This reuses the
+encoder and optimizer but initializes a new duration prior and calibration.
+When starting from `expert_segments.pt`, old inferred boundaries are discarded
+and new, longer excerpts are segmented. Online checkpoints have already started
+policy training and cannot change the duration-prior architecture. More PPO
+timesteps cannot change an existing `expert_segments.pt`. Longer pretraining
+may improve a weak representation, but same-window contrastive learning treats
+other sampled windows as negatives even if they depict the same behavior; more
+updates alone cannot guarantee cross-replay skill clusters.
+
 Run `watch_checkpoints.py --checkpoint-dir checkpoints/lbifo` to watch saved
 `lbifo_*.pt` hierarchies against each other. The viewer also supports BASIC
 and GAIFO. Representation-only checkpoints are not playable.
@@ -139,11 +177,15 @@ Resume online learning later from `expert_segments.pt` in the same way as from
 `pretrain_latest.pt`. Existing online `lbifo_*.pt` checkpoints can also be
 inspected; pretraining-only checkpoints contain no inferred expert skills.
 
-The watcher groups the **actual pro replay segments sampled at segmentation**
-by per-car latent: each displayed expert trajectory has cosine similarity at
-least the selected cutoff to that group's representative latent. Select a
-skill latent, then choose or play through **all matching expert trajectories**.
-An expert clip may appear under more than one latent when it matches both.
+The watcher groups the **actual pro replay clips sampled at segmentation**
+by per-car latent: each displayed clip has cosine similarity at least the
+selected cutoff to that group's representative latent. Select a skill latent,
+then choose or play through all its matching saved clips. An expert clip may
+appear under more than one latent when it matches both. The catalog reports
+the saved clip-duration range and, when replay files are available, how many
+distinct replays support each group. It shows one match per replay first;
+several matches from a single replay do not establish a repeatable skill. A
+source replay is counted only after its scenes match the saved excerpt.
 The similarity slider (initial `--similarity`, default `0.9`) controls grouping
 because the latent space is continuous, not a set of categorical labels. The
 browser shows each trajectory's focal car, match score, segment boundaries,
@@ -153,9 +195,10 @@ frame. If the original parsed replays are present (automatically from the
 checkpoint's target replay path, or via `--replay-dir`), it also shows all 110
 other parser fields: boost pads, relative ball/car and goal features, internal
 state, touches, bumps and correction flags. Scene alignment is checked before
-displaying raw rows. `--expert-sequences` sets how many pro chunks are sampled
-for segmentation and thus the watcher's coverage; viewing needs no GPU. The
-watcher defaults to port `8789` (`--host` and `--port` are configurable).
+displaying raw rows. `--expert-sequences` caps how many nonoverlapping pro
+excerpts are sampled for segmentation; the watcher does not scan every frame
+of every replay. Viewing needs no GPU. The watcher defaults to port `8789`
+(`--host` and `--port` are configurable).
 
 For a quick test on synthetic replay files, run
 `.venv/bin/python -m unittest discover -s tests -p 'test_lbifo*.py' -v`.
