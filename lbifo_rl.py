@@ -3,6 +3,9 @@
 import torch as th
 import torch.nn as nn
 
+from jarl.data import Evaluation, TensorBatch
+from jarl.learn import PPOLoss
+
 from gaifo import N_CARS, SCENE_SIZE
 from lbifo_repr import RelationalEncoder
 
@@ -98,6 +101,62 @@ class SkillCritic(nn.Module):
             raise ValueError("skill critic needs matching observations, requests, and ages")
         inputs = th.cat((observation, latent, (age.float() / 32)[..., None]), dim=-1)
         return self.network(inputs).squeeze(-1)
+
+
+def augmented_skill_observation(
+    observation: th.Tensor, request: th.Tensor, age: th.Tensor,
+) -> th.Tensor:
+    """Expose CARL state, requested expert latent, and skill age to JARL PPO."""
+    if observation.shape[:-1] != request.shape[:-1] or age.shape != request.shape[:-1]:
+        raise ValueError("skill observation, expert request, and age must align")
+    return th.cat((observation, request, age[..., None].to(observation.dtype)), dim=-1)
+
+
+class AugmentedSkillPolicy(nn.Module):
+    """JARL's policy interface around the checkpoint-compatible skill policy."""
+
+    def __init__(self, policy: nn.Module) -> None:
+        super().__init__()
+        self.policy = policy
+
+    def evaluate_actions(
+        self, observation: th.Tensor, action: th.Tensor,
+        state: th.Tensor | None = None, *, reset: th.Tensor | None = None,
+    ) -> Evaluation:
+        if state is not None or reset is not None:
+            raise ValueError("skill PPO uses a feed-forward policy")
+        base = self.policy.observation_size
+        log_prob, entropy = self.policy.evaluate_actions(
+            observation[..., :base], action, observation[..., base:-1],
+            observation[..., -1],
+        )
+        return Evaluation(log_prob=log_prob, entropy=entropy)
+
+
+class AugmentedSkillCritic(nn.Module):
+    """JARL's value interface around the skill-tracking critic."""
+
+    def __init__(self, critic: SkillCritic) -> None:
+        super().__init__()
+        self.critic = critic
+        self.body = nn.Identity()  # JARL checks this for a recurrent critic.
+
+    def evaluate_values(self, observation: th.Tensor) -> th.Tensor:
+        base = self.critic.observation_size
+        return self.critic(
+            observation[..., :base], observation[..., base:-1], observation[..., -1],
+        )
+
+
+class MinibatchPPOLoss(PPOLoss):
+    """Move only the sampled JARL minibatch onto the policy device."""
+
+    def __init__(self, *args, device: th.device, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.device = device
+
+    def __call__(self, sample: TensorBatch):
+        return super().__call__(sample.to(self.device))
 
 
 def tracking_gae(

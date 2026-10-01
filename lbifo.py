@@ -20,6 +20,11 @@ import torch as th
 import torch.nn.functional as F
 
 from carl.gymnasium import CARLTorchVectorEnv
+from jarl.data import TensorBatch
+from jarl.learn import (
+    IndependentOptimizerSteps, OptimizerStep, PPOConfig, Update,
+)
+from jarl.sample import RolloutMinibatches
 
 from gaifo import N_CARS, SCENE_SIZE
 from lbifo_data import ExpertCorpus, PlaySequence, TrajectoryMemory
@@ -29,7 +34,10 @@ from lbifo_planning import (
     SemiMarkovSegmenter, SphericalPlanPrior,
 )
 from lbifo_repr import SceneRepresentation, ema_update
-from lbifo_rl import EmbeddingTrackingReward, SkillCritic, tracking_gae
+from lbifo_rl import (
+    AugmentedSkillCritic, AugmentedSkillPolicy, EmbeddingTrackingReward,
+    MinibatchPPOLoss, SkillCritic, augmented_skill_observation, tracking_gae,
+)
 from lbifo_skill import (
     BehaviorPolicy, ExpertResetProvider, JointPlanController,
     expert_prior_examples, hazard_examples, hindsight_labels,
@@ -113,7 +121,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-ticks", type=int, default=36_000)
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
     parser.add_argument("--rollout", type=int, default=32)
-    parser.add_argument("--timesteps", type=int, default=10_000_000,
+    parser.add_argument("--timesteps", type=int, default=2_000_000_000,
                         help="minimum total CARL actor-steps after pretraining; the last joint step may overshoot")
     parser.add_argument("--representation-lr", type=float, default=3e-4)
     parser.add_argument("--mask-ratio", type=float, default=0.8)
@@ -964,7 +972,7 @@ class LBIFOTrainer:
         return observation, records, stats
 
     def train_ppo(self) -> dict[str, float]:
-        """Update on every active transition from the fresh joint CARL rollout."""
+        """JARL PPO over every active latent-conditioned CARL actor transition."""
         rollout = self._skill_rollout
         self._skill_rollout = None
         if rollout is None:
@@ -974,78 +982,66 @@ class LBIFOTrainer:
             rollout["active"], rollout["bootstrap"],
             self.args.gamma, self.args.ppo_lambda,
         )
-        chosen = rollout["active"].flatten().nonzero(as_tuple=True)[0]
+        mask = rollout["active"].flatten(1, 2)
+        chosen = mask.flatten().nonzero(as_tuple=True)[0]
         if not len(chosen):
             return {}
-        data = {
-            name: rollout[name].flatten(0, 2)[chosen]
-            for name in ("observation", "action", "request", "age")
-        }
-        data["advantage"] = advantage.flatten()[chosen]
-        data["returns"] = returns.flatten()[chosen]
-        centered = data["advantage"] - data["advantage"].mean()
-        data["advantage"] = centered / centered.std(unbiased=False).clamp_min(1e-6)
-        old_log_prob = []
+        state = augmented_skill_observation(
+            rollout["observation"], rollout["request"], rollout["age"],
+        ).flatten(1, 2)
+        action = rollout["action"].flatten(1, 2)
+        selected_advantage = advantage.flatten()[chosen]
+        advantage = (advantage - selected_advantage.mean()) / (
+            selected_advantage.std(unbiased=False).clamp_min(1e-6)
+        )
+        policy = AugmentedSkillPolicy(self.policy)
+        old_log_prob = th.zeros_like(mask, dtype=rollout["reward"].dtype)
+        flat_state, flat_action = state.flatten(0, 1), action.flatten(0, 1)
         with th.no_grad():
-            for start in range(0, len(chosen), self.args.ppo_batch):
-                stop = start + self.args.ppo_batch
-                old_log_prob.append(self.policy.evaluate_actions(
-                    data["observation"][start:stop].to(self.device),
-                    data["action"][start:stop].to(self.device),
-                    data["request"][start:stop].to(self.device),
-                    data["age"][start:stop].to(self.device),
-                )[0].cpu())
-        data["old_log_prob"] = th.cat(old_log_prob)
-
-        totals = {"ppo_policy_loss": 0.0, "ppo_value_loss": 0.0,
-                  "ppo_entropy": 0.0, "ppo_approx_kl": 0.0}
-        updates = 0
+            for indices in chosen.split(self.args.ppo_batch):
+                old_log_prob.flatten()[indices] = policy.evaluate_actions(
+                    flat_state[indices].to(self.device),
+                    flat_action[indices].to(self.device),
+                ).log_prob.cpu()
+        batch = TensorBatch({
+            "observation": state, "action": action,
+            "old_log_prob": old_log_prob,
+            "baseline_value": rollout["value"].flatten(1, 2),
+            "advantage": advantage.flatten(1, 2),
+            "returns": returns.flatten(1, 2), "learner_mask": mask,
+        })
+        update = Update(
+            transforms=(), sampler=RolloutMinibatches(self.args.ppo_batch),
+            loss=MinibatchPPOLoss(
+                policy, AugmentedSkillCritic(self.skill_critic),
+                PPOConfig(
+                    clip=self.args.ppo_clip, value_clip=None,
+                    value_coef=self.args.ppo_value_coef,
+                    entropy_coef=self.args.ppo_entropy,
+                    normalize_advantage=False,
+                ), device=self.device,
+            ),
+            optimizer_step=IndependentOptimizerSteps(
+                OptimizerStep(self.policy, self.policy_optimizer, max_grad_norm=1.0),
+                OptimizerStep(self.skill_critic, self.skill_critic_optimizer, max_grad_norm=1.0),
+            ), section="PPO",
+        )
+        totals = {name: 0.0 for name in ("policy_loss", "critic_loss", "entropy", "approx_kl")}
+        epochs = 0
         for _ in range(self.args.ppo_epochs):
-            epoch_kl = 0.0
-            for indices in th.randperm(len(chosen)).split(self.args.ppo_batch):
-                sample = {key: values[indices].to(self.device) for key, values in data.items()}
-                log_prob, entropy = self.policy.evaluate_actions(
-                    sample["observation"], sample["action"],
-                    sample["request"], sample["age"],
-                )
-                log_ratio = log_prob - sample["old_log_prob"]
-                ratio = log_ratio.exp()
-                surrogate = th.minimum(
-                    ratio * sample["advantage"],
-                    ratio.clamp(1 - self.args.ppo_clip, 1 + self.args.ppo_clip)
-                    * sample["advantage"],
-                )
-                policy_loss = -surrogate.mean()
-                predicted = self.skill_critic(
-                    sample["observation"], sample["request"], sample["age"],
-                )
-                value_loss = 0.5 * (predicted - sample["returns"]).square().mean()
-                loss = (
-                    policy_loss + self.args.ppo_value_coef * value_loss
-                    - self.args.ppo_entropy * entropy.mean()
-                )
-                self.policy_optimizer.zero_grad(set_to_none=True)
-                self.skill_critic_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                th.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-                th.nn.utils.clip_grad_norm_(self.skill_critic.parameters(), 1.0)
-                self.policy_optimizer.step()
-                self.skill_critic_optimizer.step()
-                with th.no_grad():
-                    kl = (ratio - 1 - log_ratio).mean()
-                    for key, value in (
-                        ("ppo_policy_loss", policy_loss),
-                        ("ppo_value_loss", value_loss),
-                        ("ppo_entropy", entropy.mean()),
-                        ("ppo_approx_kl", kl),
-                    ):
-                        totals[key] += float(value)
-                    epoch_kl += float(kl) * len(indices)
-                updates += 1
-            if epoch_kl / len(chosen) > self.args.ppo_target_kl:
+            metrics = update.update(batch)["PPO"]
+            for name in totals:
+                totals[name] += metrics[name]
+            epochs += 1
+            if metrics["approx_kl"] > self.args.ppo_target_kl:
                 break
-        return {key: value / updates for key, value in totals.items()} | {
-            "ppo_updates": float(updates), "ppo_actor_steps": float(len(chosen)),
+        return {
+            "ppo_policy_loss": totals["policy_loss"] / epochs,
+            "ppo_value_loss": totals["critic_loss"] / epochs,
+            "ppo_entropy": totals["entropy"] / epochs,
+            "ppo_approx_kl": totals["approx_kl"] / epochs,
+            "ppo_updates": float(math.ceil(len(chosen) / self.args.ppo_batch) * epochs),
+            "ppo_actor_steps": float(len(chosen)),
         }
 
     def train_hazard(self) -> tuple[dict[str, float], list[InferredSequence]]:

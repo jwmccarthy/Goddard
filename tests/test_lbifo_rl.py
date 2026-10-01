@@ -101,17 +101,19 @@ class LBIFORLTests(unittest.TestCase):
         with th.no_grad():
             actions = trainer.policy.act(observation, request, age)
             value = trainer.skill_critic(observation, request, age)
+        active = th.ones(2, 3, 2, dtype=th.bool)
+        active[0, 0, 0] = False
         trainer._skill_rollout = {
             "observation": observation, "action": actions, "request": request, "age": age,
             "reward": th.randn(2, 3, 2), "value": value,
             "ended": th.tensor([[[False, True]] * 3, [[True, True]] * 3]),
-            "active": th.ones(2, 3, 2, dtype=th.bool),
+            "active": active,
             "bootstrap": th.zeros(3, 2),
         }
         old_policy = trainer.policy.network[-1].weight.detach().clone()
         old_critic = trainer.skill_critic.network[-1].weight.detach().clone()
         metrics = trainer.train_ppo()
-        self.assertEqual(metrics["ppo_actor_steps"], 12)
+        self.assertEqual(metrics["ppo_actor_steps"], 11)
         self.assertEqual(metrics["ppo_updates"], 6)
         self.assertTrue(th.isfinite(th.tensor(list(metrics.values()))).all())
         self.assertFalse(th.equal(old_policy, trainer.policy.network[-1].weight))

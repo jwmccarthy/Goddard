@@ -47,7 +47,7 @@ replays need not still be available once pretraining is complete):
 .venv/bin/python lbifo.py \
   --resume-checkpoint checkpoints/lbifo/<pretrain-run>/pretrain_latest.pt \
   --target-replay-dir parsed_replays/pro_1v1_fs4 \
-  --timesteps 1000000000 \
+  --timesteps 2000000000 \
   --checkpoint-dir /path/to/persistent/checkpoints/lbifo
 ```
 
@@ -94,18 +94,23 @@ and plan value; the new tracking critic and policy optimizer start fresh.
   updates they are re-segmented under the current EMA to train the termination
   hazard and realizability prior. PPO trains the policy and a separate skill
   critic on every active actor transition from the current joint CARL rollout.
-  For each requested behavior, the reward is the cosine similarity of its
-  embedding to the EMA embedding of the realized prefix, plus the difference
-  from the preceding prefix. The EMA is frozen during each rollout; neither it
-  nor the decoder receives a gradient from PPO. Anchored opponent actions are
+  JARL handles the policy and critic's PPO loss, minibatches and optimizer
+  steps. The augmented policy state comprises the CARL observation, requested
+  expert latent and skill age. For each requested behavior, the reward is the
+  cosine similarity of its embedding to the EMA embedding of the realized
+  prefix, plus the difference from the preceding prefix. The EMA is frozen
+  during each rollout; neither it nor the decoder receives a gradient from
+  PPO. Anchored opponent actions are
   never policy training targets. `--ppo-epochs`, `--ppo-batch`,
   `--ppo-target-kl`, `--skill-critic-lr`, `--tracking-reward-weight` and
   `--tracking-progress-weight` control these updates; `tracking_cosine` and
   `tracking_progress` measure whether requested behaviors are actually being
-  realized. PPO updates scale with active actor-steps, rather than sampling
-  only a few trajectories from each large parallel rollout. Expert requests
-  for new resets are re-encoded when the EMA and expert segments are refit, so
-  long online runs do not compare current rollouts with stale target codes.
+  realized. Skill-boundary GAE prevents one requested behavior from receiving
+  another's returns. PPO updates scale with active actor-steps, rather than
+  sampling only a few trajectories from each large parallel rollout. Expert
+  requests for new resets are re-encoded when the EMA and expert segments are
+  refit, so long online runs do not compare current rollouts with stale target
+  codes.
 - At planning time the same joint latent prior samples candidates and inpaints
   plausible opponent futures. A separately trained, task-return-only value
   model ranks focal plans. During training the entire sampled plan is executed
