@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch BASIC, GAIFO, DIFO or SMP checkpoints play a 1v1 match in the browser."""
+"""Watch BASIC, GAIFO or LBIfO checkpoints play a 1v1 match in the browser."""
 
 import argparse
 import json
@@ -25,6 +25,9 @@ from gaifo import (
     GAIFO_GRU_ARCHITECTURE,
     build_policy as build_gaifo_policy,
 )
+from lbifo import LBIFO_ARCHITECTURE, load_resume_checkpoint as load_lbifo_checkpoint
+from lbifo_planning import PlanValue, SphericalPlanPrior
+from lbifo_skill import BehaviorPolicy, LBIFOViewerActor
 from replay_resets import load_demonstration_reset_dataset
 
 
@@ -32,8 +35,7 @@ ROOT = Path(__file__).resolve().parent
 CAR_OFFSET = (13.8757, 0.0, 20.755)
 CHECKPOINT_PATTERNS = (
     "gaifo_*.pt",
-    "difo_*.pt",
-    "smp_*.pt",
+    "lbifo_*.pt",
     "training_latest.pt",
     "actor_critic_final.pt",
     "policy_*.pt",
@@ -44,10 +46,8 @@ CHECKPOINT_PATTERNS = (
 def checkpoint_kind(path: Path) -> str:
     if path.match("gaifo_*.pt"):
         return "gaifo"
-    if path.match("difo_*.pt"):
-        return "difo"
-    if path.match("smp_*.pt"):
-        return "smp"
+    if path.match("lbifo_*.pt"):
+        return "lbifo"
     return "basic"
 
 
@@ -106,7 +106,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no BASIC, GAIFO, DIFO or SMP checkpoints found in {self.directory}"
+                f"no BASIC, GAIFO or LBIfO checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -173,9 +173,36 @@ def load_policy_checkpoint(
         )
 
     kind = checkpoint_kind(path)
-    if kind in ("gaifo", "difo", "smp"):
-        if kind in ("difo", "smp") and config.get("algorithm") != kind:
-            raise ValueError(f"unsupported {kind.upper()} checkpoint in {path}")
+    if kind == "lbifo":
+        payload = load_lbifo_checkpoint(path)
+        config = payload["config"]
+        if "policy" not in payload or "value" not in payload:
+            raise ValueError(f"LBIfO checkpoint has no trained low-level policy: {path}")
+        latent_dim = int(config["latent_dim"])
+        width = int(config["prior_hidden"])
+        horizon = int(config["plan_horizon"])
+        hidden = int(config["policy_hidden"])
+        policy = BehaviorPolicy(
+            env.single_observation_space.shape[-1],
+            tuple(int(size) for size in env.single_action_space.nvec),
+            latent_dim, hidden, env.action_codec,
+        ).to(env.device)
+        prior = SphericalPlanPrior(
+            latent_dim, width, int(config["min_duration"]),
+            int(config["max_duration"]), horizon,
+        ).to(env.device)
+        value = PlanValue(latent_dim, width, horizon).to(env.device)
+        policy.load_state_dict(payload["policy"])
+        prior.load_state_dict(payload["prior"])
+        value.load_state_dict(payload["value"])
+        actor = LBIFOViewerActor(
+            policy, prior, value, frameskip, int(config["replan_after"]),
+            candidates=int(config["plan_candidates"]),
+            opponent_samples=int(config["opponent_samples"]),
+            diffusion_steps=int(config["diffusion_steps"]),
+        )
+        return actor, (kind, hidden, LBIFO_ARCHITECTURE, latent_dim, width, horizon)
+    if kind == "gaifo":
         architecture = config.get("architecture")
         if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
             raise ValueError(f"unsupported GAIFO architecture in {path}")

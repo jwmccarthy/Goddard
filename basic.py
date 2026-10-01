@@ -73,7 +73,7 @@ class PolicyCheckpoint:
 
 
 def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
-    """Recognize BASIC and GAIFO-architecture policies by weights, including SMP."""
+    """Recognize BASIC and GAIFO-architecture policies by their weights."""
     if not isinstance(payload, dict):
         raise ValueError(f"checkpoint is not a state dictionary: {path}")
     if "modules" in payload:
