@@ -67,12 +67,20 @@ class BehaviorPolicy(nn.Module):
         self, observation: th.Tensor, action: th.Tensor,
         latent: th.Tensor, age: th.Tensor,
     ) -> th.Tensor:
+        return -self.evaluate_actions(observation, action, latent, age)[0]
+
+    def evaluate_actions(
+        self, observation: th.Tensor, action: th.Tensor,
+        latent: th.Tensor, age: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Factorized joint log probability and entropy for on-policy PPO."""
         if action.shape != (*observation.shape[:-1], len(self.action_sizes)):
             raise ValueError("CARL discrete action must have seven factors")
-        return -sum(
-            distribution.log_prob(action[..., index].long())
-            for index, distribution in enumerate(self.distributions(observation, latent, age))
-        )
+        distributions = self.distributions(observation, latent, age)
+        log_prob = sum(distribution.log_prob(action[..., index].long())
+                       for index, distribution in enumerate(distributions))
+        entropy = sum(distribution.entropy() for distribution in distributions)
+        return log_prob, entropy
 
 
 class ExpertResetProvider:
@@ -138,6 +146,21 @@ class ExpertResetProvider:
         """Save real reset states for action replay under changed dynamics."""
         return [{name: values[index].detach().cpu().clone()
                  for name, values in self.start_physics.items()} for index in indices]
+
+    def update_targets(self, states, latents: th.Tensor) -> None:
+        """Refresh demonstrated requests after the labeling encoder is refit."""
+        if not len(states) or len(states) != len(latents) or (
+            latents.shape[1:] != self.requests.shape[1:]
+            or states.device != self.target_states.device
+        ):
+            raise ValueError("refreshed expert starts and requested behaviors must align")
+        if set(states.data) != set(self.start_physics) or any(
+            values.shape[1:] != self.start_physics[name].shape[1:]
+            for name, values in states.data.items()
+        ):
+            raise ValueError("refreshed expert physical states must match the simulator")
+        self.target_states = states
+        self.target_latents = latents.to(states.device)
 
 
 @dataclass(frozen=True)

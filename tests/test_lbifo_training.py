@@ -16,6 +16,7 @@ from lbifo_dynamics import DynamicsPairs
 from lbifo_planning import SphericalPlanPrior
 from lbifo_repr import SceneRepresentation
 from lbifo_skill import BehaviorPolicy
+from watch_expert_skills import ExpertSkillCatalog
 
 
 def make_replays(folder: Path, *, offset: float = 0) -> None:
@@ -157,6 +158,10 @@ class LBIFOGpuSmokeTests(unittest.TestCase):
             self.assertEqual(saved["step"], 18)
             self.assertEqual(saved["config"]["timesteps"], 17)
             self.assertIn("policy", saved)
+            self.assertIn("skill_critic", saved)
+            self.assertEqual(saved["skill_algorithm"], "ppo-embedding-tracking-v1")
+            self.assertTrue(saved["policy_optimizer"]["state"])
+            self.assertTrue(saved["skill_critic_optimizer"]["state"])
             self.assertIn("value", saved)
             self.assertNotIn("discriminator", saved)
             main(["--resume-checkpoint", str(root / "checkpoints" / "test" / "lbifo_000000000018.pt"),
@@ -164,6 +169,46 @@ class LBIFOGpuSmokeTests(unittest.TestCase):
             resumed = load_resume_checkpoint(root / "checkpoints" / "resume" / "lbifo_000000000024.pt")
             self.assertEqual(resumed["step"], 24)
             self.assertEqual(resumed["config"]["timesteps"], 23)
+            self.assertTrue(resumed["skill_critic_optimizer"]["state"])
+
+            # Existing hindsight-policy checkpoints can warm-start tracking RL.
+            legacy = dict(saved)
+            for name in ("skill_algorithm", "skill_critic", "skill_critic_optimizer"):
+                legacy.pop(name)
+            legacy["config"] = {
+                key: value for key, value in saved["config"].items()
+                if key not in (
+                    "skill_critic_lr", "tracking_reward_weight", "tracking_progress_weight",
+                    "ppo_epochs", "ppo_batch", "ppo_clip", "ppo_target_kl", "ppo_lambda",
+                    "ppo_entropy", "ppo_value_coef",
+                )
+            }
+            path = root / "legacy.pt"
+            th.save(legacy, path)
+            main(["--resume-checkpoint", str(path), "--timesteps", "21", "--run-name", "legacy"])
+            migrated = load_resume_checkpoint(root / "checkpoints" / "legacy" / "lbifo_000000000022.pt")
+            self.assertEqual(migrated["skill_algorithm"], "ppo-embedding-tracking-v1")
+            self.assertTrue(migrated["skill_critic_optimizer"]["state"])
+
+    def test_parallel_ppo_uses_joint_rollouts_larger_than_slow_replay_capacity(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            for name, offset in (("lower", 0.0), ("pro", 0.01), ("resets", 0.02)):
+                make_replays(root / name, offset=offset)
+            main(small_args(root / "lower", root / "pro", root / "resets", root) + [
+                "--n-sim", "4", "--timesteps", "33", "--memory-capacity", "2",
+                "--ppo-batch", "8", "--ppo-epochs", "2", "--run-name", "parallel",
+            ])
+            path = root / "checkpoints" / "parallel" / "lbifo_000000000040.pt"
+            saved = load_resume_checkpoint(path)
+            self.assertEqual(saved["step"], 40)
+            self.assertTrue(saved["skill_critic_optimizer"]["state"])
+            updates = next(iter(saved["policy_optimizer"]["state"].values()))["step"]
+            self.assertGreaterEqual(int(updates), 8)
+            self.assertTrue(all(th.isfinite(value).all() for value in saved["policy"].values()))
+            expert = ExpertSkillCatalog(path).detail(0)
+            self.assertEqual(len(expert["scenes"]), expert["duration"] + 1)
+            self.assertEqual(len(expert["source"]["raw_frames"][0]), 161)
 
 
 if __name__ == "__main__":

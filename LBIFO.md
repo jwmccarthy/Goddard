@@ -1,10 +1,12 @@
 # Latent Behavior Imitation from Observation (LBIfO)
 
 `lbifo.py` implements the state-only 1v1 method in `/home/bento/rl.pdf`.
-Demonstrations supply scenes, **not actions**. The low-level policy learns by
-maximum likelihood on its own CARL actions relabeled with the EMA scene encoder;
-task rewards train only the separate plan-value model. There is no PPO, imitation
-reward, or discriminator in this trainer.
+Demonstrations supply scenes, **not actions**. Online skill acquisition uses PPO
+on a dense tracking reward: the EMA encoder compares each realized behavior
+prefix with the requested expert-trajectory embedding, and rewards both its
+alignment and the change in alignment. Environment task rewards train only the
+separate high-level plan-value model. `LBIFO_PAPER_REVISION.md` specifies the
+corresponding revision to the paper's reward-free skill-acquisition sections.
 
 ## Replay data and training phases
 
@@ -45,7 +47,8 @@ replays need not still be available once pretraining is complete):
 .venv/bin/python lbifo.py \
   --resume-checkpoint checkpoints/lbifo/<pretrain-run>/pretrain_latest.pt \
   --target-replay-dir parsed_replays/pro_1v1_fs4 \
-  --timesteps 10000000
+  --timesteps 1000000000 \
+  --checkpoint-dir /path/to/persistent/checkpoints/lbifo
 ```
 
 To train both stages in one command, supply both replay directories without
@@ -58,6 +61,11 @@ reset pool on resume. Continue an online checkpoint with
 additional-step count. The last CARL step runs all `2 * --n-sim` actors, so
 the saved step count can exceed the requested total by fewer than that many
 actor-steps; the requested total need not be divisible by the actor count.
+For sustained online skill training, set `--timesteps` to the intended long-run
+actor-step budget and put `--checkpoint-dir` on a persistent volume with enough
+free space for complete checkpoints. An existing checkpoint from the previous
+hindsight-supervised trainer can warm-start the policy, representation, prior,
+and plan value; the new tracking critic and policy optimizer start fresh.
 
 ## Method and controls
 
@@ -83,9 +91,21 @@ actor-steps; the requested total need not be divisible by the actor count.
   cross-domain positive pairs at matching physical times. Disable the latter
   with `--no-dynamics-pairs` when measuring their contribution.
 - Stored trajectories have **no frozen hindsight labels**. During online
-  updates they are re-segmented under the current EMA and policy actions are
-  fit to achieved behavior latents, weighted by relative posterior
-  concentration. Anchored opponent actions are never policy training targets.
+  updates they are re-segmented under the current EMA to train the termination
+  hazard and realizability prior. PPO trains the policy and a separate skill
+  critic on every active actor transition from the current joint CARL rollout.
+  For each requested behavior, the reward is the cosine similarity of its
+  embedding to the EMA embedding of the realized prefix, plus the difference
+  from the preceding prefix. The EMA is frozen during each rollout; neither it
+  nor the decoder receives a gradient from PPO. Anchored opponent actions are
+  never policy training targets. `--ppo-epochs`, `--ppo-batch`,
+  `--ppo-target-kl`, `--skill-critic-lr`, `--tracking-reward-weight` and
+  `--tracking-progress-weight` control these updates; `tracking_cosine` and
+  `tracking_progress` measure whether requested behaviors are actually being
+  realized. PPO updates scale with active actor-steps, rather than sampling
+  only a few trajectories from each large parallel rollout. Expert requests
+  for new resets are re-encoded when the EMA and expert segments are refit, so
+  long online runs do not compare current rollouts with stale target codes.
 - At planning time the same joint latent prior samples candidates and inpaints
   plausible opponent futures. A separately trained, task-return-only value
   model ranks focal plans. During training the entire sampled plan is executed
@@ -96,6 +116,29 @@ actor-steps; the requested total need not be divisible by the actor count.
 Run `watch_checkpoints.py --checkpoint-dir checkpoints/lbifo` to watch saved
 `lbifo_*.pt` hierarchies against each other. The viewer also supports BASIC
 and GAIFO. Representation-only checkpoints are not playable.
+
+To inspect expert skills separately from self-play, run:
+
+```bash
+.venv/bin/python watch_expert_skills.py \
+  --checkpoint checkpoints/lbifo/<run>/lbifo_000000000000.pt \
+  --replay-dir parsed_replays/pro_1v1_fs4 --open
+```
+
+The browser lists the **inferred pro segments saved in that online
+checkpoint**, with searchable skill selection, playback and scrubbing through
+the original expert trajectory, ball/car paths in 3D, segment boundaries and
+durations, and both cars' complete requested latent vectors and posterior
+concentrations, as well as the EMA embedding at every selected prefix. The
+inspector lists every normalized scene component for each frame. When the
+original parsed replays are available (automatically from the checkpoint's
+target replay path, or explicitly through `--replay-dir`), it
+also shows all 110 additional parser components: boost pads, relative ball/car
+and goal features, ego internal state, touch/bump events and correction flags.
+If the checkpoint came from a differently sampled replay directory, the viewer
+checks scene alignment before showing those raw rows. No GPU is needed for
+inspection; the watcher defaults to port `8789` (`--host` and `--port` are
+configurable). Pretraining-only checkpoints have no inferred skills to inspect.
 
 For a quick test on synthetic replay files, run
 `.venv/bin/python -m unittest discover -s tests -p 'test_lbifo*.py' -v`.

@@ -12,6 +12,7 @@ from lbifo_data import PlaySequence
 from lbifo import LBIFOTrainer
 from lbifo_planning import CalibratedSurprise, PlanValue, SemiMarkovSegmenter, SphericalPlanPrior
 from lbifo_repr import SceneRepresentation
+from lbifo_rl import EmbeddingTrackingReward, SkillCritic
 from lbifo_skill import (
     BehaviorPolicy, ExpertResetProvider, JointPlanController,
     discounted_value_targets, hindsight_labels,
@@ -46,6 +47,17 @@ class LBIFOSkillTests(unittest.TestCase):
         self.assertTrue(from_extra.all())
         self.assertTrue((requested == 0).all())
         self.assertFalse(provider.take_pending()[0].numel())
+
+    def test_refitted_expert_requests_are_used_for_subsequent_resets(self):
+        old = TensorDataset(TensorBatch({"ball_position": th.ones(1, 3)}))
+        provider = ExpertResetProvider(old, th.ones(1, 2, 8), 1, seed=2)
+        updated = TensorDataset(TensorBatch({"ball_position": th.full((1, 3), 5.0)}))
+        provider.update_targets(updated, th.full((1, 2, 8), 3.0))
+        state = provider(th.tensor([True]))
+        th.testing.assert_close(state["ball_position"], th.full((1, 3), 5.0))
+        _, requests, extra = provider.take_pending()
+        th.testing.assert_close(requests, th.full((1, 2, 8), 3.0))
+        self.assertFalse(extra.any())
 
     def test_rollout_relabeling_uses_achieved_latents_not_requests_or_rewards(self):
         model = SceneRepresentation(16, 8)
@@ -126,6 +138,10 @@ class LBIFOSkillTests(unittest.TestCase):
         trainer.round = 0
         trainer.rng = np.random.default_rng(0)
         trainer.value_memory = deque(maxlen=4)
+        trainer.skill_critic = SkillCritic(51, 8, 16)
+        trainer.tracking = EmbeddingTrackingReward(
+            SceneRepresentation(16, 8).encoder, 1, 2, 8, th.device("cpu"),
+        )
         trainer._was_reset = th.tensor([True])
         trainer._issued = th.tensor([True])
         trainer._value_starts = th.zeros(1, 51)

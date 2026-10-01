@@ -29,6 +29,7 @@ from lbifo_planning import (
     SemiMarkovSegmenter, SphericalPlanPrior,
 )
 from lbifo_repr import SceneRepresentation, ema_update
+from lbifo_rl import EmbeddingTrackingReward, SkillCritic, tracking_gae
 from lbifo_skill import (
     BehaviorPolicy, ExpertResetProvider, JointPlanController,
     expert_prior_examples, hazard_examples, hindsight_labels,
@@ -119,6 +120,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-anchor-gap", type=float, default=0.01)
     parser.add_argument("--prior-lr", type=float, default=1e-4)
     parser.add_argument("--skill-lr", type=float, default=3e-4)
+    parser.add_argument("--skill-critic-lr", type=float, default=3e-4)
     parser.add_argument("--value-lr", type=float, default=3e-4)
     parser.add_argument("--prior-rounds", type=int, default=3)
     parser.add_argument("--prior-updates", type=int, default=200)
@@ -128,8 +130,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--calibration-windows", type=int, default=64)
     parser.add_argument("--prior-weight", type=float, default=0.3)
     parser.add_argument("--boundary-penalty", type=float, default=1.0)
-    parser.add_argument("--skill-updates", type=int, default=16)
-    parser.add_argument("--skill-batch", type=int, default=512)
+    parser.add_argument("--skill-updates", type=int, default=16,
+                        help="hindsight termination-hazard updates per round")
+    parser.add_argument("--skill-batch", type=int, default=512,
+                        help="termination-hazard minibatch size")
+    parser.add_argument("--tracking-reward-weight", type=float, default=1.0,
+                        help="weight of cosine similarity to the requested behavior")
+    parser.add_argument("--tracking-progress-weight", type=float, default=1.0,
+                        help="weight of the change in requested-behavior similarity")
+    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--ppo-batch", type=int, default=4096)
+    parser.add_argument("--ppo-clip", type=float, default=0.2)
+    parser.add_argument("--ppo-target-kl", type=float, default=0.03,
+                        help="stop further PPO epochs if mean policy KL exceeds this value")
+    parser.add_argument("--ppo-lambda", type=float, default=0.95)
+    parser.add_argument("--ppo-entropy", type=float, default=0.01)
+    parser.add_argument("--ppo-value-coef", type=float, default=0.5)
     parser.add_argument("--online-repr-updates", type=int, default=8)
     parser.add_argument("--online-prior-updates", type=int, default=16)
     parser.add_argument("--online-value-updates", type=int, default=8)
@@ -180,7 +196,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "prior_hidden", "plan_horizon", "frameskip", "n_sim", "max_ticks",
         "rollout", "timesteps", "prior_rounds", "prior_updates", "prior_batch",
         "expert_sequences", "segment_steps", "calibration_windows", "skill_updates",
-        "skill_batch", "online_repr_updates", "online_prior_updates",
+        "skill_batch", "ppo_epochs", "ppo_batch", "online_repr_updates", "online_prior_updates",
         "online_value_updates", "online_refit_interval", "curriculum_rounds",
         "dynamics_pair_interval", "dynamics_pair_batch",
         "plan_candidates", "opponent_samples", "diffusion_steps", "memory_capacity",
@@ -192,6 +208,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--segment-steps must fit --max-duration and --rollout must fit --min-duration")
     if args.dynamics_pairs and args.dynamics_pair_batch < 2:
         parser.error("cross-dynamics contrastive pairs need --dynamics-pair-batch >= 2")
+    if args.skill_batch < N_CARS:
+        parser.error("--skill-batch must include at least one joint hazard example")
     if args.pretrain_frame_limit is not None and args.pretrain_frame_limit < args.min_duration + 1:
         parser.error("--pretrain-frame-limit must fit one behavior window")
     if args.target_frame_limit is not None and args.target_frame_limit < args.min_duration + 1:
@@ -200,12 +218,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--heldout-size and --seed cannot be negative")
     if args.single_reenactments < 0:
         parser.error("--single-reenactments cannot be negative")
-    for name in ("representation_lr", "prior_lr", "skill_lr", "value_lr", "no_touch_timeout"):
+    for name in ("representation_lr", "prior_lr", "skill_lr", "skill_critic_lr",
+                 "value_lr", "no_touch_timeout", "ppo_clip", "ppo_target_kl",
+                 "ppo_value_coef"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive and finite")
-    for name in ("prior_weight", "boundary_penalty"):
+    for name in ("prior_weight", "boundary_penalty", "tracking_reward_weight",
+                 "tracking_progress_weight", "ppo_entropy"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be non-negative and finite")
+    if args.tracking_reward_weight + args.tracking_progress_weight <= 0:
+        parser.error("at least one tracking reward weight must be positive")
+    if args.ppo_clip > 1 or not 0 <= args.ppo_lambda <= 1 or not math.isfinite(args.ppo_lambda):
+        parser.error("--ppo-clip must be <= 1 and --ppo-lambda must be in [0, 1]")
     if (not 0 < args.mask_ratio < 1 or not math.isfinite(args.min_concentration)
         or args.min_concentration <= 0 or not math.isfinite(args.min_anchor_gap)
         or args.min_anchor_gap < 0):
@@ -289,6 +314,7 @@ class LBIFOTrainer:
             args.representation_hidden, args.latent_dim,
         ).to(self.device)
         self.ema = copy.deepcopy(self.representation.encoder).eval().requires_grad_(False)
+        self.ema.temporal.flatten_parameters()
         self.prior = SphericalPlanPrior(
             args.latent_dim, args.prior_hidden, args.min_duration,
             args.max_duration, args.plan_horizon,
@@ -306,8 +332,11 @@ class LBIFOTrainer:
             maxlen=args.memory_capacity * 8
         )
         self.policy: BehaviorPolicy | None = None
+        self.skill_critic: SkillCritic | None = None
+        self.tracking: EmbeddingTrackingReward | None = None
+        self._skill_rollout: dict[str, th.Tensor] | None = None
         self.value: PlanValue | None = None
-        self.policy_optimizer = self.value_optimizer = None
+        self.policy_optimizer = self.skill_critic_optimizer = self.value_optimizer = None
         self.step = self.pretrain_step = self.round = 0
         self.target_sequences: list[InferredSequence] = []
         self._target_chunks: list[tuple[int, th.Tensor]] = []
@@ -646,9 +675,20 @@ class LBIFOTrainer:
             tuple(int(size) for size in environment.single_action_space.nvec),
             args.latent_dim, args.policy_hidden, environment.action_codec,
         ).to(self.device)
+        self.skill_critic = SkillCritic(
+            environment.single_observation_space.shape[-1], args.latent_dim,
+            args.policy_hidden,
+        ).to(self.device)
         self.value = PlanValue(args.latent_dim, args.prior_hidden, args.plan_horizon).to(self.device)
         self.policy_optimizer = th.optim.Adam(self.policy.parameters(), lr=args.skill_lr)
+        self.skill_critic_optimizer = th.optim.Adam(
+            self.skill_critic.parameters(), lr=args.skill_critic_lr,
+        )
         self.value_optimizer = th.optim.Adam(self.value.parameters(), lr=args.value_lr)
+        self.tracking = EmbeddingTrackingReward(
+            self.ema, args.n_sim, args.max_duration, args.latent_dim, self.device,
+            args.tracking_reward_weight, args.tracking_progress_weight,
+        )
 
     def checkpoint(self, *, final: bool = False) -> Path:
         name = f"lbifo_{self.step:012d}.pt" if self.policy is not None else "pretrain_latest.pt"
@@ -676,8 +716,11 @@ class LBIFOTrainer:
         if self.policy is not None:
             payload.update(
                 policy=self.policy.state_dict(), value=self.value.state_dict(),
+                skill_critic=self.skill_critic.state_dict(),
                 policy_optimizer=self.policy_optimizer.state_dict(),
+                skill_critic_optimizer=self.skill_critic_optimizer.state_dict(),
                 value_optimizer=self.value_optimizer.state_dict(),
+                skill_algorithm="ppo-embedding-tracking-v1",
             )
         if self._target_chunks:
             payload["target_chunks"] = self._target_chunks
@@ -688,8 +731,15 @@ class LBIFOTrainer:
             payload["cuda_rng_state"] = th.cuda.get_rng_state_all()
         path = self.checkpoint_dir / name
         temporary = path.with_suffix(".pt.tmp")
-        th.save(payload, temporary)
-        temporary.replace(path)
+        try:
+            th.save(payload, temporary)
+            temporary.replace(path)
+        except Exception:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass  # Preserve the original write failure if the volume is unhealthy.
+            raise
         if self.policy is not None:
             previous = sorted(self.checkpoint_dir.glob("lbifo_*.pt"))
             for old in previous[:-self.args.checkpoint_keep]:
@@ -702,6 +752,7 @@ class LBIFOTrainer:
         saved = load_resume_checkpoint(checkpoint)
         self.representation.load_state_dict(saved["representation"])
         self.ema.load_state_dict(saved["ema_encoder"])
+        self.ema.temporal.flatten_parameters()
         self.prior.load_state_dict(saved["prior"])
         self.repr_optimizer.load_state_dict(saved["representation_optimizer"])
         self.prior_optimizer.load_state_dict(saved["prior_optimizer"])
@@ -711,8 +762,15 @@ class LBIFOTrainer:
         if restore_policy and "policy" in saved:
             self.policy.load_state_dict(saved["policy"])
             self.value.load_state_dict(saved["value"])
-            self.policy_optimizer.load_state_dict(saved["policy_optimizer"])
             self.value_optimizer.load_state_dict(saved["value_optimizer"])
+            if saved.get("skill_algorithm") == "ppo-embedding-tracking-v1":
+                self.skill_critic.load_state_dict(saved["skill_critic"])
+                self.policy_optimizer.load_state_dict(saved["policy_optimizer"])
+                self.skill_critic_optimizer.load_state_dict(saved["skill_critic_optimizer"])
+            else:
+                # Old policy weights can seed RL; behavioral-cloning Adam
+                # moments and a nonexistent tracking critic cannot be reused.
+                print("Starting tracking PPO from the previous hindsight-policy weights")
         self.step, self.pretrain_step, self.round = (
             saved["step"], saved["pretrain_step"], saved["round"]
         )
@@ -750,9 +808,11 @@ class LBIFOTrainer:
             key: [] for key in (
                 "scenes", "next_scenes", "observation", "action", "reward",
                 "request", "age", "plan", "new_plan", "done",
-                "completed_plan",
+                "completed_plan", "skill_reward", "skill_value", "skill_active",
+                "skill_ended", "skill_cosine", "skill_progress",
             )
         }
+        self.tracking.refresh(planner.current_latents(), planner.age, ~planner.finished)
         issued = self._issued
         started_at_reset = self._was_reset
         snapshots: dict[tuple[int, int], dict[str, th.Tensor]] = {}
@@ -765,6 +825,11 @@ class LBIFOTrainer:
             requests = planner.current_latents().clone()
             age = planner.age.clone()
             plans = planner.plan.clone()
+            active = ~planner.finished.clone()
+            prior_indices = planner.index.clone()
+            skill_value = self.skill_critic(
+                observation.flatten(0, 1), requests.flatten(0, 1), age.flatten(),
+            ).reshape(count, N_CARS)
             starting_plan = issued | ~self._value_active
             self._value_starts[starting_plan] = before[starting_plan]
             self._value_plans[starting_plan] = plans[starting_plan]
@@ -781,11 +846,17 @@ class LBIFOTrainer:
                     raise RuntimeError("CARL must expose the final state before autoresetting")
                 final = info["final_obs"].reshape(count, N_CARS, -1)
                 next_scene[done] = final[done, 0, :SCENE_SIZE]
+            tracking_reward, cosine, progress = self.tracking.step(
+                before, next_scene, requests, age, active,
+            )
             for key, value in (
                 ("scenes", before), ("next_scenes", next_scene),
                 ("observation", observation), ("action", action),
                 ("reward", reward.reshape(count, N_CARS)), ("request", requests),
                 ("age", age), ("plan", plans), ("new_plan", issued), ("done", done),
+                ("skill_reward", tracking_reward), ("skill_value", skill_value),
+                ("skill_active", active), ("skill_cosine", cosine),
+                ("skill_progress", progress),
             ):
                 traces[key].append(value.detach().cpu())
             step_reward = reward.reshape(count, N_CARS)
@@ -793,6 +864,10 @@ class LBIFOTrainer:
             self._value_discounts *= self.args.gamma
             replan = planner.advance(before, next_scene, done)
             traces["completed_plan"].append((replan | done).detach().cpu())
+            traces["skill_ended"].append((
+                (planner.index != prior_indices) | (planner.finished & active)
+                | done[:, None] | replan[:, None]
+            ).detach().cpu())
             complete = (replan | done) & self._value_active
             for index in complete.nonzero(as_tuple=True)[0].tolist():
                 self.value_memory.append(tuple(value[index].detach().cpu().clone()
@@ -827,6 +902,18 @@ class LBIFOTrainer:
         self._issued = issued
 
         stacked = {key: th.stack(value) for key, value in traces.items()}
+        final_value = self.skill_critic(
+            observation.flatten(0, 1), planner.current_latents().flatten(0, 1),
+            planner.age.flatten(),
+        ).reshape(count, N_CARS).detach().cpu()
+        self._skill_rollout = {
+            name: stacked[field] for name, field in (
+                ("observation", "observation"), ("action", "action"),
+                ("request", "request"), ("age", "age"),
+                ("reward", "skill_reward"), ("value", "skill_value"),
+                ("ended", "skill_ended"), ("active", "skill_active"),
+            )
+        } | {"bootstrap": final_value}
         records = []
         for simulation in range(count):
             starts = [0]
@@ -856,9 +943,102 @@ class LBIFOTrainer:
             "goal_reward_per_actor_step": float(stacked["reward"].mean()),
             "stored_trajectories": float(len(records)),
         }
+        valid = stacked["skill_active"]
+        if valid.any():
+            for metric, field in (
+                ("tracking_cosine", "skill_cosine"),
+                ("tracking_progress", "skill_progress"),
+                ("tracking_reward", "skill_reward"),
+            ):
+                stats[metric] = float(stacked[field][valid].mean())
         return observation, records, stats
 
-    def train_skill(self) -> tuple[dict[str, float], list[InferredSequence]]:
+    def train_ppo(self) -> dict[str, float]:
+        """Update on every active transition from the fresh joint CARL rollout."""
+        rollout = self._skill_rollout
+        self._skill_rollout = None
+        if rollout is None:
+            return {}
+        advantage, returns = tracking_gae(
+            rollout["reward"], rollout["value"], rollout["ended"],
+            rollout["active"], rollout["bootstrap"],
+            self.args.gamma, self.args.ppo_lambda,
+        )
+        chosen = rollout["active"].flatten().nonzero(as_tuple=True)[0]
+        if not len(chosen):
+            return {}
+        data = {
+            name: rollout[name].flatten(0, 2)[chosen]
+            for name in ("observation", "action", "request", "age")
+        }
+        data["advantage"] = advantage.flatten()[chosen]
+        data["returns"] = returns.flatten()[chosen]
+        centered = data["advantage"] - data["advantage"].mean()
+        data["advantage"] = centered / centered.std(unbiased=False).clamp_min(1e-6)
+        old_log_prob = []
+        with th.no_grad():
+            for start in range(0, len(chosen), self.args.ppo_batch):
+                stop = start + self.args.ppo_batch
+                old_log_prob.append(self.policy.evaluate_actions(
+                    data["observation"][start:stop].to(self.device),
+                    data["action"][start:stop].to(self.device),
+                    data["request"][start:stop].to(self.device),
+                    data["age"][start:stop].to(self.device),
+                )[0].cpu())
+        data["old_log_prob"] = th.cat(old_log_prob)
+
+        totals = {"ppo_policy_loss": 0.0, "ppo_value_loss": 0.0,
+                  "ppo_entropy": 0.0, "ppo_approx_kl": 0.0}
+        updates = 0
+        for _ in range(self.args.ppo_epochs):
+            epoch_kl = 0.0
+            for indices in th.randperm(len(chosen)).split(self.args.ppo_batch):
+                sample = {key: values[indices].to(self.device) for key, values in data.items()}
+                log_prob, entropy = self.policy.evaluate_actions(
+                    sample["observation"], sample["action"],
+                    sample["request"], sample["age"],
+                )
+                log_ratio = log_prob - sample["old_log_prob"]
+                ratio = log_ratio.exp()
+                surrogate = th.minimum(
+                    ratio * sample["advantage"],
+                    ratio.clamp(1 - self.args.ppo_clip, 1 + self.args.ppo_clip)
+                    * sample["advantage"],
+                )
+                policy_loss = -surrogate.mean()
+                predicted = self.skill_critic(
+                    sample["observation"], sample["request"], sample["age"],
+                )
+                value_loss = 0.5 * (predicted - sample["returns"]).square().mean()
+                loss = (
+                    policy_loss + self.args.ppo_value_coef * value_loss
+                    - self.args.ppo_entropy * entropy.mean()
+                )
+                self.policy_optimizer.zero_grad(set_to_none=True)
+                self.skill_critic_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                th.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                th.nn.utils.clip_grad_norm_(self.skill_critic.parameters(), 1.0)
+                self.policy_optimizer.step()
+                self.skill_critic_optimizer.step()
+                with th.no_grad():
+                    kl = (ratio - 1 - log_ratio).mean()
+                    for key, value in (
+                        ("ppo_policy_loss", policy_loss),
+                        ("ppo_value_loss", value_loss),
+                        ("ppo_entropy", entropy.mean()),
+                        ("ppo_approx_kl", kl),
+                    ):
+                        totals[key] += float(value)
+                    epoch_kl += float(kl) * len(indices)
+                updates += 1
+            if epoch_kl / len(chosen) > self.args.ppo_target_kl:
+                break
+        return {key: value / updates for key, value in totals.items()} | {
+            "ppo_updates": float(updates), "ppo_actor_steps": float(len(chosen)),
+        }
+
+    def train_hazard(self) -> tuple[dict[str, float], list[InferredSequence]]:
         records = self.memory.sample_trajectories(min(8, len(self.memory.trajectories)))
         if not records:
             return {}, []
@@ -869,20 +1049,12 @@ class LBIFOTrainer:
         except ValueError:
             return {}, []
         data = {name: getattr(labels, name).to(self.device)
-                for name in labels.__dataclass_fields__}
+                for name in (
+                    "start_scene", "current_scene", "joint_latent",
+                    "previous", "joint_age", "ends", "hazard_mask",
+                )}
         results = {}
         for _ in range(self.args.skill_updates):
-            selected = th.randint(len(data["action"]), (self.args.skill_batch,), device=self.device)
-            nll = self.policy.negative_log_likelihood(
-                data["observation"][selected], data["action"][selected],
-                data["latent"][selected], data["age"][selected],
-            )
-            loss = (data["weight"][selected] * nll).mean()
-            self.policy_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-            self.policy_optimizer.step()
-
             examples = th.randint(len(data["ends"]), (self.args.skill_batch // N_CARS,), device=self.device)
             probability = self.prior.hazard_probability(
                 data["start_scene"][examples], data["current_scene"][examples],
@@ -900,8 +1072,7 @@ class LBIFOTrainer:
             hazard.backward()
             th.nn.utils.clip_grad_norm_(self.prior.parameters(), 1.0)
             self.prior_optimizer.step()
-            results = {"policy_nll": float(loss.detach()),
-                       "hazard_bce": float(hazard.detach()),
+            results = {"hazard_bce": float(hazard.detach()),
                        "hindsight_segments": float(sum(len(seq.latents) for seq in inferred))}
         return results, inferred
 
@@ -978,6 +1149,14 @@ class LBIFOTrainer:
                 )
                 self.step += int(metrics["actor_steps"])
                 self.round += 1
+                metrics.update(self.train_ppo())
+                if len(records) > args.memory_capacity:
+                    # The slow representation/hazard replay should sample all
+                    # simulations, not just the last actors in a large batch.
+                    selected = self.rng.choice(
+                        len(records), args.memory_capacity, replace=False,
+                    )
+                    records = [records[int(index)] for index in selected]
                 for record in records:
                     self.memory.add(record)
                 if dynamics is not None and args.single_reenactments:
@@ -989,8 +1168,8 @@ class LBIFOTrainer:
                     if dynamics is not None and self.round % args.dynamics_pair_interval == 0:
                         metrics.update(self.train_dynamics_pairs(dynamics))
                     self.recalibrate(1)
-                    skill, inferred = self.train_skill()
-                    metrics.update(skill)
+                    hazard, inferred = self.train_hazard()
+                    metrics.update(hazard)
                     metrics.update(self.train_value())
                     if self.round % args.online_refit_interval == 0:
                         self.recalibrate(0)
@@ -1003,9 +1182,16 @@ class LBIFOTrainer:
                             self.target_sequences, inferred,
                             updates=args.online_prior_updates,
                         ))
+                        new_states, new_requests = self.target_reset_pool(chunks)
+                        provider.update_targets(new_states, new_requests)
                 print(f"LBIfO round {self.round}, actors {self.step:,}/{args.timesteps:,}: "
                       + ", ".join(f"{name}={value:.3f}" for name, value in metrics.items()
-                                     if name in ("loss", "policy_nll", "hazard_bce", "value_mse", "prior_loss")))
+                                     if name in (
+                                         "tracking_cosine", "tracking_progress", "tracking_reward",
+                                         "ppo_policy_loss", "ppo_value_loss", "ppo_updates",
+                                         "ppo_actor_steps", "ppo_approx_kl", "ppo_entropy",
+                                         "hazard_bce", "value_mse", "prior_loss",
+                                     )))
                 if self.round % args.checkpoint_interval == 0:
                     self.checkpoint()
             self.checkpoint(final=True)

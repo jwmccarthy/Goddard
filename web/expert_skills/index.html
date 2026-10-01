@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Goddard Expert Skills</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #132b32;
+      --subtle: #536c73;
+      --line: #d5e0df;
+      --blue: #145bd7;
+      --orange: #da572f;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; color: var(--ink); background: #b9cfd1;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    #view { position: fixed; inset: 0; }
+    .panel { position: fixed; top: 16px; left: 16px; bottom: 16px; width: min(430px, calc(100vw - 32px));
+      display: flex; flex-direction: column; overflow: hidden; background: #f7faf8f0;
+      border: 1px solid #ffffff; border-radius: 5px 22px 22px 22px;
+      box-shadow: 0 12px 50px #1a384330; backdrop-filter: blur(16px); }
+    .top { padding: 20px 20px 14px; border-bottom: 1px solid var(--line); }
+    .eyebrow { color: var(--subtle); font-size: 10px; font-weight: 750;
+      letter-spacing: .18em; text-transform: uppercase; }
+    h1 { margin: 4px 0 8px; font-size: 25px; letter-spacing: -.04em; }
+    .hint { margin: 0 0 14px; color: var(--subtle); font-size: 12px; line-height: 1.45; }
+    label { display: grid; gap: 5px; color: var(--subtle); font-size: 10px;
+      font-weight: 760; letter-spacing: .07em; text-transform: uppercase; }
+    select, input[type="search"], button, .download { font: 650 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    select, input[type="search"] { width: 100%; min-height: 38px; padding: 6px 9px;
+      border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); }
+    #skillSearch { margin-bottom: 9px; }
+    .transport { display: flex; gap: 7px; margin: 12px 0 8px; }
+    button, .download { border: 1px solid #215461; border-radius: 9px; background: #164550;
+      color: #fff; min-height: 32px; padding: 5px 11px; cursor: pointer; }
+    button:hover, .download:hover { background: #0b6676; }
+    button:disabled { opacity: .45; cursor: default; }
+    .download { margin-left: auto; display: inline-flex; align-items: center; text-decoration: none; }
+    #scrub { width: 100%; accent-color: var(--blue); cursor: pointer; }
+    .time { display: flex; justify-content: space-between; color: var(--subtle); font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .scroll { padding: 17px 20px 24px; overflow-y: auto; min-height: 0; }
+    h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .1em; }
+    .overview { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 20px; }
+    .stat { border: 1px solid var(--line); border-radius: 10px; padding: 9px; background: #fff9; }
+    .stat small { display: block; color: var(--subtle); margin-bottom: 4px; font-size: 10px; }
+    .stat strong { font: 680 12px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .latent { padding: 12px; margin: 0 0 10px; background: #fff; border: 1px solid var(--line);
+      border-left: 4px solid var(--blue); border-radius: 9px; }
+    .latent.orange { border-left-color: var(--orange); }
+    .latent header { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px;
+      font-size: 12px; font-weight: 700; }
+    .latent pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+      font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .note { color: var(--subtle); font-size: 11px; line-height: 1.5; padding: 9px 11px;
+      border-radius: 8px; background: #e7f2f2; margin: 10px 0 16px; overflow-wrap: anywhere; }
+    details { background: #fff9; border: 1px solid var(--line); border-radius: 8px; margin: 7px 0; }
+    summary { padding: 10px 12px; cursor: pointer; font-size: 12px; font-weight: 700; }
+    .fields { padding: 0 11px 9px; }
+    .field { display: flex; justify-content: space-between; gap: 12px;
+      padding: 5px 2px; border-top: 1px solid #edf1ef;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .field span:first-child { color: var(--subtle); overflow-wrap: anywhere; }
+    .field output { flex-shrink: 0; font-weight: 650; text-align: right; }
+    .empty { margin: 22px 0; color: var(--subtle); font-size: 12px; }
+    @media (max-width: 760px) {
+      .panel { top: auto; left: 8px; bottom: 8px; width: calc(100vw - 16px); height: min(73vh, 650px); }
+      .top { padding: 12px 14px 10px; }
+      h1 { font-size: 20px; margin-bottom: 3px; }
+      .hint { margin-bottom: 8px; }
+      .scroll { padding: 12px 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="view"></div>
+  <aside class="panel">
+    <div class="top">
+      <div class="eyebrow">Goddard / LBIfO</div>
+      <h1>Expert skill explorer</h1>
+      <p class="hint" id="checkpoint">Loading saved expert segments…</p>
+      <label>Find skill<input id="skillSearch" type="search" placeholder="ID, chunk or frame number"></label>
+      <label>Expert segment<select id="skillSelect" aria-label="Choose an inferred expert skill"></select></label>
+      <div class="transport">
+        <button id="previous" title="Previous frame (←)">←</button>
+        <button id="play" title="Play / pause (space)">Play</button>
+        <button id="next" title="Next frame (→)">→</button>
+        <label>Speed<select id="speed"><option value="0.25">¼×</option><option value="0.5">½×</option>
+          <option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+        <a class="download" id="download" download="expert-skill.json" href="#">JSON</a>
+      </div>
+      <input id="scrub" type="range" min="0" max="0" value="0" aria-label="Replay frame">
+      <div class="time"><span id="frameLabel">Frame —</span><span id="timeLabel">0.00 s</span></div>
+    </div>
+    <div class="scroll" id="inspector" aria-live="polite"><p class="empty">Select an expert skill to inspect it.</p></div>
+  </aside>
+  <script type="importmap">
+    {"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+  </script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
