@@ -88,6 +88,7 @@ function position(values, offset) {
   return new THREE.Vector3(...SCALE.map((factor, axis) => values[offset + axis] * factor));
 }
 function showScene(values) {
+  ball.visible = true;
   ball.position.copy(position(values, 0));
   cars.forEach(({ group, material }, index) => {
     const start = 9 + index * 21;
@@ -100,7 +101,8 @@ function showScene(values) {
     group.quaternion.setFromRotationMatrix(basis);
     group.visible = !values[start + 17];
     material.emissive.setHex(index ? ORANGE : BLUE);
-    material.emissiveIntensity = values[start + 20] ? 0.6 : 0;
+    material.emissiveIntensity = values[start + 20] ? 0.6 :
+      (trajectory?.car === index ? 0.18 : 0);
   });
 }
 function showTrails(frames) {
@@ -113,13 +115,17 @@ function showTrails(frames) {
   }
 }
 
-let skill = null;
+let trajectory = null;
+let group = null;
 let allSkills = [];
 let index = 0;
 let playing = false;
+let playAll = false;
 let lastTime = performance.now();
 let accumulated = 0;
-let loading = 0;
+let catalogRequest = 0;
+let groupRequest = 0;
+let trajectoryRequest = 0;
 let outputs = [];
 let downloadUrl = null;
 let prefixOutputs = [];
@@ -167,22 +173,34 @@ function inspect(selected) {
   outputs = [];
   prefixOutputs = [];
   const heading = document.createElement('h2');
-  heading.textContent = `Skill ${selected.id + 1} · expert segment`;
+  heading.textContent = `Skill latent ${group.id + 1} · real expert trajectory`;
   panel.appendChild(heading);
   const overview = document.createElement('div');
   overview.className = 'overview';
+  const match = group.trajectories.find((item) => item.id === selected.id);
+  addStat(overview, 'Matching trajectory', `${group.trajectories.indexOf(match) + 1} / ${group.count}`);
+  addStat(overview, 'Cosine to skill', match.cosine.toFixed(4));
+  addStat(overview, 'Focal car', selected.car ? 'Orange' : 'Blue');
   addStat(overview, 'Sample / segment', `${selected.chunk + 1} / ${selected.segment + 1}`);
   addStat(overview, 'Source frames', `${selected.start}–${selected.stop}`);
   addStat(overview, 'Duration', `${selected.duration} steps · ${(selected.duration * selected.frameskip / 120).toFixed(2)} s`);
   addStat(overview, 'Checkpoint', selected.checkpoint);
   panel.appendChild(overview);
 
+  const representative = document.createElement('div');
+  representative.className = 'latent';
+  const representativeHeader = document.createElement('header');
+  representativeHeader.textContent = 'Selected skill · representative unit latent';
+  const representativeVector = document.createElement('pre');
+  representativeVector.textContent = `[${group.latent.map((value) => value.toFixed(4)).join(', ')}]`;
+  representative.append(representativeHeader, representativeVector);
+  panel.appendChild(representative);
   selected.latents.forEach((latent, car) => {
     const box = document.createElement('div');
     box.className = car ? 'latent orange' : 'latent';
     const header = document.createElement('header');
     const name = document.createElement('span');
-    name.textContent = car ? 'Orange · requested embedding' : 'Blue · requested embedding';
+    name.textContent = `${car ? 'Orange' : 'Blue'} · expert segment embedding`;
     const kappa = document.createElement('span');
     kappa.textContent = `κ ${selected.concentrations[car].toFixed(3)}`;
     header.append(name, kappa);
@@ -230,38 +248,48 @@ function inspect(selected) {
   }
 }
 function showFrame(newIndex) {
-  if (!skill) return;
-  index = Math.max(0, Math.min(newIndex, skill.scenes.length - 1));
-  const values = skill.scenes[index];
+  if (!trajectory) return;
+  index = Math.max(0, Math.min(newIndex, trajectory.scenes.length - 1));
+  const values = trajectory.scenes[index];
   showScene(values);
   $('scrub').value = index;
-  $('frameLabel').textContent = `Frame ${index + 1} / ${skill.scenes.length}`;
-  $('timeLabel').textContent = `${(index * skill.frameskip / 120).toFixed(2)} s` +
-    (skill.source ? ` · raw row ${skill.source.native_rows[index]}` : '');
+  $('frameLabel').textContent = `Frame ${index + 1} / ${trajectory.scenes.length}`;
+  $('timeLabel').textContent = `${(index * trajectory.frameskip / 120).toFixed(2)} s` +
+    (trajectory.source ? ` · raw row ${trajectory.source.native_rows[index]}` : '');
   for (const { output, source, column } of outputs) {
-    output.textContent = format(source === 'scene' ? values[column] : skill.source.raw_frames[index][column]);
+    output.textContent = format(source === 'scene' ? values[column] : trajectory.source.raw_frames[index][column]);
   }
   for (const [car, output] of prefixOutputs.entries()) {
-    output.kappa.textContent = `κ ${skill.prefix_concentrations[index][car].toFixed(3)}`;
-    output.vector.textContent = `[${skill.prefix_latents[index][car]
+    output.kappa.textContent = `κ ${trajectory.prefix_concentrations[index][car].toFixed(3)}`;
+    output.vector.textContent = `[${trajectory.prefix_latents[index][car]
       .map((value) => value.toFixed(4)).join(', ')}]`;
   }
 }
 function pause() {
   playing = false;
+  playAll = false;
   $('play').textContent = 'Play';
+  $('playAll').textContent = 'Play all';
   accumulated = 0;
 }
-async function selectSkill(id) {
-  const request = ++loading;
+function showMessage(message) {
+  const element = document.createElement('p');
+  element.className = 'empty';
+  element.textContent = message;
+  $('inspector').replaceChildren(element);
+}
+async function selectTrajectory(id, autoplay = false) {
+  const request = ++trajectoryRequest;
+  const selectedGroup = group;
   pause();
+  trajectory = null;
   try {
-    const response = await fetch(`/api/skills/${id}`);
-    if (!response.ok) throw new Error(`Cannot load skill ${id + 1} (HTTP ${response.status})`);
+    const response = await fetch(`/api/trajectories/${id}`);
+    if (!response.ok) throw new Error(`Cannot load expert trajectory ${id + 1} (HTTP ${response.status})`);
     const selected = await response.json();
-    if (request !== loading) return;
-    skill = selected;
-    $('skillSelect').value = String(id);
+    if (request !== trajectoryRequest || selectedGroup !== group) return;
+    trajectory = selected;
+    $('trajectorySelect').value = String(id);
     $('scrub').max = selected.scenes.length - 1;
     inspect(selected);
     showTrails(selected.scenes);
@@ -270,56 +298,109 @@ async function selectSkill(id) {
     downloadUrl = URL.createObjectURL(new Blob([JSON.stringify(selected, null, 2)],
       { type: 'application/json' }));
     $('download').href = downloadUrl;
-    $('download').download = `expert-skill-${selected.id + 1}.json`;
+    $('download').download = `expert-trajectory-${selected.id + 1}.json`;
+    if (autoplay) {
+      playing = playAll = true;
+      lastTime = performance.now();
+      $('play').textContent = 'Pause';
+      $('playAll').textContent = 'Playing all';
+    }
   } catch (error) {
-    if (request !== loading) return;
-    const message = document.createElement('p');
-    message.className = 'empty';
-    message.textContent = error.message;
-    $('inspector').replaceChildren(message);
+    if (request === trajectoryRequest) showMessage(error.message);
   }
 }
-function filterSkills() {
-  const previous = skill?.id;
+async function selectSkill(id) {
+  const request = ++groupRequest;
+  ++trajectoryRequest;
+  pause();
+  group = trajectory = null;
+  try {
+    const similarity = Number($('similarity').value);
+    const response = await fetch(`/api/skills/${id}?similarity=${similarity}`);
+    if (!response.ok) throw new Error(`Cannot load skill latent ${id + 1} (HTTP ${response.status})`);
+    const selected = await response.json();
+    if (request !== groupRequest) return;
+    group = selected;
+    $('skillSelect').value = String(id);
+    $('trajectorySelect').replaceChildren();
+    selected.trajectories.forEach((item, position) => {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `${position + 1}/${selected.count} · ${item.car ? 'Orange' : 'Blue'} · ` +
+        `frames ${item.start}–${item.stop} · cosine ${item.cosine.toFixed(3)}`;
+      $('trajectorySelect').appendChild(option);
+    });
+    await selectTrajectory(selected.trajectories[0].id);
+  } catch (error) {
+    if (request === groupRequest) showMessage(error.message);
+  }
+}
+function filterSkills(preferredId = group?.id) {
   const search = $('skillSearch').value.trim().toLowerCase();
   $('skillSelect').replaceChildren();
   for (const item of allSkills) {
-    const text = `skill ${item.id + 1} · sample ${item.chunk + 1} · frames ${item.start}-${item.stop}`;
+    const text = `skill ${item.id + 1} · ${item.count} expert car trajectories`;
     if (!text.includes(search)) continue;
     const option = document.createElement('option');
     option.value = item.id;
-    option.textContent = `${text} · ${item.duration} steps`;
+    option.textContent = text;
     $('skillSelect').appendChild(option);
   }
-  if (previous !== undefined && [...$('skillSelect').options].some(
-    (option) => Number(option.value) === previous)) {
-    $('skillSelect').value = String(previous);
-  } else if ($('skillSelect').options.length) {
-    selectSkill(Number($('skillSelect').value));
+  if ($('skillSelect').options.length) {
+    const chosen = [...$('skillSelect').options].some(
+      (option) => Number(option.value) === preferredId)
+      ? preferredId : Number($('skillSelect').value);
+    $('skillSelect').value = String(chosen);
+    if (!group || group.id !== chosen || group.similarity !== Number($('similarity').value)) {
+      selectSkill(chosen);
+    }
   } else {
     pause();
-    skill = null;
-    loading += 1;
-    const message = document.createElement('p');
-    message.className = 'empty';
-    message.textContent = allSkills.length ? 'No expert skills match this filter.' :
-      'This checkpoint has no expert skills.';
-    $('inspector').replaceChildren(message);
+    group = trajectory = null;
+    ++groupRequest;
+    ++trajectoryRequest;
+    $('trajectorySelect').replaceChildren();
+    showMessage(allSkills.length ? 'No skill latents match this filter.' :
+      'This checkpoint has no demonstrated skill latents.');
   }
 }
 
-$('skillSearch').addEventListener('input', filterSkills);
+$('skillSearch').addEventListener('input', () => filterSkills());
 $('skillSelect').addEventListener('change', () => selectSkill(Number($('skillSelect').value)));
+$('trajectorySelect').addEventListener('change', () => selectTrajectory(Number($('trajectorySelect').value)));
+$('previousClip').addEventListener('click', () => {
+  if (!group || !trajectory) return;
+  const current = group.trajectories.findIndex((item) => item.id === trajectory.id);
+  selectTrajectory(group.trajectories[Math.max(0, current - 1)].id);
+});
+$('nextClip').addEventListener('click', () => {
+  if (!group || !trajectory) return;
+  const current = group.trajectories.findIndex((item) => item.id === trajectory.id);
+  selectTrajectory(group.trajectories[Math.min(group.count - 1, current + 1)].id);
+});
+$('similarity').addEventListener('input', () => {
+  $('similarityLabel').textContent = Number($('similarity').value).toFixed(3);
+});
+$('similarity').addEventListener('change', () => loadSkills(group?.latent));
 $('previous').addEventListener('click', () => { pause(); showFrame(index - 1); });
 $('next').addEventListener('click', () => { pause(); showFrame(index + 1); });
 $('scrub').addEventListener('input', () => { pause(); showFrame(Number($('scrub').value)); });
 $('play').addEventListener('click', () => {
-  if (!skill) return;
+  if (!trajectory) return;
   if (playing) { pause(); return; }
-  if (index === skill.scenes.length - 1) showFrame(0);
+  if (index === trajectory.scenes.length - 1) showFrame(0);
   playing = true;
   lastTime = performance.now();
   $('play').textContent = 'Pause';
+});
+$('playAll').addEventListener('click', () => {
+  if (!trajectory || !group) return;
+  if (playAll) { pause(); return; }
+  if (index === trajectory.scenes.length - 1) showFrame(0);
+  playing = playAll = true;
+  lastTime = performance.now();
+  $('play').textContent = 'Pause';
+  $('playAll').textContent = 'Playing all';
 });
 addEventListener('keydown', (event) => {
   if (['INPUT', 'SELECT'].includes(document.activeElement.tagName)) return;
@@ -332,27 +413,49 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
-async function loadSkills() {
+async function loadSkills(previousLatent = null, initial = false) {
+  const request = ++catalogRequest;
+  ++groupRequest;
+  ++trajectoryRequest;
+  pause();
+  group = trajectory = null;
   try {
-    const response = await fetch('/api/skills');
+    const response = await fetch(initial ? '/api/skills' :
+      `/api/skills?similarity=${Number($('similarity').value)}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const catalog = await response.json();
+    if (request !== catalogRequest) return;
     allSkills = catalog.skills;
-    $('checkpoint').textContent = `${catalog.checkpoint} · ${catalog.step.toLocaleString()} actor-steps · ${allSkills.length} sampled expert skills`;
-    filterSkills();
+    $('similarity').value = catalog.similarity;
+    $('similarityLabel').textContent = catalog.similarity.toFixed(3);
+    $('checkpoint').textContent = `${catalog.checkpoint} · ${catalog.trajectory_count} real expert car trajectories · ${allSkills.length} skill latents`;
+    const preferred = previousLatent && allSkills.length
+      ? allSkills.reduce((best, item) => item.latent.reduce(
+        (total, value, i) => total + value * previousLatent[i], 0) >
+          best.latent.reduce((total, value, i) => total + value * previousLatent[i], 0)
+        ? item : best)
+      : allSkills[0];
+    filterSkills(preferred?.id);
   } catch (error) {
-    $('checkpoint').textContent = `Could not load expert skills: ${error.message}`;
+    if (request === catalogRequest) $('checkpoint').textContent = `Could not load expert skills: ${error.message}`;
   }
 }
 function render(now) {
-  if (playing && skill) {
+  if (playing && trajectory) {
     accumulated += (now - lastTime) * Number($('speed').value);
-    const frameTime = skill.frameskip / 120 * 1000;
+    const frameTime = trajectory.frameskip / 120 * 1000;
     if (accumulated >= frameTime) {
       const count = Math.floor(accumulated / frameTime);
       accumulated %= frameTime;
       showFrame(index + count);
-      if (index === skill.scenes.length - 1) pause();
+      if (index === trajectory.scenes.length - 1) {
+        const current = group?.trajectories.findIndex((item) => item.id === trajectory.id);
+        if (playAll && current < group.count - 1) {
+          selectTrajectory(group.trajectories[current + 1].id, true);
+        } else {
+          pause();
+        }
+      }
     }
   }
   lastTime = now;
@@ -360,5 +463,5 @@ function render(now) {
   renderer.render(scene, camera);
   requestAnimationFrame(render);
 }
-loadSkills();
+loadSkills(null, true);
 requestAnimationFrame(render);

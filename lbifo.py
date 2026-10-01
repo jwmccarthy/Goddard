@@ -91,6 +91,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="fraction of resets drawn from --replay-reset-dir if supplied")
     parser.add_argument("--pretrain-only", action=argparse.BooleanOptionalAction, default=False,
                         help="train and save the state-only representation without starting CARL")
+    parser.add_argument("--segment-only", action=argparse.BooleanOptionalAction, default=False,
+                        help="save expert_segments.pt after pro segmentation without starting CARL")
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--pretrain-updates", type=int, default=10_000)
     parser.add_argument("--pretrain-checkpoint-interval", type=int, default=1_000)
@@ -178,11 +180,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             if name in {action.dest for action in parser._actions} and name != "resume_checkpoint"
         }
         defaults["pretrain_only"] = False  # a saved representation can start the pro-only stage
+        defaults["segment_only"] = False  # a segmentation snapshot can start online training
         defaults.pop("run_name", None)
-        if saved["config"].get("pretrain_only") and th.cuda.is_available():
+        if (saved["config"].get("pretrain_only") or saved["config"].get("segment_only")) and th.cuda.is_available():
             defaults["device"] = "cuda"
         parser.set_defaults(**defaults)
     args = parser.parse_args(argv)
+    if args.pretrain_only and args.segment_only:
+        parser.error("--pretrain-only and --segment-only are separate training phases")
+    if args.segment_only and saved is not None and saved["step"]:
+        parser.error("--segment-only needs a pretraining or segmentation checkpoint, not an online run")
     if args.min_duration < 2 or args.max_duration < args.min_duration:
         parser.error("--min-duration and --max-duration require 2 <= min <= max")
     if args.latent_dim < 3 or args.prior_hidden % 4:
@@ -240,9 +247,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be in [0, 1]")
     if not 0 < args.gamma <= 1:
         parser.error("--gamma must be in (0, 1]")
-    if not args.pretrain_only and not th.cuda.is_available():
+    if not (args.pretrain_only or args.segment_only) and not th.cuda.is_available():
         parser.error("low-level CARL training requires a CUDA-capable GPU")
-    if not args.pretrain_only and th.device(args.device).type != "cuda":
+    if not (args.pretrain_only or args.segment_only) and th.device(args.device).type != "cuda":
         parser.error("low-level CARL training must use --device cuda")
     args.pretrain_data_needed = (
         saved is None or saved["pretrain_step"] < args.pretrain_updates or args.pretrain_only
@@ -690,8 +697,11 @@ class LBIFOTrainer:
             args.tracking_reward_weight, args.tracking_progress_weight,
         )
 
-    def checkpoint(self, *, final: bool = False) -> Path:
-        name = f"lbifo_{self.step:012d}.pt" if self.policy is not None else "pretrain_latest.pt"
+    def checkpoint(self, *, final: bool = False, expert: bool = False) -> Path:
+        if expert and (self.policy is not None or not self._target_chunks or not self.target_sequences):
+            raise ValueError("expert snapshot requires finished segmentation before online training")
+        name = ("expert_segments.pt" if expert else
+                f"lbifo_{self.step:012d}.pt" if self.policy is not None else "pretrain_latest.pt")
         payload = {
             "architecture": LBIFO_ARCHITECTURE,
             "config": {
@@ -1214,7 +1224,13 @@ def main(argv: list[str] | None = None) -> None:
         trainer.resume_targets(load_resume_checkpoint(args.resume_checkpoint))
         if args.resume_checkpoint is not None else None
     )
-    chunks = resumed if resumed is not None else trainer.segment_experts()
+    if resumed is None:
+        chunks = trainer.segment_experts()
+        trainer.checkpoint(expert=True, final=True)
+    else:
+        chunks = resumed
+    if args.segment_only:
+        return
     trainer.train_online(chunks)
 
 

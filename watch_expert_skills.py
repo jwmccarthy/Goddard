@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Inspect the expert segments and original replay features behind LBIfO skills."""
+"""Select an LBIfO skill latent and watch matching, actual expert trajectories."""
 
 import argparse
 import bisect
 import json
+import math
 import mimetypes
 import threading
 import webbrowser
 from dataclasses import dataclass
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import carl
 import numpy as np
@@ -70,6 +72,38 @@ def feature_groups() -> list[dict]:
 def json_values(array: np.ndarray) -> list:
     """Keep a nonfinite raw replay component visible as null rather than invalid JSON."""
     return [float(value) if np.isfinite(value) else None for value in array]
+
+
+def group_skill_latents(
+    embeddings: np.ndarray, similarity: float,
+) -> list[tuple[int, list[tuple[int, float]]]]:
+    """Select unit-sphere exemplars, then include *every* matching expert clip.
+
+    The cover chooses representatives, but memberships may overlap: a clip
+    matching two skill latents must remain visible under both selected latents.
+    """
+    if not math.isfinite(similarity) or not 0 <= similarity <= 1:
+        raise ValueError("skill latent similarity must be in [0, 1]")
+    if embeddings.ndim != 2 or not np.isfinite(embeddings).all():
+        raise ValueError("expert skill latents must be finite vectors")
+    if len(embeddings) and (np.linalg.norm(embeddings, axis=-1) < 1e-8).any():
+        raise ValueError("expert skill latents must not be zero")
+    unit = embeddings / np.linalg.norm(embeddings, axis=-1, keepdims=True).clip(1e-8)
+    anchors: list[int] = []
+    for index, latent in enumerate(unit):
+        if not anchors or (unit[anchors] @ latent).max() < similarity:
+            anchors.append(index)
+    if not anchors:
+        return []
+    cosines = unit[anchors] @ unit.T
+    groups = []
+    for group_index, anchor in enumerate(anchors):
+        cosines[group_index, anchor] = 1.0
+        groups.append([
+            (index, float(score)) for index, score in enumerate(cosines[group_index])
+            if score >= similarity
+        ])
+    return sorted(zip(anchors, groups), key=lambda group: (-len(group[1]), group[0]))
 
 
 @dataclass(frozen=True)
@@ -150,25 +184,32 @@ class ReplayIndex:
 
 
 class ExpertSkillCatalog:
-    """Expose saved expert segments, both entity embeddings, and per-frame components."""
+    """Group saved demonstrations by per-car skill latent, then serve each real clip."""
 
-    def __init__(self, checkpoint: Path, replay_dir: Path | None = None) -> None:
+    def __init__(
+        self, checkpoint: Path, replay_dir: Path | None = None, similarity: float = 0.9,
+    ) -> None:
         payload = load_resume_checkpoint(checkpoint)
         chunks = payload.get("target_chunks")
         boundaries = payload.get("target_boundaries")
         if not chunks or boundaries is None or len(chunks) != len(boundaries):
-            raise ValueError("checkpoint has no expert segments; select an online lbifo_*.pt checkpoint")
+            raise ValueError("checkpoint has no expert segments; select expert_segments.pt or an online lbifo_*.pt checkpoint")
+        if not math.isfinite(similarity) or not 0 <= similarity <= 1:
+            raise ValueError("skill latent similarity must be in [0, 1]")
         config = payload["config"]
         self.checkpoint = checkpoint.name
         self.step = int(payload["step"])
         self.frameskip = int(config["frameskip"])
+        self.default_similarity = similarity
         encoder = RelationalEncoder(int(config["representation_hidden"]), int(config["latent_dim"]))
         encoder.load_state_dict(payload["ema_encoder"])
         encoder.eval().requires_grad_(False)
-        self.skills: list[dict] = []
+        self.trajectories: list[dict] = []
+        self.trajectory_segments: list[int] = []
         self.scenes: list[th.Tensor] = []
         self.prefix_latents: list[th.Tensor] = []
         self.prefix_concentrations: list[th.Tensor] = []
+        seen: set[tuple[int, int, int]] = set()
 
         with th.inference_mode():
             for chunk_index, ((offset, frames), ends) in enumerate(zip(chunks, boundaries)):
@@ -179,22 +220,28 @@ class ExpertSkillCatalog:
                 ):
                     raise ValueError(f"invalid saved expert segment boundaries in chunk {chunk_index}")
                 for segment_index, (left, right) in enumerate(zip(ends[:-1], ends[1:])):
+                    start, stop = int(offset) + left, int(offset) + right
+                    if all((start, stop, car) in seen for car in range(2)):
+                        continue
                     window = frames[left:right + 1].cpu().contiguous()
                     latent, concentration = encoder(window[None])
-                    skill_id = len(self.skills)
-                    self.skills.append({
-                        "id": skill_id,
-                        "chunk": chunk_index,
-                        "segment": segment_index,
-                        "start": int(offset) + left,
-                        "stop": int(offset) + right,
-                        "duration": right - left,
-                        "latents": latent[0, -1].tolist(),
-                        "concentrations": concentration[0, -1].tolist(),
-                    })
+                    scene_index = len(self.scenes)
                     self.scenes.append(window)
                     self.prefix_latents.append(latent[0].clone())
                     self.prefix_concentrations.append(concentration[0].clone())
+                    for car in range(2):
+                        if (start, stop, car) in seen:
+                            continue
+                        seen.add((start, stop, car))
+                        self.trajectories.append({
+                            "id": len(self.trajectories), "car": car,
+                            "chunk": chunk_index, "segment": segment_index,
+                            "start": start, "stop": stop, "duration": right - left,
+                            "latent": latent[0, -1, car].tolist(),
+                            "concentration": float(concentration[0, -1, car]),
+                        })
+                        self.trajectory_segments.append(scene_index)
+        self.embeddings = np.asarray([item["latent"] for item in self.trajectories], dtype=np.float32)
         self.replays = None
         if replay_dir is None:
             stored = config.get("target_replay_dir")
@@ -206,19 +253,47 @@ class ExpertSkillCatalog:
         if replay_dir is not None:
             self.replays = ReplayIndex(replay_folder(replay_dir, self.frameskip), config)
 
-    def list(self) -> dict:
-        return {"checkpoint": self.checkpoint, "step": self.step,
-                "frameskip": self.frameskip, "skills": self.skills}
+    @lru_cache(maxsize=16)
+    def groups(self, similarity: float) -> tuple[tuple[int, tuple[tuple[int, float], ...]], ...]:
+        return tuple((anchor, tuple(members)) for anchor, members in
+                     group_skill_latents(self.embeddings, similarity))
 
-    def detail(self, skill_id: int) -> dict:
-        if not 0 <= skill_id < len(self.skills):
-            raise KeyError(skill_id)
-        scenes = self.scenes[skill_id]
+    def list(self, similarity: float | None = None) -> dict:
+        cutoff = self.default_similarity if similarity is None else similarity
+        return {
+            "checkpoint": self.checkpoint, "step": self.step, "frameskip": self.frameskip,
+            "similarity": cutoff, "trajectory_count": len(self.trajectories),
+            "skills": [{"id": anchor, "latent": self.trajectories[anchor]["latent"],
+                        "count": len(members)} for anchor, members in self.groups(cutoff)],
+        }
+
+    def group(self, skill_id: int, similarity: float | None = None) -> dict:
+        cutoff = self.default_similarity if similarity is None else similarity
+        for anchor, members in self.groups(cutoff):
+            if anchor == skill_id:
+                ranked = sorted(members, key=lambda item: (-item[1], item[0]))
+                return {
+                    "id": anchor, "latent": self.trajectories[anchor]["latent"],
+                    "similarity": cutoff, "count": len(ranked),
+                    "trajectories": [
+                        {**self.trajectories[index], "cosine": cosine}
+                        for index, cosine in ranked
+                    ],
+                }
+        raise KeyError(skill_id)
+
+    def detail(self, trajectory_id: int) -> dict:
+        if not 0 <= trajectory_id < len(self.trajectories):
+            raise KeyError(trajectory_id)
+        scene_index = self.trajectory_segments[trajectory_id]
+        scenes = self.scenes[scene_index]
         result = {
-            **self.skills[skill_id], "checkpoint": self.checkpoint,
+            **self.trajectories[trajectory_id], "checkpoint": self.checkpoint,
             "frameskip": self.frameskip, "scenes": scenes.tolist(),
-            "prefix_latents": self.prefix_latents[skill_id].tolist(),
-            "prefix_concentrations": self.prefix_concentrations[skill_id].tolist(),
+            "latents": self.prefix_latents[scene_index][-1].tolist(),
+            "concentrations": self.prefix_concentrations[scene_index][-1].tolist(),
+            "prefix_latents": self.prefix_latents[scene_index].tolist(),
+            "prefix_concentrations": self.prefix_concentrations[scene_index].tolist(),
             "feature_groups": feature_groups(),
         }
         if self.replays is None:
@@ -234,9 +309,23 @@ class ExpertSkillCatalog:
 def make_handler(catalog: ExpertSkillCatalog, frontend: Path, arena: Path):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            path = urlsplit(self.path).path
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            similarity = catalog.default_similarity
+            if path == "/api/skills" or path.startswith("/api/skills/"):
+                try:
+                    query = parse_qs(parsed.query)
+                    if "similarity" in query:
+                        if len(query["similarity"]) != 1:
+                            raise ValueError("provide one skill similarity value")
+                        similarity = float(query["similarity"][0])
+                    if not math.isfinite(similarity) or not 0 <= similarity <= 1:
+                        raise ValueError("skill similarity must be between 0 and 1")
+                except ValueError as error:
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(error))
+                    return
             if path == "/api/skills":
-                self._json(catalog.list())
+                self._json(catalog.list(similarity))
                 return
             if path.startswith("/api/skills/"):
                 skill_id = path.removeprefix("/api/skills/")
@@ -244,7 +333,17 @@ def make_handler(catalog: ExpertSkillCatalog, frontend: Path, arena: Path):
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
                 try:
-                    self._json(catalog.detail(int(skill_id)))
+                    self._json(catalog.group(int(skill_id), similarity))
+                except KeyError:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if path.startswith("/api/trajectories/"):
+                trajectory_id = path.removeprefix("/api/trajectories/")
+                if len(trajectory_id) > 12 or not trajectory_id.isascii() or not trajectory_id.isdecimal():
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                try:
+                    self._json(catalog.detail(int(trajectory_id)))
                 except KeyError:
                     self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -278,21 +377,25 @@ def make_handler(catalog: ExpertSkillCatalog, frontend: Path, arena: Path):
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True,
-                        help="LBIfO online checkpoint containing sampled expert segments")
+                        help="post-segmentation expert_segments.pt or online LBIfO checkpoint")
     parser.add_argument("--replay-dir", type=Path,
                         help="original parsed 1v1 replays for all 161 fields (defaults to checkpoint's target replay path if present)")
+    parser.add_argument("--similarity", type=float, default=0.9,
+                        help="minimum cosine similarity to a representative expert skill latent")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8789)
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
+    if not math.isfinite(args.similarity) or not 0 <= args.similarity <= 1:
+        parser.error("--similarity must be between 0 and 1")
     return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    catalog = ExpertSkillCatalog(args.checkpoint, args.replay_dir)
+    catalog = ExpertSkillCatalog(args.checkpoint, args.replay_dir, args.similarity)
     frontend = ROOT / "web" / "expert_skills"
     arena = Path(carl.__file__).resolve().parent / "assets" / "arena.obj"
     if not (frontend / "index.html").is_file() or not (frontend / "app.js").is_file():
@@ -301,7 +404,8 @@ def main(argv: list[str] | None = None) -> None:
         raise FileNotFoundError(f"CARL arena asset not found: {arena}")
     server = ThreadingHTTPServer((args.host, args.port), make_handler(catalog, frontend, arena))
     url = f"http://{args.host}:{server.server_port}"
-    print(f"Expert skills: {len(catalog.skills)} from {args.checkpoint}")
+    print(f"Expert skill latents: {len(catalog.list()['skills'])} groups across "
+          f"{len(catalog.trajectories)} demonstrated car trajectories from {args.checkpoint}")
     print(f"Viewer: {url}")
     if args.open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

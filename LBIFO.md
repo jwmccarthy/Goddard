@@ -117,28 +117,40 @@ Run `watch_checkpoints.py --checkpoint-dir checkpoints/lbifo` to watch saved
 `lbifo_*.pt` hierarchies against each other. The viewer also supports BASIC
 and GAIFO. Representation-only checkpoints are not playable.
 
-To inspect expert skills separately from self-play, run:
+After pro segmentation, `lbifo.py` saves `expert_segments.pt` immediately,
+before the first CARL rollout. To stop there and inspect the demonstrations
+before starting online training, run:
 
 ```bash
+.venv/bin/python lbifo.py \
+  --resume-checkpoint checkpoints/lbifo/<pretrain-run>/pretrain_latest.pt \
+  --target-replay-dir parsed_replays/pro_1v1_fs4 --segment-only
 .venv/bin/python watch_expert_skills.py \
-  --checkpoint checkpoints/lbifo/<run>/lbifo_000000000000.pt \
+  --checkpoint checkpoints/lbifo/<segmentation-run>/expert_segments.pt \
   --replay-dir parsed_replays/pro_1v1_fs4 --open
 ```
 
-The browser lists the **inferred pro segments saved in that online
-checkpoint**, with searchable skill selection, playback and scrubbing through
-the original expert trajectory, ball/car paths in 3D, segment boundaries and
-durations, and both cars' complete requested latent vectors and posterior
-concentrations, as well as the EMA embedding at every selected prefix. The
-inspector lists every normalized scene component for each frame. When the
-original parsed replays are available (automatically from the checkpoint's
-target replay path, or explicitly through `--replay-dir`), it
-also shows all 110 additional parser components: boost pads, relative ball/car
-and goal features, ego internal state, touch/bump events and correction flags.
-If the checkpoint came from a differently sampled replay directory, the viewer
-checks scene alignment before showing those raw rows. No GPU is needed for
-inspection; the watcher defaults to port `8789` (`--host` and `--port` are
-configurable). Pretraining-only checkpoints have no inferred skills to inspect.
+Resume online learning later from `expert_segments.pt` in the same way as from
+`pretrain_latest.pt`. Existing online `lbifo_*.pt` checkpoints can also be
+inspected; pretraining-only checkpoints contain no inferred expert skills.
+
+The watcher groups the **actual pro replay segments sampled at segmentation**
+by per-car latent: each displayed expert trajectory has cosine similarity at
+least the selected cutoff to that group's representative latent. Select a
+skill latent, then choose or play through **all matching expert trajectories**.
+An expert clip may appear under more than one latent when it matches both.
+The similarity slider (initial `--similarity`, default `0.9`) controls grouping
+because the latent space is continuous, not a set of categorical labels. The
+browser shows each trajectory's focal car, match score, segment boundaries,
+3D playback, both cars' latent vectors and concentrations, and each evolving
+prefix embedding. The inspector lists all 51 saved scene features for every
+frame. If the original parsed replays are present (automatically from the
+checkpoint's target replay path, or via `--replay-dir`), it also shows all 110
+other parser fields: boost pads, relative ball/car and goal features, internal
+state, touches, bumps and correction flags. Scene alignment is checked before
+displaying raw rows. `--expert-sequences` sets how many pro chunks are sampled
+for segmentation and thus the watcher's coverage; viewing needs no GPU. The
+watcher defaults to port `8789` (`--host` and `--port` are configurable).
 
 For a quick test on synthetic replay files, run
 `.venv/bin/python -m unittest discover -s tests -p 'test_lbifo*.py' -v`.

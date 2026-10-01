@@ -89,6 +89,32 @@ class ReplayRolesTests(unittest.TestCase):
                     "--target-replay-dir", str(pro), "--pretrain-only", "--device", "cpu",
                 ])
 
+    def test_segment_only_saves_watchable_expert_groups_before_carl_starts(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            for name, offset in (("lower", 0.0), ("pro", 0.01), ("resets", 0.02)):
+                make_replays(root / name, offset=offset)
+            main(small_args(root / "lower", root / "pro", root / "resets", root) + [
+                "--segment-only", "--device", "cpu", "--run-name", "segmented",
+            ])
+            path = root / "checkpoints" / "segmented" / "expert_segments.pt"
+            snapshot = load_resume_checkpoint(path)
+            self.assertEqual(snapshot["step"], 0)
+            self.assertNotIn("policy", snapshot)
+            self.assertEqual(len(snapshot["target_chunks"]), len(snapshot["target_boundaries"]))
+            self.assertEqual(len(list(path.parent.glob("lbifo_*.pt"))), 0)
+            catalog = ExpertSkillCatalog(path)
+            listing = catalog.list()
+            self.assertGreater(listing["trajectory_count"], 1)
+            matches = {item["id"] for skill in listing["skills"] for item in
+                       catalog.group(skill["id"])["trajectories"]}
+            self.assertEqual(len(matches), listing["trajectory_count"])
+            self.assertIn("source", catalog.detail(0))
+            if th.cuda.is_available():
+                args = parse_args(["--resume-checkpoint", str(path), "--timesteps", "33"])
+                self.assertFalse(args.segment_only)
+                self.assertEqual(args.device, "cuda")
+
 
 @unittest.skipUnless(
     os.environ.get("GODDARD_GPU_SMOKE") == "1" and th.cuda.is_available(),
@@ -154,6 +180,17 @@ class LBIFOGpuSmokeTests(unittest.TestCase):
                 "--resume-checkpoint", str(root / "checkpoints" / "pretrain" / "pretrain_latest.pt"),
                 "--run-name", "test",
             ])
+            expert_path = root / "checkpoints" / "test" / "expert_segments.pt"
+            expert_snapshot = load_resume_checkpoint(expert_path)
+            self.assertEqual(expert_snapshot["step"], 0)
+            self.assertNotIn("policy", expert_snapshot)
+            main(["--resume-checkpoint", str(expert_path), "--timesteps", "3",
+                  "--run-name", "from-segments"])
+            from_segments = load_resume_checkpoint(
+                root / "checkpoints" / "from-segments" / "lbifo_000000000004.pt"
+            )
+            self.assertEqual(from_segments["step"], 4)
+            self.assertIn("policy", from_segments)
             saved = load_resume_checkpoint(root / "checkpoints" / "test" / "lbifo_000000000018.pt")
             self.assertEqual(saved["step"], 18)
             self.assertEqual(saved["config"]["timesteps"], 17)
@@ -206,9 +243,14 @@ class LBIFOGpuSmokeTests(unittest.TestCase):
             updates = next(iter(saved["policy_optimizer"]["state"].values()))["step"]
             self.assertGreaterEqual(int(updates), 8)
             self.assertTrue(all(th.isfinite(value).all() for value in saved["policy"].values()))
-            expert = ExpertSkillCatalog(path).detail(0)
+            catalog = ExpertSkillCatalog(path)
+            expert = catalog.detail(0)
             self.assertEqual(len(expert["scenes"]), expert["duration"] + 1)
             self.assertEqual(len(expert["source"]["raw_frames"][0]), 161)
+            listing = catalog.list()
+            matches = {item["id"] for skill in listing["skills"] for item in
+                       catalog.group(skill["id"])["trajectories"]}
+            self.assertEqual(len(matches), listing["trajectory_count"])
 
 
 if __name__ == "__main__":
