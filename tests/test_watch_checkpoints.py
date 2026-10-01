@@ -10,11 +10,7 @@ import torch as th
 from gymnasium.spaces import Box, MultiDiscrete
 
 from gaifo import GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, build_policy
-from lbifo import LBIFO_ARCHITECTURE
-from lbifo_planning import PlanValue, SphericalPlanPrior
-from lbifo_repr import SceneRepresentation
-from lbifo_skill import BehaviorPolicy
-from watch_checkpoints import load_policy_checkpoint, parse_args
+from watch_checkpoints import CheckpointRegistry, load_policy_checkpoint, parse_args
 
 
 class FakeEnv:
@@ -57,6 +53,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                             ),
                             "frameskip": 4,
                             "policy_hidden": 16,
+                            "factorize": not gru,
                             **({"gru": True} if gru else {}),
                         },
                         "policy": reference.state_dict(),
@@ -114,40 +111,17 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "GRU setting"):
                 load_policy_checkpoint(path, env, 4, None)
 
-    def test_lbifo_checkpoint_loads_entire_hierarchy_for_both_teams(self):
-        env = FakeEnv()
-        env.single_observation_space = Box(-1, 1, shape=(205,), dtype=np.float32)
-        env.single_action_space = MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
-        representation = SceneRepresentation(16, 8)
-        policy = BehaviorPolicy(205, (3, 3, 3, 2, 2, 3, 2), 8, 16)
-        prior = SphericalPlanPrior(8, 16, 2, 3, 2)
-        value = PlanValue(8, 16, 2)
+    def test_registry_ignores_removed_skill_checkpoints(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            path = Path(directory) / "lbifo_000000000008.pt"
-            th.save({
-                "architecture": LBIFO_ARCHITECTURE, "step": 8, "pretrain_step": 2,
-                "config": {
-                    "frameskip": 4, "latent_dim": 8, "prior_hidden": 16,
-                    "policy_hidden": 16, "min_duration": 2, "max_duration": 3,
-                    "plan_horizon": 2, "replan_after": 1,
-                    "plan_candidates": 2, "opponent_samples": 2,
-                    "diffusion_steps": 2,
-                },
-                "policy": policy.state_dict(), "value": value.state_dict(),
-                "prior": prior.state_dict(),
-                "representation": representation.state_dict(),
-                "ema_encoder": representation.encoder.state_dict(),
-            }, path)
-            actor, signature = load_policy_checkpoint(path, env, 4, None)
-            self.assertEqual(signature[0], "lbifo")
-            observation = th.zeros(1, 205)
-            state = actor.initial_state(1)
-            with th.no_grad():
-                for _ in range(5):
-                    decision = actor.act(observation, state, deterministic=True)
-                    self.assertEqual(decision.action.shape, (1, 7))
-                    self.assertGreaterEqual(decision.next_state.age, 1)
-                    state = decision.next_state
+            folder = Path(directory)
+            checkpoint = folder / "gaifo_000000000001.pt"
+            checkpoint.touch()
+            (folder / "lbifo_000000000099.pt").touch()
+            registry = CheckpointRegistry(folder)
+            self.assertEqual([item.path for item in registry.list()], [checkpoint])
+            self.assertEqual(registry.newest_pair(), (checkpoint, checkpoint))
+            with self.assertRaisesRegex(ValueError, "invalid checkpoint path"):
+                registry.resolve("lbifo_000000000099.pt")
 
     def test_basic_checkpoints_started_from_gaifo_remain_watchable(self):
         env = FakeEnv()

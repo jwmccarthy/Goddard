@@ -20,7 +20,7 @@ from gaifo import load_resume_checkpoint, main
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
-    def test_short_window_training_and_terminal_metrics(self):
+    def _short_window_training(self, factorize: bool):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
             replays = root / "replays"
@@ -42,19 +42,36 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "--log-dir", str(root / "runs"),
                 "--checkpoint-dir", str(root / "checkpoints"),
             ]
+            if factorize:
+                flags.append("--factorize")
             output = io.StringIO()
             with patch.object(sys, "argv", flags), redirect_stdout(output):
                 main()
 
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)
-            saved = load_resume_checkpoint(max(checkpoints))
-            self.assertEqual(saved["step"], 64)
-            self.assertNotIn("long_discriminator", saved)
-            self.assertNotIn("long_discriminator_optimizer", saved)
-            self.assertIn("D heldout accuracy", output.getvalue())
-            self.assertNotIn("short D", output.getvalue())
-            self.assertNotIn("long D", output.getvalue())
+            return load_resume_checkpoint(max(checkpoints)), output.getvalue()
+
+    def test_short_window_training_and_terminal_metrics(self):
+        saved, output = self._short_window_training(False)
+        self.assertEqual(saved["step"], 64)
+        self.assertFalse(saved["config"]["factorize"])
+        self.assertNotIn("long_discriminator", saved)
+        self.assertNotIn("long_discriminator_optimizer", saved)
+        self.assertIn("D heldout accuracy", output)
+        self.assertNotIn("short D", output)
+        self.assertNotIn("long D", output)
+
+    def test_factorized_short_window_training(self):
+        saved, output = self._short_window_training(True)
+        self.assertEqual(saved["step"], 64)
+        self.assertTrue(saved["config"]["factorize"])
+        self.assertTrue(any(key.startswith("car_encoder.")
+                            for key in saved["discriminator"]))
+        self.assertTrue(any(key.startswith("ball_encoder.")
+                            for key in saved["discriminator"]))
+        self.assertIn("D car accuracy", output)
+        self.assertIn("D ball accuracy", output)
 
 
 if __name__ == "__main__":

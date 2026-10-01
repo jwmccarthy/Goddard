@@ -75,6 +75,10 @@ CAR_MAX_SPEED = 2300.0
 CAR_MAX_ANG_SPEED = 5.5
 BOOST_MAX = 100.0
 INTERNAL_BOOL_INDICES = (0, 2, 3, 4, 5, 7, 8, 9, 11, 17)
+BALL_NEAR_DISTANCE = 1_500.0
+BALL_GATE_RADIUS = 200.0
+BALL_GATE_SCALE = 1_000.0
+BALL_GATE_FLOOR = 0.1
 
 
 def noise_mask(device: str | th.device = "cpu") -> th.Tensor:
@@ -96,6 +100,23 @@ def add_scene_noise(windows: th.Tensor, std: float) -> th.Tensor:
     mask = noise_mask(windows.device).view(*((1,) * (windows.ndim - 1)), SCENE_SIZE)
     noise = th.randn_like(windows) * std * mask
     return windows + noise
+
+
+def nearest_ball_distance(windows: th.Tensor) -> th.Tensor:
+    """Closest ego-car/ball distance in physical units over each causal window."""
+    if windows.ndim < 3 or windows.shape[-1] != SCENE_SIZE:
+        raise ValueError("ball proximity needs scene windows")
+    relative = windows[..., :3] - windows[..., BLUE_START:BLUE_START + 3]
+    scale = windows.new_tensor(POSITION_SCALE)
+    return th.linalg.vector_norm(relative * scale, dim=-1).amin(dim=-1)
+
+
+def ball_responsibility(windows: th.Tensor) -> th.Tensor:
+    """Keep a small off-ball signal and credit recent proximity after contact."""
+    separation = (nearest_ball_distance(windows) - BALL_GATE_RADIUS).clamp_min(0)
+    return BALL_GATE_FLOOR + (1 - BALL_GATE_FLOOR) * th.exp(
+        -0.5 * (separation / BALL_GATE_SCALE).square()
+    )
 
 
 def opponent_view(scenes: th.Tensor) -> th.Tensor:
@@ -155,17 +176,13 @@ def resample_scene(
     scene: np.ndarray,
     source_frame_skip: int,
     target_frame_skip: int,
-    *, target_indices: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Resample normalized scenes, optionally only at selected target frames."""
+    """Resample normalized physical scenes onto the simulator's time cadence."""
     if len(scene) < 2 or source_frame_skip == target_frame_skip:
-        output = np.asarray(scene, dtype=np.float32)
-        return output if target_indices is None else output[target_indices]
+        return np.asarray(scene, dtype=np.float32)
     left, right, alpha = _resample_coordinates(
         len(scene), source_frame_skip, target_frame_skip
     )
-    if target_indices is not None:
-        left, right, alpha = left[target_indices], right[target_indices], alpha[target_indices]
     output = (
         scene[left] * (1.0 - alpha[:, None])
         + scene[right] * alpha[:, None]
@@ -663,6 +680,9 @@ class ExpertSceneDataset:
             self.train_window_starts = safe_starts(self.train_window_starts)
             self.heldout_window_starts = safe_starts(self.heldout_window_starts)
             self.reset_indices = self.reset_indices[~invalid[self.reset_indices]]
+        self._near_frames: th.Tensor | None = None
+        self._train_near_pairs: th.Tensor | None = None
+        self._heldout_near_pairs: th.Tensor | None = None
 
     def _split_heldout(self, device: str | th.device, seed: int) -> None:
         split_rng = th.Generator(device=device).manual_seed(seed)
@@ -794,6 +814,57 @@ class ExpertSceneDataset:
         return self._sample_dual(
             self.heldout_window_starts, n, device, self._heldout_generator
         )
+
+    def _near_pairs(self, heldout: bool = False) -> th.Tensor:
+        """Cache eligible (start, focal car) windows near the ball."""
+        cached = self._heldout_near_pairs if heldout else self._train_near_pairs
+        if cached is not None:
+            return cached
+        if self._near_frames is None:
+            cars = th.stack((
+                self.frames[:, BLUE_START:BLUE_START + 3],
+                self.frames[:, ORANGE_START:ORANGE_START + 3],
+            ), dim=1)
+            distance = (self.frames[:, None, :3] - cars) * self.frames.new_tensor(POSITION_SCALE)
+            self._near_frames = distance.square().sum(dim=-1) <= BALL_NEAR_DISTANCE ** 2
+        starts = self.heldout_window_starts if heldout else self.train_window_starts
+        found = []
+        for chunk in starts.split(32_768):
+            near = self._near_frames[chunk[:, None] + self.window_offsets].any(dim=1)
+            choices = near.nonzero(as_tuple=False)
+            if len(choices):
+                found.append(th.stack((chunk[choices[:, 0]], choices[:, 1]), dim=-1))
+        pairs = th.cat(found) if found else starts.new_empty((0, 2))
+        if heldout:
+            self._heldout_near_pairs = pairs
+        else:
+            self._train_near_pairs = pairs
+        return pairs
+
+    @property
+    def near_total(self) -> int:
+        return len(self._near_pairs())
+
+    @property
+    def heldout_near_total(self) -> int:
+        return len(self._near_pairs(heldout=True))
+
+    def sample_near(
+        self, n: int, device: str | th.device, *, heldout: bool = False,
+    ) -> th.Tensor:
+        """Sample near-ball windows only for the focal car, without held-out leakage."""
+        if n < 1 or th.device(device) != self.frames.device:
+            raise ValueError("near-ball sample count must be positive and use the expert device")
+        pairs = self._near_pairs(heldout)
+        if not len(pairs):
+            raise ValueError("no near-ball expert windows in this split")
+        generator = self._heldout_generator if heldout else self._train_generator
+        chosen = pairs[th.randint(len(pairs), (n,), device=self.frames.device, generator=generator)]
+        windows = self.frames[chosen[:, 0, None] + self.window_offsets]
+        opponent = chosen[:, 1].bool()
+        if opponent.any():
+            windows[opponent] = opponent_view(windows[opponent])
+        return windows
 
     def reset_dataset(self) -> TensorDataset:
         frames = self.frames[self.reset_indices]
@@ -938,16 +1009,89 @@ class SceneDiscriminator(nn.Module):
         return self.head(gru_out[:, -1]).squeeze(-1)
 
 
+class FactorizedSceneDiscriminator(nn.Module):
+    """Separate car-motion and ball-control critics of the same short scene window."""
+
+    factorized = True
+
+    def __init__(
+        self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
+    ) -> None:
+        super().__init__()
+        if min(frame_embedding, temporal_hidden, hidden_size) < 1:
+            raise ValueError("discriminator dimensions must be positive")
+        self.car_encoder = nn.Sequential(
+            nn.Linear(CAR_SIZE + 6, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
+        )
+        self.ball_encoder = nn.Sequential(
+            nn.Linear(BALL_SIZE + 6, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
+        )
+        self.car_gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
+        self.ball_gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
+        self.car_head = nn.Linear(temporal_hidden, 1)
+        self.ball_head = nn.Linear(temporal_hidden, 1)
+
+    def forward(self, windows: th.Tensor) -> th.Tensor:
+        if windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE:
+            raise ValueError("factorized discriminator needs [batch, frames, scene] windows")
+        ball = windows[..., :BALL_SIZE]
+        ego = windows[..., BLUE_START:BLUE_START + CAR_SIZE]
+        relative_position = ball[..., :3] - ego[..., :3]
+        relative_velocity = (
+            ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
+        )
+        # Hold context fixed so the car head cannot classify subsequent ball motion.
+        initial_context = th.cat((relative_position[:, 0], relative_velocity[:, 0]), dim=-1)
+        car_input = th.cat((
+            ego, initial_context[:, None].expand(-1, windows.shape[1], -1),
+        ), dim=-1)
+        ball_input = th.cat((ball, relative_position, relative_velocity), dim=-1)
+        car_features, _ = self.car_gru(self.car_encoder(car_input))
+        ball_features, _ = self.ball_gru(self.ball_encoder(ball_input))
+        return th.cat((
+            self.car_head(car_features[:, -1]), self.ball_head(ball_features[:, -1]),
+        ), dim=-1)
+
+
 class SceneDiscriminatorLoss:
     """BCE-with-logits loss for generated-vs-expert scene windows."""
 
-    def __init__(self, discriminator: SceneDiscriminator) -> None:
+    def __init__(self, discriminator: SceneDiscriminator | FactorizedSceneDiscriminator) -> None:
         self.discriminator = discriminator
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
         logit = self.discriminator(batch["window"])
         target = batch["is_agent"]
-        loss = F.binary_cross_entropy_with_logits(logit, target)
+        metrics = {}
+        if getattr(self.discriminator, "factorized", False):
+            if logit.shape != (len(target), 2):
+                raise ValueError("factorized discriminator must return car and ball logits")
+            car_loss = F.binary_cross_entropy_with_logits(logit[:, 0], target)
+            ball_errors = F.binary_cross_entropy_with_logits(
+                logit[:, 1], target, reduction="none",
+            )
+            weights = batch.get("ball_weight")
+            if weights is None:
+                weights = ball_responsibility(batch["window"]).square()
+                agent = target.bool()
+                class_losses = [
+                    (ball_errors[chosen] * weights[chosen]).sum()
+                    / weights[chosen].sum().clamp_min(1e-6)
+                    for chosen in (agent, ~agent) if chosen.any()
+                ]
+                ball_loss = th.stack(class_losses).mean()
+            else:
+                ball_loss = (ball_errors * weights).mean()
+            loss = (car_loss + ball_loss) * 0.5
+            metrics = {
+                "car_loss": car_loss.detach(), "ball_loss": ball_loss.detach(),
+                "near_ball_fraction": (nearest_ball_distance(batch["window"])
+                                       <= BALL_NEAR_DISTANCE).float().mean(),
+            }
+        else:
+            loss = F.binary_cross_entropy_with_logits(logit, target)
 
         agent = target.bool()
         with th.no_grad():
@@ -964,6 +1108,7 @@ class SceneDiscriminatorLoss:
                 "expert_score": expert_score,
                 "agent_accuracy": agent_accuracy,
                 "expert_accuracy": expert_accuracy,
+                **metrics,
             },
         )
 
@@ -979,6 +1124,7 @@ class SceneGAIFOMinibatches:
         noise_std: float,
         history: HistoricalReplayBuffer | None = None,
         mix_fraction: float = 0.5,
+        factorize: bool = False,
     ) -> None:
         if batch_size < 1 or epochs < 1:
             raise ValueError("batch size and epochs must be positive")
@@ -990,12 +1136,22 @@ class SceneGAIFOMinibatches:
         self.noise_std = noise_std
         self.history = history
         self.mix_fraction = mix_fraction if (history is not None) else 0.0
+        self.factorize = factorize
         self._epoch_callback = None
 
     def set_epoch_callback(self, callback) -> None:
         self._epoch_callback = callback
 
     def sample_windows(self, windows: th.Tensor, indices: th.Tensor):
+        near_indices = indices[:0]
+        if self.factorize:
+            near = []
+            for chunk in indices.split(8_192):
+                eligible = chunk[nearest_ball_distance(windows[chunk]) <= BALL_NEAR_DISTANCE]
+                if len(eligible):
+                    near.append(eligible)
+            if near and self.expert.near_total:
+                near_indices = th.cat(near)
         for _ in range(self.epochs):
             order = indices[th.randperm(len(indices), device=indices.device)]
             for start in range(0, len(order), self.batch_size):
@@ -1012,6 +1168,11 @@ class SceneGAIFOMinibatches:
                 n_current = sample_count - n_history
 
                 agent_windows = current_windows[:n_current]
+                n_near = min(n_current, sample_count // 2) if len(near_indices) else 0
+                if n_near:
+                    agent_windows = agent_windows.clone()
+                    choices = th.randint(len(near_indices), (n_near,), device=indices.device)
+                    agent_windows[:n_near] = windows[near_indices[choices]]
                 if n_history > 0:
                     historical = self.history.sample(
                         n_history,
@@ -1020,10 +1181,10 @@ class SceneGAIFOMinibatches:
                     agent_windows = th.cat([agent_windows, historical], dim=0)
 
                 agent_windows = add_scene_noise(agent_windows, self.noise_std)
-                expert_windows = add_scene_noise(
-                    self.expert.sample(sample_count, agent_windows.device),
-                    self.noise_std,
-                )
+                expert_windows = self.expert.sample(sample_count, agent_windows.device)
+                if n_near:
+                    expert_windows[:n_near] = self.expert.sample_near(n_near, agent_windows.device)
+                expert_windows = add_scene_noise(expert_windows, self.noise_std)
                 is_agent = th.cat(
                     [
                         th.ones(sample_count, device=agent_windows.device),
@@ -1044,7 +1205,7 @@ class SceneGAIFOMinibatches:
 
 def train_discriminator_minibatch(
     sample: TensorBatch,
-    discriminator: SceneDiscriminator,
+    discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
     optimizer: th.optim.Optimizer,
     loss: SceneDiscriminatorLoss,
     microbatch_size: int,
@@ -1061,12 +1222,21 @@ def train_discriminator_minibatch(
 
     optimizer.zero_grad(set_to_none=True)
     metrics: dict[str, th.Tensor] = {}
+    ball_weights = None
+    if getattr(discriminator, "factorized", False):
+        ball_weights = ball_responsibility(windows).square()
+        for chosen in (slice(None, n_agent), slice(n_agent, None)):
+            ball_weights[chosen] /= ball_weights[chosen].mean().clamp_min(1e-6)
     for start in range(0, n_agent, microbatch_size):
         stop = min(start + microbatch_size, n_agent)
         chunk = TensorBatch({
             "window": th.cat((windows[start:stop], windows[n_agent + start:n_agent + stop])),
             "is_agent": th.cat((labels[start:stop], labels[n_agent + start:n_agent + stop])),
         })
+        if ball_weights is not None:
+            chunk = chunk.with_fields(ball_weight=th.cat((
+                ball_weights[start:stop], ball_weights[n_agent + start:n_agent + stop],
+            )))
         output = loss(chunk)
         fraction = (stop - start) / n_agent
         (output.loss * fraction).backward()
@@ -1089,7 +1259,7 @@ class SceneDiscriminatorReward:
 
     def __init__(
         self,
-        discriminator: SceneDiscriminator,
+        discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
         noise_std: float,
         trajectory_length: int,
         goal_reward_weight: float = 1.0,
@@ -1109,6 +1279,7 @@ class SceneDiscriminatorReward:
         if not math.isfinite(flip_reset_reward_weight) or flip_reset_reward_weight < 0.0:
             raise ValueError("flip reset reward weight must be non-negative")
         self.discriminator = discriminator
+        self.factorize = getattr(discriminator, "factorized", False)
         self.noise_std = noise_std
         self.trajectory_length = trajectory_length
         self.goal_reward_weight = goal_reward_weight
@@ -1135,15 +1306,19 @@ class SceneDiscriminatorReward:
         windows: th.Tensor,
         valid: th.Tensor,
     ) -> th.Tensor:
-        scores = th.zeros_like(valid, dtype=windows.dtype)
+        scores = th.zeros(
+            (*valid.shape, 2) if self.factorize else valid.shape,
+            dtype=windows.dtype, device=windows.device,
+        )
         if not valid.any():
             return scores
 
         flat_windows = windows.reshape(-1, self.trajectory_length, SCENE_SIZE)
-        flat_scores = scores.flatten()
+        flat_scores = scores.reshape(-1, 2) if self.factorize else scores.flatten()
         indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
         selected_scores = th.empty(
-            len(indices), dtype=scores.dtype, device=scores.device
+            (len(indices), 2) if self.factorize else (len(indices),),
+            dtype=scores.dtype, device=scores.device,
         )
         for start in range(0, len(indices), self.batch_size):
             stop = min(start + self.batch_size, len(indices))
@@ -1155,11 +1330,19 @@ class SceneDiscriminatorReward:
                 -self.max_magnitude, self.max_magnitude
             )
 
-        std = selected_scores.std(unbiased=False)
-        if std > 1e-8:
-            normalized = (selected_scores - selected_scores.mean()) / std
+        if self.factorize:
+            std = selected_scores.std(dim=0, unbiased=False)
+            normalized = th.where(
+                std > 1e-8,
+                (selected_scores - selected_scores.mean(dim=0)) / std.clamp_min(1e-8),
+                th.zeros_like(selected_scores),
+            )
         else:
-            normalized = th.zeros_like(selected_scores)
+            std = selected_scores.std(unbiased=False)
+            if std > 1e-8:
+                normalized = (selected_scores - selected_scores.mean()) / std
+            else:
+                normalized = th.zeros_like(selected_scores)
         flat_scores[indices] = normalized.clamp(
             -self.max_magnitude, self.max_magnitude
         )
@@ -1177,7 +1360,20 @@ class SceneDiscriminatorReward:
             raise ValueError("scene windows have the wrong shape")
 
         dtype = batch["observation"].dtype
-        imitation_reward = self._score_windows(windows, valid).to(dtype)
+        scores = self._score_windows(windows, valid).to(dtype)
+        components = {}
+        if self.factorize:
+            proximity = ball_responsibility(windows).to(dtype)
+            car_reward = 0.5 * scores[..., 0]
+            ball_reward = 0.5 * proximity * scores[..., 1]
+            imitation_reward = car_reward + ball_reward
+            components = {
+                "car_imitation_reward": car_reward,
+                "ball_imitation_reward": ball_reward,
+                "ball_proximity": proximity,
+            }
+        else:
+            imitation_reward = scores
         goal_reward = batch["reward"].to(dtype) * self.goal_reward_weight
         if goal_reward.shape != imitation_reward.shape:
             raise ValueError("goal rewards must match the actor rollout shape")
@@ -1192,6 +1388,7 @@ class SceneDiscriminatorReward:
 
         result = batch.with_fields(
             imitation_reward=imitation_reward,
+            **components,
             goal_reward=goal_reward,
             aerial_touch_reward=aerial_touch_reward,
             flip_reset_reward=flip_reset_reward,
@@ -1253,7 +1450,7 @@ class AdaptiveDiscriminatorUpdate:
         history_add_size: int,
         history_mix_fraction: float,
         max_grad_norm: float,
-        discriminator: SceneDiscriminator,
+        discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
         optimizer: th.optim.Optimizer,
         loss: SceneDiscriminatorLoss,
         section: str = "Discriminator",
@@ -1312,8 +1509,14 @@ class AdaptiveDiscriminatorUpdate:
         )
         train_indices, heldout_indices = self._split_generated(valid)
         heldout_generated = flat_windows[heldout_indices]
+        heldout_near = None
+        if (getattr(self.discriminator, "factorized", False)
+                and len(heldout_generated) and self.expert.heldout_near_total):
+            heldout_near = heldout_generated[
+                nearest_ball_distance(heldout_generated) <= BALL_NEAR_DISTANCE
+            ]
 
-        evaluation = self._evaluate(heldout_generated)
+        evaluation = self._evaluate(heldout_generated, heldout_near)
         if self._has_updated:
             self._rollouts_since_update += 1
         scheduled = (
@@ -1334,6 +1537,7 @@ class AdaptiveDiscriminatorUpdate:
                 self.noise_std,
                 history=self.history,
                 mix_fraction=self.history_mix_fraction,
+                factorize=getattr(self.discriminator, "factorized", False),
             )
             sampler.set_epoch_callback(self._epoch_finished)
             metric_totals: dict[str, float | th.Tensor] = {}
@@ -1352,7 +1556,7 @@ class AdaptiveDiscriminatorUpdate:
                         metric_totals[key] = metric_totals.get(key, 0.0) + value
                     minibatch_count += 1
 
-                    evaluation = self._evaluate(heldout_generated)
+                    evaluation = self._evaluate(heldout_generated, heldout_near)
                     if evaluation["heldout_accuracy"] >= self.accuracy_target:
                         metrics["updated"] = 1.0
                         break
@@ -1440,11 +1644,15 @@ class AdaptiveDiscriminatorUpdate:
             th.nonzero(heldout_mask, as_tuple=False).squeeze(-1),
         )
 
-    def _evaluate(self, heldout_generated: th.Tensor) -> dict[str, float]:
+    def _evaluate(
+        self, heldout_generated: th.Tensor, heldout_near: th.Tensor | None = None,
+    ) -> dict[str, float]:
         n_gen = len(heldout_generated)
         n_exp = self.expert.heldout_total
+        factorize = getattr(self.discriminator, "factorized", False)
+        head_names = ("car", "ball") if factorize else ("unified",)
         if n_gen == 0 or n_exp == 0:
-            return {
+            metrics = {
                 "loss": 0.0,
                 "agent_score": 0.0,
                 "expert_score": 0.0,
@@ -1452,10 +1660,13 @@ class AdaptiveDiscriminatorUpdate:
                 "expert_accuracy": 0.0,
                 "heldout_accuracy": 0.0,
             }
+            if factorize:
+                metrics.update({f"{name}_heldout_accuracy": 0.0 for name in head_names})
+            return metrics
 
         n = min(n_gen, n_exp, self.heldout_size)
         gen_indices = th.randperm(n_gen, device=heldout_generated.device)[:n]
-        totals = th.zeros(5, device=heldout_generated.device)
+        totals = th.zeros(5, len(head_names), device=heldout_generated.device)
 
         with th.no_grad():
             self.discriminator.eval()
@@ -1471,26 +1682,59 @@ class AdaptiveDiscriminatorUpdate:
                 expert_logits = self.discriminator(
                     add_scene_noise(expert, self.noise_std)
                 )
-                totals[0] += F.softplus(-generated_logits).sum()
-                totals[0] += F.softplus(expert_logits).sum()
-                totals[1] += th.sigmoid(generated_logits).sum()
-                totals[2] += th.sigmoid(expert_logits).sum()
-                totals[3] += (generated_logits > 0.0).sum()
-                totals[4] += (expert_logits <= 0.0).sum()
+                if not factorize:
+                    generated_logits = generated_logits[:, None]
+                    expert_logits = expert_logits[:, None]
+                totals[0] += F.softplus(-generated_logits).sum(dim=0)
+                totals[0] += F.softplus(expert_logits).sum(dim=0)
+                totals[1] += th.sigmoid(generated_logits).sum(dim=0)
+                totals[2] += th.sigmoid(expert_logits).sum(dim=0)
+                totals[3] += (generated_logits > 0.0).sum(dim=0)
+                totals[4] += (expert_logits <= 0.0).sum(dim=0)
         self.discriminator.train()
-        loss, agent_score, expert_score, agent_correct, expert_correct = (
-            totals.tolist()
-        )
-        agent_accuracy = agent_correct / n
-        expert_accuracy = expert_correct / n
-        return {
-            "loss": loss / (2 * n),
-            "agent_score": agent_score / n,
-            "expert_score": expert_score / n,
-            "agent_accuracy": agent_accuracy,
-            "expert_accuracy": expert_accuracy,
-            "heldout_accuracy": (agent_accuracy + expert_accuracy) / 2,
+        loss, agent_score, expert_score, agent_correct, expert_correct = totals.tolist()
+        head_accuracies = [
+            (agent_correct[index] + expert_correct[index]) / (2 * n)
+            for index in range(len(head_names))
+        ]
+        metrics = {
+            "loss": sum(loss) / (2 * n * len(head_names)),
+            "agent_score": sum(agent_score) / (n * len(head_names)),
+            "expert_score": sum(expert_score) / (n * len(head_names)),
+            "agent_accuracy": sum(agent_correct) / (n * len(head_names)),
+            "expert_accuracy": sum(expert_correct) / (n * len(head_names)),
+            "heldout_accuracy": min(head_accuracies),
         }
+        if factorize:
+            metrics.update({
+                f"{name}_heldout_accuracy": head_accuracies[index]
+                for index, name in enumerate(head_names)
+            })
+            n_near = min(len(heldout_near), self.heldout_size) if heldout_near is not None else 0
+            if n_near:
+                near_indices = th.randperm(len(heldout_near), device=heldout_near.device)[:n_near]
+                near_correct = th.zeros(2, device=heldout_generated.device)
+                with th.no_grad():
+                    self.discriminator.eval()
+                    for start in range(0, n_near, self.microbatch_size):
+                        stop = min(start + self.microbatch_size, n_near)
+                        generated = heldout_near[near_indices[start:stop]]
+                        expert = self.expert.sample_near(
+                            stop - start, heldout_generated.device, heldout=True,
+                        )
+                        generated_logit = self.discriminator(
+                            add_scene_noise(generated, self.noise_std)
+                        )[:, 1]
+                        expert_logit = self.discriminator(
+                            add_scene_noise(expert, self.noise_std)
+                        )[:, 1]
+                        near_correct[0] += (generated_logit > 0).sum()
+                        near_correct[1] += (expert_logit <= 0).sum()
+                self.discriminator.train()
+                near_accuracy = near_correct.sum().item() / (2 * n_near)
+                metrics["ball_near_heldout_accuracy"] = near_accuracy
+                metrics["heldout_accuracy"] = min(metrics["heldout_accuracy"], near_accuracy)
+        return metrics
 
     def _epoch_finished(self) -> None:
         if self._progress_callback is not None:
@@ -1630,6 +1874,8 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
             "--gru must match the checkpoint architecture when resuming; "
             "start a new run to change policy/critic architecture"
         )
+    if args.factorize != config.get("factorize", False):
+        raise ValueError("--factorize must match the checkpoint discriminator when resuming")
     for name in (
         "frameskip", "trajectory_length", "policy_hidden", "critic_hidden",
         "discriminator_hidden", "frame_embedding", "temporal_hidden",
@@ -1703,6 +1949,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument(
         "--trajectory-length", type=int, default=8,
         help="frames in the short discriminator scene window",
+    )
+    parser.add_argument(
+        "--factorize", action=argparse.BooleanOptionalAction, default=False,
+        help="train separate car-motion and near-ball-control discriminators with proximity-gated ball reward",
     )
     parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,
@@ -1973,8 +2223,11 @@ def build_critic(env, args: argparse.Namespace) -> Critic:
     ).build(env).to(env.device)
 
 
-def build_discriminator(args: argparse.Namespace) -> SceneDiscriminator:
-    return SceneDiscriminator(
+def build_discriminator(
+    args: argparse.Namespace,
+) -> SceneDiscriminator | FactorizedSceneDiscriminator:
+    model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
+    return model(
         frame_embedding=args.frame_embedding,
         temporal_hidden=args.temporal_hidden,
         hidden_size=args.discriminator_hidden,
@@ -2171,6 +2424,14 @@ def main() -> None:
         ("Gameplay", "timeout_fraction", "timeout frac", ".3f"),
     ):
         logger.register_progress_metric(section, key, label, fmt)
+    if args.factorize:
+        for key, label in (
+            ("car_heldout_accuracy", "D car accuracy"),
+            ("ball_heldout_accuracy", "D ball accuracy"),
+            ("ball_near_heldout_accuracy", "D ball near accuracy"),
+            ("train_near_ball_fraction", "D near-ball fraction"),
+        ):
+            logger.register_progress_metric("Discriminator", key, label, ".3f")
     if value_scheduler is not None:
         logger.register_progress_metric(
             "Schedule", "entropy_coef", "entropy coef", ".4f"
