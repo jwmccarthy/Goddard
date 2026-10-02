@@ -64,7 +64,7 @@ def training_segments(expert: ExpertSceneDataset) -> list[th.Tensor]:
 
 
 def frame_ids(resets: TensorBatch) -> th.Tensor:
-    return (resets["ball_position"][:, 0] * (10_000 / POSITION_SCALE[0])).round().long()
+    return resets["frame_index"]
 
 
 class HardPositiveMiningTests(unittest.TestCase):
@@ -106,8 +106,8 @@ class HardPositiveMiningTests(unittest.TestCase):
             ordinary = uniform(mask)
             selected = sampler(mask)
             self.assertGreater(
-                (selected["ball_velocity"][:, 2] < 0).float().mean().item(),
-                (ordinary["ball_velocity"][:, 2] < 0).float().mean().item() + 0.15,
+                (expert.frames[frame_ids(selected), 5] < 0).float().mean().item(),
+                (expert.frames[frame_ids(ordinary), 5] < 0).float().mean().item() + 0.15,
             )
             self.assertTrue(th.isin(frame_ids(selected), expert.reset_indices).all())
             changed = frame_ids(selected) != frame_ids(ordinary)
@@ -139,8 +139,12 @@ class HardPositiveMiningTests(unittest.TestCase):
             mask = th.ones(4_096, dtype=th.bool)
             selected = sampler(mask)
             baseline = ordinary(mask)
-            near_selected = (selected["car_position"][:, 0, 0] < 500).float().mean().item()
-            near_baseline = (baseline["car_position"][:, 0, 0] < 500).float().mean().item()
+            near_selected = (
+                expert.frames[frame_ids(selected), BLUE_START] * POSITION_SCALE[0] < 500
+            ).float().mean().item()
+            near_baseline = (
+                expert.frames[frame_ids(baseline), BLUE_START] * POSITION_SCALE[0] < 500
+            ).float().mean().item()
             self.assertGreater(near_selected, near_baseline + 0.15)
             self.assertTrue(th.isin(frame_ids(selected), expert.reset_indices).all())
             self.assertGreater(miner.take_mined_fraction(), 0.4)

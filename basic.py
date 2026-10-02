@@ -10,7 +10,9 @@ import torch.nn as nn
 from torch.distributions import kl_divergence
 from torch.optim import Adam
 
-from carl.gymnasium import CARLTorchVectorEnv, REGULATION_TICKS
+from carl.gymnasium import (
+    CARLMatchReset, CARLResetState, CARLTorchVectorEnv, REGULATION_TICKS,
+)
 from jarl.collect import (
     CriticCapture,
     LogProbCapture,
@@ -51,7 +53,9 @@ from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
 from reward_spec import RewardSpec
-from replay_resets import load_demonstration_reset_dataset
+from replay_resets import (
+    ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
+)
 from training_checkpoint import TrainingCheckpointer
 from gaifo import (
     GAIFO_ARCHITECTURE,
@@ -258,19 +262,17 @@ class DiagnosticRewardSpec(RewardSpec):
 
 
 class SyntheticMatchResetProvider:
-    def __init__(self, provider) -> None:
+    def __init__(self, provider: ReplayResetProvider) -> None:
         self.provider = provider
 
-    def __call__(self, reset_mask: torch.Tensor):
-        sample = self.provider(reset_mask)
-        if sample is None:
+    def __call__(self, reset_mask: torch.Tensor) -> CARLResetState | None:
+        state = self.provider(reset_mask)
+        if state is None:
             return None
-        state = dict(sample)
-        indices = state["simulation_indices"]
         remaining = torch.randint(
             0,
             REGULATION_TICKS + 1,
-            (len(indices),),
+            (len(state.simulation_indices),),
             device=reset_mask.device,
         )
         elapsed = REGULATION_TICKS - remaining
@@ -278,13 +280,14 @@ class SyntheticMatchResetProvider:
         scores = torch.poisson(
             elapsed_minutes[:, None].expand(-1, 2)
         ).to(torch.int32)
-        state.update(
-            simulation_indices=indices,
-            blue_score=scores[:, 0].contiguous(),
-            orange_score=scores[:, 1].contiguous(),
-            episode_ticks=elapsed.to(torch.int32),
+        return replace(
+            state,
+            match=CARLMatchReset(
+                blue_score=scores[:, 0].contiguous(),
+                orange_score=scores[:, 1].contiguous(),
+                episode_ticks=elapsed.to(torch.int32),
+            ),
         )
-        return state
 
 
 class KLLimitedUpdate(Update):
@@ -999,7 +1002,7 @@ def main() -> None:
     run_dir = arguments.tensorboard_dir / run_id
     checkpoint_dir = arguments.checkpoint_dir / run_id
 
-    replay_dataset = load_demonstration_reset_dataset(
+    replay_frames, replay_internal = load_demonstration_reset_frames(
         arguments.replay_dataset,
         "cuda:0",
         arguments.frameskip,
@@ -1008,11 +1011,15 @@ def main() -> None:
         require_frame_skip_match=False,
     )
     reset_sampler = DatasetResetSampler(
-        replay_dataset,
+        reset_index_dataset(torch.arange(
+            len(replay_frames), device=replay_frames.device,
+        )),
         probability=arguments.replay_reset_probability,
         seed=arguments.seed,
     )
-    reset_sampler = SyntheticMatchResetProvider(reset_sampler)
+    reset_provider = SyntheticMatchResetProvider(
+        ReplayResetProvider(reset_sampler, replay_frames, replay_internal)
+    )
     environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=1,
@@ -1023,7 +1030,7 @@ def main() -> None:
         no_touch_timeout_seconds=arguments.no_touch_timeout,
         synchronize=False,
         reward_scale=arguments.reward_scale,
-        reset_state_provider=reset_sampler,
+        reset_state_provider=reset_provider,
         normalize=arguments.normalize,
         discrete_actions=True,
     )

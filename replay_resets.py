@@ -6,18 +6,14 @@ from pathlib import Path
 import numpy as np
 import torch as th
 
+from carl.gymnasium import CARLBall, CARLCars, CARLResetState
 from jarl.data import TensorBatch, TensorDataset
+from jarl.envs import DatasetResetSampler
 
-from physics_utils import forward_up_to_quat
 from replay_safety import infer_unsafe_start_mask, pre_goal_start_mask
 
 
-POSITION_SCALE = (4108.0, 6000.0, 2076.0)
 BALL_MAX_SPEED = 6000.0
-BALL_MAX_ANG_SPEED = 6.0
-CAR_MAX_SPEED = 2300.0
-CAR_MAX_ANG_SPEED = 5.5
-BOOST_MAX = 100.0
 
 
 # parse_replays.py's 1v1 layout: ball(9), two cars(2 * 21), pads(68),
@@ -25,6 +21,39 @@ BOOST_MAX = 100.0
 SCENE_SIZE = 51
 INTERNAL_START = 137
 INTERNAL_SIZE = 19
+
+
+def reset_index_dataset(indices: th.Tensor) -> TensorDataset:
+    """Sample eligible frame IDs without copying their scenes."""
+    return TensorDataset(TensorBatch({"frame_index": indices}))
+
+
+class ReplayResetProvider:
+    """Resolve sampled replay frames to normalized CARL reset requests."""
+
+    def __init__(
+        self,
+        sampler: DatasetResetSampler,
+        frames: th.Tensor,
+        internal_states: th.Tensor,
+    ) -> None:
+        self.sampler = sampler
+        self.frames = frames
+        self.internal_states = internal_states
+
+    def __call__(self, reset_mask: th.Tensor) -> CARLResetState | None:
+        sample = self.sampler(reset_mask)
+        if sample is None:
+            return None
+        indices = sample["frame_index"]
+        scenes = self.frames[indices]
+        return CARLResetState(
+            simulation_indices=sample["simulation_indices"],
+            ball=CARLBall.from_tensor(scenes[:, :9]),
+            cars=CARLCars.from_tensor(scenes[:, 9:SCENE_SIZE].view(-1, 2, 21), 2),
+            car_internal_state=self.internal_states[indices],
+            normalized=True,
+        )
 
 
 def _sampled_frame_skip(path: Path, fallback: int) -> int:
@@ -103,16 +132,17 @@ def _paired_opponent_internal(
     return internal
 
 
-def load_demonstration_reset_dataset(
+def load_demonstration_reset_frames(
     replay_dir: Path,
     device,
     frame_skip: int = 4,
     limit: int | None = None,
     seed: int = 0,
     require_frame_skip_match: bool = True,
-) -> TensorDataset:
+) -> tuple[th.Tensor, th.Tensor]:
     """Sample safe replay frames with both cars' available CARL control state.
 
+    Return normalized scenes and raw internal states on the requested device.
     Unpaired opponent POVs contain only ground/flip/double-jump/boosting flags;
     their unknown jump, flip, and boost timers remain zero. This can give an
     airborne, unspent opponent a fresh dodge window. CARL resets boost pads to
@@ -202,26 +232,9 @@ def load_demonstration_reset_dataset(
         selected = random.choice(len(states), size=limit, replace=False)
         states = states[selected]
     state = th.from_numpy(np.ascontiguousarray(states)).to(device)
-    ball = state[:, :9]
-    cars = state[:, 9:SCENE_SIZE].reshape(-1, 2, 21)
-    internal_state = th.stack((
-        state[:, SCENE_SIZE:SCENE_SIZE + INTERNAL_SIZE],
-        state[:, SCENE_SIZE + INTERNAL_SIZE:],
-    ), dim=1)
-    position_scale = th.tensor(POSITION_SCALE, device=device)
-    data = TensorBatch({
-        "ball_position": ball[:, :3] * position_scale,
-        "ball_velocity": ball[:, 3:6] * BALL_MAX_SPEED,
-        "ball_angular_velocity": ball[:, 6:9] * BALL_MAX_ANG_SPEED,
-        "car_position": cars[..., :3] * position_scale,
-        "car_rotation": forward_up_to_quat(cars[..., 9:12], cars[..., 12:15]),
-        "car_velocity": cars[..., 3:6] * CAR_MAX_SPEED,
-        "car_angular_velocity": cars[..., 6:9] * CAR_MAX_ANG_SPEED,
-        "car_demoed": cars[..., 17].bool(),
-        "car_boost": cars[..., 15] * BOOST_MAX,
-        "car_internal_state": internal_state,
-    })
-    return TensorDataset(data)
+    return state[:, :SCENE_SIZE], state[:, SCENE_SIZE:].view(-1, 2, INTERNAL_SIZE)
 
 
-__all__ = ["load_demonstration_reset_dataset"]
+__all__ = [
+    "ReplayResetProvider", "load_demonstration_reset_frames", "reset_index_dataset",
+]

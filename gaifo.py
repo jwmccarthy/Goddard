@@ -49,8 +49,9 @@ from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
-from physics_utils import forward_up_to_quat
-from replay_resets import _sampled_frame_skip
+from replay_resets import (
+    ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
+)
 
 
 SCENE_SIZE = 51
@@ -70,10 +71,7 @@ BALL_MAX_SPEED = 6000.0
 BALL_RADIUS = 91.25
 GOAL_Y = 5124.25
 GOAL_HEIGHT = 642.775
-BALL_MAX_ANG_SPEED = 6.0
 CAR_MAX_SPEED = 2300.0
-CAR_MAX_ANG_SPEED = 5.5
-BOOST_MAX = 100.0
 INTERNAL_BOOL_INDICES = (0, 2, 3, 4, 5, 7, 8, 9, 11, 17)
 BALL_NEAR_DISTANCE = 1_500.0
 BALL_GATE_RADIUS = 200.0
@@ -870,24 +868,8 @@ class ExpertSceneDataset:
         return windows
 
     def reset_dataset(self) -> TensorDataset:
-        frames = self.frames[self.reset_indices]
-        ball = frames[:, :BALL_SIZE]
-        cars = frames[:, BALL_SIZE:SCENE_SIZE].view(-1, N_CARS, CAR_SIZE)
-        position_scale = th.tensor(
-            POSITION_SCALE, dtype=self.frames.dtype, device=self.frames.device
-        )
-        return TensorDataset(TensorBatch({
-            "ball_position": ball[:, :3] * position_scale,
-            "ball_velocity": ball[:, 3:6] * BALL_MAX_SPEED,
-            "ball_angular_velocity": ball[:, 6:9] * BALL_MAX_ANG_SPEED,
-            "car_position": cars[..., :3] * position_scale,
-            "car_rotation": forward_up_to_quat(cars[..., 9:12], cars[..., 12:15]),
-            "car_velocity": cars[..., 3:6] * CAR_MAX_SPEED,
-            "car_angular_velocity": cars[..., 6:9] * CAR_MAX_ANG_SPEED,
-            "car_demoed": cars[..., 17].bool(),
-            "car_boost": cars[..., 15] * BOOST_MAX,
-            "car_internal_state": self.internal_states[self.reset_indices],
-        }))
+        """Sample eligible training frame IDs without copying expert scenes."""
+        return reset_index_dataset(self.reset_indices)
 
 
 class HistoricalReplayBuffer:
@@ -1132,14 +1114,10 @@ class ConfidentExpertResetTransform:
 
         selected = selected[accepted]
         best_starts = starts[accepted, best_candidate[accepted]]
-        # Training starts are indices into the same ordered frames as reset_indices.
-        indices = th.searchsorted(self.expert.reset_indices, best_starts)
-        mined = self.dataset[indices]
         self._mined += len(selected)
-        return sample.replace_fields(**{
-            key: value.index_copy(0, selected, mined[key])
-            for key, value in sample.items()
-        })
+        return sample.replace_fields(
+            frame_index=sample["frame_index"].index_copy(0, selected, best_starts),
+        )
 
     def take_mined_fraction(self) -> float:
         fraction = self._mined / self._total if self._total else 0.0
@@ -2414,11 +2392,15 @@ def main() -> None:
             expert, reset_dataset, discriminator, args.discriminator_microbatch,
         ) if args.hard_positive_mining else None
     )
-    env.reset_state_provider = DatasetResetSampler(
-        reset_dataset,
-        transforms=(reset_miner,) if reset_miner is not None else (),
-        probability=args.replay_reset_fraction,
-        seed=args.seed,
+    env.reset_state_provider = ReplayResetProvider(
+        DatasetResetSampler(
+            reset_dataset,
+            transforms=(reset_miner,) if reset_miner is not None else (),
+            probability=args.replay_reset_fraction,
+            seed=args.seed,
+        ),
+        expert.frames,
+        expert.internal_states,
     )
 
     history = HistoricalReplayBuffer(

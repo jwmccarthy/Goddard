@@ -25,7 +25,7 @@ wheels = [
 [[package]]
 name = "carl"
 version = "0.1.0"
-source = { git = "https://github.com/jwmccarthy/CARL.git?rev=6362f59f1b426ebb05df1345d270eaa37c53ddd9#6362f59f1b426ebb05df1345d270eaa37c53ddd9" }
+source = { git = "https://github.com/jwmccarthy/CARL.git?rev=7c328a8f0f78d4fda8c9e2ef4e81d7f494f0070f#7c328a8f0f78d4fda8c9e2ef4e81d7f494f0070f" }
 
 [package.optional-dependencies]
 gymnasium = [
@@ -271,7 +271,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "carl", extras = ["gymnasium"], git = "https://github.com/jwmccarthy/CARL.git?rev=6362f59f1b426ebb05df1345d270eaa37c53ddd9" },
+    { name = "carl", extras = ["gymnasium"], git = "https://github.com/jwmccarthy/CARL.git?rev=7c328a8f0f78d4fda8c9e2ef4e81d7f494f0070f" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "jarl", git = "https://github.com/jwmccarthy/JARL.git?rev=8759825fa8e063121378e14bb32002364dc4e2a3" },
     { name = "numba", specifier = ">=0.67.0" },

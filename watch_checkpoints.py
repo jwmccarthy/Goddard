@@ -25,7 +25,9 @@ from gaifo import (
     GAIFO_GRU_ARCHITECTURE,
     build_policy as build_gaifo_policy,
 )
-from replay_resets import load_demonstration_reset_dataset
+from replay_resets import (
+    ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -287,7 +289,7 @@ def simulate(
 ) -> None:
     env = None
     try:
-        reset_dataset = load_demonstration_reset_dataset(
+        replay_frames, replay_internal = load_demonstration_reset_frames(
             args.replay_dir,
             "cuda:0",
             args.frameskip,
@@ -296,7 +298,10 @@ def simulate(
             require_frame_skip_match=False,
         )
         reset_sampler = DatasetResetSampler(
-            reset_dataset, probability=1.0, seed=args.seed
+            reset_index_dataset(th.arange(
+                len(replay_frames), device=replay_frames.device,
+            )),
+            probability=1.0, seed=args.seed,
         )
         env = CARLTorchVectorEnv(
             n_sim=1,
@@ -307,7 +312,9 @@ def simulate(
             max_ticks=args.max_ticks,
             normalize=True,
             synchronize=True,
-            reset_state_provider=reset_sampler,
+            reset_state_provider=ReplayResetProvider(
+                reset_sampler, replay_frames, replay_internal,
+            ),
             discrete_actions=True,
         )
         blue, blue_signature = load_policy_checkpoint(
