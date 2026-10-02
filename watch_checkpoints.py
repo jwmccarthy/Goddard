@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch BASIC or GAIFO checkpoints play a 1v1 match in the browser."""
+"""Watch BASIC, GAIFO, or PULSE checkpoints play a 1v1 match in the browser."""
 
 import argparse
 import json
@@ -25,6 +25,10 @@ from gaifo import (
     GAIFO_GRU_ARCHITECTURE,
     build_policy as build_gaifo_policy,
 )
+from pulse import (
+    PULSE_ARCHITECTURE, FrozenPulseController, PulseLatentEnv,
+    build_policy as build_pulse_policy, file_sha256,
+)
 from replay_resets import (
     ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
 )
@@ -34,6 +38,8 @@ ROOT = Path(__file__).resolve().parent
 CAR_OFFSET = (13.8757, 0.0, 20.755)
 CHECKPOINT_PATTERNS = (
     "gaifo_*.pt",
+    "pulse_*.pt",
+    "self_play_*.pt",
     "training_latest.pt",
     "actor_critic_final.pt",
     "policy_*.pt",
@@ -44,6 +50,8 @@ CHECKPOINT_PATTERNS = (
 def checkpoint_kind(path: Path) -> str:
     if path.match("gaifo_*.pt"):
         return "gaifo"
+    if path.match("pulse_*.pt") or path.match("self_play_*.pt"):
+        return "pulse"
     return "basic"
 
 
@@ -102,7 +110,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no BASIC or GAIFO checkpoints found in {self.directory}"
+                f"no BASIC, GAIFO, or PULSE checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -156,7 +164,7 @@ class SpectatorState:
 
 def load_policy_checkpoint(
     path: Path,
-    env: CARLTorchVectorEnv,
+    env: CARLTorchVectorEnv | PulseLatentEnv,
     frameskip: int,
     hidden_size: int | None,
 ):
@@ -169,7 +177,20 @@ def load_policy_checkpoint(
         )
 
     kind = checkpoint_kind(path)
-    if kind == "gaifo":
+    if kind == "pulse":
+        if not isinstance(env, PulseLatentEnv):
+            raise ValueError("PULSE checkpoint requires a frozen latent controller")
+        if config.get("architecture", PULSE_ARCHITECTURE) != PULSE_ARCHITECTURE:
+            raise ValueError(f"unsupported PULSE architecture in {path}")
+        policy = build_pulse_policy(
+            env,
+            float(config["exploration_std"]),
+            int(config["feature_size"]),
+            list(config["policy_hidden"]),
+        )
+        policy_state = payload["policy"]
+        signature = ("pulse", payload["distill_sha256"], bool(config.get("bf16", False)))
+    elif kind == "gaifo":
         architecture = config.get("architecture")
         if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
@@ -203,9 +224,66 @@ def load_policy_checkpoint(
             )
 
     policy.load_state_dict(policy_state)
-    return policy.eval().requires_grad_(False), (
-        kind, hidden, architecture
+    if kind == "pulse":
+        return policy.eval().requires_grad_(False), signature
+    return policy.eval().requires_grad_(False), (kind, hidden, architecture)
+
+
+def resolve_pulse_artifact(
+    blue_path: Path,
+    orange_path: Path,
+    explicit: Path | None = None,
+) -> tuple[Path, bool]:
+    """Verify that both residual policies use the same frozen decoder."""
+    blue = th.load(blue_path, map_location="cpu", weights_only=True)
+    orange = th.load(orange_path, map_location="cpu", weights_only=True)
+    if blue["distill_sha256"] != orange["distill_sha256"]:
+        raise ValueError("selected PULSE policies use different distillation artifacts")
+    blue_bf16 = bool(blue["config"].get("bf16", False))
+    if blue_bf16 != bool(orange["config"].get("bf16", False)):
+        raise ValueError("selected PULSE policies use different decoder precision")
+    if explicit is not None:
+        if file_sha256(explicit) != blue["distill_sha256"]:
+            raise ValueError("explicit distillation artifact does not match checkpoints")
+        return explicit, blue_bf16
+
+    for path, payload in ((blue_path, blue), (orange_path, orange)):
+        artifact = path.parent / payload["pulse_artifact"]
+        if file_sha256(artifact) != payload["pulse_sha256"]:
+            raise ValueError("embedded frozen PULSE artifact failed verification")
+    return blue_path.parent / blue["pulse_artifact"], blue_bf16
+
+
+def load_match(
+    blue_path: Path,
+    orange_path: Path,
+    base: CARLTorchVectorEnv,
+    frameskip: int,
+    hidden_size: int | None,
+    distill_checkpoint: Path | None = None,
+):
+    kind = checkpoint_kind(blue_path)
+    if kind != checkpoint_kind(orange_path):
+        raise ValueError("selected policies use different trainer architectures")
+    env: CARLTorchVectorEnv | PulseLatentEnv = base
+    if kind == "pulse":
+        artifact, bf16 = resolve_pulse_artifact(
+            blue_path, orange_path, distill_checkpoint
+        )
+        controller = FrozenPulseController.load(
+            artifact, base.action_codec, base.device,
+            frame_skip=frameskip, bf16=bf16,
+        )
+        env = PulseLatentEnv(base, controller)
+    blue, blue_signature = load_policy_checkpoint(
+        blue_path, env, frameskip, hidden_size
     )
+    orange, orange_signature = load_policy_checkpoint(
+        orange_path, env, frameskip, hidden_size
+    )
+    if blue_signature != orange_signature:
+        raise ValueError("selected policies use different trainer architectures")
+    return env, blue, orange
 
 
 def raw_state(environment: CARLTorchVectorEnv) -> th.Tensor:
@@ -268,16 +346,17 @@ def render_frame(
     }
 
 
-def reset_observation(env: CARLTorchVectorEnv, kickoff: bool):
+def reset_observation(env: CARLTorchVectorEnv | PulseLatentEnv, kickoff: bool):
     """Reset via demonstration states or a plain random kickoff."""
     if not kickoff:
         return env.reset()
-    provider = env.reset_state_provider
-    env.reset_state_provider = None
+    base = env.env if isinstance(env, PulseLatentEnv) else env
+    provider = base.reset_state_provider
+    base.reset_state_provider = None
     try:
         return env.reset()
     finally:
-        env.reset_state_provider = provider
+        base.reset_state_provider = provider
 
 
 def simulate(
@@ -287,7 +366,7 @@ def simulate(
     orange_path: Path,
     args: argparse.Namespace,
 ) -> None:
-    env = None
+    base = None
     try:
         replay_frames, replay_internal = load_demonstration_reset_frames(
             args.replay_dir,
@@ -303,7 +382,7 @@ def simulate(
             )),
             probability=1.0, seed=args.seed,
         )
-        env = CARLTorchVectorEnv(
+        base = CARLTorchVectorEnv(
             n_sim=1,
             n_blue=1,
             n_orange=1,
@@ -317,14 +396,10 @@ def simulate(
             ),
             discrete_actions=True,
         )
-        blue, blue_signature = load_policy_checkpoint(
-            blue_path, env, args.frameskip, args.hidden_size
+        env, blue, orange = load_match(
+            blue_path, orange_path, base, args.frameskip, args.hidden_size,
+            args.distill_checkpoint,
         )
-        orange, orange_signature = load_policy_checkpoint(
-            orange_path, env, args.frameskip, args.hidden_size
-        )
-        if blue_signature != orange_signature:
-            raise ValueError("selected policies use different trainer architectures")
         observation = env.reset()
         blue_state = blue.initial_state(1)
         orange_state = orange.initial_state(1)
@@ -337,20 +412,15 @@ def simulate(
             pending = state.take_match()
             if pending is not None:
                 try:
-                    next_blue, next_blue_signature = load_policy_checkpoint(
-                        pending[0], env, args.frameskip, args.hidden_size
+                    next_env, next_blue, next_orange = load_match(
+                        pending[0], pending[1], base, args.frameskip,
+                        args.hidden_size, args.distill_checkpoint,
                     )
-                    next_orange, next_orange_signature = load_policy_checkpoint(
-                        pending[1], env, args.frameskip, args.hidden_size
-                    )
-                    if next_blue_signature != next_orange_signature:
-                        raise ValueError(
-                            "selected policies use different trainer architectures"
-                        )
                 except Exception as error:
                     state.publish({"error": f"{type(error).__name__}: {error}"})
                 else:
                     blue_path, orange_path = pending
+                    env = next_env
                     blue, orange = next_blue, next_orange
                     blue_state = blue.initial_state(1)
                     orange_state = orange.initial_state(1)
@@ -390,7 +460,7 @@ def simulate(
                 tick = 0
 
             state.publish(render_frame(
-                raw_state(env),
+                raw_state(base),
                 registry.directory,
                 blue_path,
                 orange_path,
@@ -408,8 +478,8 @@ def simulate(
     except Exception as error:
         state.publish({"error": f"{type(error).__name__}: {error}"})
     finally:
-        if env is not None:
-            env.close()
+        if base is not None:
+            base.close()
 
 
 def make_handler(
@@ -510,6 +580,10 @@ def make_handler(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "checkpoints")
+    parser.add_argument(
+        "--distill-checkpoint", type=Path,
+        help="optional original PULSE distillation artifact instead of the embedded copy",
+    )
     parser.add_argument(
         "--replay-dir", type=Path, default=ROOT / "parsed_replays/pro_1v1_fs4"
     )
