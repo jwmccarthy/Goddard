@@ -12,7 +12,10 @@ from unittest.mock import patch
 import numpy as np
 import torch as th
 
-from gaifo import load_resume_checkpoint, main
+from gaifo import (
+    BLUE_START, ConfidentExpertResetTransform, ORANGE_START, POSITION_SCALE,
+    load_resume_checkpoint, main,
+)
 
 
 @unittest.skipUnless(
@@ -25,10 +28,18 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             root = Path(directory)
             replays = root / "replays"
             replays.mkdir()
-            np.save(replays / "replay.npy", np.zeros((48, 161), np.float32))
+            rows = np.zeros((48, 161), np.float32)
+            rows[:, 2] = 91.25 / POSITION_SCALE[2]
+            for car, y in ((BLUE_START, -1_200), (ORANGE_START, 1_200)):
+                rows[:, car + 1] = y / POSITION_SCALE[1]
+                rows[:, car + 2] = 17 / POSITION_SCALE[2]
+                rows[:, car + 9] = 1
+                rows[:, car + 14] = 1
+            np.save(replays / "replay.npy", rows)
             flags = [
                 "gaifo.py", "--replay-dir", str(replays),
-                "--replay-reset-fraction", "0", "--n-sim", "2",
+                "--replay-reset-fraction", "1" if hard_positive_mining else "0",
+                "--n-sim", "2",
                 "--rollout", "8", "--trajectory-length", "8",
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
@@ -45,17 +56,25 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             if factorize:
                 flags.append("--factorize")
             if hard_positive_mining:
-                flags.append("--hard-positive-mining")
+                flags.extend(("--hard-positive-mining", "--no-touch-timeout", "0.3"))
             output = io.StringIO()
-            with patch.object(sys, "argv", flags), redirect_stdout(output):
+            ready_resets = []
+            original_reset = ConfidentExpertResetTransform.__call__
+
+            def record_reset(miner, sample, context):
+                ready_resets.append(miner.ready)
+                return original_reset(miner, sample, context)
+
+            with (patch.object(sys, "argv", flags), redirect_stdout(output),
+                  patch.object(ConfidentExpertResetTransform, "__call__", record_reset)):
                 main()
 
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)
-            return load_resume_checkpoint(max(checkpoints)), output.getvalue()
+            return load_resume_checkpoint(max(checkpoints)), output.getvalue(), ready_resets
 
     def test_short_window_training_and_terminal_metrics(self):
-        saved, output = self._short_window_training(False)
+        saved, output, _ = self._short_window_training(False)
         self.assertEqual(saved["step"], 64)
         self.assertFalse(saved["config"]["factorize"])
         self.assertNotIn("long_discriminator", saved)
@@ -65,7 +84,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         self.assertNotIn("long D", output)
 
     def test_factorized_short_window_training(self):
-        saved, output = self._short_window_training(True)
+        saved, output, _ = self._short_window_training(True)
         self.assertEqual(saved["step"], 64)
         self.assertTrue(saved["config"]["factorize"])
         self.assertTrue(any(key.startswith("car_encoder.")
@@ -78,11 +97,15 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
     def test_hard_positive_mining_in_unified_and_factorized_modes(self):
         for factorize in (False, True):
             with self.subTest(factorize=factorize):
-                saved, output = self._short_window_training(factorize, hard_positive_mining=True)
+                saved, output, resets = self._short_window_training(
+                    factorize, hard_positive_mining=True,
+                )
                 self.assertEqual(saved["step"], 64)
                 self.assertTrue(saved["config"]["hard_positive_mining"])
                 self.assertEqual(saved["config"]["factorize"], factorize)
-                self.assertIn("D max expert weight", output)
+                self.assertIn(False, resets)
+                self.assertIn(True, resets)
+                self.assertIn("D mined reset frac", output)
 
 
 if __name__ == "__main__":

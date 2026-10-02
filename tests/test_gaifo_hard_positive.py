@@ -1,55 +1,70 @@
-"""Confidence-weighted expert examples for both GAIFO discriminator modes."""
+"""Discriminator-guided expert replay resets for both GAIFO modes."""
 
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import torch as th
-import torch.nn.functional as F
 
 from gaifo import (
+    AdaptiveDiscriminatorUpdate,
     BLUE_START,
+    ConfidentExpertResetTransform,
+    ExpertSceneDataset,
+    ORANGE_START,
+    POSITION_SCALE,
+    SCENE_SIZE,
     SceneDiscriminatorLoss,
-    confident_expert_weights,
     parse_args,
-    train_discriminator_minibatch,
 )
 from jarl.data import TensorBatch
+from jarl.envs import DatasetResetSampler
 
 
 class ScoreDiscriminator(th.nn.Module):
     def __init__(self):
         super().__init__()
-        self.scale = th.nn.Parameter(th.tensor(1.0))
+        self.scale = th.nn.Parameter(th.tensor(10.0))
+        self.grad_modes = []
 
     def forward(self, windows: th.Tensor) -> th.Tensor:
-        return self.scale * windows[:, -1, 3]
+        self.grad_modes.append(th.is_grad_enabled())
+        return self.scale * windows[:, -1, 5]
 
 
-class ScoreFactorizedDiscriminator(th.nn.Module):
+class ScoreFactorizedDiscriminator(ScoreDiscriminator):
     factorized = True
 
-    def __init__(self):
-        super().__init__()
-        self.car_scale = th.nn.Parameter(th.tensor(1.0))
-        self.ball_scale = th.nn.Parameter(th.tensor(1.0))
-
     def forward(self, windows: th.Tensor) -> th.Tensor:
-        return th.stack((
-            self.car_scale * windows[:, -1, BLUE_START + 15],
-            self.ball_scale * windows[:, -1, 3],
+        self.grad_modes.append(th.is_grad_enabled())
+        return self.scale * th.stack((
+            windows[:, -1, BLUE_START + 5], windows[:, -1, 5],
         ), dim=-1)
 
 
-def example_batch() -> TensorBatch:
-    windows = th.zeros(8, 2, 51)
-    windows[:, -1, 3] = th.tensor([0.7, -0.7, 1.5, -1.5, -3., -0.5, 0.6, -2.])
-    windows[:, -1, BLUE_START + 15] = th.tensor([1., -1., 2., -2., -1., -3., 0.6, 1.])
-    windows[[1, 3, 5, 7], :, BLUE_START] = 3_000 / 4_108
-    return TensorBatch({
-        "window": windows,
-        "is_agent": th.tensor([1., 1., 1., 1., 0., 0., 0., 0.]),
-    })
+def make_expert(folder: Path, *, heldout_size: int = 8) -> ExpertSceneDataset:
+    for segment in range(3):
+        rows = np.zeros((32, 161), dtype=np.float32)
+        rows[:, 0] = (32 * segment + np.arange(32)) / 10_000
+        rows[:, 2] = 91.25 / POSITION_SCALE[2]
+        for car in (BLUE_START, ORANGE_START):
+            rows[:, car + 2] = 17 / POSITION_SCALE[2]
+            rows[:, car + 9] = 1
+            rows[:, car + 14] = 1
+        np.save(folder / f"segment{segment}.npy", rows)
+    return ExpertSceneDataset(folder, trajectory_length=8, heldout_size=heldout_size)
+
+
+def training_segments(expert: ExpertSceneDataset) -> list[th.Tensor]:
+    return [indices for indices in expert.segment_frame_indices
+            if (expert.reset_indices == indices[0]).any()]
+
+
+def frame_ids(resets: TensorBatch) -> th.Tensor:
+    return (resets["ball_position"][:, 0] * (10_000 / POSITION_SCALE[0])).round().long()
 
 
 class HardPositiveMiningTests(unittest.TestCase):
@@ -64,64 +79,120 @@ class HardPositiveMiningTests(unittest.TestCase):
                     parsed, _ = parse_args()
                 self.assertIs(parsed.hard_positive_mining, expected)
 
-    def test_only_confident_expert_examples_gain_weight_without_weight_gradients(self):
-        logits = th.tensor([-8., -2., 0., 2.], requires_grad=True)
-        weights = confident_expert_weights(logits)
-        self.assertFalse(weights.requires_grad)
-        self.assertGreater(weights[0], weights[1])
-        self.assertGreater(weights[1], weights[2])
-        th.testing.assert_close(weights[2:], th.ones(2))
-        self.assertLessEqual(weights.max().item(), 3.0)
+    def test_unified_resets_favor_confident_training_window_starts(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = make_expert(Path(directory))
+            training = training_segments(expert)
+            self.assertEqual(len(training), 2)
+            expert.frames[training[0], 5] = -0.9
+            expert.frames[training[1], 5] = 0.9
+            # More confident held-out scenes must never become reset candidates.
+            expert.frames[expert.heldout_window_starts, 5] = -0.99
+            dataset = expert.reset_dataset()
+            discriminator = ScoreDiscriminator()
+            miner = ConfidentExpertResetTransform(expert, dataset, discriminator, 128)
+            sampler = DatasetResetSampler(dataset, transforms=(miner,), seed=11)
+            uniform = DatasetResetSampler(dataset, seed=11)
+            mask = th.ones(4_096, dtype=th.bool)
 
-        batch = example_batch()
-        discriminator = ScoreDiscriminator()
-        logits = discriminator(batch["window"])
-        expert_weights = confident_expert_weights(logits[4:])
-        expert_weights /= expert_weights.mean()
-        self.assertGreater(expert_weights[0], expert_weights[2])
-        th.testing.assert_close(expert_weights.mean(), th.tensor(1.0))
-        expected = 0.5 * (
-            F.binary_cross_entropy_with_logits(logits[:4], batch["is_agent"][:4])
-            + (F.binary_cross_entropy_with_logits(
-                logits[4:], batch["is_agent"][4:], reduction="none",
-            ) * expert_weights).mean()
-        )
-        mined = SceneDiscriminatorLoss(discriminator, hard_positive_mining=True)(batch)
-        ordinary = SceneDiscriminatorLoss(discriminator)(batch)
-        th.testing.assert_close(mined.loss, expected)
-        self.assertLess(mined.loss.item(), ordinary.loss.item())
+            before = sampler(mask)
+            ordinary = uniform(mask)
+            for key in before:
+                th.testing.assert_close(before[key], ordinary[key])
+            self.assertEqual(miner.take_mined_fraction(), 0)
+            self.assertEqual(discriminator.grad_modes, [])
 
-    def test_mining_is_stable_across_microbatch_sizes_in_both_modes(self):
-        batch = example_batch()
-        for discriminator_type in (ScoreDiscriminator, ScoreFactorizedDiscriminator):
-            with self.subTest(mode=discriminator_type.__name__):
-                reference = discriminator_type()
-                expected = SceneDiscriminatorLoss(reference, hard_positive_mining=True)(batch)
-                if getattr(reference, "factorized", False):
-                    expert_logits = reference(batch["window"])[4:]
-                    car_favorite = confident_expert_weights(expert_logits[:, 0]).argmax()
-                    ball_favorite = confident_expert_weights(expert_logits[:, 1]).argmax()
-                    self.assertNotEqual(car_favorite.item(), ball_favorite.item())
-                    ordinary = SceneDiscriminatorLoss(reference)(batch)
-                    self.assertNotAlmostEqual(expected.metrics["ball_loss"].item(),
-                                              ordinary.metrics["ball_loss"].item(), places=4)
+            miner.ready = True
+            ordinary = uniform(mask)
+            selected = sampler(mask)
+            self.assertGreater(
+                (selected["ball_velocity"][:, 2] < 0).float().mean().item(),
+                (ordinary["ball_velocity"][:, 2] < 0).float().mean().item() + 0.15,
+            )
+            self.assertTrue(th.isin(frame_ids(selected), expert.reset_indices).all())
+            changed = frame_ids(selected) != frame_ids(ordinary)
+            self.assertTrue(th.isin(frame_ids(selected)[changed], expert.train_window_starts).all())
+            self.assertGreater(miner.take_mined_fraction(), 0.4)
+            self.assertTrue(discriminator.training)
+            self.assertIsNone(discriminator.scale.grad)
+            self.assertFalse(any(discriminator.grad_modes))
 
-                outcomes = []
-                for size in (4, 1):
-                    discriminator = discriminator_type()
-                    optimizer = th.optim.SGD(discriminator.parameters(), lr=0)
-                    metrics = train_discriminator_minibatch(
-                        batch, discriminator, optimizer,
-                        SceneDiscriminatorLoss(discriminator, hard_positive_mining=True),
-                        microbatch_size=size, max_grad_norm=100,
-                    )
-                    outcomes.append((metrics, [parameter.grad.clone()
-                                               for parameter in discriminator.parameters()]))
-                    th.testing.assert_close(metrics["loss"], expected.loss)
-                    self.assertGreater(metrics["expert_mining_max_weight"].item(), 1.0)
-                for first, second in zip(outcomes[0][1], outcomes[1][1]):
-                    th.testing.assert_close(first, second)
-                th.testing.assert_close(outcomes[0][0]["loss"], outcomes[1][0]["loss"])
+    def test_factorized_resets_prioritize_near_ball_control(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = make_expert(Path(directory))
+            near, far = training_segments(expert)
+            expert.frames[near, 5] = -0.4
+            expert.frames[far, 5] = -0.9
+            for car in (BLUE_START, ORANGE_START):
+                expert.frames[far, car] = 3_000 / POSITION_SCALE[0]
+                expert.frames[:, car + 5] = 0  # The car head is equally undecided.
+            dataset = expert.reset_dataset()
+            discriminator = ScoreFactorizedDiscriminator()
+            miner = ConfidentExpertResetTransform(expert, dataset, discriminator, 128)
+            scores = miner._score(th.stack((near[0], far[0])))
+            self.assertGreater(scores[0].item(), 0.7)
+            self.assertAlmostEqual(scores[1].item(), 0.5)
+
+            miner.ready = True
+            sampler = DatasetResetSampler(dataset, transforms=(miner,), seed=7)
+            ordinary = DatasetResetSampler(dataset, seed=7)
+            mask = th.ones(4_096, dtype=th.bool)
+            selected = sampler(mask)
+            baseline = ordinary(mask)
+            near_selected = (selected["car_position"][:, 0, 0] < 500).float().mean().item()
+            near_baseline = (baseline["car_position"][:, 0, 0] < 500).float().mean().item()
+            self.assertGreater(near_selected, near_baseline + 0.15)
+            self.assertTrue(th.isin(frame_ids(selected), expert.reset_indices).all())
+            self.assertGreater(miner.take_mined_fraction(), 0.4)
+            self.assertFalse(any(discriminator.grad_modes))
+
+    def test_no_confident_candidates_preserves_uniform_reset_sampling(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = make_expert(Path(directory))
+            expert.frames[:, 5] = 0.9
+            dataset = expert.reset_dataset()
+            miner = ConfidentExpertResetTransform(expert, dataset, ScoreDiscriminator(), 128)
+            miner.ready = True
+            sampler = DatasetResetSampler(dataset, transforms=(miner,), seed=13)
+            ordinary = DatasetResetSampler(dataset, seed=13)
+            mask = th.ones(128, dtype=th.bool)
+            selected, baseline = sampler(mask), ordinary(mask)
+            for key in selected:
+                th.testing.assert_close(selected[key], baseline[key])
+            self.assertEqual(miner.take_mined_fraction(), 0)
+
+    def test_discriminator_update_enables_mining_without_weighting_its_loss(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = make_expert(Path(directory), heldout_size=0)
+            expert.frames[:, 5] = -0.9
+            dataset = expert.reset_dataset()
+            discriminator = ScoreDiscriminator()
+            miner = ConfidentExpertResetTransform(expert, dataset, discriminator, 16)
+            update = AdaptiveDiscriminatorUpdate(
+                expert=expert, history=None, batch_size=2, epochs=1,
+                noise_std=0, heldout_size=0, accuracy_target=1,
+                history_add_size=0, history_mix_fraction=0, max_grad_norm=1,
+                discriminator=discriminator,
+                optimizer=th.optim.SGD(discriminator.parameters(), lr=0),
+                loss=SceneDiscriminatorLoss(discriminator),
+                microbatch_size=2, reset_miner=miner,
+            )
+            windows = th.zeros(1, 2, 8, SCENE_SIZE)
+            windows[..., 5] = 0.9
+            rollout = TensorBatch({
+                "scene_window": windows,
+                "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+            })
+            _, first = update.run(rollout)
+            self.assertTrue(miner.ready)
+            self.assertEqual(first["Discriminator"]["reset_mined_fraction"], 0)
+            self.assertEqual(first["Discriminator"]["minibatches"], 1)
+
+            sampler = DatasetResetSampler(dataset, transforms=(miner,), seed=0)
+            sampler(th.ones(128, dtype=th.bool))
+            _, second = update.run(rollout)
+            self.assertGreater(second["Discriminator"]["reset_mined_fraction"], 0.3)
+            self.assertNotIn("train_expert_mining_max_weight", second["Discriminator"])
 
 
 if __name__ == "__main__":
