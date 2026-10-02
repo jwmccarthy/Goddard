@@ -135,6 +135,116 @@ class PulseGpuSmokeTests(unittest.TestCase):
             self.assertEqual(payload["config"]["architecture"], "pulse-latent-mlp-v1")
             self.assertTrue((saved.parent / payload["pulse_artifact"]).is_file())
 
+            with (
+                patch.object(sys, "argv", [
+                    "pulse.py", "--resume-checkpoint", str(saved),
+                    "--timesteps", "16", "--run-name", "standard-resume",
+                ]),
+                redirect_stdout(io.StringIO()),
+            ):
+                pulse_main()
+            standard_resume = pulse_dir / "standard-resume"
+            restored = th.load(
+                standard_resume / f"pulse_{payload['step']:012d}.pt",
+                map_location="cpu", weights_only=True,
+            )
+            self.assertEqual(restored["clock"]["env_steps"], payload["step"])
+            for name, value in payload["policy"].items():
+                th.testing.assert_close(value, restored["policy"][name])
+            self.assertNotIn("discriminator", restored)
+            self.assertGreaterEqual(
+                th.load(max(standard_resume.glob("pulse_*.pt")),
+                        map_location="cpu", weights_only=True)["step"], 16,
+            )
+
+            gaifo_dir = root / "pulse_gaifo"
+            with (
+                patch.object(sys, "argv", [
+                    "pulse.py", "--replay-dir", str(replay_dir),
+                    "--distill-checkpoint", str(distill_path),
+                    "--gaifo-imitation", "--n-sim", "2", "--rollout", "2",
+                    "--ppo-batch", "4", "--feature-size", "8",
+                    "--policy-hidden", "8", "--critic-hidden", "8",
+                    "--trajectory-length", "2", "--discriminator-batch", "2",
+                    "--discriminator-microbatch", "2",
+                    "--discriminator-heldout-size", "4",
+                    "--discriminator-hidden", "8", "--frame-embedding", "8",
+                    "--temporal-hidden", "8", "--history-capacity", "8",
+                    "--history-add-size", "4", "--replay-reset-fraction", "1",
+                    "--reset-state-limit", "16", "--no-bf16", "--timesteps", "8",
+                    "--checkpoint-interval", "8", "--log-dir", str(root / "logs"),
+                    "--checkpoint-dir", str(gaifo_dir),
+                ]),
+                redirect_stdout(io.StringIO()),
+            ):
+                pulse_main()
+            gaifo_saved = max(gaifo_dir.rglob("pulse_*.pt"))
+            gaifo_payload = th.load(gaifo_saved, map_location="cpu", weights_only=True)
+            self.assertGreaterEqual(gaifo_payload["step"], 8)
+            self.assertTrue(gaifo_payload["config"]["gaifo_imitation"])
+            self.assertIn("gaifo_history", gaifo_payload)
+            self.assertIn("discriminator_optimizer", gaifo_payload)
+            self.assertTrue(gaifo_payload["gaifo_update"]["has_updated"])
+
+            with (
+                patch.object(sys, "argv", [
+                    "pulse.py", "--resume-checkpoint", str(gaifo_saved),
+                    "--timesteps", "16", "--run-name", "gaifo-resume",
+                ]),
+                redirect_stdout(io.StringIO()),
+            ):
+                pulse_main()
+            gaifo_resume = gaifo_dir / "gaifo-resume"
+            gaifo_restored = th.load(
+                gaifo_resume / f"pulse_{gaifo_payload['step']:012d}.pt",
+                map_location="cpu", weights_only=True,
+            )
+            self.assertEqual(gaifo_restored["clock"]["env_steps"], gaifo_payload["step"])
+            self.assertEqual(
+                gaifo_restored["distill_sha256"], gaifo_payload["distill_sha256"]
+            )
+            for name, value in gaifo_payload["discriminator"].items():
+                th.testing.assert_close(value, gaifo_restored["discriminator"][name])
+            self.assertEqual(
+                gaifo_restored["gaifo_history"]["size"],
+                gaifo_payload["gaifo_history"]["size"],
+            )
+            gaifo_latest = max(gaifo_resume.glob("pulse_*.pt"))
+            self.assertGreaterEqual(
+                th.load(gaifo_latest, map_location="cpu", weights_only=True)["step"], 16
+            )
+
+            advanced_dir = root / "pulse_gaifo_advanced"
+            with (
+                patch.object(sys, "argv", [
+                    "pulse.py", "--replay-dir", str(replay_dir),
+                    "--distill-checkpoint", str(distill_path),
+                    "--gaifo-imitation", "--factorize", "--recency-replay",
+                    "--exp-log-odds-reward", "--n-sim", "2", "--rollout", "2",
+                    "--ppo-batch", "4", "--feature-size", "8",
+                    "--policy-hidden", "8", "--critic-hidden", "8",
+                    "--trajectory-length", "2", "--discriminator-batch", "2",
+                    "--discriminator-microbatch", "2",
+                    "--discriminator-heldout-size", "4",
+                    "--discriminator-hidden", "8", "--frame-embedding", "8",
+                    "--temporal-hidden", "8", "--history-capacity", "8",
+                    "--history-add-size", "4", "--replay-reset-fraction", "1",
+                    "--reset-state-limit", "16", "--no-bf16", "--timesteps", "8",
+                    "--checkpoint-interval", "8", "--log-dir", str(root / "logs"),
+                    "--checkpoint-dir", str(advanced_dir),
+                ]),
+                redirect_stdout(io.StringIO()),
+            ):
+                pulse_main()
+            advanced = th.load(
+                max(advanced_dir.rglob("pulse_*.pt")), map_location="cpu",
+                weights_only=True,
+            )
+            self.assertTrue(advanced["config"]["factorize"])
+            self.assertTrue(advanced["config"]["exp_log_odds_reward"])
+            self.assertEqual(advanced["gaifo_history"]["type"], "recency")
+            self.assertIn("ball_encoder.0.weight", advanced["discriminator"])
+
             frames, internal = load_demonstration_reset_frames(
                 replay_dir, "cuda:0", limit=16,
             )
@@ -159,6 +269,8 @@ class PulseGpuSmokeTests(unittest.TestCase):
                 ))
                 observation, _, _, _, _ = viewer_env.step(latent)
                 self.assertEqual(observation.shape, scene.shape)
+                mixed, _, _ = load_match(gaifo_saved, gaifo_latest, base, 4, None)
+                self.assertEqual(mixed.reset().shape, scene.shape)
             finally:
                 base.close()
 

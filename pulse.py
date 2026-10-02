@@ -1,13 +1,17 @@
 """Train a PULSE latent residual policy against itself in CARL 1v1 matches."""
 
 import argparse
+import copy
 import hashlib
 import math
 
+from collections import OrderedDict
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 import torch as th
 import torch.nn as nn
 
@@ -23,6 +27,7 @@ from jarl.collect import (
     SnapshotPool,
 )
 from jarl.collect.capture import CaptureBase, CaptureContext
+from jarl.data import TensorBatch
 from jarl.data.records import Evaluation, PolicyOutput
 from jarl.learn import Algorithm, OptimizerStep, PPOConfig, PPOLoss, Update
 from jarl.log.logger import Logger
@@ -31,10 +36,10 @@ from jarl.modules import MLP, orthogonal_init
 from jarl.modules.encoder import LinearEncoder
 from jarl.modules.operator import Critic
 from jarl.modules.policy import DiagonalGaussianPolicy
-from jarl.runtime import OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
+from jarl.runtime import Clock, OnPolicySchedule, ScheduledValue, Trainer, ValueScheduler
 from jarl.sample import RolloutMinibatches
 from jarl.store.rollout import RolloutBuffer
-from jarl.transform import GAE
+from jarl.transform import GAE, PrepareContext
 
 from distill import (
     ACTION_FORMAT,
@@ -43,6 +48,19 @@ from distill import (
     GOAL_STATE_SIZE,
     factor_actions,
     masked_logits,
+)
+from gaifo import (
+    AdaptiveDiscriminatorUpdate,
+    ExpertSceneDataset,
+    FactorizedSceneDiscriminator,
+    HistoricalReplayBuffer,
+    RecencyReplayBuffer,
+    SCENE_SIZE,
+    SceneDiscriminator,
+    SceneDiscriminatorLoss,
+    SceneDiscriminatorReward,
+    SceneWindowCapture,
+    SelectPPOFields,
 )
 from pulse_reward import PulseReward
 from replay_resets import (
@@ -276,6 +294,148 @@ class CriticValueCapture(CaptureBase):
         }
 
 
+class PulseGAIFOReward:
+    """Add GAIFO's scene-window score without replacing PULSE's gameplay reward."""
+
+    def __init__(
+        self,
+        discriminator: nn.Module,
+        trajectory_length: int,
+        noise_std: float,
+        microbatch_size: int,
+        max_magnitude: float,
+        weight: float,
+        exp_log_odds_reward: bool = False,
+    ) -> None:
+        self.score = SceneDiscriminatorReward(
+            discriminator,
+            noise_std=noise_std,
+            trajectory_length=trajectory_length,
+            goal_reward_weight=0.0,
+            batch_size=microbatch_size,
+            max_magnitude=max_magnitude,
+            exp_log_odds_reward=exp_log_odds_reward,
+        )
+        self.weight = weight
+        self.last_mean: float | None = None
+
+    def __call__(self, batch: TensorBatch, context: PrepareContext) -> TensorBatch:
+        scored = self.score(batch, context)
+        imitation = scored["imitation_reward"] * self.weight
+        learner = batch["learner_mask"]
+        self.last_mean = float(
+            (imitation * learner).sum().div(learner.sum().clamp_min(1)).item()
+        )
+        components = {
+            name: scored[name] * self.weight
+            for name in ("car_imitation_reward", "ball_imitation_reward")
+            if name in scored
+        }
+        return scored.replace_fields(
+            imitation_reward=imitation,
+            training_reward=batch["reward"] + imitation,
+            learner_mask=batch["learner_mask"],
+            **components,
+        )
+
+
+def snapshot_pool_state(pool: SnapshotPool) -> dict:
+    return {
+        "snapshots": [
+            (snapshot_id, pool._archive[snapshot_id][0], snapshot.state_dict())
+            for snapshot_id, snapshot in pool._snapshots.items()
+        ],
+        "next_id": pool._next_id,
+        "last_snapshot": pool._last_snapshot,
+        "rng_state": pool._random.getstate(),
+    }
+
+
+def restore_snapshot_pool(pool: SnapshotPool, policy: nn.Module, state: dict) -> None:
+    if (
+        not state["snapshots"]
+        or len(state["snapshots"]) > pool.max_size
+        or not any(snapshot_id == 0 for snapshot_id, _, _ in state["snapshots"])
+    ):
+        raise ValueError("invalid PULSE self-play snapshot pool")
+    pool._snapshots = OrderedDict()
+    pool._archive = {}
+    pool._active.clear()
+    for snapshot_id, step, weights in state["snapshots"]:
+        snapshot = copy.deepcopy(policy).to("cpu").eval().requires_grad_(False)
+        snapshot.load_state_dict(weights)
+        pool._snapshots[snapshot_id] = snapshot
+        pool._archive[snapshot_id] = (step, None)
+    pool._next_id = state["next_id"]
+    pool._last_snapshot = state["last_snapshot"]
+    pool._random.setstate(state["rng_state"])
+
+
+def gaifo_history_state(history: HistoricalReplayBuffer | RecencyReplayBuffer) -> dict:
+    if isinstance(history, RecencyReplayBuffer):
+        return {
+            "type": "recency",
+            "recent": gaifo_history_state(history.recent),
+            "reservoir": (
+                None if history.reservoir is None
+                else history.reservoir[:history.reservoir_size].detach().to("cpu", copy=True)
+            ),
+            "reservoir_size": history.reservoir_size,
+            "seen": history.seen,
+            "rng_state": history.rng.get_state(),
+        }
+    return {
+        "type": "fifo",
+        "buffer": (
+            None if history.buffer is None
+            else history.buffer[:history.size].detach().to("cpu", copy=True)
+        ),
+        "size": history.size,
+        "start": history.start,
+        "rng_state": history.rng.get_state(),
+    }
+
+
+def restore_gaifo_history(
+    history: HistoricalReplayBuffer | RecencyReplayBuffer, state: dict,
+) -> None:
+    if isinstance(history, RecencyReplayBuffer):
+        if state["type"] != "recency":
+            raise ValueError("GAIFO history type does not match checkpoint")
+        restore_gaifo_history(history.recent, state["recent"])
+        reservoir = state["reservoir"]
+        if reservoir is None and state["reservoir_size"]:
+            raise ValueError("GAIFO reservoir checkpoint is incomplete")
+        if reservoir is not None:
+            if len(reservoir) != state["reservoir_size"] or len(reservoir) > history.reservoir_capacity:
+                raise ValueError("GAIFO reservoir does not fit configured capacity")
+            history.reservoir = th.empty(
+                history.reservoir_capacity, history.trajectory_length, SCENE_SIZE,
+                device=history.device, dtype=reservoir.dtype,
+            )
+            history.reservoir[:len(reservoir)] = reservoir.to(history.device)
+        history.reservoir_size = state["reservoir_size"]
+        history.seen = state["seen"]
+        history.rng.set_state(state["rng_state"])
+        return
+    if state["type"] != "fifo":
+        raise ValueError("GAIFO history type does not match checkpoint")
+    stored = state["buffer"]
+    if stored is None and state["size"]:
+        raise ValueError("GAIFO history checkpoint is incomplete")
+    if stored is not None:
+        if len(stored) != state["size"] or len(stored) > history.capacity:
+            raise ValueError("GAIFO history does not fit configured capacity")
+        history.buffer = th.empty(
+            history.capacity, history.trajectory_length, SCENE_SIZE,
+            device=history.device, dtype=stored.dtype,
+        )
+        history.buffer[:len(stored)] = stored.to(history.device)
+    history.size = state["size"]
+    history.start = state["start"]
+    history.rng.set_state(state["rng_state"])
+
+
 class PulseCheckpoints:
     def __init__(
         self,
@@ -288,7 +448,17 @@ class PulseCheckpoints:
         buffer: RolloutBuffer,
         controller: FrozenPulseController,
         args: argparse.Namespace,
+        *,
+        discriminator: nn.Module | None = None,
+        discriminator_optimizer: th.optim.Optimizer | None = None,
+        discriminator_update: AdaptiveDiscriminatorUpdate | None = None,
+        pool: SnapshotPool | None = None,
+        matchmaker: SelfPlayMatchmaker | None = None,
+        reset_sampler: DatasetResetSampler | None = None,
+        resume: dict | None = None,
     ) -> None:
+        if (discriminator is None) != (discriminator_optimizer is None):
+            raise ValueError("GAIFO discriminator and optimizer must be provided together")
         self.directory = directory
         self.interval = interval
         self.keep = keep
@@ -298,12 +468,22 @@ class PulseCheckpoints:
         self.buffer = buffer
         self.controller = controller
         self.args = args
+        self.discriminator = discriminator
+        self.discriminator_optimizer = discriminator_optimizer
+        self.discriminator_update = discriminator_update
+        self.pool = pool
+        self.matchmaker = matchmaker
+        self.reset_sampler = reset_sampler
+        self.clock: Clock | None = None
         self.step = 0
         self.next_step = interval
         directory.mkdir(parents=True, exist_ok=True)
         for path in directory.glob("pulse_*.pt.tmp"):
             path.unlink()
-        self.distill_sha256 = file_sha256(args.distill_checkpoint)
+        self.distill_sha256 = (
+            resume["distill_sha256"] if resume is not None
+            else file_sha256(args.distill_checkpoint)
+        )
         source = th.load(args.distill_checkpoint, map_location="cpu", weights_only=True)
         artifact = directory / "frozen_pulse.pt"
         temporary = artifact.with_suffix(".pt.tmp")
@@ -343,6 +523,34 @@ class PulseCheckpoints:
                 },
             },
         }
+        if self.clock is not None:
+            payload["clock"] = asdict(self.clock)
+        if self.pool is not None:
+            payload["snapshot_pool"] = snapshot_pool_state(self.pool)
+        if self.matchmaker is not None:
+            payload["matchmaker_rng_state"] = self.matchmaker._generator.get_state()
+        if self.reset_sampler is not None:
+            payload["reset_sampler_rng_state"] = self.reset_sampler._generator.get_state()
+        payload["torch_rng_state"] = th.get_rng_state()
+        if th.cuda.is_initialized():
+            payload["cuda_rng_state"] = th.cuda.get_rng_state_all()
+        if self.discriminator is not None:
+            payload["discriminator"] = self.discriminator.state_dict()
+            payload["discriminator_optimizer"] = self.discriminator_optimizer.state_dict()
+            update = self.discriminator_update
+            if update is not None:
+                payload["gaifo_update"] = {
+                    "has_updated": update._has_updated,
+                    "rollouts_since_update": update._rollouts_since_update,
+                    "heldout_sim": (
+                        None if update._heldout_sim is None
+                        else update._heldout_sim.detach().cpu()
+                    ),
+                    "train_rng_state": update.expert._train_generator.get_state(),
+                    "heldout_rng_state": update.expert._heldout_generator.get_state(),
+                }
+                if update.history is not None:
+                    payload["gaifo_history"] = gaifo_history_state(update.history)
         path = self.directory / f"pulse_{step:012d}.pt"
         temporary = path.with_suffix(".pt.tmp")
         th.save(payload, temporary)
@@ -359,6 +567,118 @@ def file_sha256(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def load_pulse_resume_checkpoint(path: Path) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(f"PULSE checkpoint not found: {path}")
+    payload = th.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("config"), dict):
+        raise ValueError(f"invalid PULSE checkpoint: {path}")
+    if payload["config"].get("architecture") != PULSE_ARCHITECTURE:
+        raise ValueError(f"incompatible PULSE architecture in {path}")
+    step = payload.get("step")
+    if type(step) is not int or step < 0:
+        raise ValueError(f"checkpoint has an invalid training step: {path}")
+    required = (
+        "policy", "critic", "optimizer", "distill_sha256",
+        "pulse_artifact", "pulse_sha256",
+    )
+    if payload["config"].get("gaifo_imitation", False):
+        required += ("discriminator", "discriminator_optimizer")
+    missing = [name for name in required if name not in payload]
+    if missing:
+        raise ValueError(f"checkpoint is missing {', '.join(missing)}: {path}")
+    artifact = path.parent / payload["pulse_artifact"]
+    if not artifact.is_file() or file_sha256(artifact) != payload["pulse_sha256"]:
+        raise ValueError(f"embedded frozen PULSE artifact failed verification: {path}")
+    if "clock" in payload:
+        try:
+            clock = Clock(**payload["clock"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"checkpoint has an invalid training clock: {path}") from error
+        if clock.env_steps != step:
+            raise ValueError(f"checkpoint clock does not match step {step}: {path}")
+    return payload
+
+
+def validate_pulse_resume_args(args: argparse.Namespace, payload: dict | None) -> None:
+    if payload is None:
+        return
+    step = payload["step"]
+    if args.timesteps <= step:
+        raise ValueError(
+            f"--timesteps must exceed checkpoint step {step:,}; "
+            "it is the total target, not additional steps"
+        )
+    config = payload["config"]
+    required = (
+        "frameskip", "feature_size", "policy_hidden", "critic_hidden",
+        "exploration_std", "gaifo_imitation",
+    )
+    if args.gaifo_imitation:
+        required += (
+            "factorize", "trajectory_length", "discriminator_hidden",
+            "frame_embedding", "temporal_hidden", "recency_replay",
+            "history_capacity", "history_reservoir_fraction",
+        )
+    for name in required:
+        saved = config.get(name, False if name in ("gaifo_imitation", "factorize") else None)
+        if getattr(args, name) != saved:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must match the checkpoint ({saved}) "
+                "when resuming"
+            )
+    source_hash = file_sha256(args.distill_checkpoint)
+    if source_hash not in (payload["distill_sha256"], payload["pulse_sha256"]):
+        raise ValueError("distillation artifact does not match the PULSE checkpoint")
+
+
+def restore_pulse_training(
+    payload: dict,
+    args: argparse.Namespace,
+    policy: nn.Module,
+    critic: nn.Module,
+    optimizer: th.optim.Optimizer,
+    discriminator: nn.Module | None = None,
+    discriminator_optimizer: th.optim.Optimizer | None = None,
+    discriminator_update: AdaptiveDiscriminatorUpdate | None = None,
+) -> Clock:
+    policy.load_state_dict(payload["policy"])
+    critic.load_state_dict(payload["critic"])
+    optimizer.load_state_dict(payload["optimizer"])
+    for group in optimizer.param_groups:
+        group["lr"] = args.ppo_lr
+    if args.gaifo_imitation:
+        discriminator.load_state_dict(payload["discriminator"])
+        discriminator_optimizer.load_state_dict(payload["discriminator_optimizer"])
+        for group in discriminator_optimizer.param_groups:
+            group["lr"] = args.discriminator_lr
+        state = payload.get("gaifo_update")
+        if state is not None:
+            discriminator_update._has_updated = state["has_updated"]
+            discriminator_update._rollouts_since_update = state["rollouts_since_update"]
+            heldout = state["heldout_sim"]
+            discriminator_update._heldout_sim = (
+                heldout.to(next(discriminator.parameters()).device)
+                if heldout is not None and len(heldout) == args.n_sim else None
+            )
+            expert = discriminator_update.expert
+            expert._train_generator.set_state(state["train_rng_state"])
+            expert._heldout_generator.set_state(state["heldout_rng_state"])
+        if "gaifo_history" in payload:
+            if discriminator_update.history is None:
+                raise ValueError("GAIFO history capacity must match the checkpoint")
+            restore_gaifo_history(discriminator_update.history, payload["gaifo_history"])
+    if "clock" in payload:
+        return Clock(**payload["clock"])
+    # Legacy PULSE checkpoints recorded learner steps but not vector/update counts.
+    vector_steps = payload["step"] // max(1, args.n_sim)
+    return Clock(
+        vector_steps=vector_steps,
+        env_steps=payload["step"],
+        learner_updates=vector_steps // args.rollout,
+    )
 
 
 def baseline_opponent_ids(pool: SnapshotPool, count: int) -> tuple[int, ...]:
@@ -490,12 +810,24 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         } if metrics else {}
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> tuple[argparse.Namespace, dict | None]:
+    resume_parser = argparse.ArgumentParser(add_help=False)
+    resume_parser.add_argument("--resume-checkpoint", type=Path)
+    preliminary, _ = resume_parser.parse_known_args()
+    resume = (
+        load_pulse_resume_checkpoint(preliminary.resume_checkpoint)
+        if preliminary.resume_checkpoint is not None else None
+    )
+
     parser = argparse.ArgumentParser(
         description="Train a feed-forward PULSE latent policy with Rocket League self-play."
     )
-    parser.add_argument("--distill-checkpoint", type=Path, required=True)
-    parser.add_argument("--replay-dir", type=Path, required=True)
+    parser.add_argument(
+        "--resume-checkpoint", type=Path,
+        help="continue a PULSE run from a saved checkpoint into a new run",
+    )
+    parser.add_argument("--distill-checkpoint", type=Path, required=resume is None)
+    parser.add_argument("--replay-dir", type=Path, required=resume is None)
     parser.add_argument("--n-sim", "--num-simulations", type=int, default=256)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--max-ticks", type=int, default=36_000)
@@ -549,6 +881,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-reward-scale", type=float, default=10.0)
     parser.add_argument("--touch-reward-scale", type=float, default=0.1)
     parser.add_argument("--no-touch-penalty", type=float, default=1.0)
+    parser.add_argument(
+        "--gaifo-imitation", action="store_true",
+        help="train a GAIFO scene discriminator on 1v1 replay windows and add its reward",
+    )
+    parser.add_argument("--imitation-weight", type=float, default=1.0)
+    parser.add_argument("--trajectory-length", type=int, default=8)
+    parser.add_argument("--expert-frame-limit", type=int, default=None)
+    parser.add_argument("--factorize", action="store_true")
+    parser.add_argument("--exp-log-odds-reward", action="store_true")
+    parser.add_argument("--discriminator-noise", type=float, default=0.01)
+    parser.add_argument("--discriminator-batch", type=int, default=4_096)
+    parser.add_argument("--discriminator-microbatch", type=int, default=1_024)
+    parser.add_argument("--discriminator-epochs", type=int, default=1)
+    parser.add_argument("--discriminator-update-interval", type=int, default=4)
+    parser.add_argument("--discriminator-lr", type=float, default=3e-4)
+    parser.add_argument("--discriminator-hidden", type=int, default=128)
+    parser.add_argument("--frame-embedding", type=int, default=128)
+    parser.add_argument("--temporal-hidden", type=int, default=128)
+    parser.add_argument("--discriminator-heldout-size", type=int, default=1_024)
+    parser.add_argument("--discriminator-accuracy-target", type=float, default=0.8)
+    parser.add_argument("--history-capacity", type=int, default=262_144)
+    parser.add_argument("--history-add-size", type=int, default=16_384)
+    parser.add_argument("--history-mix-fraction", type=float, default=0.5)
+    parser.add_argument("--recency-replay", action="store_true")
+    parser.add_argument("--history-reservoir-fraction", type=float, default=0.25)
+    parser.add_argument("--reward-max-magnitude", type=float, default=10.0)
     parser.add_argument("--timesteps", type=int, default=2_000_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", type=str, default=None)
@@ -558,7 +916,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-interval", type=int, default=10_000_000)
     parser.add_argument("--checkpoint-keep", type=int, default=5)
-    return parser.parse_args()
+    if resume is not None:
+        options = {action.dest for action in parser._actions}
+        inherited = {
+            name: Path(value) if name in {
+                "distill_checkpoint", "replay_dir", "log_dir", "checkpoint_dir",
+            } else value
+            for name, value in resume["config"].items()
+            if name in options and name not in {"resume_checkpoint", "run_name"}
+        }
+        if "basic_shaping_scale" not in resume["config"]:
+            inherited["basic_shaping_scale"] = 0.0
+        inherited["distill_checkpoint"] = (
+            preliminary.resume_checkpoint.parent / resume["pulse_artifact"]
+        )
+        parser.set_defaults(**inherited)
+    return parser.parse_args(), resume
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -618,6 +991,120 @@ def validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(args.distill_checkpoint)
     if not args.replay_dir.is_dir():
         raise FileNotFoundError(args.replay_dir)
+    if args.gaifo_imitation:
+        args.replay_dir = gaifo_replay_dir(args.replay_dir, args.frameskip)
+        positive = (
+            "discriminator_batch", "discriminator_microbatch", "discriminator_epochs",
+            "discriminator_update_interval", "discriminator_lr", "discriminator_hidden",
+            "frame_embedding", "temporal_hidden", "reward_max_magnitude",
+        )
+        for name in positive:
+            value = getattr(args, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"--{name.replace('_', '-')} must be positive")
+        if args.trajectory_length < 2 or args.rollout < args.trajectory_length - 1:
+            raise ValueError("--rollout must fit a --trajectory-length of at least two")
+        if args.expert_frame_limit is not None and args.expert_frame_limit < args.trajectory_length:
+            raise ValueError("--expert-frame-limit must fit one trajectory")
+        generated = (
+            args.rollout - args.trajectory_length + 2
+        ) * args.n_sim * 2
+        if generated < args.discriminator_batch:
+            raise ValueError(
+                f"rollout produces at most {generated} scene windows; "
+                "reduce --discriminator-batch or increase --n-sim/--rollout"
+            )
+        for name in ("imitation_weight", "discriminator_noise"):
+            value = getattr(args, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"--{name.replace('_', '-')} must be nonnegative")
+        if not 0 <= args.discriminator_heldout_size or not 0 <= args.history_capacity:
+            raise ValueError("heldout size and history capacity must be nonnegative")
+        if args.n_sim > 1 and args.discriminator_heldout_size >= generated:
+            raise ValueError(
+                "--discriminator-heldout-size must leave generated scene windows "
+                "for discriminator training"
+            )
+        if args.history_add_size < 0 or (
+            args.history_capacity and args.history_add_size > args.history_capacity
+        ):
+            raise ValueError("--history-add-size must fit --history-capacity")
+        if not 0 <= args.discriminator_accuracy_target <= 1:
+            raise ValueError("--discriminator-accuracy-target must be in [0, 1]")
+        if not 0 <= args.history_mix_fraction < 1:
+            raise ValueError("--history-mix-fraction must be in [0, 1)")
+        if args.recency_replay and args.history_capacity < 2:
+            raise ValueError("--recency-replay requires at least two history slots")
+        if args.recency_replay and not 0 < args.history_reservoir_fraction <= 0.5:
+            raise ValueError("--history-reservoir-fraction must be in (0, 0.5]")
+
+
+def gaifo_replay_dir(replay_dir: Path, frameskip: int) -> Path:
+    """Resolve GAIFO's canonical 1v1 folder from a replay path or its parent."""
+    for candidate in dict.fromkeys((
+        replay_dir,
+        replay_dir / f"pro_1v1_fs{frameskip}",
+        replay_dir / "pro_1v1_fs4",
+    )):
+        if candidate.is_dir():
+            for path in candidate.glob("*.npy"):
+                source = np.load(path, mmap_mode="r")
+                if source.ndim == 2 and source.shape[1] == 161:
+                    return candidate
+    raise FileNotFoundError(f"no GAIFO-compatible 1v1 replays in {replay_dir}")
+
+
+def build_gaifo_imitation(args: argparse.Namespace, device: th.device):
+    expert = ExpertSceneDataset(
+        args.replay_dir, args.trajectory_length, args.expert_frame_limit,
+        args.seed, frame_skip=args.frameskip, device=device,
+        heldout_size=args.discriminator_heldout_size,
+    )
+    if expert.train_total < 1:
+        raise ValueError("expert dataset contains no GAIFO training windows")
+
+    model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
+    discriminator = model(
+        args.frame_embedding, args.temporal_hidden, args.discriminator_hidden,
+    ).to(device)
+    optimizer = Adam(discriminator.parameters(), lr=args.discriminator_lr)
+    history_options = dict(
+        capacity=args.history_capacity, trajectory_length=args.trajectory_length,
+        device=device, seed=args.seed,
+    )
+    history = (
+        RecencyReplayBuffer(
+            **history_options, reservoir_fraction=args.history_reservoir_fraction,
+        ) if args.recency_replay else HistoricalReplayBuffer(**history_options)
+    ) if args.history_capacity else None
+
+    update = AdaptiveDiscriminatorUpdate(
+        expert=expert,
+        history=history,
+        batch_size=args.discriminator_batch,
+        epochs=args.discriminator_epochs,
+        noise_std=args.discriminator_noise,
+        heldout_size=args.discriminator_heldout_size,
+        accuracy_target=args.discriminator_accuracy_target,
+        history_add_size=args.history_add_size,
+        history_mix_fraction=args.history_mix_fraction,
+        max_grad_norm=args.max_grad_norm,
+        discriminator=discriminator,
+        optimizer=optimizer,
+        loss=SceneDiscriminatorLoss(discriminator),
+        update_interval=args.discriminator_update_interval,
+        microbatch_size=args.discriminator_microbatch,
+    )
+    reward = PulseGAIFOReward(
+        discriminator=discriminator,
+        trajectory_length=args.trajectory_length,
+        noise_std=args.discriminator_noise,
+        microbatch_size=args.discriminator_microbatch,
+        max_magnitude=args.reward_max_magnitude,
+        weight=args.imitation_weight,
+        exp_log_odds_reward=args.exp_log_odds_reward,
+    )
+    return update, reward, discriminator, optimizer
 
 
 def build_policy(
@@ -651,8 +1138,9 @@ def build_policy_and_critic(
 
 
 def main() -> None:
-    args = parse_args()
+    args, resume = parse_args()
     validate_args(args)
+    validate_pulse_resume_args(args, resume)
     th.manual_seed(args.seed)
 
     replay_frames, replay_internal = load_demonstration_reset_frames(
@@ -712,6 +1200,19 @@ def main() -> None:
             args.policy_hidden,
             args.critic_hidden,
         )
+        discriminator_update = imitation_reward = discriminator = discriminator_optimizer = None
+        if args.gaifo_imitation:
+            (
+                discriminator_update, imitation_reward,
+                discriminator, discriminator_optimizer,
+            ) = build_gaifo_imitation(args, env.device)
+        optimizer = Adam((*policy.parameters(), *critic.parameters()), lr=args.ppo_lr)
+        restored_clock = (
+            restore_pulse_training(
+                resume, args, policy, critic, optimizer,
+                discriminator, discriminator_optimizer, discriminator_update,
+            ) if resume is not None else Clock()
+        )
 
         run_id = args.run_name or datetime.now().strftime("pulse-%Y%m%d-%H%M%S-%f")
         pool = SnapshotPool(
@@ -721,6 +1222,8 @@ def main() -> None:
             seed=args.seed,
             checkpoint_dir=None,
         )
+        if resume is not None and "snapshot_pool" in resume:
+            restore_snapshot_pool(pool, policy, resume["snapshot_pool"])
         matchmaker = SelfPlayMatchmaker(
             num_matches=args.n_sim,
             team_sizes=(1, 1),
@@ -729,12 +1232,17 @@ def main() -> None:
             device=env.device,
             seed=args.seed,
         )
+        if resume is not None and "matchmaker_rng_state" in resume:
+            matchmaker._generator.set_state(resume["matchmaker_rng_state"])
         buffer = RolloutBuffer(
             horizon=args.rollout,
             num_envs=env.n_envs,
             device=env.device,
             copy_on_finish=False,
         )
+        captures = [LogProbCapture(), CriticValueCapture(critic)]
+        if args.gaifo_imitation:
+            captures.append(SceneWindowCapture(args.trajectory_length))
         runner = DiagnosticSelfPlayRunner(
             env,
             policy,
@@ -743,14 +1251,21 @@ def main() -> None:
             matchmaker=matchmaker,
             snapshot_policy=policy,
             historical_policies=args.historical_policies,
-            captures=(LogProbCapture(), CriticValueCapture(critic)),
+            captures=captures,
             gameplay_reward=reward,
         )
 
         gamma = primitive_discount(args.frameskip, args.discount_half_life)
-        optimizer = Adam((*policy.parameters(), *critic.parameters()), lr=args.ppo_lr)
+        transforms = (
+            (
+                imitation_reward,
+                GAE(gamma=gamma, lambda_=args.gae_lambda, reward_field="training_reward"),
+                SelectPPOFields(),
+            ) if imitation_reward is not None
+            else (GAE(gamma=gamma, lambda_=args.gae_lambda),)
+        )
         update = Update(
-            transforms=(GAE(gamma=gamma, lambda_=args.gae_lambda),),
+            transforms=transforms,
             sampler=RolloutMinibatches(args.ppo_batch, args.ppo_epochs),
             loss=PPOLoss(
                 policy,
@@ -790,8 +1305,14 @@ def main() -> None:
             buffer,
             controller,
             args,
+            discriminator=discriminator,
+            discriminator_optimizer=discriminator_optimizer,
+            discriminator_update=discriminator_update,
+            pool=pool,
+            matchmaker=matchmaker,
+            reset_sampler=reset_sampler,
+            resume=resume,
         )
-        checkpoints.save(0, force=True)
         logger = Logger(log_dir=str(args.log_dir / run_id))
         for section, key, label, format_spec in (
             ("PPO", "policy_loss", "policy loss", ".4f"),
@@ -805,22 +1326,53 @@ def main() -> None:
             ("Reward", "shaping_scale", "reward shaping", ".3f"),
         ):
             logger.register_progress_metric(section, key, label, format_spec)
+        if discriminator_update is not None:
+            logger.register_progress_metric(
+                "Reward", "gaifo_imitation", "GAIFO reward", ".3f",
+            )
+            for key, label, format_spec in (
+                ("train_loss", "D loss", ".4f"),
+                ("heldout_accuracy", "D heldout accuracy", ".3f"),
+                ("updated", "D updated", ".0f"),
+            ):
+                logger.register_progress_metric("Discriminator", key, label, format_spec)
+            if args.factorize:
+                for key, label in (
+                    ("car_heldout_accuracy", "D car accuracy"),
+                    ("ball_heldout_accuracy", "D ball accuracy"),
+                ):
+                    logger.register_progress_metric("Discriminator", key, label, ".3f")
 
         def log_diagnostics(trainer: Trainer) -> None:
             metrics = runner.diagnostic_metrics()
+            if imitation_reward is not None and imitation_reward.last_mean is not None:
+                metrics.setdefault("Reward", {})["gaifo_imitation"] = imitation_reward.last_mean
             if metrics:
                 trainer.logger.update(metrics, step=trainer.clock.env_steps)
 
         trainer = Trainer(
             runner,
             buffer,
-            Algorithm(update),
+            Algorithm(*(
+                (discriminator_update, update)
+                if discriminator_update is not None else (update,)
+            )),
             OnPolicySchedule(),
             logger=logger,
             checkpoint=checkpoints,
             value_scheduler=value_scheduler,
             update_callback=log_diagnostics,
         )
+        trainer.clock = restored_clock
+        checkpoints.clock = trainer.clock
+        if resume is not None:
+            if "reset_sampler_rng_state" in resume:
+                reset_sampler._generator.set_state(resume["reset_sampler_rng_state"])
+            if "torch_rng_state" in resume:
+                th.set_rng_state(resume["torch_rng_state"])
+            if "cuda_rng_state" in resume:
+                th.cuda.set_rng_state_all(resume["cuda_rng_state"])
+        checkpoints.save(trainer.clock.env_steps, force=True)
         trainer.run(args.timesteps)
         checkpoints.save(trainer.clock.env_steps, force=True)
     finally:
