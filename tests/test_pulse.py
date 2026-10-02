@@ -27,6 +27,7 @@ from pulse import (
 )
 from pulse_reward import PulseReward
 from replay_safety import nearest_safe_start_map
+from reward_spec import RewardSpec
 from tracker import CONTROL_STATE_SIZE, ExpertLookaheadEnv, GOAL_STATE_SIZE
 from watch_checkpoints import (
     CheckpointRegistry, load_match, reset_observation, resolve_pulse_artifact,
@@ -142,7 +143,8 @@ class PulseTests(unittest.TestCase):
 
     def test_pulse_reward_keeps_local_shaping_and_permanent_gameplay_events(self):
         reward = PulseReward(
-            shaping_scale=0.0, no_touch_timeout_steps=1,
+            shaping_scale=0.0, basic_shaping_scale=0.0,
+            no_touch_timeout_steps=1,
         )
         th.testing.assert_close(
             reward(reward_context(score=1)), th.tensor([[10.0, -10.0]])
@@ -155,6 +157,29 @@ class PulseTests(unittest.TestCase):
         )
         self.assertGreater(
             PulseReward(shaping_scale=1.0)(reward_context()).sum().item(), 0.0
+        )
+
+    def test_basic_dense_reward_persists_after_nexto_shaping_anneals(self):
+        for score in (0, 1):
+            with self.subTest(score=score):
+                context = reward_context(score=score)
+                context.current.raw[:, 9 + 1] = -300.0
+                if score:
+                    context.current.raw[:, 31 + 17] = 1.0
+
+                expected = RewardSpec(normalize=False)(context)
+                actual = PulseReward(shaping_scale=0.0)(context)
+                self.assertGreater(expected.abs().max().item(), 0.01)
+                th.testing.assert_close(actual, expected)
+
+    def test_optional_basic_shaping_preserves_nexto_demo_reward(self):
+        reward = PulseReward(basic_shaping_scale=0.0)
+        baseline = reward(reward_context())
+        demo = reward_context()
+        demo.current.raw[:, 31 + 17] = 1.0
+
+        th.testing.assert_close(
+            reward(demo) - baseline, th.tensor([[0.5, -0.5]])
         )
 
     def test_distillation_pairs_and_backpropagates_into_prior_and_decoder(self):

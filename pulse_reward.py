@@ -4,11 +4,11 @@ import torch as th
 
 from carl.gymnasium.state import RewardContext
 
-from reward_spec import RewardSpec, RewardWeights
+from reward_spec import RewardSpec
 
 
 class PulseReward(RewardSpec):
-    """Anneal local Nexto shaping while retaining goals and touch/timeout rewards."""
+    """Keep BASIC dense shaping alongside annealed Nexto and gameplay rewards."""
 
     def __init__(
         self,
@@ -17,11 +17,13 @@ class PulseReward(RewardSpec):
         touch_scale: float = 0.1,
         no_touch_penalty: float = 1.0,
         no_touch_timeout_steps: int | None = None,
+        basic_shaping_scale: float = 1.0,
     ) -> None:
-        # The shared reward halves the demo difference before weighting it.
-        # PULSE's original Nexto shaping used the full difference.
-        super().__init__(normalize=False, weights=RewardWeights(demo=10.0))
+        # Keep fixed goal/touch rewards in PULSE's units rather than normalizing
+        # the entire reward as BASIC does.
+        super().__init__(normalize=False)
         self.shaping_scale = shaping_scale
+        self.basic_shaping_scale = basic_shaping_scale
         self.goal_scale = goal_scale
         self.touch_scale = touch_scale
         self.no_touch_penalty = no_touch_penalty
@@ -57,20 +59,24 @@ class PulseReward(RewardSpec):
     def _finish_reward(
         self, context: RewardContext, components: dict[str, th.Tensor]
     ) -> th.Tensor:
-        # The original PULSE reward kept shaping local to each player instead
-        # of centering it against the opponent, and scaled it against a goal of 10.
-        shaping = sum(
+        dense = sum(
             value for name, value in components.items() if name != "goal_scored"
-        ) / 10.0
-        # Kickoff shaping in PULSE only applied during the first second.
-        shaping = shaping - components["kickoff"] * (
-            context.episode_ticks[:, None] >= 120
+        )
+        # BASIC centers its dense reward against the opposing player. Its goal
+        # component is omitted here because PULSE already awards goals below.
+        basic_shaping = dense - self._opponent_team_mean(dense)
+        # Nexto keeps shaping local, doubles BASIC's demo term, and only gives
+        # kickoff shaping in the first second.
+        nexto_shaping = (
+            dense + components["demo"] - components["kickoff"]
+            * (context.episode_ticks[:, None] >= 120)
         ) / 10.0
         reward = (
             self.goal_scale * self.last_score_for_actor
             + self.touch_scale * self.last_touches
             - self.no_touch_penalty * self.last_no_touch_timeout[:, None]
-            + self.shaping_scale * shaping
+            + self.basic_shaping_scale * basic_shaping
+            + self.shaping_scale * nexto_shaping
         )
         done = context.events.done
         self._last_touch[done] = False

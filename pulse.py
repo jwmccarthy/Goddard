@@ -498,7 +498,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-dir", type=Path, required=True)
     parser.add_argument("--n-sim", "--num-simulations", type=int, default=256)
     parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument("--max-ticks", type=int, default=1_000_000)
+    parser.add_argument("--max-ticks", type=int, default=36_000)
     parser.add_argument(
         "--no-touch-timeout", "--no-touch-timeout-seconds",
         dest="no_touch_timeout", type=float, default=30.0,
@@ -544,6 +544,7 @@ def parse_args() -> argparse.Namespace:
         "--shaping-scale", "--nexto-shaping-scale",
         dest="shaping_scale", type=float, default=1.0,
     )
+    parser.add_argument("--basic-shaping-scale", type=float, default=1.0)
     parser.add_argument("--shaping-anneal-fraction", type=float, default=0.5)
     parser.add_argument("--goal-reward-scale", type=float, default=10.0)
     parser.add_argument("--touch-reward-scale", type=float, default=0.1)
@@ -603,7 +604,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--shaping-anneal-fraction must be in (0, 1]")
     if not math.isfinite(args.goal_reward_scale) or args.goal_reward_scale <= 0:
         raise ValueError("--goal-reward-scale must be positive and finite")
-    for name in ("touch_reward_scale", "no_touch_penalty"):
+    for name in ("basic_shaping_scale", "touch_reward_scale", "no_touch_penalty"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
     if args.historical_policies >= args.opponent_pool_size:
@@ -671,6 +672,7 @@ def main() -> None:
     )
     reward = PulseReward(
         shaping_scale=args.shaping_scale,
+        basic_shaping_scale=args.basic_shaping_scale,
         goal_scale=args.goal_reward_scale,
         touch_scale=args.touch_reward_scale,
         no_touch_penalty=args.no_touch_penalty,
