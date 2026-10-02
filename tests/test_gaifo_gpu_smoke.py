@@ -20,7 +20,7 @@ from gaifo import load_resume_checkpoint, main
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
-    def _short_window_training(self, factorize: bool):
+    def _short_window_training(self, factorize: bool, hard_positive_mining: bool = False):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
             replays = root / "replays"
@@ -44,6 +44,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             ]
             if factorize:
                 flags.append("--factorize")
+            if hard_positive_mining:
+                flags.append("--hard-positive-mining")
             output = io.StringIO()
             with patch.object(sys, "argv", flags), redirect_stdout(output):
                 main()
@@ -72,6 +74,15 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                             for key in saved["discriminator"]))
         self.assertIn("D car accuracy", output)
         self.assertIn("D ball accuracy", output)
+
+    def test_hard_positive_mining_in_unified_and_factorized_modes(self):
+        for factorize in (False, True):
+            with self.subTest(factorize=factorize):
+                saved, output = self._short_window_training(factorize, hard_positive_mining=True)
+                self.assertEqual(saved["step"], 64)
+                self.assertTrue(saved["config"]["hard_positive_mining"])
+                self.assertEqual(saved["config"]["factorize"], factorize)
+                self.assertIn("D max expert weight", output)
 
 
 if __name__ == "__main__":

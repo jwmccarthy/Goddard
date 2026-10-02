@@ -216,11 +216,13 @@ class FactorizedGAIFOTests(unittest.TestCase):
         with patch.object(sys, "argv", ["gaifo.py", "--replay-dir", "parsed_replays"]):
             default, _ = parse_args()
         self.assertFalse(default.factorize)
+        self.assertFalse(default.hard_positive_mining)
         self.assertIsInstance(build_discriminator(default), SceneDiscriminator)
 
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             flags = [
                 "gaifo.py", "--replay-dir", "parsed_replays", "--factorize",
+                "--hard-positive-mining",
                 "--n-sim", "1", "--rollout", "4", "--policy-hidden", "16",
                 "--critic-hidden", "16", "--discriminator-hidden", "16",
                 "--frame-embedding", "8", "--temporal-hidden", "8",
@@ -242,9 +244,11 @@ class FactorizedGAIFOTests(unittest.TestCase):
             path = Path(directory) / "gaifo_000000000000.pt"
             payload = load_resume_checkpoint(path)
             self.assertTrue(payload["config"]["factorize"])
+            self.assertTrue(payload["config"]["hard_positive_mining"])
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)]):
                 resumed, _ = parse_args()
             self.assertTrue(resumed.factorize)
+            self.assertTrue(resumed.hard_positive_mining)
             validate_resume_args(resumed, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
                                             "--no-factorize"]):

@@ -79,6 +79,7 @@ BALL_NEAR_DISTANCE = 1_500.0
 BALL_GATE_RADIUS = 200.0
 BALL_GATE_SCALE = 1_000.0
 BALL_GATE_FLOOR = 0.1
+EXPERT_MINING_BOOST = 2.0
 
 
 def noise_mask(device: str | th.device = "cpu") -> th.Tensor:
@@ -117,6 +118,13 @@ def ball_responsibility(windows: th.Tensor) -> th.Tensor:
     return BALL_GATE_FLOOR + (1 - BALL_GATE_FLOOR) * th.exp(
         -0.5 * (separation / BALL_GATE_SCALE).square()
     )
+
+
+def confident_expert_weights(logits: th.Tensor) -> th.Tensor:
+    """Bounded weights for confidently expert windows; expert is class zero."""
+    expert_confidence = th.sigmoid(-logits.detach())
+    distinctive = (2 * expert_confidence - 1).clamp_min(0)
+    return 1 + EXPERT_MINING_BOOST * distinctive.square()
 
 
 def opponent_view(scenes: th.Tensor) -> th.Tensor:
@@ -1058,24 +1066,48 @@ class FactorizedSceneDiscriminator(nn.Module):
 class SceneDiscriminatorLoss:
     """BCE-with-logits loss for generated-vs-expert scene windows."""
 
-    def __init__(self, discriminator: SceneDiscriminator | FactorizedSceneDiscriminator) -> None:
+    def __init__(
+        self, discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+        hard_positive_mining: bool = False,
+    ) -> None:
         self.discriminator = discriminator
+        self.hard_positive_mining = hard_positive_mining
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
         logit = self.discriminator(batch["window"])
         target = batch["is_agent"]
+        agent = target.bool()
+        expert_weights = None
+        if self.hard_positive_mining:
+            expert_weights = batch.get("expert_weight")
+            if expert_weights is None:
+                expert_weights = th.ones_like(logit)
+                if (~agent).any():
+                    confident = confident_expert_weights(logit[~agent])
+                    expert_weights[~agent] = confident / confident.mean(
+                        dim=0, keepdim=True,
+                    )
+            if expert_weights.shape != logit.shape:
+                raise ValueError("expert mining weights must match discriminator logits")
         metrics = {}
         if getattr(self.discriminator, "factorized", False):
             if logit.shape != (len(target), 2):
                 raise ValueError("factorized discriminator must return car and ball logits")
-            car_loss = F.binary_cross_entropy_with_logits(logit[:, 0], target)
+            if expert_weights is None:
+                car_loss = F.binary_cross_entropy_with_logits(logit[:, 0], target)
+            else:
+                car_errors = F.binary_cross_entropy_with_logits(
+                    logit[:, 0], target, reduction="none",
+                )
+                car_loss = (car_errors * expert_weights[:, 0]).mean()
             ball_errors = F.binary_cross_entropy_with_logits(
                 logit[:, 1], target, reduction="none",
             )
             weights = batch.get("ball_weight")
             if weights is None:
                 weights = ball_responsibility(batch["window"]).square()
-                agent = target.bool()
+                if expert_weights is not None:
+                    weights[~agent] *= expert_weights[~agent, 1]
                 class_losses = [
                     (ball_errors[chosen] * weights[chosen]).sum()
                     / weights[chosen].sum().clamp_min(1e-6)
@@ -1091,9 +1123,12 @@ class SceneDiscriminatorLoss:
                                        <= BALL_NEAR_DISTANCE).float().mean(),
             }
         else:
-            loss = F.binary_cross_entropy_with_logits(logit, target)
+            if expert_weights is None:
+                loss = F.binary_cross_entropy_with_logits(logit, target)
+            else:
+                errors = F.binary_cross_entropy_with_logits(logit, target, reduction="none")
+                loss = (errors * expert_weights).mean()
 
-        agent = target.bool()
         with th.no_grad():
             agent_score = th.sigmoid(logit[agent]).mean()
             expert_score = th.sigmoid(logit[~agent]).mean()
@@ -1225,6 +1260,26 @@ def train_discriminator_minibatch(
     ball_weights = None
     if getattr(discriminator, "factorized", False):
         ball_weights = ball_responsibility(windows).square()
+    expert_weights = None
+    if loss.hard_positive_mining:
+        # Score the full expert half before microbatching, so weights are
+        # normalized across the effective batch instead of each GRU chunk.
+        with th.no_grad():
+            confident = []
+            for start in range(n_agent, len(windows), microbatch_size):
+                logits = discriminator(windows[start:start + microbatch_size])
+                confident.append(confident_expert_weights(logits))
+            normalized = th.cat(confident)
+            normalized /= normalized.mean(dim=0, keepdim=True)
+            metrics["expert_mining_max_weight"] = normalized.amax()
+            expert_weights = th.ones(
+                (len(windows), 2) if ball_weights is not None else (len(windows),),
+                dtype=windows.dtype, device=windows.device,
+            )
+            expert_weights[n_agent:] = normalized
+            if ball_weights is not None:
+                ball_weights[n_agent:] *= normalized[:, 1]
+    if ball_weights is not None:
         for chosen in (slice(None, n_agent), slice(n_agent, None)):
             ball_weights[chosen] /= ball_weights[chosen].mean().clamp_min(1e-6)
     for start in range(0, n_agent, microbatch_size):
@@ -1236,6 +1291,10 @@ def train_discriminator_minibatch(
         if ball_weights is not None:
             chunk = chunk.with_fields(ball_weight=th.cat((
                 ball_weights[start:stop], ball_weights[n_agent + start:n_agent + stop],
+            )))
+        if expert_weights is not None:
+            chunk = chunk.with_fields(expert_weight=th.cat((
+                expert_weights[start:stop], expert_weights[n_agent + start:n_agent + stop],
             )))
         output = loss(chunk)
         fraction = (stop - start) / n_agent
@@ -1955,6 +2014,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="train separate car-motion and near-ball-control discriminators with proximity-gated ball reward",
     )
     parser.add_argument(
+        "--hard-positive-mining", action=argparse.BooleanOptionalAction, default=False,
+        help="favor confidently expert windows in discriminator training (bounded, class-balanced weights)",
+    )
+    parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,
         help="scale the +/-1 goal reward per actor (0 disables it)",
     )
@@ -2357,7 +2420,7 @@ def main() -> None:
         max_grad_norm=args.max_grad_norm,
         discriminator=discriminator,
         optimizer=discriminator_optimizer,
-        loss=SceneDiscriminatorLoss(discriminator),
+        loss=SceneDiscriminatorLoss(discriminator, hard_positive_mining=args.hard_positive_mining),
         update_interval=args.discriminator_update_interval,
         microbatch_size=args.discriminator_microbatch,
     )
@@ -2432,6 +2495,10 @@ def main() -> None:
             ("train_near_ball_fraction", "D near-ball fraction"),
         ):
             logger.register_progress_metric("Discriminator", key, label, ".3f")
+    if args.hard_positive_mining:
+        logger.register_progress_metric(
+            "Discriminator", "train_expert_mining_max_weight", "D max expert weight", ".2f",
+        )
     if value_scheduler is not None:
         logger.register_progress_metric(
             "Schedule", "entropy_coef", "entropy coef", ".4f"
