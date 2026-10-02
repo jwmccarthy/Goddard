@@ -946,6 +946,100 @@ class HistoricalReplayBuffer:
         return self.buffer[pos].to(device, non_blocking=False)
 
 
+class RecencyReplayBuffer:
+    """Sample a recent FIFO plus a uniform reservoir of all past windows."""
+
+    def __init__(
+        self,
+        capacity: int,
+        trajectory_length: int,
+        device: str | th.device,
+        seed: int = 0,
+        reservoir_fraction: float = 0.25,
+    ) -> None:
+        if capacity < 2:
+            raise ValueError("recency replay capacity must be at least two")
+        if not math.isfinite(reservoir_fraction) or not 0 < reservoir_fraction <= 0.5:
+            raise ValueError("reservoir fraction must be in (0, 0.5]")
+        self.reservoir_fraction = reservoir_fraction
+        self.reservoir_capacity = max(1, round(capacity * reservoir_fraction))
+        self.recent = HistoricalReplayBuffer(
+            capacity - self.reservoir_capacity, trajectory_length, device, seed,
+        )
+        self.trajectory_length = trajectory_length
+        self.device = th.device(device)
+        self.reservoir: th.Tensor | None = None
+        self.reservoir_size = 0
+        self.seen = 0
+        self.rng = th.Generator(device=self.device).manual_seed(seed + 1)
+
+    @property
+    def size(self) -> int:
+        return self.recent.size + self.reservoir_size
+
+    def add(self, windows: th.Tensor, add_size: int) -> None:
+        if add_size <= 0 or len(windows) == 0:
+            return
+        if windows.shape[1:] != (self.trajectory_length, SCENE_SIZE):
+            raise ValueError("historical windows have the wrong shape")
+        windows = windows.detach().to(self.device, non_blocking=False)
+        if len(windows) > add_size:
+            chosen = th.randperm(len(windows), device=self.device, generator=self.rng)
+            windows = windows[chosen[:add_size]]
+
+        self.recent.add(windows, len(windows))
+        if self.reservoir is None:
+            self.reservoir = windows.new_empty(
+                (self.reservoir_capacity, self.trajectory_length, SCENE_SIZE)
+            )
+        filling = min(self.reservoir_capacity - self.reservoir_size, len(windows))
+        if filling:
+            self.reservoir[
+                self.reservoir_size:self.reservoir_size + filling
+            ] = windows[:filling]
+            self.reservoir_size += filling
+
+        remaining = windows[filling:]
+        if len(remaining):
+            # Reservoir sampling: each later window gets one uniformly random
+            # slot in the stream so far. The last replacement wins per slot.
+            counts = th.arange(
+                self.seen + filling + 1, self.seen + len(windows) + 1,
+                dtype=th.float64, device=self.device,
+            )
+            slots = (
+                th.rand(len(remaining), dtype=th.float64, device=self.device,
+                        generator=self.rng) * counts
+            ).long()
+            admitted = (slots < self.reservoir_capacity).nonzero(as_tuple=True)[0]
+            last = th.full(
+                (self.reservoir_capacity,), -1, dtype=th.long, device=self.device,
+            )
+            last.scatter_reduce_(0, slots[admitted], admitted, reduce="amax")
+            replaced = (last >= 0).nonzero(as_tuple=True)[0]
+            self.reservoir[replaced] = remaining[last[replaced]]
+        self.seen += len(windows)
+
+    def sample(self, n: int, device: str | th.device) -> th.Tensor:
+        if self.size == 0:
+            return th.empty(0, self.trajectory_length, SCENE_SIZE, device=device)
+        n = min(n, self.size)
+        n_old = min(int(n * self.reservoir_fraction), self.reservoir_size)
+        if n > 1 and self.reservoir_size:
+            n_old = max(1, n_old)
+        n_recent = min(n - n_old, self.recent.size)
+        n_old += min(n - n_recent - n_old, self.reservoir_size - n_old)
+
+        recent = self.recent.sample(n_recent, device)
+        if n_old == 0:
+            return recent
+        indices = th.randperm(
+            self.reservoir_size, device=self.device, generator=self.rng,
+        )[:n_old]
+        old = self.reservoir[indices].to(device, non_blocking=False)
+        return th.cat((recent, old), dim=0) if n_recent else old
+
+
 class SceneDiscriminator(nn.Module):
     """Structured scene-level discriminator for short 1v1 trajectory windows."""
 
@@ -1193,7 +1287,7 @@ class SceneGAIFOMinibatches:
         batch_size: int,
         epochs: int,
         noise_std: float,
-        history: HistoricalReplayBuffer | None = None,
+        history: HistoricalReplayBuffer | RecencyReplayBuffer | None = None,
         mix_fraction: float = 0.5,
         factorize: bool = False,
     ) -> None:
@@ -1324,9 +1418,10 @@ def train_discriminator_minibatch(
 class SceneDiscriminatorReward:
     """Combine imitation, goal, and physical touch rewards per actor.
 
-    Short windows receive normalized, clamped negative-logit rewards. Physical
-    bonuses are zero-sum in 1v1; goal and touch transitions remain learnable
-    before imitation windows are valid.
+    Short windows receive normalized expert log-odds by default, or capped
+    expert-to-agent odds with the optional exponential reward. Physical bonuses
+    are zero-sum in 1v1; goal and touch transitions remain learnable before
+    imitation windows are valid.
     """
 
     def __init__(
@@ -1339,6 +1434,7 @@ class SceneDiscriminatorReward:
         flip_reset_reward_weight: float = 0.0,
         batch_size: int = 16_384,
         max_magnitude: float = 10.0,
+        exp_log_odds_reward: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -1359,6 +1455,7 @@ class SceneDiscriminatorReward:
         self.flip_reset_reward_weight = flip_reset_reward_weight
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
+        self.exp_log_odds_reward = exp_log_odds_reward
 
     @staticmethod
     def _event_reward(
@@ -1398,9 +1495,20 @@ class SceneDiscriminatorReward:
                 flat_windows[indices[start:stop]], self.noise_std
             )
             logits = self.discriminator(noisy)
-            selected_scores[start:stop] = (-logits).clamp(
-                -self.max_magnitude, self.max_magnitude
-            )
+            if self.exp_log_odds_reward:
+                # D = sigmoid(-logits) is the expert probability, so
+                # exp(log D - log(1-D)) = exp(-logits).
+                selected_scores[start:stop] = (-logits).clamp(
+                    max=math.log(self.max_magnitude)
+                ).exp()
+            else:
+                selected_scores[start:stop] = (-logits).clamp(
+                    -self.max_magnitude, self.max_magnitude
+                )
+
+        if self.exp_log_odds_reward:
+            flat_scores[indices] = selected_scores
+            return scores
 
         if self.factorize:
             std = selected_scores.std(dim=0, unbiased=False)
@@ -1513,7 +1621,7 @@ class AdaptiveDiscriminatorUpdate:
     def __init__(
         self,
         expert: ExpertSceneDataset,
-        history: HistoricalReplayBuffer | None,
+        history: HistoricalReplayBuffer | RecencyReplayBuffer | None,
         batch_size: int,
         epochs: int,
         noise_std: float,
@@ -2037,6 +2145,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="bias replay resets toward window starts the trained discriminator confidently recognizes as expert",
     )
     parser.add_argument(
+        "--exp-log-odds-reward", action=argparse.BooleanOptionalAction, default=False,
+        help="reward exp(log D - log(1-D)) instead of normalized log-odds (D = expert probability)",
+    )
+    parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,
         help="scale the +/-1 goal reward per actor (0 disables it)",
     )
@@ -2070,7 +2182,18 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument("--history-capacity", type=int, default=262_144)
     parser.add_argument("--history-add-size", type=int, default=16_384)
     parser.add_argument("--history-mix-fraction", type=float, default=0.5)
-    parser.add_argument("--reward-max-magnitude", type=float, default=10.0)
+    parser.add_argument(
+        "--recency-replay", action=argparse.BooleanOptionalAction, default=False,
+        help="favor recent generated windows while keeping older ones in a reservoir",
+    )
+    parser.add_argument(
+        "--history-reservoir-fraction", type=float, default=0.25,
+        help="share of history capacity and samples reserved for old windows with --recency-replay",
+    )
+    parser.add_argument(
+        "--reward-max-magnitude", type=float, default=10.0,
+        help="clip standardized imitation rewards or cap exponential rewards",
+    )
     parser.add_argument("--ppo-batch", type=int, default=16_384)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument(
@@ -2222,6 +2345,13 @@ def validate_args(args: argparse.Namespace) -> None:
         or not 0.0 <= args.history_mix_fraction < 1.0
     ):
         raise ValueError("--history-mix-fraction must be in [0, 1)")
+    if (
+        not math.isfinite(args.history_reservoir_fraction)
+        or not 0.0 < args.history_reservoir_fraction <= 0.5
+    ):
+        raise ValueError("--history-reservoir-fraction must be in (0, 0.5]")
+    if args.recency_replay and args.history_capacity < 2:
+        raise ValueError("--history-capacity must be at least two with --recency-replay")
     if (
         not math.isfinite(args.discriminator_accuracy_target)
         or not 0.0 <= args.discriminator_accuracy_target <= 1.0
@@ -2403,11 +2533,15 @@ def main() -> None:
         expert.internal_states,
     )
 
-    history = HistoricalReplayBuffer(
-        capacity=args.history_capacity,
-        trajectory_length=args.trajectory_length,
-        device=env.device,
-        seed=args.seed,
+    history_options = dict(
+        capacity=args.history_capacity, trajectory_length=args.trajectory_length,
+        device=env.device, seed=args.seed,
+    )
+    history = (
+        RecencyReplayBuffer(
+            **history_options, reservoir_fraction=args.history_reservoir_fraction,
+        )
+        if args.recency_replay else HistoricalReplayBuffer(**history_options)
     )
 
     policy_optimizer = th.optim.Adam(policy.parameters(), lr=args.ppo_lr)
@@ -2480,6 +2614,7 @@ def main() -> None:
                 flip_reset_reward_weight=args.flip_reset_reward_weight,
                 batch_size=args.discriminator_microbatch,
                 max_magnitude=args.reward_max_magnitude,
+                exp_log_odds_reward=args.exp_log_odds_reward,
             ),
             GAE(
                 gamma=args.gamma,

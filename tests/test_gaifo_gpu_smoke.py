@@ -23,7 +23,10 @@ from gaifo import (
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
-    def _short_window_training(self, factorize: bool, hard_positive_mining: bool = False):
+    def _short_window_training(
+        self, factorize: bool, hard_positive_mining: bool = False,
+        exp_log_odds_reward: bool = False, recency_replay: bool = False,
+    ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
             replays = root / "replays"
@@ -44,7 +47,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
                 "--discriminator-hidden", "16", "--frame-embedding", "8",
-                "--temporal-hidden", "8", "--discriminator-batch", "2",
+                "--temporal-hidden", "8",
+                "--discriminator-batch", "4" if recency_replay else "2",
                 "--discriminator-microbatch", "2",
                 "--discriminator-heldout-size", "4",
                 "--discriminator-accuracy-target", "1.0",
@@ -57,6 +61,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 flags.append("--factorize")
             if hard_positive_mining:
                 flags.extend(("--hard-positive-mining", "--no-touch-timeout", "0.3"))
+            if exp_log_odds_reward:
+                flags.append("--exp-log-odds-reward")
+            if recency_replay:
+                flags.append("--recency-replay")
             output = io.StringIO()
             ready_resets = []
             original_reset = ConfidentExpertResetTransform.__call__
@@ -106,6 +114,17 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertIn(False, resets)
                 self.assertIn(True, resets)
                 self.assertIn("D mined reset frac", output)
+
+    def test_exp_log_odds_and_recency_replay_in_both_modes(self):
+        for factorize in (False, True):
+            with self.subTest(factorize=factorize):
+                saved, output, _ = self._short_window_training(
+                    factorize, exp_log_odds_reward=True, recency_replay=True,
+                )
+                self.assertEqual(saved["step"], 64)
+                self.assertTrue(saved["config"]["exp_log_odds_reward"])
+                self.assertTrue(saved["config"]["recency_replay"])
+                self.assertIn("D heldout accuracy", output)
 
 
 if __name__ == "__main__":

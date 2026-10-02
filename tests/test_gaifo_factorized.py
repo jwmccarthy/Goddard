@@ -121,6 +121,27 @@ class FactorizedGAIFOTests(unittest.TestCase):
         self.assertEqual(result["imitation_reward"][0, 4].item(), 0.0)
         self.assertTrue(result["learner_mask"].all())
 
+    def test_exp_log_odds_rewards_keep_factorized_ball_proximity_gate(self):
+        windows = th.zeros(1, 2, 2, 51)
+        windows[0, :, :, BLUE_START + 15] = th.log(th.tensor(2.0))
+        windows[0, :, :, 3] = -th.log(th.tensor(2.0))
+        windows[0, 1, :, BLUE_START] = 3_000 / 4_108
+        batch = TensorBatch({
+            "observation": th.zeros(1, 2, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+            "reward": th.zeros(1, 2),
+        })
+        result = SceneDiscriminatorReward(
+            CoordinateHeads(), noise_std=0, trajectory_length=2,
+            exp_log_odds_reward=True,
+        )(batch, PrepareContext())
+        th.testing.assert_close(result["car_imitation_reward"], th.full((1, 2), 0.25))
+        th.testing.assert_close(result["ball_imitation_reward"],
+                                result["ball_proximity"])
+        self.assertGreater(result["ball_imitation_reward"][0, 0].item(), 0.9)
+        self.assertLess(result["ball_imitation_reward"][0, 1].item(), 0.2)
+
     def test_balanced_near_ball_expert_sampling_and_both_heads_train(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)

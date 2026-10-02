@@ -185,6 +185,29 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         )
         self.assertNotIn("long_imitation_reward", reward)
 
+    def test_exp_log_odds_reward_is_bounded_without_batch_centering(self):
+        windows = th.zeros(1, 5, 2, 51)
+        windows[0, :, -1, 0] = th.tensor([
+            0.0, math.log(2.0), -math.log(2.0), -100.0, 0.0,
+        ])
+        batch = TensorBatch({
+            "observation": th.zeros(1, 5, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.tensor([[True, True, True, True, False]]),
+            "reward": th.tensor([[0.0, 0.0, 0.0, 0.0, 2.0]]),
+        })
+        result = SceneDiscriminatorReward(
+            PositionDiscriminator(), noise_std=0, trajectory_length=2,
+            batch_size=2, max_magnitude=10.0, exp_log_odds_reward=True,
+        )(batch, PrepareContext())
+        th.testing.assert_close(
+            result["imitation_reward"], th.tensor([[1.0, 0.5, 2.0, 10.0, 0.0]]),
+        )
+        th.testing.assert_close(
+            result["training_reward"], th.tensor([[1.0, 0.5, 2.0, 10.0, 2.0]]),
+        )
+        self.assertTrue(result["learner_mask"].all())
+
     def test_aerial_bonus_requires_height_and_goalward_acceleration(self):
         context = touch_context()
         raw = context.current.raw.clone()
@@ -207,10 +230,21 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             "gaifo.py", "--replay-dir", "parsed_replays",
             "--aerial-touch-reward-weight", "0.25",
             "--flip-reset-reward-weight", "2.0",
+            "--exp-log-odds-reward", "--recency-replay",
+            "--history-reservoir-fraction", "0.3",
         ]):
             args, _ = parse_args()
         self.assertEqual(args.aerial_touch_reward_weight, 0.25)
         self.assertEqual(args.flip_reset_reward_weight, 2.0)
+        self.assertTrue(args.exp_log_odds_reward)
+        self.assertTrue(args.recency_replay)
+        self.assertEqual(args.history_reservoir_fraction, 0.3)
+        with patch.object(sys, "argv", [
+            "gaifo.py", "--replay-dir", "parsed_replays",
+        ]):
+            defaults, _ = parse_args()
+        self.assertFalse(defaults.exp_log_odds_reward)
+        self.assertFalse(defaults.recency_replay)
 
 
 if __name__ == "__main__":
