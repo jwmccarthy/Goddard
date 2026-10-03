@@ -22,9 +22,11 @@ from jarl.envs import DatasetResetSampler
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
 from gaifo import (
     GAIFO_ARCHITECTURE,
+    GAIFO_ASE_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
     build_policy as build_gaifo_policy,
 )
+from gaifo_ase import SkillObservationSpace, SkillViewerPolicy
 from pulse import (
     PULSE_ARCHITECTURE, FrozenPulseController, PulseLatentEnv,
     build_policy as build_pulse_policy, file_sha256,
@@ -167,6 +169,8 @@ def load_policy_checkpoint(
     env: CARLTorchVectorEnv | PulseLatentEnv,
     frameskip: int,
     hidden_size: int | None,
+    *,
+    skill_seed: int = 0,
 ):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
@@ -192,14 +196,25 @@ def load_policy_checkpoint(
         signature = ("pulse", payload["distill_sha256"], bool(config.get("bf16", False)))
     elif kind == "gaifo":
         architecture = config.get("architecture")
-        if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+        if architecture not in (
+            GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
+        ):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
         gru = architecture == GAIFO_GRU_ARCHITECTURE
         if config.get("gru", False) != gru:
             raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
+        if config.get("ase_diversity", False) != (architecture == GAIFO_ASE_ARCHITECTURE):
+            raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
         hidden = int(config["policy_hidden"])
+        skill_size = (
+            int(config["ase_skill_dim"])
+            if architecture == GAIFO_ASE_ARCHITECTURE else 0
+        )
+        if architecture == GAIFO_ASE_ARCHITECTURE and skill_size < 2:
+            raise ValueError(f"checkpoint ASE skill dimension is invalid: {path}")
         policy = build_gaifo_policy(
-            env, argparse.Namespace(policy_hidden=hidden, gru=gru)
+            SkillObservationSpace(env, skill_size) if skill_size else env,
+            argparse.Namespace(policy_hidden=hidden, gru=gru),
         )
         policy_state = payload["policy"]
     else:
@@ -226,6 +241,13 @@ def load_policy_checkpoint(
     policy.load_state_dict(policy_state)
     if kind == "pulse":
         return policy.eval().requires_grad_(False), signature
+    if kind == "gaifo" and architecture == GAIFO_ASE_ARCHITECTURE:
+        wrapped = SkillViewerPolicy(
+            policy.eval().requires_grad_(False), skill_size, skill_seed,
+        )
+        return wrapped.eval().requires_grad_(False), (
+            "gaifo", hidden, architecture, skill_size,
+        )
     return policy.eval().requires_grad_(False), (kind, hidden, architecture)
 
 
@@ -261,6 +283,8 @@ def load_match(
     frameskip: int,
     hidden_size: int | None,
     distill_checkpoint: Path | None = None,
+    blue_skill_seed: int = 0,
+    orange_skill_seed: int = 1,
 ):
     kind = checkpoint_kind(blue_path)
     if kind != checkpoint_kind(orange_path):
@@ -276,10 +300,10 @@ def load_match(
         )
         env = PulseLatentEnv(base, controller)
     blue, blue_signature = load_policy_checkpoint(
-        blue_path, env, frameskip, hidden_size
+        blue_path, env, frameskip, hidden_size, skill_seed=blue_skill_seed,
     )
     orange, orange_signature = load_policy_checkpoint(
-        orange_path, env, frameskip, hidden_size
+        orange_path, env, frameskip, hidden_size, skill_seed=orange_skill_seed,
     )
     if blue_signature != orange_signature:
         raise ValueError("selected policies use different trainer architectures")
@@ -398,7 +422,7 @@ def simulate(
         )
         env, blue, orange = load_match(
             blue_path, orange_path, base, args.frameskip, args.hidden_size,
-            args.distill_checkpoint,
+            args.distill_checkpoint, args.blue_skill_seed, args.orange_skill_seed,
         )
         observation = env.reset()
         blue_state = blue.initial_state(1)
@@ -415,6 +439,7 @@ def simulate(
                     next_env, next_blue, next_orange = load_match(
                         pending[0], pending[1], base, args.frameskip,
                         args.hidden_size, args.distill_checkpoint,
+                        args.blue_skill_seed, args.orange_skill_seed,
                     )
                 except Exception as error:
                     state.publish({"error": f"{type(error).__name__}: {error}"})
@@ -597,6 +622,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-ticks", type=int, default=4096)
     parser.add_argument("--reset-state-limit", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--blue-skill-seed", type=int, default=0)
+    parser.add_argument("--orange-skill-seed", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--sample", action="store_true")

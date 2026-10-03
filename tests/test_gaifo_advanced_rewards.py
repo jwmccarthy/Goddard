@@ -14,6 +14,7 @@ from carl.gymnasium.state import (
     RewardContext,
 )
 from gaifo import (
+    ASEBallTouchCapture,
     AdvancedTouchCapture,
     GameplayDiagnostics,
     SceneDiscriminatorReward,
@@ -121,6 +122,15 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertAlmostEqual(aerial[3, 0].item(), -orange_score)
         th.testing.assert_close(flip[2], th.tensor([-1.0, 1.0]))
         th.testing.assert_close(flip[3], th.zeros(2))
+        touches = ASEBallTouchCapture(gameplay)(None)
+        th.testing.assert_close(
+            touches["ego_ball_touch"].view(4, 2),
+            th.tensor([[True, False], [True, False], [False, True], [False, True]]),
+        )
+        th.testing.assert_close(
+            touches["opponent_ball_touch"].view(4, 2),
+            touches["ego_ball_touch"].view(4, 2).flip(-1),
+        )
 
         batch = TensorBatch({
             "observation": th.zeros(1, 8, 51),

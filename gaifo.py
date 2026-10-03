@@ -49,6 +49,10 @@ from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
+from gaifo_ase import (
+    ASEPPOLoss, SkillConditionedEnv, SkillDiscoveryReward, SkillEncoder,
+    SkillEncoderUpdate,
+)
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
 )
@@ -57,6 +61,7 @@ from replay_resets import (
 SCENE_SIZE = 51
 GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v3"
 GAIFO_GRU_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-gru"
+GAIFO_ASE_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-ase"
 BALL_SIZE = 9
 CAR_SIZE = 21
 N_CARS = 2
@@ -286,6 +291,8 @@ class GameplayDiagnostics:
         self.touch_steps = th.zeros(n_sim, dtype=th.long, device=device)
         self.last_aerial_touch_score = th.zeros(n_sim * N_CARS, device=device)
         self.last_flip_reset = th.zeros(n_sim * N_CARS, device=device)
+        self.last_ego_ball_touch = th.zeros(n_sim * N_CARS, dtype=th.bool, device=device)
+        self.last_opponent_ball_touch = th.zeros(n_sim * N_CARS, dtype=th.bool, device=device)
         self.counts = {
             name: th.zeros((), dtype=th.float32, device=device)
             for name in (
@@ -303,6 +310,8 @@ class GameplayDiagnostics:
     @th.no_grad()
     def __call__(self, context: RewardContext) -> th.Tensor:
         touches = context.current.car_ball_touches
+        self.last_ego_ball_touch = touches.reshape(-1)
+        self.last_opponent_ball_touch = touches.flip(dims=(-1,)).reshape(-1)
         score_for_actor = context.events.score_delta[:, None] * context.current.team_sign
         aerial_score, aerial, flip_reset = advanced_touch_events(context)
         self.last_aerial_touch_score = (
@@ -369,6 +378,19 @@ class AdvancedTouchCapture(CaptureBase):
         return {
             "aerial_touch_score": self.gameplay.last_aerial_touch_score,
             "flip_reset_event": self.gameplay.last_flip_reset,
+        }
+
+
+class ASEBallTouchCapture(CaptureBase):
+    """Capture which player caused a ball touch on the scored transition."""
+
+    def __init__(self, gameplay: GameplayDiagnostics) -> None:
+        self.gameplay = gameplay
+
+    def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        return {
+            "ego_ball_touch": self.gameplay.last_ego_ball_touch,
+            "opponent_ball_touch": self.gameplay.last_opponent_ball_touch,
         }
 
 
@@ -1928,7 +1950,7 @@ class AdaptiveDiscriminatorUpdate:
 
 
 class GAIFOCheckpoints:
-    """Periodic checkpointing for policy, critic, discriminator and optimizers."""
+    """Checkpoint the policy, discriminator and optional ASE skill encoder."""
 
     def __init__(
         self,
@@ -1943,7 +1965,18 @@ class GAIFOCheckpoints:
         discriminator_optimizer: th.optim.Optimizer,
         buffer: RolloutBuffer,
         args: argparse.Namespace,
+        *,
+        skill_encoder: SkillEncoder | None = None,
+        skill_optimizer: th.optim.Optimizer | None = None,
+        skill_env: SkillConditionedEnv | None = None,
+        skill_update: SkillEncoderUpdate | None = None,
     ) -> None:
+        if getattr(args, "ase_diversity", False) and not all((
+            skill_encoder, skill_optimizer, skill_env, skill_update,
+        )):
+            raise ValueError(
+                "ASE checkpoint requires an encoder, optimizer, skill environment and update"
+            )
         self.directory = Path(directory)
         self.interval = interval
         self.keep = keep
@@ -1955,6 +1988,10 @@ class GAIFOCheckpoints:
         self.discriminator_optimizer = discriminator_optimizer
         self.buffer = buffer
         self.args = args
+        self.skill_encoder = skill_encoder
+        self.skill_optimizer = skill_optimizer
+        self.skill_env = skill_env
+        self.skill_update = skill_update
         self.step = 0
         self.next_step = 0
         self.clock: Clock | None = None
@@ -1982,7 +2019,9 @@ class GAIFOCheckpoints:
             "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
             "config": {
                 "architecture": (
-                    GAIFO_GRU_ARCHITECTURE if self.args.gru else GAIFO_ARCHITECTURE
+                    GAIFO_ASE_ARCHITECTURE if getattr(self.args, "ase_diversity", False) else (
+                        GAIFO_GRU_ARCHITECTURE if self.args.gru else GAIFO_ARCHITECTURE
+                    )
                 ),
                 **{
                     name: str(value) if isinstance(value, Path) else value
@@ -1990,6 +2029,13 @@ class GAIFOCheckpoints:
                 },
             },
         }
+        if self.skill_encoder is not None:
+            payload.update({
+                "skill_encoder": self.skill_encoder.state_dict(),
+                "skill_encoder_optimizer": self.skill_optimizer.state_dict(),
+                "skill_rng_state": self.skill_env.generator.get_state(),
+                "skill_encoder_rng_state": self.skill_update.generator.get_state(),
+            })
         if self.clock is not None:
             payload["clock"] = asdict(self.clock)
             payload["torch_rng_state"] = th.get_rng_state()
@@ -2014,10 +2060,14 @@ def load_resume_checkpoint(path: Path) -> dict:
         raise ValueError(f"invalid GAIFO checkpoint: {path}")
     config = payload["config"]
     architecture = config.get("architecture")
-    if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+    if architecture not in (
+        GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
+    ):
         raise ValueError(f"incompatible GAIFO architecture in {path}")
     if config.get("gru", False) != (architecture == GAIFO_GRU_ARCHITECTURE):
         raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
+    if config.get("ase_diversity", False) != (architecture == GAIFO_ASE_ARCHITECTURE):
+        raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
     step = payload.get("step")
     if type(step) is not int or step < 0:
         raise ValueError(f"checkpoint has an invalid training step: {path}")
@@ -2030,6 +2080,11 @@ def load_resume_checkpoint(path: Path) -> dict:
         "policy", "critic", "discriminator", "policy_optimizer",
         "critic_optimizer", "discriminator_optimizer",
     )
+    if architecture == GAIFO_ASE_ARCHITECTURE:
+        required += (
+            "skill_encoder", "skill_encoder_optimizer",
+            "skill_rng_state", "skill_encoder_rng_state",
+        )
     # Older dual-timescale checkpoints may also include long-discriminator state.
     # Its short discriminator and optimizer remain compatible with this trainer.
     missing = [name for name in required if name not in payload]
@@ -2062,10 +2117,12 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         )
     if args.factorize != config.get("factorize", False):
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
+    if args.ase_diversity != config.get("ase_diversity", False):
+        raise ValueError("--ase-diversity must match the checkpoint architecture when resuming")
     for name in (
         "frameskip", "trajectory_length", "policy_hidden", "critic_hidden",
         "discriminator_hidden", "frame_embedding", "temporal_hidden",
-    ):
+    ) + (("ase_skill_dim", "ase_skill_steps", "ase_encoder_hidden") if args.ase_diversity else ()):
         if getattr(args, name) != config.get(name):
             raise ValueError(
                 f"--{name.replace('_', '-')} must match the checkpoint "
@@ -2084,7 +2141,9 @@ def restore_training_checkpoint(
     for name, optimizer in optimizers.items():
         optimizer.load_state_dict(payload[f"{name}_optimizer"])
         learning_rate = (
-            args.discriminator_lr if "discriminator" in name else args.ppo_lr
+            args.ase_encoder_lr if name == "skill_encoder" else (
+                args.discriminator_lr if "discriminator" in name else args.ppo_lr
+            )
         )
         for group in optimizer.param_groups:
             group["lr"] = learning_rate
@@ -2200,6 +2259,19 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--gru", action=argparse.BooleanOptionalAction, default=False,
         help="use GRU policy and critic with recurrent PPO (default: MLP)",
     )
+    parser.add_argument(
+        "--ase-diversity", action=argparse.BooleanOptionalAction, default=False,
+        help="train a skill-conditioned MLP with ASE skill discovery and action diversity",
+    )
+    parser.add_argument("--ase-skill-dim", type=int, default=16)
+    parser.add_argument("--ase-skill-steps", type=int, default=32)
+    parser.add_argument("--ase-reward-weight", type=float, default=0.5)
+    parser.add_argument("--ase-diversity-weight", type=float, default=0.01)
+    parser.add_argument("--ase-diversity-batch", type=int, default=1_024)
+    parser.add_argument("--ase-encoder-hidden", type=int, default=128)
+    parser.add_argument("--ase-encoder-batch", type=int, default=4_096)
+    parser.add_argument("--ase-encoder-steps", type=int, default=4)
+    parser.add_argument("--ase-encoder-lr", type=float, default=3e-4)
     parser.add_argument(
         "--sequence-length", type=int, default=16,
         help="steps per recurrent PPO training sequence when --gru is enabled",
@@ -2391,11 +2463,25 @@ def validate_args(args: argparse.Namespace) -> None:
     n_envs = args.n_sim * 2
     if args.ppo_batch > args.rollout * n_envs:
         raise ValueError("--ppo-batch must fit the rollout size")
+    if args.ase_diversity and args.gru:
+        raise ValueError("--ase-diversity currently supports MLP policies only")
     if args.gru:
         if args.rollout % args.sequence_length:
             raise ValueError("--rollout must be divisible by --sequence-length")
         if args.ppo_batch % args.sequence_length:
             raise ValueError("--ppo-batch must be divisible by --sequence-length")
+    if args.ase_diversity:
+        if args.ase_skill_dim < 2:
+            raise ValueError("--ase-skill-dim must be at least two")
+        for name in (
+            "ase_skill_steps", "ase_diversity_batch", "ase_encoder_hidden",
+            "ase_encoder_batch", "ase_encoder_steps", "ase_encoder_lr",
+        ):
+            if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+                raise ValueError(f"--{name.replace('_', '-')} must be positive")
+        for name in ("ase_reward_weight", "ase_diversity_weight"):
+            if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+                raise ValueError(f"--{name.replace('_', '-')} must be nonnegative")
 
 
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
@@ -2457,6 +2543,8 @@ def build_runner(
         captures.append(CriticCapture(critic))
     if gameplay is not None:
         captures.append(AdvancedTouchCapture(gameplay))
+        if getattr(args, "ase_diversity", False):
+            captures.append(ASEBallTouchCapture(gameplay))
     captures.append(SceneWindowCapture(args.trajectory_length))
     return Runner(env, policy, buffer, captures=captures)
 
@@ -2494,15 +2582,24 @@ def main() -> None:
     th.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    env = build_env(args)
-    gameplay = env.register_reward(GameplayDiagnostics(
-        env.n_sim,
-        env.device,
+    base_env = build_env(args)
+    gameplay = base_env.register_reward(GameplayDiagnostics(
+        base_env.n_sim,
+        base_env.device,
         math.ceil(args.no_touch_timeout * 120.0 / args.frameskip),
     ))
+    skill_env = (
+        SkillConditionedEnv(base_env, args.ase_skill_dim, args.ase_skill_steps, args.seed)
+        if args.ase_diversity else None
+    )
+    env = skill_env if skill_env is not None else base_env
     policy = build_policy(env, args)
     critic = build_critic(env, args)
     discriminator = build_discriminator(args).to(env.device)
+    skill_encoder = (
+        SkillEncoder(args.ase_skill_dim, args.ase_encoder_hidden).to(env.device)
+        if args.ase_diversity else None
+    )
 
     expert = ExpertSceneDataset(
         args.replay_dir,
@@ -2522,7 +2619,7 @@ def main() -> None:
             expert, reset_dataset, discriminator, args.discriminator_microbatch,
         ) if args.hard_positive_mining else None
     )
-    env.reset_state_provider = ReplayResetProvider(
+    base_env.reset_state_provider = ReplayResetProvider(
         DatasetResetSampler(
             reset_dataset,
             transforms=(reset_miner,) if reset_miner is not None else (),
@@ -2549,22 +2646,34 @@ def main() -> None:
     discriminator_optimizer = th.optim.Adam(
         discriminator.parameters(), lr=args.discriminator_lr
     )
+    skill_optimizer = (
+        th.optim.Adam(skill_encoder.parameters(), lr=args.ase_encoder_lr)
+        if skill_encoder is not None else None
+    )
+    skill_update = (
+        SkillEncoderUpdate(
+            skill_encoder, skill_optimizer, args.ase_encoder_batch,
+            args.ase_encoder_steps, args.max_grad_norm, args.seed, env.device,
+        ) if skill_encoder is not None else None
+    )
     restored_clock = None
     if resume is not None:
+        modules = {
+            "policy": policy, "critic": critic, "discriminator": discriminator,
+        }
+        optimizers = {
+            "policy": policy_optimizer, "critic": critic_optimizer,
+            "discriminator": discriminator_optimizer,
+        }
+        if skill_encoder is not None:
+            modules["skill_encoder"] = skill_encoder
+            optimizers["skill_encoder"] = skill_optimizer
         restored_clock = restore_training_checkpoint(
-            resume,
-            args,
-            {
-                "policy": policy,
-                "critic": critic,
-                "discriminator": discriminator,
-            },
-            {
-                "policy": policy_optimizer,
-                "critic": critic_optimizer,
-                "discriminator": discriminator_optimizer,
-            },
+            resume, args, modules, optimizers,
         )
+        if skill_env is not None:
+            skill_env.generator.set_state(resume["skill_rng_state"])
+            skill_update.generator.set_state(resume["skill_encoder_rng_state"])
         if reset_miner is not None:
             reset_miner.ready = restored_clock.learner_updates > 0
 
@@ -2592,16 +2701,24 @@ def main() -> None:
         reset_miner=reset_miner,
     )
 
-    ppo_loss = PPOLoss(
-        policy,
-        critic,
-        PPOConfig(
-            clip=args.ppo_clip,
-            value_clip=args.value_clip,
-            value_coef=args.value_coef,
-            entropy_coef=args.entropy,
-            normalize_advantage=True,
-        ),
+    ppo_config = PPOConfig(
+        clip=args.ppo_clip,
+        value_clip=args.value_clip,
+        value_coef=args.value_coef,
+        entropy_coef=args.entropy,
+        normalize_advantage=True,
+    )
+    ppo_loss = (
+        ASEPPOLoss(
+            policy, critic, ppo_config, args.ase_skill_dim,
+            args.ase_diversity_weight, args.ase_diversity_batch,
+        ) if skill_encoder is not None else PPOLoss(policy, critic, ppo_config)
+    )
+    skill_reward = (
+        SkillDiscoveryReward(
+            skill_encoder, args.ase_reward_weight, args.ase_encoder_batch,
+        )
+        if skill_encoder is not None else None
     )
     ppo_update = Update(
         transforms=(
@@ -2616,6 +2733,7 @@ def main() -> None:
                 max_magnitude=args.reward_max_magnitude,
                 exp_log_odds_reward=args.exp_log_odds_reward,
             ),
+            *((skill_reward,) if skill_reward is not None else ()),
             GAE(
                 gamma=args.gamma,
                 lambda_=args.lambda_,
@@ -2633,7 +2751,9 @@ def main() -> None:
     )
     value_scheduler = build_entropy_scheduler(args, ppo_loss)
 
-    learner = Algorithm(discriminator_update, ppo_update)
+    learner = Algorithm(discriminator_update, *(
+        (skill_update,) if skill_update is not None else ()
+    ), ppo_update)
 
     run_id = datetime.now().strftime("gaifo-%Y%m%d-%H%M%S-%f")
     logger = Logger(args.log_dir / run_id)
@@ -2667,6 +2787,16 @@ def main() -> None:
         logger.register_progress_metric(
             "Discriminator", "reset_mined_fraction", "D mined reset frac", ".3f",
         )
+    if skill_update is not None:
+        for section, key, label, fmt in (
+            ("Skill", "encoder_loss", "skill encoder loss", ".3f"),
+            ("Skill", "alignment", "skill alignment", ".3f"),
+            ("Skill", "ball_credit", "ASE ball credit", ".3f"),
+            ("Skill", "reward", "ASE reward", ".3f"),
+            ("PPO", "ase_diversity_loss", "ASE diversity loss", ".3f"),
+            ("PPO", "ase_action_kl", "ASE action KL", ".3f"),
+        ):
+            logger.register_progress_metric(section, key, label, fmt)
     if value_scheduler is not None:
         logger.register_progress_metric(
             "Schedule", "entropy_coef", "entropy coef", ".4f"
@@ -2684,10 +2814,16 @@ def main() -> None:
         discriminator_optimizer,
         buffer,
         args,
+        skill_encoder=skill_encoder,
+        skill_optimizer=skill_optimizer,
+        skill_env=skill_env,
+        skill_update=skill_update,
     )
 
     def update_callback(trainer: Trainer) -> None:
         metrics = gameplay.diagnostic_metrics()
+        if skill_reward is not None and skill_reward.last_mean is not None:
+            metrics.setdefault("Skill", {})["reward"] = skill_reward.last_mean
         if metrics:
             trainer.logger.update(metrics, step=trainer.clock.env_steps)
 
