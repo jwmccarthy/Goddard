@@ -1,5 +1,6 @@
 """Opt-in CUDA/CARL smoke for replay-backed ASE GAIFO, resume and viewer."""
 
+import copy
 import io
 import os
 import sys
@@ -18,7 +19,13 @@ from gaifo import (
     BLUE_START, GAIFO_ASE_ARCHITECTURE, ORANGE_START,
     POSITION_SCALE, load_resume_checkpoint, main,
 )
-from gaifo_ase import stable_categorical_kl
+from gaifo_ase import (
+    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate, SkillSequenceEncoder,
+    stable_categorical_kl,
+)
+from jarl.data import TensorBatch
+from jarl.store.rollout import Rollout
+from jarl.transform import PrepareContext
 from torch.distributions import Categorical
 from watch_checkpoints import load_match
 
@@ -28,6 +35,38 @@ from watch_checkpoints import load_match
     "opt-in CUDA/CARL integration smoke",
 )
 class ASEGAIFOGpuSmokeTests(unittest.TestCase):
+    def test_cuda_skill_sequences_score_and_train_in_bounded_chunks(self):
+        length, n_envs, dim = 64, 512, 16
+        encoder = SkillSequenceEncoder(dim, 64, sequence_length=32).cuda()
+        optimizer = th.optim.Adam(encoder.parameters(), lr=3e-4)
+        skill = th.nn.functional.normalize(
+            th.randn(2, n_envs, dim, device="cuda:0"), dim=-1,
+        ).repeat_interleave(32, dim=0)
+        scene = th.randn(length, n_envs, 51, device="cuda:0") * 0.01
+        observation = th.cat((scene, skill), dim=-1)
+        next_observation = observation.clone()
+        next_observation[..., 9] += 0.01
+        done = th.zeros(length, n_envs, dtype=th.bool, device="cuda:0")
+        batch = TensorBatch({
+            "observation": observation, "next_obs": next_observation,
+            "training_reward": th.zeros_like(done, dtype=th.float32),
+            "learner_mask": done.clone(),
+            "terminated": done, "truncated": done.clone(),
+            "ego_ball_touch": done.clone(), "opponent_ball_touch": done.clone(),
+        })
+        reward = SkillDiscoveryReward(encoder, 0.5, batch_size=4_096)(
+            batch, PrepareContext(),
+        )
+        self.assertTrue(th.isfinite(reward["skill_reward"]).all())
+        self.assertTrue(reward["learner_mask"].all())
+        update = SkillEncoderUpdate(
+            encoder, optimizer, batch_size=4_096, steps=1,
+            max_grad_norm=0.5, seed=0, device=th.device("cuda:0"),
+        )
+        _, metrics = update.run(Rollout(batch))
+        self.assertTrue(all(np.isfinite(x) for x in metrics["Skill"].values()))
+        self.assertTrue(th.isfinite(encoder.sequence_head.weight).all())
+
     def test_cuda_ase_kl_with_confident_masked_actions_at_training_batch_size(self):
         mask_logit = th.finfo(th.float32).min
         logits = th.zeros(16_384, 4, 3, device="cuda:0", requires_grad=True)
@@ -85,6 +124,10 @@ class ASEGAIFOGpuSmokeTests(unittest.TestCase):
             saved = load_resume_checkpoint(first_path)
             self.assertEqual(saved["step"], 64)
             self.assertEqual(saved["config"]["architecture"], GAIFO_ASE_ARCHITECTURE)
+            self.assertEqual(saved["config"]["ase_sequence_length"], 2)
+            self.assertTrue(any(
+                key.startswith("sequence_") for key in saved["skill_encoder"]
+            ))
             self.assertTrue(saved["config"]["factorize"])
             self.assertIn("skill_encoder_optimizer", saved)
             self.assertTrue(saved["skill_encoder_optimizer"]["state"])
@@ -123,6 +166,31 @@ class ASEGAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertEqual(env.step(action)[0].shape, observation.shape)
             finally:
                 base.close()
+
+            legacy = copy.deepcopy(saved)
+            legacy["config"].pop("ase_sequence_length")
+            legacy["skill_encoder"] = {
+                key: value for key, value in legacy["skill_encoder"].items()
+                if not key.startswith("sequence_")
+            }
+            old_encoder = SkillEncoder(4, 16)
+            old_encoder.load_state_dict(legacy["skill_encoder"])
+            legacy["skill_encoder_optimizer"] = th.optim.Adam(
+                old_encoder.parameters(), lr=3e-4,
+            ).state_dict()
+            legacy_path = root / "legacy_ase.pt"
+            th.save(legacy, legacy_path)
+            upgraded_dir = root / "upgraded_checkpoints"
+            with patch.object(sys, "argv", [
+                "gaifo.py", "--resume-checkpoint", str(legacy_path),
+                "--timesteps", "128", "--checkpoint-dir", str(upgraded_dir),
+            ]), redirect_stdout(io.StringIO()):
+                main()
+            upgraded = load_resume_checkpoint(
+                next(upgraded_dir.rglob("gaifo_000000000128.pt"))
+            )
+            self.assertEqual(upgraded["config"]["ase_sequence_length"], 2)
+            self.assertIn("sequence_head.weight", upgraded["skill_encoder"])
 
 
 if __name__ == "__main__":

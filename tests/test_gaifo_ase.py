@@ -20,8 +20,8 @@ from gaifo import (
 from gaifo_ase import (
     ASEPPOLoss, FiniteIndependentOptimizerSteps, SkillConditionedEnv,
     SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate,
-    SkillObservationSpace, ball_ownership, predicted_skill,
-    sample_skills, stable_categorical_kl,
+    SkillObservationSpace, SkillSequenceEncoder, ball_ownership,
+    predicted_skill, sample_skills, skill_segments, stable_categorical_kl,
 )
 from jarl.data import TensorBatch
 from jarl.learn import OptimizerStep, PPOConfig
@@ -81,6 +81,115 @@ class FixedEncoder(th.nn.Module):
 
 
 class GAIFOASETests(unittest.TestCase):
+    def test_sequence_windows_split_at_skill_switch_done_and_context_limit(self):
+        skill = th.tensor([1., 0.]).expand(8, 2, 2).clone()
+        skill[4:, 0] = th.tensor([0., 1.])
+        observations = th.cat((th.zeros(8, 2, 51), skill), dim=-1)
+        terminated = th.zeros(8, 2, dtype=th.bool)
+        terminated[3, 1] = True
+        truncated = th.zeros_like(terminated)
+        truncated[7, 1] = True
+        batch = TensorBatch({
+            "observation": observations, "next_obs": observations.clone(),
+            "terminated": terminated, "truncated": truncated,
+            "ego_ball_touch": th.zeros_like(terminated),
+            "opponent_ball_touch": th.zeros_like(terminated),
+        })
+        segments = skill_segments(batch, skill_size=2, length=3)
+        self.assertEqual(
+            sorted(zip(segments.actor.tolist(), segments.start.tolist(),
+                       segments.end.tolist(), strict=True)),
+            [(0, 0, 2), (0, 3, 3), (0, 4, 6), (0, 7, 7),
+             (1, 0, 2), (1, 4, 6)],
+        )
+        selected = th.arange(len(segments))
+        _, _, _, _, held, times, actors, active = segments.gather(
+            batch, selected, 3, 2,
+        )
+        for index in range(len(segments)):
+            self.assertTrue((held[index] == skill[times[index, active[index]],
+                                                   actors[index, active[index]]]).all())
+            self.assertFalse(terminated[times[index, active[index]],
+                                        actors[index, active[index]]].any())
+
+    def test_sequence_encoder_uses_past_but_never_future_motion(self):
+        th.manual_seed(14)
+        encoder = SkillSequenceEncoder(skill_size=4, hidden_size=16, sequence_length=3)
+        with th.no_grad():
+            th.nn.init.normal_(encoder.sequence_head.weight, std=0.1)
+        scene = th.randn(1, 3, 51) * 0.01
+        next_scene = scene.clone()
+        touches = th.zeros(1, 3, dtype=th.bool)
+        baseline, _ = encoder.predict_sequence(scene, next_scene, touches, touches)
+
+        earlier = scene.clone()
+        earlier[:, 0, 9] += 1
+        later_from_earlier, _ = encoder.predict_sequence(
+            earlier, next_scene, touches, touches,
+        )
+        self.assertGreater(
+            (baseline[:, 2] - later_from_earlier[:, 2]).abs().max().item(), 1e-5,
+        )
+        future = scene.clone()
+        future[:, 2, 9] += 1
+        before_future, _ = encoder.predict_sequence(
+            future, next_scene, touches, touches,
+        )
+        th.testing.assert_close(before_future[:, :2], baseline[:, :2])
+
+    def test_sequence_reward_matches_legacy_before_temporal_training(self):
+        th.manual_seed(19)
+        old = SkillEncoder(2, 8)
+        encoder = SkillSequenceEncoder(2, 8, sequence_length=3)
+        missing = encoder.load_state_dict(old.state_dict(), strict=False)
+        self.assertTrue(all(key.startswith("sequence_") for key in missing.missing_keys))
+        observation = th.randn(6, 2, 53) * 0.01
+        observation[..., -2:] = th.tensor([1., 0.])
+        observation[3:, 0, -2:] = th.tensor([0., 1.])
+        done = th.zeros(6, 2, dtype=th.bool)
+        done[2, 1] = True
+        batch = TensorBatch({
+            "observation": observation, "next_obs": observation.clone(),
+            "training_reward": th.zeros(6, 2),
+            "learner_mask": th.zeros(6, 2, dtype=th.bool),
+            "terminated": done, "truncated": th.zeros_like(done),
+            "ego_ball_touch": th.zeros_like(done),
+            "opponent_ball_touch": th.zeros_like(done),
+        })
+        legacy = SkillDiscoveryReward(old, 0.5)(batch, PrepareContext())
+        sequence = SkillDiscoveryReward(encoder, 0.5, batch_size=6)(
+            batch, PrepareContext(),
+        )
+        th.testing.assert_close(sequence["skill_reward"], legacy["skill_reward"])
+        th.testing.assert_close(sequence["learner_mask"], legacy["learner_mask"])
+
+    def test_sequence_encoder_update_trains_temporal_weights_on_held_skills(self):
+        th.manual_seed(23)
+        encoder = SkillSequenceEncoder(4, 16, sequence_length=3)
+        optimizer = th.optim.Adam(encoder.parameters(), lr=1e-2)
+        update = SkillEncoderUpdate(
+            encoder, optimizer, batch_size=12, steps=2,
+            max_grad_norm=1.0, seed=3, device=th.device("cpu"),
+        )
+        scene = th.randn(6, 4, 51) * 0.01
+        skill = sample_skills(8, 4, "cpu").reshape(2, 4, 4).repeat_interleave(3, dim=0)
+        observation = th.cat((scene, skill), dim=-1)
+        future = observation.clone()
+        future[..., 9] += skill[..., 0] * 0.1
+        done = th.zeros(6, 4, dtype=th.bool)
+        rollout = Rollout(TensorBatch({
+            "observation": observation, "next_obs": future,
+            "terminated": done, "truncated": done.clone(),
+            "ego_ball_touch": done.clone(), "opponent_ball_touch": done.clone(),
+        }))
+        old_head = encoder.sequence_head.weight.detach().clone()
+        old_input = encoder.sequence_input.weight.detach().clone()
+        _, metrics = update.run(rollout)
+        self.assertTrue(all(np.isfinite(x) for x in metrics["Skill"].values()))
+        self.assertEqual(metrics["Skill"]["context_steps"], 3.0)
+        self.assertFalse(th.equal(old_head, encoder.sequence_head.weight))
+        self.assertFalse(th.equal(old_input, encoder.sequence_input.weight))
+
     def test_large_masked_categorical_kl_stays_finite_after_probability_underflow(self):
         count = 16_384
         mask_logit = th.finfo(th.float32).min
@@ -301,6 +410,11 @@ class GAIFOASETests(unittest.TestCase):
                 args, resume = parse_args()
             self.assertIsNone(resume)
             validate_args(args)
+            self.assertEqual(args.ase_sequence_length, 2)
+            args.ase_sequence_length = 3
+            with self.assertRaisesRegex(ValueError, "cannot exceed --ase-skill-steps"):
+                validate_args(args)
+            args.ase_sequence_length = 2
             args.gru = True
             with self.assertRaisesRegex(ValueError, "MLP policies only"):
                 validate_args(args)
@@ -317,7 +431,7 @@ class GAIFOASETests(unittest.TestCase):
             policy = build_policy(skill_env, args)
             critic = build_critic(skill_env, args)
             discriminator = th.nn.Linear(3, 1)
-            encoder = SkillEncoder(4, 8)
+            encoder = SkillSequenceEncoder(4, 8, 2)
             optimizers = {
                 "policy": th.optim.Adam(policy.parameters()),
                 "critic": th.optim.Adam(critic.parameters()),
@@ -360,11 +474,15 @@ class GAIFOASETests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must match the checkpoint"):
                 validate_resume_args(resumed_args, loaded)
             resumed_args.ase_skill_dim = 4
+            resumed_args.ase_sequence_length = 1
+            with self.assertRaisesRegex(ValueError, "must match the checkpoint"):
+                validate_resume_args(resumed_args, loaded)
+            resumed_args.ase_sequence_length = 2
 
             restored_policy = build_policy(SkillObservationSpace(StubEnv(), 4), args)
             restored_critic = build_critic(SkillObservationSpace(StubEnv(), 4), args)
             restored_discriminator = th.nn.Linear(3, 1)
-            restored_encoder = SkillEncoder(4, 8)
+            restored_encoder = SkillSequenceEncoder(4, 8, 2)
             modules = {
                 "policy": restored_policy, "critic": restored_critic,
                 "discriminator": restored_discriminator,
@@ -384,6 +502,48 @@ class GAIFOASETests(unittest.TestCase):
                 restored_optimizers["skill_encoder"].param_groups[0]["lr"],
                 resumed_args.ase_encoder_lr,
             )
+
+            legacy = copy.deepcopy(payload)
+            legacy["config"].pop("ase_sequence_length")
+            legacy["skill_encoder"] = {
+                name: value for name, value in legacy["skill_encoder"].items()
+                if not name.startswith("sequence_")
+            }
+            legacy_model = SkillEncoder(4, 8)
+            legacy_model.load_state_dict(legacy["skill_encoder"])
+            legacy_optimizer = th.optim.Adam(
+                legacy_model.parameters(), lr=args.ase_encoder_lr,
+            )
+            car, ball = legacy_model(th.zeros(1, 51), th.ones(1, 51) * 0.1)
+            (car + ball).sum().backward()
+            legacy_optimizer.step()
+            legacy["skill_encoder"] = legacy_model.state_dict()
+            legacy["skill_encoder_optimizer"] = legacy_optimizer.state_dict()
+            self.assertTrue(legacy["skill_encoder_optimizer"]["state"])
+            old_path = root / "checkpoints" / "gaifo_old_ase.pt"
+            th.save(legacy, old_path)
+            with patch.object(sys, "argv", [
+                "gaifo.py", "--resume-checkpoint", str(old_path), "--timesteps", "32",
+            ]):
+                upgraded_args, old_payload = parse_args()
+            validate_resume_args(upgraded_args, old_payload)
+            self.assertEqual(upgraded_args.ase_sequence_length, 2)
+            upgraded_encoder = SkillSequenceEncoder(4, 8, 2)
+            upgraded_modules = {
+                **modules, "skill_encoder": upgraded_encoder,
+            }
+            upgraded_optimizers = {
+                **restored_optimizers,
+                "skill_encoder": th.optim.Adam(upgraded_encoder.parameters()),
+            }
+            clock = restore_training_checkpoint(
+                old_payload, upgraded_args, upgraded_modules, upgraded_optimizers,
+            )
+            self.assertEqual(clock.env_steps, 16)
+            for name, value in legacy["skill_encoder"].items():
+                th.testing.assert_close(value, upgraded_encoder.state_dict()[name])
+            self.assertFalse(upgraded_optimizers["skill_encoder"].state)
+            self.assertTrue(th.count_nonzero(upgraded_encoder.sequence_head.weight) == 0)
 
             viewer, signature = load_policy_checkpoint(path, StubEnv(), 4, None)
             self.assertEqual(signature[-2:], (GAIFO_ASE_ARCHITECTURE, 4))

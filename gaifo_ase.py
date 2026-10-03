@@ -1,5 +1,7 @@
 """Opt-in ASE skill discovery and action-diversity training for GAIFO."""
 
+from dataclasses import dataclass
+
 import gymnasium as gym
 import numpy as np
 import torch as th
@@ -135,6 +137,57 @@ class SkillEncoder(nn.Module):
         )
 
 
+class SkillSequenceEncoder(SkillEncoder):
+    """Predict the held skill from causal, skill-aligned scene transitions."""
+
+    def __init__(self, skill_size: int, hidden_size: int, sequence_length: int) -> None:
+        super().__init__(skill_size, hidden_size)
+        if sequence_length < 2:
+            raise ValueError("ASE sequence length must be at least two")
+        self.sequence_length = sequence_length
+        self.sequence_input = nn.Linear(2 * skill_size + 1, hidden_size)
+        self.sequence_position = nn.Embedding(sequence_length, hidden_size)
+        self.sequence_model = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_size,
+                nhead=4 if hidden_size % 4 == 0 else 1,
+                dim_feedforward=2 * hidden_size,
+                dropout=0.0,
+                batch_first=True,
+                norm_first=True,
+            ),
+            num_layers=1,
+            enable_nested_tensor=False,
+        )
+        self.sequence_head = nn.Linear(hidden_size, skill_size)
+        # When upgrading an old checkpoint, start with exactly its one-step
+        # prediction and learn the longer-context correction gradually.
+        nn.init.zeros_(self.sequence_head.weight)
+        nn.init.zeros_(self.sequence_head.bias)
+
+    def predict_sequence(
+        self, scene: th.Tensor, next_scene: th.Tensor,
+        ego_touch: th.Tensor, opponent_touch: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        if scene.ndim != 3 or not 1 <= scene.shape[1] <= self.sequence_length:
+            raise ValueError("ASE requires [sequences, skill-aligned steps, scene] inputs")
+        car, ball = self(scene, next_scene)
+        ownership = ball_ownership(scene, next_scene, ego_touch, opponent_touch)
+        base = combine_skill_predictions(car, ball, ownership)
+        token = th.cat((car, ownership[..., None] * ball, ownership[..., None]), dim=-1)
+        positions = th.arange(scene.shape[1], device=scene.device)
+        token = self.sequence_input(token) + self.sequence_position(positions)
+        causal = th.ones(
+            scene.shape[1], scene.shape[1], device=scene.device, dtype=th.bool,
+        ).triu(1)
+        correction = self.sequence_head(
+            self.sequence_model(token, mask=causal, is_causal=True)
+        )
+        combined = base + correction
+        stable = th.where(combined.norm(dim=-1, keepdim=True) < 0.1, base, combined)
+        return F.normalize(stable, dim=-1), ownership
+
+
 def ball_ownership(
     scene: th.Tensor, next_scene: th.Tensor,
     ego_touch: th.Tensor, opponent_touch: th.Tensor,
@@ -169,18 +222,82 @@ def ball_ownership(
     )
 
 
-def predicted_skill(
-    encoder: SkillEncoder, scene: th.Tensor, next_scene: th.Tensor,
-    ego_touch: th.Tensor, opponent_touch: th.Tensor,
-) -> tuple[th.Tensor, th.Tensor]:
+def combine_skill_predictions(
+    car: th.Tensor, ball: th.Tensor, ownership: th.Tensor,
+) -> th.Tensor:
     """Combine car and attributable ball predictions into one vMF direction."""
-    car, ball = encoder(scene, next_scene)
-    ownership = ball_ownership(scene, next_scene, ego_touch, opponent_touch)
     combined = car + ownership[..., None] * ball
     # Antipodal heads can cancel on a touch. Fall back to the unit car head
     # before normalization so its gradient cannot blow up near the origin.
     stable = th.where(combined.norm(dim=-1, keepdim=True) < 0.1, car, combined)
-    return F.normalize(stable, dim=-1), ownership
+    return F.normalize(stable, dim=-1)
+
+
+def predicted_skill(
+    encoder: SkillEncoder, scene: th.Tensor, next_scene: th.Tensor,
+    ego_touch: th.Tensor, opponent_touch: th.Tensor,
+) -> tuple[th.Tensor, th.Tensor]:
+    """Predict a skill from one transition (legacy ASE encoder)."""
+    car, ball = encoder(scene, next_scene)
+    ownership = ball_ownership(scene, next_scene, ego_touch, opponent_touch)
+    return combine_skill_predictions(car, ball, ownership), ownership
+
+
+@dataclass(frozen=True)
+class SkillSegments:
+    """Contiguous valid transitions with one skill and a bounded context."""
+
+    start: th.Tensor
+    end: th.Tensor
+    actor: th.Tensor
+    length: th.Tensor
+
+    def __len__(self) -> int:
+        return len(self.length)
+
+    def gather(
+        self, batch: TensorBatch, selected: th.Tensor,
+        size: int, skill_size: int,
+    ):
+        start = self.start[selected]
+        end = self.end[selected]
+        actors = self.actor[selected]
+        lengths = self.length[selected]
+        offsets = th.arange(size, device=start.device)[None]
+        active = offsets < lengths[:, None]
+        times = th.minimum(start[:, None] + offsets, end[:, None])
+        actors = actors[:, None].expand_as(times)
+        return (
+            batch["observation"][times, actors, :SCENE_SIZE],
+            batch["next_obs"][times, actors, :SCENE_SIZE],
+            batch["ego_ball_touch"][times, actors].bool(),
+            batch["opponent_ball_touch"][times, actors].bool(),
+            batch["observation"][start, self.actor[selected], -skill_size:],
+            times, actors, active,
+        )
+
+
+def skill_segments(batch: TensorBatch, skill_size: int, length: int) -> SkillSegments:
+    """Partition a rollout without crossing skill switches, done or its boundary."""
+    valid = ~(batch["terminated"].bool() | batch["truncated"].bool())
+    skills = batch["observation"][..., -skill_size:]
+    new = valid.clone()
+    new[1:] = valid[1:] & (
+        ~valid[:-1] | skills[1:].ne(skills[:-1]).any(dim=-1)
+    )
+    times = th.arange(valid.shape[0], device=valid.device)[:, None]
+    start = th.cummax(th.where(new, times, -1), dim=0).values
+    age = th.where(valid, times - start + 1, 0)
+    end = valid & (age.remainder(length) == 0)
+    end[:-1] |= valid[:-1] & (
+        ~valid[1:] | skills[:-1].ne(skills[1:]).any(dim=-1)
+    )
+    end[-1] |= valid[-1]
+    end_times, actors = th.where(end)
+    segment_length = (age[end_times, actors] - 1).remainder(length) + 1
+    return SkillSegments(
+        end_times - segment_length + 1, end_times, actors, segment_length,
+    )
 
 
 def stable_categorical_kl(left, right) -> th.Tensor:
@@ -231,7 +348,7 @@ class FiniteIndependentOptimizerSteps(IndependentOptimizerSteps):
 
 
 class SkillEncoderUpdate:
-    """Fit ASE's von Mises-Fisher skill predictor on generated transitions."""
+    """Fit ASE's skill predictor on generated, skill-aligned motion."""
 
     def __init__(
         self, encoder: SkillEncoder, optimizer: th.optim.Optimizer,
@@ -249,6 +366,8 @@ class SkillEncoderUpdate:
         return
 
     def run(self, experience: Rollout):
+        if isinstance(self.encoder, SkillSequenceEncoder):
+            return self._run_sequences(experience)
         batch = experience.steps
         valid = ~(batch["terminated"].bool() | batch["truncated"].bool())
         indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
@@ -290,6 +409,61 @@ class SkillEncoderUpdate:
             "ball_credit": total_ball_credit / self.steps,
         }}
 
+    def _run_sequences(self, experience: Rollout):
+        batch = experience.steps
+        length = self.encoder.sequence_length
+        segments = skill_segments(batch, self.encoder.skill_size, length)
+        if not len(segments):
+            return experience, {"Skill": {
+                "encoder_loss": 0.0, "alignment": 0.0, "ball_credit": 0.0,
+                "end_alignment": 0.0, "context_steps": 0.0,
+            }}
+
+        # Keep the encoder batch a budget of transitions, not thousands of
+        # full sequences: the latter would multiply ASE's memory by their length.
+        count = min(len(segments), max(1, self.batch_size // length))
+        total_loss = total_alignment = total_ball_credit = 0.0
+        total_end_alignment = total_context_steps = 0.0
+        for _ in range(self.steps):
+            selected = th.randint(
+                len(segments), (count,), device=segments.start.device,
+                generator=self.generator,
+            )
+            scene, next_scene, ego_touch, opponent_touch, skill, _, _, active = (
+                segments.gather(batch, selected, length, self.encoder.skill_size)
+            )
+            prediction, ownership = self.encoder.predict_sequence(
+                scene, next_scene, ego_touch, opponent_touch,
+            )
+            per_step_alignment = (prediction * skill[:, None]).sum(dim=-1)
+            alignment = (per_step_alignment * active).sum() / active.sum()
+            loss = -alignment
+            if not th.isfinite(loss):
+                raise FloatingPointError("non-finite ASE skill loss; no optimizer step was taken")
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            th.nn.utils.clip_grad_norm_(
+                self.encoder.parameters(), self.max_grad_norm, error_if_nonfinite=True,
+            )
+            self.optimizer.step()
+            total_loss += float(loss.detach().item())
+            total_alignment += float(alignment.detach().item())
+            total_ball_credit += float(
+                ((ownership * active).sum() / active.sum()).item()
+            )
+            context_steps = active.sum(dim=-1)
+            total_context_steps += float(context_steps.float().mean().item())
+            total_end_alignment += float(per_step_alignment.detach().gather(
+                dim=-1, index=(context_steps - 1)[:, None],
+            ).mean().item())
+        return experience, {"Skill": {
+            "encoder_loss": total_loss / self.steps,
+            "alignment": total_alignment / self.steps,
+            "ball_credit": total_ball_credit / self.steps,
+            "end_alignment": total_end_alignment / self.steps,
+            "context_steps": total_context_steps / self.steps,
+        }}
+
 
 class SkillDiscoveryReward:
     """Add the vMF log likelihood (up to a constant) before PPO's GAE."""
@@ -312,22 +486,40 @@ class SkillDiscoveryReward:
         valid = ~(batch["terminated"].bool() | batch["truncated"].bool())
         reward = th.zeros_like(batch["training_reward"])
         if valid.any() and self.weight:
-            flat_observation = observation.flatten(0, 1)
-            flat_next = next_observation.flatten(0, 1)
-            flat_reward = reward.flatten()
-            ego_touch = batch["ego_ball_touch"].flatten()
-            opponent_touch = batch["opponent_ball_touch"].flatten()
-            indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
-            for chosen in indices.split(self.batch_size):
-                prediction, _ = predicted_skill(
-                    self.encoder,
-                    flat_observation[chosen, :size], flat_next[chosen, :size],
-                    ego_touch[chosen].bool(), opponent_touch[chosen].bool(),
-                )
-                skill = flat_observation[chosen, -self.encoder.skill_size:]
-                flat_reward[chosen] = (
-                    (prediction * skill).sum(dim=-1) * self.weight
-                ).to(reward.dtype)
+            if isinstance(self.encoder, SkillSequenceEncoder):
+                length = self.encoder.sequence_length
+                segments = skill_segments(batch, self.encoder.skill_size, length)
+                count = max(1, self.batch_size // length)
+                for selected in th.arange(
+                    len(segments), device=valid.device,
+                ).split(count):
+                    scene, next_scene, ego_touch, opponent_touch, skill, times, actors, active = (
+                        segments.gather(batch, selected, length, self.encoder.skill_size)
+                    )
+                    prediction, _ = self.encoder.predict_sequence(
+                        scene, next_scene, ego_touch, opponent_touch,
+                    )
+                    values = (
+                        (prediction * skill[:, None]).sum(dim=-1) * self.weight
+                    ).to(reward.dtype)
+                    reward[times[active], actors[active]] = values[active]
+            else:
+                flat_observation = observation.flatten(0, 1)
+                flat_next = next_observation.flatten(0, 1)
+                flat_reward = reward.flatten()
+                ego_touch = batch["ego_ball_touch"].flatten()
+                opponent_touch = batch["opponent_ball_touch"].flatten()
+                indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
+                for chosen in indices.split(self.batch_size):
+                    prediction, _ = predicted_skill(
+                        self.encoder,
+                        flat_observation[chosen, :size], flat_next[chosen, :size],
+                        ego_touch[chosen].bool(), opponent_touch[chosen].bool(),
+                    )
+                    skill = flat_observation[chosen, -self.encoder.skill_size:]
+                    flat_reward[chosen] = (
+                        (prediction * skill).sum(dim=-1) * self.weight
+                    ).to(reward.dtype)
         self.last_mean = float(reward[valid].mean().item()) if valid.any() else 0.0
         return batch.replace_fields(
             training_reward=batch["training_reward"] + reward,

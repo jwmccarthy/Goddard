@@ -51,7 +51,7 @@ from jarl.transform import GAE, PrepareContext
 
 from gaifo_ase import (
     ASEPPOLoss, FiniteIndependentOptimizerSteps, SkillConditionedEnv,
-    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate,
+    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate, SkillSequenceEncoder,
 )
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
@@ -2139,10 +2139,17 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
     if args.ase_diversity != config.get("ase_diversity", False):
         raise ValueError("--ase-diversity must match the checkpoint architecture when resuming")
+    ase_settings = (
+        "ase_skill_dim", "ase_skill_steps", "ase_encoder_hidden",
+        "ase_sequence_length",
+    ) if args.ase_diversity else ()
     for name in (
         "frameskip", "trajectory_length", "policy_hidden", "critic_hidden",
         "discriminator_hidden", "frame_embedding", "temporal_hidden",
-    ) + (("ase_skill_dim", "ase_skill_steps", "ase_encoder_hidden") if args.ase_diversity else ()):
+    ) + ase_settings:
+        if name == "ase_sequence_length" and name not in config:
+            # Checkpoints predating skill-aligned sequences can upgrade in place.
+            continue
         if getattr(args, name) != config.get(name):
             raise ValueError(
                 f"--{name.replace('_', '-')} must match the checkpoint "
@@ -2156,10 +2163,23 @@ def restore_training_checkpoint(
     modules: dict[str, nn.Module],
     optimizers: dict[str, th.optim.Optimizer],
 ) -> Clock:
+    upgrade_encoder = False
     for name, module in modules.items():
-        module.load_state_dict(payload[name])
+        if name == "skill_encoder" and isinstance(module, SkillSequenceEncoder) and (
+            "ase_sequence_length" not in payload["config"]
+        ):
+            missing = module.load_state_dict(payload[name], strict=False)
+            expected = {
+                key for key in module.state_dict() if key.startswith("sequence_")
+            }
+            if set(missing.missing_keys) != expected or missing.unexpected_keys:
+                raise ValueError("legacy ASE checkpoint has incompatible encoder weights")
+            upgrade_encoder = True
+        else:
+            module.load_state_dict(payload[name])
     for name, optimizer in optimizers.items():
-        optimizer.load_state_dict(payload[f"{name}_optimizer"])
+        if name != "skill_encoder" or not upgrade_encoder:
+            optimizer.load_state_dict(payload[f"{name}_optimizer"])
         learning_rate = (
             args.ase_encoder_lr if name == "skill_encoder" else (
                 args.discriminator_lr if "discriminator" in name else args.ppo_lr
@@ -2167,6 +2187,8 @@ def restore_training_checkpoint(
         )
         for group in optimizer.param_groups:
             group["lr"] = learning_rate
+    if upgrade_encoder:
+        print("Initialized skill-aligned ASE encoder from checkpoint; reset encoder optimizer")
 
     if "torch_rng_state" in payload:
         th.set_rng_state(payload["torch_rng_state"].cpu())
@@ -2289,6 +2311,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument("--ase-diversity-weight", type=float, default=0.01)
     parser.add_argument("--ase-diversity-batch", type=int, default=1_024)
     parser.add_argument("--ase-encoder-hidden", type=int, default=128)
+    parser.add_argument(
+        "--ase-sequence-length", type=int, default=None,
+        help="skill-aligned causal encoder context (default: up to 32 steps; 1 for legacy)",
+    )
     parser.add_argument("--ase-encoder-batch", type=int, default=4_096)
     parser.add_argument("--ase-encoder-steps", type=int, default=4)
     parser.add_argument("--ase-encoder-lr", type=float, default=3e-4)
@@ -2331,6 +2357,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         }
         parser.set_defaults(**inherited)
     args = parser.parse_args()
+    if args.ase_diversity and args.ase_sequence_length is None:
+        args.ase_sequence_length = min(32, args.ase_skill_steps)
     if args.replay_dir is None:
         parser.error("--replay-dir is required when it is absent from the checkpoint")
     return args, resume
@@ -2496,9 +2524,12 @@ def validate_args(args: argparse.Namespace) -> None:
         for name in (
             "ase_skill_steps", "ase_diversity_batch", "ase_encoder_hidden",
             "ase_encoder_batch", "ase_encoder_steps", "ase_encoder_lr",
+            "ase_sequence_length",
         ):
             if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be positive")
+        if args.ase_sequence_length > args.ase_skill_steps:
+            raise ValueError("--ase-sequence-length cannot exceed --ase-skill-steps")
         for name in ("ase_reward_weight", "ase_diversity_weight"):
             if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be nonnegative")
@@ -2616,10 +2647,15 @@ def main() -> None:
     policy = build_policy(env, args)
     critic = build_critic(env, args)
     discriminator = build_discriminator(args).to(env.device)
-    skill_encoder = (
-        SkillEncoder(args.ase_skill_dim, args.ase_encoder_hidden).to(env.device)
-        if args.ase_diversity else None
-    )
+    skill_encoder = None
+    if args.ase_diversity:
+        skill_encoder = (
+            SkillSequenceEncoder(
+                args.ase_skill_dim, args.ase_encoder_hidden, args.ase_sequence_length,
+            ) if args.ase_sequence_length > 1 else SkillEncoder(
+                args.ase_skill_dim, args.ase_encoder_hidden,
+            )
+        ).to(env.device)
 
     expert = ExpertSceneDataset(
         args.replay_dir,
@@ -2822,6 +2858,13 @@ def main() -> None:
             ("PPO", "ase_action_kl", "ASE action KL", ".3f"),
         ):
             logger.register_progress_metric(section, key, label, fmt)
+        if isinstance(skill_encoder, SkillSequenceEncoder):
+            logger.register_progress_metric(
+                "Skill", "end_alignment", "skill end alignment", ".3f",
+            )
+            logger.register_progress_metric(
+                "Skill", "context_steps", "skill context steps", ".1f",
+            )
     if value_scheduler is not None:
         logger.register_progress_metric(
             "Schedule", "entropy_coef", "entropy coef", ".4f"
