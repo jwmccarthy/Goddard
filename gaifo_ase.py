@@ -188,6 +188,153 @@ class SkillSequenceEncoder(SkillEncoder):
         return F.normalize(stable, dim=-1), ownership
 
 
+@dataclass
+class SkillStreamState:
+    """Detached per-car skill context carried into the next rollout."""
+
+    car: th.Tensor
+    ball: th.Tensor
+    skill: th.Tensor
+    age: th.Tensor
+    touch_age: th.Tensor
+
+    def select(self, actors: th.Tensor) -> "SkillStreamState":
+        return SkillStreamState(
+            self.car[actors], self.ball[actors], self.skill[actors],
+            self.age[actors], self.touch_age[actors],
+        )
+
+
+class SkillStreamContext:
+    def __init__(self) -> None:
+        self.state: SkillStreamState | None = None
+
+
+class SkillGRUEncoder(SkillEncoder):
+    """Infer each car's skill from raw ego motion and owned ball effects."""
+
+    def __init__(
+        self, skill_size: int, hidden_size: int, sequence_length: int,
+        ball_credit_steps: int = 8,
+    ) -> None:
+        super().__init__(skill_size, hidden_size)
+        if sequence_length < 2 or ball_credit_steps < 1:
+            raise ValueError("ASE GRU requires a multi-step context and positive ball credit")
+        self.sequence_length = sequence_length
+        self.hidden_size = hidden_size
+        self.ball_credit_steps = min(ball_credit_steps, sequence_length)
+        self.car_gru = nn.GRUCell(2 * CAR_SIZE + 12, hidden_size)
+        self.ball_gru = nn.GRUCell(2 * BALL_SIZE + 8, hidden_size)
+        self.car_head = nn.Linear(hidden_size, skill_size)
+        self.ball_head = nn.Linear(hidden_size, skill_size)
+        # The old predictors remain as residuals when loading an ASE checkpoint.
+        for head in (self.car_head, self.ball_head):
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
+    def initial_state(self, n_actors: int, device: th.device) -> SkillStreamState:
+        hidden = th.zeros(n_actors, self.hidden_size, device=device)
+        return SkillStreamState(
+            hidden, hidden.clone(),
+            th.zeros(n_actors, self.skill_size, device=device),
+            th.zeros(n_actors, dtype=th.long, device=device),
+            th.zeros(n_actors, dtype=th.long, device=device),
+        )
+
+    @staticmethod
+    def _direction(base: th.Tensor, correction: th.Tensor) -> th.Tensor:
+        combined = base + correction
+        stable = th.where(combined.norm(dim=-1, keepdim=True) < 0.1, base, combined)
+        return F.normalize(stable, dim=-1)
+
+    @staticmethod
+    def _motion_inputs(
+        scene: th.Tensor, next_scene: th.Tensor,
+        ego_touch: th.Tensor, opponent_touch: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        ego = scene[:, BALL_SIZE:BALL_SIZE + CAR_SIZE]
+        next_ego = next_scene[:, BALL_SIZE:BALL_SIZE + CAR_SIZE]
+        opponent = scene[:, BALL_SIZE + CAR_SIZE:]
+        ball = scene[:, :BALL_SIZE]
+        relative_ball = ball[:, :3] - ego[:, :3]
+        relative_ball_velocity = ball[:, 3:6] - ego[:, 3:6] * (2300.0 / 6000.0)
+        relative_opponent = opponent[:, :3] - ego[:, :3]
+        relative_opponent_velocity = opponent[:, 3:6] - ego[:, 3:6]
+        car_input = th.cat((
+            ego, next_ego - ego, relative_ball, relative_ball_velocity,
+            relative_opponent, relative_opponent_velocity,
+        ), dim=-1)
+        ball_input = th.cat((
+            ball, next_scene[:, :BALL_SIZE] - ball,
+            relative_ball, relative_ball_velocity,
+            ego_touch[:, None].to(ball.dtype), opponent_touch[:, None].to(ball.dtype),
+        ), dim=-1)
+        return car_input, ball_input
+
+    def encode_rollout(
+        self, observation: th.Tensor, next_observation: th.Tensor,
+        ego_touch: th.Tensor, opponent_touch: th.Tensor, valid: th.Tensor,
+        state: SkillStreamState | None = None,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, SkillStreamState]:
+        if observation.shape != next_observation.shape or observation.ndim != 3:
+            raise ValueError("ASE GRU requires matching [steps, cars, observation] tensors")
+        n_actors = observation.shape[1]
+        if valid.shape != (observation.shape[0], n_actors):
+            raise ValueError("ASE GRU validity mask does not match the rollout")
+        if state is None:
+            state = self.initial_state(n_actors, observation.device)
+        elif len(state.age) != n_actors:
+            raise ValueError("ASE GRU context has the wrong number of cars")
+        car_predictions = []
+        ball_predictions = []
+        ball_gates = []
+        ages = []
+        for t in range(len(observation)):
+            current = observation[t]
+            skill = current[:, -self.skill_size:]
+            active = valid[t]
+            reset = (
+                (state.age == 0) | (state.age >= self.sequence_length)
+                | skill.ne(state.skill).any(dim=-1)
+            )
+            scene = th.where(active[:, None], current[:, :SCENE_SIZE], 0)
+            next_scene = th.where(
+                active[:, None], next_observation[t, :, :SCENE_SIZE], 0,
+            )
+            car_input, ball_input = self._motion_inputs(
+                scene, next_scene, ego_touch[t], opponent_touch[t],
+            )
+            car_base, ball_base = self(scene, next_scene)
+            old_car = th.where(reset[:, None], 0, state.car)
+            car_hidden = self.car_gru(car_input, old_car)
+            recent = th.where(reset, 0, (state.touch_age - 1).clamp_min(0))
+            recent = th.where(opponent_touch[t], 0, recent)
+            recent = th.where(
+                ego_touch[t] & ~opponent_touch[t], self.ball_credit_steps, recent,
+            )
+            gate = active & (recent > 0)
+            old_ball = th.where(gate[:, None] & ~reset[:, None], state.ball, 0)
+            ball_hidden = self.ball_gru(ball_input, old_ball)
+            car_predictions.append(self._direction(car_base, self.car_head(car_hidden)))
+            ball_predictions.append(self._direction(ball_base, self.ball_head(ball_hidden)))
+            ball_gates.append(gate)
+            age = th.where(active, th.where(reset, 1, state.age + 1), 0)
+            ages.append(age)
+            state = SkillStreamState(
+                th.where(active[:, None], car_hidden, 0),
+                th.where(gate[:, None], ball_hidden, 0),
+                skill, age, th.where(gate, recent, 0),
+            )
+        return (
+            th.stack(car_predictions), th.stack(ball_predictions),
+            th.stack(ball_gates), th.stack(ages),
+            SkillStreamState(
+                state.car.detach(), state.ball.detach(), state.skill.detach(),
+                state.age.detach(), state.touch_age.detach(),
+            ),
+        )
+
+
 def ball_ownership(
     scene: th.Tensor, next_scene: th.Tensor,
     ego_touch: th.Tensor, opponent_touch: th.Tensor,
@@ -354,6 +501,7 @@ class SkillEncoderUpdate:
         self, encoder: SkillEncoder, optimizer: th.optim.Optimizer,
         batch_size: int, steps: int, max_grad_norm: float, seed: int,
         device: th.device,
+        *, stream_context: SkillStreamContext | None = None,
     ) -> None:
         self.encoder = encoder
         self.optimizer = optimizer
@@ -361,11 +509,14 @@ class SkillEncoderUpdate:
         self.steps = steps
         self.max_grad_norm = max_grad_norm
         self.generator = th.Generator(device=device).manual_seed(seed)
+        self.stream_context = stream_context or SkillStreamContext()
 
     def set_progress_callback(self, callback) -> None:
         return
 
     def run(self, experience: Rollout):
+        if isinstance(self.encoder, SkillGRUEncoder):
+            return self._run_gru(experience)
         if isinstance(self.encoder, SkillSequenceEncoder):
             return self._run_sequences(experience)
         batch = experience.steps
@@ -464,12 +615,88 @@ class SkillEncoderUpdate:
             "context_steps": total_context_steps / self.steps,
         }}
 
+    def _run_gru(self, experience: Rollout):
+        batch = experience.steps
+        valid = ~(batch["terminated"].bool() | batch["truncated"].bool())
+        if not valid.any():
+            return experience, {"Skill": {
+                name: 0.0 for name in (
+                    "encoder_loss", "alignment", "car_alignment", "ball_alignment",
+                    "ball_credit", "end_alignment", "context_steps",
+                )
+            }}
+        available_actors = th.nonzero(valid.any(dim=0), as_tuple=False).flatten()
+        count = max(1, min(len(available_actors), self.batch_size // len(valid)))
+        owned_actors = th.nonzero(
+            (valid & batch["ego_ball_touch"].bool()
+             & ~batch["opponent_ball_touch"].bool()).any(dim=0),
+            as_tuple=False,
+        ).flatten()
+        totals = dict.fromkeys((
+            "encoder_loss", "alignment", "car_alignment", "ball_alignment",
+            "ball_credit", "end_alignment", "context_steps",
+        ), 0.0)
+        for _ in range(self.steps):
+            actors = available_actors[th.randint(
+                len(available_actors), (count,), device=valid.device,
+                generator=self.generator,
+            )]
+            if len(owned_actors):
+                chosen = owned_actors[th.randint(
+                    len(owned_actors), (max(1, count // 2),),
+                    device=valid.device, generator=self.generator,
+                )]
+                actors = th.cat((actors, chosen))
+            start = self.stream_context.state
+            if start is not None:
+                start = start.select(actors)
+            car, ball, gate, age, _ = self.encoder.encode_rollout(
+                batch["observation"][:, actors], batch["next_obs"][:, actors],
+                batch["ego_ball_touch"][:, actors].bool(),
+                batch["opponent_ball_touch"][:, actors].bool(),
+                valid[:, actors], start,
+            )
+            active = valid[:, actors]
+            skill = batch["observation"][:, actors, -self.encoder.skill_size:]
+            car_alignment = (car * skill).sum(dim=-1)
+            ball_alignment = (ball * skill).sum(dim=-1)
+            car_mean = car_alignment[active].mean()
+            ball_mean = ball_alignment[gate].mean() if gate.any() else car_mean.new_zeros(())
+            loss = -car_mean - 0.5 * ball_mean
+            if not th.isfinite(loss):
+                raise FloatingPointError("non-finite ASE skill loss; no optimizer step was taken")
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            th.nn.utils.clip_grad_norm_(
+                self.encoder.parameters(), self.max_grad_norm, error_if_nonfinite=True,
+            )
+            self.optimizer.step()
+            mixed = (
+                car_alignment.detach() + gate * ball_alignment.detach()
+            ) / (1 + gate.float())
+            end = active.clone()
+            end[:-1] &= (
+                ~active[1:] | (age[:-1] == self.encoder.sequence_length)
+                | skill[:-1].ne(skill[1:]).any(dim=-1)
+            )
+            totals["encoder_loss"] += float(loss.detach().item())
+            totals["alignment"] += float(mixed[active].mean().item())
+            totals["car_alignment"] += float(car_mean.detach().item())
+            totals["ball_alignment"] += float(ball_mean.detach().item())
+            totals["ball_credit"] += float(gate[active].float().mean().item())
+            totals["end_alignment"] += float(car_alignment.detach()[end].mean().item())
+            totals["context_steps"] += float(age[active].float().mean().item())
+        return experience, {"Skill": {
+            name: value / self.steps for name, value in totals.items()
+        }}
+
 
 class SkillDiscoveryReward:
     """Add the vMF log likelihood (up to a constant) before PPO's GAE."""
 
     def __init__(
         self, encoder: SkillEncoder, weight: float, batch_size: int = 4_096,
+        *, stream_context: SkillStreamContext | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("ASE reward microbatch size must be positive")
@@ -477,6 +704,7 @@ class SkillDiscoveryReward:
         self.weight = weight
         self.batch_size = batch_size
         self.last_mean: float | None = None
+        self.stream_context = stream_context or SkillStreamContext()
 
     @th.no_grad()
     def __call__(self, batch: TensorBatch, context: PrepareContext) -> TensorBatch:
@@ -485,7 +713,20 @@ class SkillDiscoveryReward:
         next_observation = batch["next_obs"]
         valid = ~(batch["terminated"].bool() | batch["truncated"].bool())
         reward = th.zeros_like(batch["training_reward"])
-        if valid.any() and self.weight:
+        if isinstance(self.encoder, SkillGRUEncoder):
+            car, ball, gate, _, state = self.encoder.encode_rollout(
+                observation, next_observation,
+                batch["ego_ball_touch"].bool(),
+                batch["opponent_ball_touch"].bool(), valid,
+                self.stream_context.state,
+            )
+            self.stream_context.state = state
+            skill = observation[..., -self.encoder.skill_size:]
+            score = (
+                (car * skill).sum(dim=-1) + gate * (ball * skill).sum(dim=-1)
+            ) / (1 + gate.float())
+            reward = th.where(valid, score * self.weight, 0).to(reward.dtype)
+        elif valid.any() and self.weight:
             if isinstance(self.encoder, SkillSequenceEncoder):
                 length = self.encoder.sequence_length
                 segments = skill_segments(batch, self.encoder.skill_size, length)

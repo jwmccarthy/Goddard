@@ -12,6 +12,7 @@ import numpy as np
 import torch as th
 from gymnasium.spaces import Box, MultiDiscrete
 
+from evaluate_skill_conditioning import comparison_latents
 from gaifo import (
     GAIFO_ASE_ARCHITECTURE, GAIFOCheckpoints, ExpertSceneDataset,
     build_critic, build_policy, load_resume_checkpoint, parse_args,
@@ -19,9 +20,10 @@ from gaifo import (
 )
 from gaifo_ase import (
     ASEPPOLoss, FiniteIndependentOptimizerSteps, SkillConditionedEnv,
-    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate,
+    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate, SkillGRUEncoder,
     SkillObservationSpace, SkillSequenceEncoder, ball_ownership,
     predicted_skill, sample_skills, skill_segments, stable_categorical_kl,
+    SkillStreamContext,
 )
 from jarl.data import TensorBatch
 from jarl.learn import OptimizerStep, PPOConfig
@@ -81,6 +83,132 @@ class FixedEncoder(th.nn.Module):
 
 
 class GAIFOASETests(unittest.TestCase):
+    def test_skill_comparison_keeps_opponent_fixed_across_ego_skills(self):
+        skills = comparison_latents(
+            4, 3, th.device("cpu"), th.Generator().manual_seed(7),
+        )
+        self.assertEqual(skills.shape, (8, 3))
+        th.testing.assert_close(skills.norm(dim=-1), th.ones(8))
+        th.testing.assert_close(skills[1::2], skills[1:2].expand(4, -1))
+        self.assertFalse(th.allclose(skills[::2], skills[:1].expand(4, -1)))
+
+    def test_gru_carries_skill_context_across_rollouts_and_resets_on_switch(self):
+        th.manual_seed(4)
+        encoder = SkillGRUEncoder(2, 8, sequence_length=4)
+        with th.no_grad():
+            th.nn.init.normal_(encoder.car_head.weight, std=0.1)
+        scene = th.randn(4, 2, 51) * 0.01
+        skill = th.tensor([1., 0.]).expand(4, 2, 2).clone()
+        observation = th.cat((scene, skill), dim=-1)
+        next_observation = observation.clone()
+        next_observation[..., 9] += 0.1
+        touch = th.zeros(4, 2, dtype=th.bool)
+        valid = ~touch
+
+        whole = encoder.encode_rollout(
+            observation, next_observation, touch, touch, valid,
+        )
+        first = encoder.encode_rollout(
+            observation[:2], next_observation[:2], touch[:2], touch[:2], valid[:2],
+        )
+        second = encoder.encode_rollout(
+            observation[2:], next_observation[2:], touch[2:], touch[2:],
+            valid[2:], first[-1],
+        )
+        th.testing.assert_close(th.cat((first[0], second[0])), whole[0])
+        th.testing.assert_close(second[-1].age, th.full((2,), 4))
+
+        switched = observation[2:].clone()
+        switched[:, 0, -2:] = th.tensor([0., 1.])
+        from_old = encoder.encode_rollout(
+            switched, next_observation[2:], touch[2:], touch[2:],
+            valid[2:], first[-1],
+        )
+        fresh = encoder.encode_rollout(
+            switched[:, :1], next_observation[2:, :1], touch[2:, :1],
+            touch[2:, :1], valid[2:, :1],
+        )
+        th.testing.assert_close(from_old[0][:, :1], fresh[0])
+        th.testing.assert_close(from_old[-1].age, th.tensor([2, 4]))
+
+    def test_gru_credits_ball_only_until_opponent_touch_or_skill_switch(self):
+        encoder = SkillGRUEncoder(2, 8, sequence_length=4, ball_credit_steps=3)
+        observations = th.zeros(5, 2, 53)
+        observations[..., -2:] = th.tensor([1., 0.])
+        observations[3:, 0, -2:] = th.tensor([0., 1.])
+        next_obs = observations.clone()
+        ego = th.zeros(5, 2, dtype=th.bool)
+        opponent = ego.clone()
+        ego[0, 0] = True
+        ego[0, 1] = opponent[0, 1] = True
+        opponent[2, 0] = True
+        ego[2, 1] = True
+        valid = th.ones(5, 2, dtype=th.bool)
+        valid[4, 1] = False
+        _, _, gate, age, final = encoder.encode_rollout(
+            observations, next_obs, ego, opponent, valid,
+        )
+        th.testing.assert_close(gate[:, 0], th.tensor([True, True, False, False, False]))
+        th.testing.assert_close(gate[:, 1], th.tensor([False, False, True, True, False]))
+        th.testing.assert_close(age[:, 0], th.tensor([1, 2, 3, 1, 2]))
+        self.assertEqual(final.touch_age[1].item(), 0)
+        self.assertTrue(th.equal(final.ball[0], th.zeros_like(final.ball[0])))
+
+    def test_gru_encoder_trains_car_and_ego_owned_ball_heads_separately(self):
+        th.manual_seed(8)
+        encoder = SkillGRUEncoder(4, 16, sequence_length=3)
+        optimizer = th.optim.Adam(encoder.parameters(), lr=1e-2)
+        shared = SkillStreamContext()
+        updater = SkillEncoderUpdate(
+            encoder, optimizer, batch_size=12, steps=2,
+            max_grad_norm=0.5, seed=0, device=th.device("cpu"),
+            stream_context=shared,
+        )
+        skill = sample_skills(4, 4, "cpu").expand(4, -1, -1).clone()
+        scene = th.randn(4, 4, 51) * 0.01
+        observation = th.cat((scene, skill), dim=-1)
+        future = observation.clone()
+        future[..., 9] += skill[..., 0] * 0.1
+        done = th.zeros(4, 4, dtype=th.bool)
+        ego = done.clone()
+        ego[1, :2] = True
+        batch = TensorBatch({
+            "observation": observation, "next_obs": future,
+            "terminated": done, "truncated": done.clone(),
+            "ego_ball_touch": ego, "opponent_ball_touch": done.clone(),
+            "training_reward": th.zeros(4, 4), "learner_mask": done.clone(),
+        })
+        _, metrics = updater.run(Rollout(batch))
+        self.assertTrue(all(np.isfinite(x) for x in metrics["Skill"].values()))
+        self.assertGreater(metrics["Skill"]["ball_credit"], 0)
+        self.assertTrue(th.count_nonzero(encoder.car_head.weight))
+        self.assertTrue(th.count_nonzero(encoder.ball_head.weight))
+        self.assertIsNone(shared.state)
+
+        reward = SkillDiscoveryReward(
+            encoder, weight=0.5, stream_context=shared,
+        )(batch, PrepareContext())
+        self.assertTrue(th.isfinite(reward["skill_reward"]).all())
+        self.assertTrue(reward["learner_mask"].all())
+        self.assertIsNotNone(shared.state)
+        th.testing.assert_close(shared.state.age, th.full((4,), 1))
+        previous = shared.state.car.clone()
+        updater.run(Rollout(batch))
+        th.testing.assert_close(shared.state.car, previous)
+
+        other_encoder = SkillGRUEncoder(4, 16, sequence_length=3)
+        other_optimizer = th.optim.Adam(other_encoder.parameters(), lr=1e-2)
+        other_updater = SkillEncoderUpdate(
+            other_encoder, other_optimizer, batch_size=12, steps=2,
+            max_grad_norm=0.5, seed=0, device=th.device("cpu"),
+        )
+        only_opponent = batch.replace_fields(
+            ego_ball_touch=done.clone(), opponent_ball_touch=ego,
+        )
+        ball_weights = other_encoder.ball_head.weight.detach().clone()
+        other_updater.run(Rollout(only_opponent))
+        th.testing.assert_close(other_encoder.ball_head.weight, ball_weights)
+
     def test_sequence_windows_split_at_skill_switch_done_and_context_limit(self):
         skill = th.tensor([1., 0.]).expand(8, 2, 2).clone()
         skill[4:, 0] = th.tensor([0., 1.])
@@ -431,7 +559,7 @@ class GAIFOASETests(unittest.TestCase):
             policy = build_policy(skill_env, args)
             critic = build_critic(skill_env, args)
             discriminator = th.nn.Linear(3, 1)
-            encoder = SkillSequenceEncoder(4, 8, 2)
+            encoder = SkillGRUEncoder(4, 8, 2)
             optimizers = {
                 "policy": th.optim.Adam(policy.parameters()),
                 "critic": th.optim.Adam(critic.parameters()),
@@ -482,7 +610,7 @@ class GAIFOASETests(unittest.TestCase):
             restored_policy = build_policy(SkillObservationSpace(StubEnv(), 4), args)
             restored_critic = build_critic(SkillObservationSpace(StubEnv(), 4), args)
             restored_discriminator = th.nn.Linear(3, 1)
-            restored_encoder = SkillSequenceEncoder(4, 8, 2)
+            restored_encoder = SkillGRUEncoder(4, 8, 2)
             modules = {
                 "policy": restored_policy, "critic": restored_critic,
                 "discriminator": restored_discriminator,
@@ -505,9 +633,10 @@ class GAIFOASETests(unittest.TestCase):
 
             legacy = copy.deepcopy(payload)
             legacy["config"].pop("ase_sequence_length")
+            legacy["config"].pop("ase_encoder_type")
             legacy["skill_encoder"] = {
                 name: value for name, value in legacy["skill_encoder"].items()
-                if not name.startswith("sequence_")
+                if name.startswith(("car_model.", "ball_model."))
             }
             legacy_model = SkillEncoder(4, 8)
             legacy_model.load_state_dict(legacy["skill_encoder"])
@@ -528,7 +657,7 @@ class GAIFOASETests(unittest.TestCase):
                 upgraded_args, old_payload = parse_args()
             validate_resume_args(upgraded_args, old_payload)
             self.assertEqual(upgraded_args.ase_sequence_length, 2)
-            upgraded_encoder = SkillSequenceEncoder(4, 8, 2)
+            upgraded_encoder = SkillGRUEncoder(4, 8, 2)
             upgraded_modules = {
                 **modules, "skill_encoder": upgraded_encoder,
             }
@@ -543,7 +672,51 @@ class GAIFOASETests(unittest.TestCase):
             for name, value in legacy["skill_encoder"].items():
                 th.testing.assert_close(value, upgraded_encoder.state_dict()[name])
             self.assertFalse(upgraded_optimizers["skill_encoder"].state)
-            self.assertTrue(th.count_nonzero(upgraded_encoder.sequence_head.weight) == 0)
+            self.assertTrue(th.count_nonzero(upgraded_encoder.car_head.weight) == 0)
+            self.assertTrue(th.count_nonzero(upgraded_encoder.ball_head.weight) == 0)
+
+            old_transformer = SkillSequenceEncoder(4, 8, 2)
+            old_transformer.load_state_dict(legacy["skill_encoder"], strict=False)
+            old_transformer_optimizer = th.optim.Adam(old_transformer.parameters())
+            scene = th.randn(2, 2, 51)
+            touches = th.zeros(2, 2, dtype=th.bool)
+            prediction, _ = old_transformer.predict_sequence(
+                scene, scene + 0.1, touches, touches,
+            )
+            prediction[..., 0].sum().backward()
+            old_transformer_optimizer.step()
+            former = copy.deepcopy(payload)
+            former["config"].pop("ase_encoder_type")
+            former["skill_encoder"] = old_transformer.state_dict()
+            former["skill_encoder_optimizer"] = old_transformer_optimizer.state_dict()
+            former_path = root / "checkpoints" / "gaifo_old_transformer.pt"
+            th.save(former, former_path)
+
+            for encoder_type in ("transformer", "mlp"):
+                with self.subTest(encoder_type=encoder_type), patch.object(sys, "argv", [
+                    "gaifo.py", "--resume-checkpoint", str(former_path),
+                    "--ase-encoder-type", encoder_type,
+                ]):
+                    former_args, former_payload = parse_args()
+                validate_resume_args(former_args, former_payload)
+                former_encoder = (
+                    SkillSequenceEncoder(4, 8, 2) if encoder_type == "transformer"
+                    else SkillEncoder(4, 8)
+                )
+                former_modules = {**modules, "skill_encoder": former_encoder}
+                former_optimizers = {
+                    **restored_optimizers,
+                    "skill_encoder": th.optim.Adam(former_encoder.parameters()),
+                }
+                restore_training_checkpoint(
+                    former_payload, former_args, former_modules, former_optimizers,
+                )
+                for name, value in former_encoder.state_dict().items():
+                    th.testing.assert_close(value, old_transformer.state_dict()[name])
+                self.assertEqual(
+                    bool(former_optimizers["skill_encoder"].state),
+                    encoder_type == "transformer",
+                )
 
             viewer, signature = load_policy_checkpoint(path, StubEnv(), 4, None)
             self.assertEqual(signature[-2:], (GAIFO_ASE_ARCHITECTURE, 4))

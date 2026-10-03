@@ -15,13 +15,14 @@ import torch as th
 import torch.nn.functional as F
 
 from carl.gymnasium import CARLTorchVectorEnv
+from evaluate_skill_conditioning import evaluate_skill_conditioning
 from gaifo import (
     BLUE_START, GAIFO_ASE_ARCHITECTURE, ORANGE_START,
     POSITION_SCALE, load_resume_checkpoint, main,
 )
 from gaifo_ase import (
-    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate, SkillSequenceEncoder,
-    stable_categorical_kl,
+    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate, SkillGRUEncoder,
+    SkillSequenceEncoder, SkillStreamContext, stable_categorical_kl,
 )
 from jarl.data import TensorBatch
 from jarl.store.rollout import Rollout
@@ -35,6 +36,47 @@ from watch_checkpoints import load_match
     "opt-in CUDA/CARL integration smoke",
 )
 class ASEGAIFOGpuSmokeTests(unittest.TestCase):
+    def test_cuda_streaming_gru_scores_and_trains_with_owned_touches(self):
+        length, n_envs, dim = 64, 512, 16
+        encoder = SkillGRUEncoder(dim, 64, sequence_length=32).cuda()
+        optimizer = th.optim.Adam(encoder.parameters(), lr=3e-4)
+        stream = SkillStreamContext()
+        skill = th.nn.functional.normalize(
+            th.randn(2, n_envs, dim, device="cuda:0"), dim=-1,
+        ).repeat_interleave(32, dim=0)
+        scene = th.randn(length, n_envs, 51, device="cuda:0") * 0.01
+        observation = th.cat((scene, skill), dim=-1)
+        next_observation = observation.clone()
+        next_observation[..., 9] += 0.01
+        done = th.zeros(length, n_envs, dtype=th.bool, device="cuda:0")
+        touches = done.clone()
+        touches[16, ::8] = True
+        opponent = done.clone()
+        opponent[20, ::16] = True
+        batch = TensorBatch({
+            "observation": observation, "next_obs": next_observation,
+            "training_reward": th.zeros_like(done, dtype=th.float32),
+            "learner_mask": done.clone(), "terminated": done,
+            "truncated": done.clone(), "ego_ball_touch": touches,
+            "opponent_ball_touch": opponent,
+        })
+        reward = SkillDiscoveryReward(
+            encoder, 0.5, stream_context=stream,
+        )(batch, PrepareContext())
+        self.assertTrue(th.isfinite(reward["skill_reward"]).all())
+        self.assertTrue(reward["learner_mask"].all())
+        self.assertTrue(th.equal(stream.state.age, th.full_like(stream.state.age, 32)))
+        update = SkillEncoderUpdate(
+            encoder, optimizer, batch_size=4_096, steps=1,
+            max_grad_norm=0.5, seed=0, device=th.device("cuda:0"),
+            stream_context=stream,
+        )
+        _, metrics = update.run(Rollout(batch))
+        self.assertTrue(all(np.isfinite(x) for x in metrics["Skill"].values()))
+        self.assertGreater(metrics["Skill"]["ball_credit"], 0)
+        self.assertTrue(th.isfinite(encoder.car_head.weight).all())
+        self.assertTrue(th.isfinite(encoder.ball_head.weight).all())
+
     def test_cuda_skill_sequences_score_and_train_in_bounded_chunks(self):
         length, n_envs, dim = 64, 512, 16
         encoder = SkillSequenceEncoder(dim, 64, sequence_length=32).cuda()
@@ -89,7 +131,7 @@ class ASEGAIFOGpuSmokeTests(unittest.TestCase):
             root = Path(directory)
             replays = root / "parsed_replays" / "pro_1v1_fs4"
             replays.mkdir(parents=True)
-            rows = np.zeros((48, 161), dtype=np.float32)
+            rows = np.zeros((192, 161), dtype=np.float32)
             rows[:, 2] = 91.25 / POSITION_SCALE[2]
             for car, y in ((BLUE_START, -1_200), (ORANGE_START, 1_200)):
                 rows[:, car + 1] = y / POSITION_SCALE[1]
@@ -125,14 +167,21 @@ class ASEGAIFOGpuSmokeTests(unittest.TestCase):
             self.assertEqual(saved["step"], 64)
             self.assertEqual(saved["config"]["architecture"], GAIFO_ASE_ARCHITECTURE)
             self.assertEqual(saved["config"]["ase_sequence_length"], 2)
+            self.assertEqual(saved["config"]["ase_encoder_type"], "gru")
             self.assertTrue(any(
-                key.startswith("sequence_") for key in saved["skill_encoder"]
+                key.startswith("car_gru.") for key in saved["skill_encoder"]
             ))
             self.assertTrue(saved["config"]["factorize"])
             self.assertIn("skill_encoder_optimizer", saved)
             self.assertTrue(saved["skill_encoder_optimizer"]["state"])
             self.assertIn("ASE diversity loss", output.getvalue())
             self.assertIn("ASE reward", output.getvalue())
+            diagnostic = evaluate_skill_conditioning(
+                first_path, replays.parent, skills=3, starts=1, steps=4,
+                reset_state_limit=8,
+            )
+            self.assertTrue(all(np.isfinite(value) for value in diagnostic.values()))
+            self.assertGreaterEqual(diagnostic["first_action_disagreement"], 0)
 
             with patch.object(sys, "argv", [
                 "gaifo.py", "--resume-checkpoint", str(first_path),
@@ -168,13 +217,14 @@ class ASEGAIFOGpuSmokeTests(unittest.TestCase):
                 base.close()
 
             legacy = copy.deepcopy(saved)
-            legacy["config"].pop("ase_sequence_length")
-            legacy["skill_encoder"] = {
+            legacy["config"].pop("ase_encoder_type")
+            base_state = {
                 key: value for key, value in legacy["skill_encoder"].items()
-                if not key.startswith("sequence_")
+                if key.startswith(("car_model.", "ball_model."))
             }
-            old_encoder = SkillEncoder(4, 16)
-            old_encoder.load_state_dict(legacy["skill_encoder"])
+            old_encoder = SkillSequenceEncoder(4, 16, 2)
+            old_encoder.load_state_dict(base_state, strict=False)
+            legacy["skill_encoder"] = old_encoder.state_dict()
             legacy["skill_encoder_optimizer"] = th.optim.Adam(
                 old_encoder.parameters(), lr=3e-4,
             ).state_dict()
@@ -190,7 +240,8 @@ class ASEGAIFOGpuSmokeTests(unittest.TestCase):
                 next(upgraded_dir.rglob("gaifo_000000000128.pt"))
             )
             self.assertEqual(upgraded["config"]["ase_sequence_length"], 2)
-            self.assertIn("sequence_head.weight", upgraded["skill_encoder"])
+            self.assertEqual(upgraded["config"]["ase_encoder_type"], "gru")
+            self.assertIn("car_gru.weight_ih", upgraded["skill_encoder"])
 
 
 if __name__ == "__main__":
