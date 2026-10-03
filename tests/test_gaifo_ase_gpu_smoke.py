@@ -11,12 +11,15 @@ from unittest.mock import patch
 
 import numpy as np
 import torch as th
+import torch.nn.functional as F
 
 from carl.gymnasium import CARLTorchVectorEnv
 from gaifo import (
     BLUE_START, GAIFO_ASE_ARCHITECTURE, ORANGE_START,
     POSITION_SCALE, load_resume_checkpoint, main,
 )
+from gaifo_ase import stable_categorical_kl
+from torch.distributions import Categorical
 from watch_checkpoints import load_match
 
 
@@ -25,6 +28,23 @@ from watch_checkpoints import load_match
     "opt-in CUDA/CARL integration smoke",
 )
 class ASEGAIFOGpuSmokeTests(unittest.TestCase):
+    def test_cuda_ase_kl_with_confident_masked_actions_at_training_batch_size(self):
+        mask_logit = th.finfo(th.float32).min
+        logits = th.zeros(16_384, 4, 3, device="cuda:0", requires_grad=True)
+        other = th.zeros_like(logits)
+        other[..., 1] = -120.0
+        other[..., 2] = mask_logit
+        masked = logits.masked_fill(
+            th.tensor([False, False, True], device="cuda:0"), mask_logit,
+        )
+        action_kl = stable_categorical_kl(
+            Categorical(logits=masked), Categorical(logits=other),
+        ).sum(dim=-1)
+        loss = 2 * F.huber_loss(action_kl / 0.5, th.ones_like(action_kl), delta=4.0)
+        self.assertTrue(th.isfinite(loss))
+        loss.backward()
+        self.assertTrue(th.isfinite(logits.grad).all())
+
     def test_1v1_training_resume_and_viewer(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)

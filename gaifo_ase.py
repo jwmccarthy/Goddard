@@ -8,11 +8,10 @@ import torch.nn.functional as F
 
 from gymnasium.vector.utils import batch_space
 from jarl.data import TensorBatch
-from jarl.learn import LossOutput, PPOLoss
+from jarl.learn import IndependentOptimizerSteps, LossOutput, PPOLoss
 from jarl.modules.policy import MultiCategoricalPolicy
 from jarl.store.rollout import Rollout
 from jarl.transform import PrepareContext
-from torch.distributions.kl import kl_divergence
 
 
 BALL_SIZE = 9
@@ -177,7 +176,58 @@ def predicted_skill(
     """Combine car and attributable ball predictions into one vMF direction."""
     car, ball = encoder(scene, next_scene)
     ownership = ball_ownership(scene, next_scene, ego_touch, opponent_touch)
-    return F.normalize(car + ownership[..., None] * ball, dim=-1), ownership
+    combined = car + ownership[..., None] * ball
+    # Antipodal heads can cancel on a touch. Fall back to the unit car head
+    # before normalization so its gradient cannot blow up near the origin.
+    stable = th.where(combined.norm(dim=-1, keepdim=True) < 0.1, car, combined)
+    return F.normalize(stable, dim=-1), ownership
+
+
+def stable_categorical_kl(left, right) -> th.Tensor:
+    """Finite KL even when a valid action's softmax probability underflows.
+
+    PyTorch's Categorical KL returns inf whenever q.probs is numerically zero,
+    even when both logit vectors and the true KL are finite. Use log probabilities
+    directly and exclude zero-mass terms instead. Cap only extreme outliers far
+    beyond the range relevant to the ASE target of one.
+    """
+    log_p = left.logits.double()
+    log_q = right.logits.double()
+    probability = log_p.softmax(dim=-1)
+    terms = th.where(
+        probability > 0,
+        probability * (log_p - log_q),
+        th.zeros_like(probability),
+    )
+    return terms.sum(dim=-1).clamp(0, 100).float()
+
+
+class FiniteIndependentOptimizerSteps(IndependentOptimizerSteps):
+    """Reject a bad ASE minibatch before either PPO optimizer can be poisoned."""
+
+    def __call__(self, loss: th.Tensor) -> None:
+        if not th.isfinite(loss).all():
+            raise FloatingPointError("non-finite ASE PPO loss; no optimizer step was taken")
+        for step in self.steps:
+            step.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        try:
+            for step in self.steps:
+                if step.max_grad_norm is not None:
+                    th.nn.utils.clip_grad_norm_(
+                        step.parameters, step.max_grad_norm, error_if_nonfinite=True,
+                    )
+                elif any(
+                    parameter.grad is not None and not th.isfinite(parameter.grad).all()
+                    for parameter in step.parameters
+                ):
+                    raise FloatingPointError("non-finite ASE PPO gradients")
+        except RuntimeError as error:
+            raise FloatingPointError(
+                "non-finite ASE PPO gradients; no optimizer step was taken"
+            ) from error
+        for step in self.steps:
+            step.optimizer.step()
 
 
 class SkillEncoderUpdate:
@@ -223,9 +273,13 @@ class SkillEncoderUpdate:
             )
             alignment = (prediction * skill).sum(dim=-1).mean()
             loss = -alignment
+            if not th.isfinite(loss):
+                raise FloatingPointError("non-finite ASE skill loss; no optimizer step was taken")
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            th.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
+            th.nn.utils.clip_grad_norm_(
+                self.encoder.parameters(), self.max_grad_norm, error_if_nonfinite=True,
+            )
             self.optimizer.step()
             total_loss += float(loss.detach().item())
             total_alignment += float(alignment.detach().item())
@@ -315,10 +369,15 @@ class ASEPPOLoss(PPOLoss):
 
         first, second = distributions(skill), distributions(other)
         action_kl = sum(
-            kl_divergence(left, right).sum(dim=-1)
+            stable_categorical_kl(left, right).sum(dim=-1)
             for (_, left), (_, right) in zip(first, second, strict=True)
         )
-        diversity = ((action_kl / distance - 1).square()).mean()
+        ratio = action_kl / distance
+        # Exactly ASE's squared ratio error near its optimum; linear tails
+        # prevent a rare overconfident actor from dominating a PPO minibatch.
+        diversity = 2 * F.huber_loss(
+            ratio, th.ones_like(ratio), delta=4.0,
+        )
         return LossOutput(
             output.loss + self.weight * diversity,
             {**output.metrics, "ase_diversity_loss": diversity,

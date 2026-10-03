@@ -50,8 +50,8 @@ from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
 from gaifo_ase import (
-    ASEPPOLoss, SkillConditionedEnv, SkillDiscoveryReward, SkillEncoder,
-    SkillEncoderUpdate,
+    ASEPPOLoss, FiniteIndependentOptimizerSteps, SkillConditionedEnv,
+    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate,
 )
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
@@ -2052,6 +2052,16 @@ class GAIFOCheckpoints:
         self.next_step = step + self.interval
 
 
+def finite_checkpoint_state(value) -> bool:
+    if isinstance(value, th.Tensor):
+        return not value.is_floating_point() or bool(th.isfinite(value).all())
+    if isinstance(value, dict):
+        return all(finite_checkpoint_state(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(finite_checkpoint_state(item) for item in value)
+    return True
+
+
 def load_resume_checkpoint(path: Path) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"GAIFO checkpoint not found: {path}")
@@ -2090,6 +2100,16 @@ def load_resume_checkpoint(path: Path) -> dict:
     missing = [name for name in required if name not in payload]
     if missing:
         raise ValueError(f"checkpoint is missing {', '.join(missing)}: {path}")
+    if architecture == GAIFO_ASE_ARCHITECTURE:
+        for name in (
+            "policy", "critic", "discriminator", "skill_encoder",
+            "policy_optimizer", "critic_optimizer", "discriminator_optimizer",
+            "skill_encoder_optimizer",
+        ):
+            if not finite_checkpoint_state(payload[name]):
+                raise ValueError(
+                    f"non-finite {name} in GAIFO checkpoint {path}; use an earlier checkpoint"
+                )
     if "clock" in payload:
         try:
             clock = Clock(**payload["clock"])
@@ -2720,6 +2740,10 @@ def main() -> None:
         )
         if skill_encoder is not None else None
     )
+    ppo_optimizer_steps = (
+        OptimizerStep(policy, policy_optimizer, max_grad_norm=args.max_grad_norm),
+        OptimizerStep(critic, critic_optimizer, max_grad_norm=args.max_grad_norm),
+    )
     ppo_update = Update(
         transforms=(
             SceneDiscriminatorReward(
@@ -2743,9 +2767,10 @@ def main() -> None:
         ),
         sampler=build_ppo_sampler(args),
         loss=ppo_loss,
-        optimizer_step=IndependentOptimizerSteps(
-            OptimizerStep(policy, policy_optimizer, max_grad_norm=args.max_grad_norm),
-            OptimizerStep(critic, critic_optimizer, max_grad_norm=args.max_grad_norm),
+        optimizer_step=(
+            FiniteIndependentOptimizerSteps(*ppo_optimizer_steps)
+            if skill_encoder is not None
+            else IndependentOptimizerSteps(*ppo_optimizer_steps)
         ),
         section="PPO",
     )

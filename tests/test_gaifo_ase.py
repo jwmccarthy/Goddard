@@ -1,6 +1,7 @@
 """ASE skills, multi-agent ball credit, and checkpoint compatibility for GAIFO."""
 
 import argparse
+import copy
 import sys
 import tempfile
 import unittest
@@ -17,15 +18,19 @@ from gaifo import (
     restore_training_checkpoint, validate_args, validate_resume_args,
 )
 from gaifo_ase import (
-    ASEPPOLoss, SkillConditionedEnv, SkillDiscoveryReward, SkillEncoder,
-    SkillEncoderUpdate, SkillObservationSpace, ball_ownership, sample_skills,
+    ASEPPOLoss, FiniteIndependentOptimizerSteps, SkillConditionedEnv,
+    SkillDiscoveryReward, SkillEncoder, SkillEncoderUpdate,
+    SkillObservationSpace, ball_ownership, predicted_skill,
+    sample_skills, stable_categorical_kl,
 )
 from jarl.data import TensorBatch
-from jarl.learn import PPOConfig
+from jarl.learn import OptimizerStep, PPOConfig
 from jarl.runtime import Clock
 from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import PrepareContext
+from torch.distributions import Categorical
+from torch.distributions.kl import kl_divergence
 from watch_checkpoints import load_policy_checkpoint
 
 
@@ -76,6 +81,69 @@ class FixedEncoder(th.nn.Module):
 
 
 class GAIFOASETests(unittest.TestCase):
+    def test_large_masked_categorical_kl_stays_finite_after_probability_underflow(self):
+        count = 16_384
+        mask_logit = th.finfo(th.float32).min
+        policy_logits = th.zeros(count, 4, 3, requires_grad=True)
+        other_logits = th.zeros(count, 4, 3)
+        other_logits[..., 1] = -120.0
+        other_logits[..., 2] = mask_logit
+        # The same action is unavailable under both skills.
+        first = Categorical(logits=policy_logits.masked_fill(
+            th.tensor([False, False, True]), mask_logit,
+        ))
+        second = Categorical(logits=other_logits)
+        self.assertTrue(th.isinf(kl_divergence(first, second)).all())
+        stable = stable_categorical_kl(first, second)
+        self.assertEqual(stable.shape, (count, 4))
+        self.assertTrue(th.isfinite(stable).all())
+        self.assertGreater(stable.mean().item(), 50.0)
+        stable.mean().backward()
+        self.assertTrue(th.isfinite(policy_logits.grad).all())
+
+    def test_opposing_ball_and_car_heads_keep_skill_gradients_bounded(self):
+        class OpposingEncoder(th.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.car = th.nn.Parameter(th.tensor([1.0, 0.3]))
+                self.ball = th.nn.Parameter(th.tensor([-1.0, -0.3]))
+
+            def forward(self, scene, next_scene):
+                return (
+                    th.nn.functional.normalize(self.car, dim=0).expand(len(scene), -1),
+                    th.nn.functional.normalize(self.ball, dim=0).expand(len(scene), -1),
+                )
+
+        encoder = OpposingEncoder()
+        scene = th.zeros(1, 51)
+        predicted, _ = predicted_skill(
+            encoder, scene, scene, th.tensor([True]), th.tensor([False]),
+        )
+        th.testing.assert_close(predicted.norm(dim=-1), th.ones(1))
+        predicted[:, 1].sum().backward()
+        self.assertTrue(th.isfinite(encoder.car.grad).all())
+        self.assertLess(encoder.car.grad.abs().max().item(), 100)
+
+    def test_bad_ppo_gradients_never_step_either_optimizer(self):
+        policy = th.nn.Linear(1, 1)
+        critic = th.nn.Linear(1, 1)
+        policy_optimizer = th.optim.Adam(policy.parameters())
+        critic_optimizer = th.optim.Adam(critic.parameters())
+        update = FiniteIndependentOptimizerSteps(
+            OptimizerStep(policy, policy_optimizer, max_grad_norm=0.5),
+            OptimizerStep(critic, critic_optimizer, max_grad_norm=0.5),
+        )
+        saved_policy = policy.weight.detach().clone()
+        saved_critic = critic.weight.detach().clone()
+        loss = policy.weight.sum() + (critic.weight - critic.weight.detach()).sqrt().sum()
+        self.assertTrue(th.isfinite(loss))
+        with self.assertRaisesRegex(FloatingPointError, "non-finite ASE PPO gradients"):
+            update(loss)
+        th.testing.assert_close(policy.weight, saved_policy)
+        th.testing.assert_close(critic.weight, saved_critic)
+        self.assertFalse(policy_optimizer.state_dict()["state"])
+        self.assertFalse(critic_optimizer.state_dict()["state"])
+
     def test_each_car_keeps_a_unit_skill_until_switch_or_reset(self):
         env = SkillConditionedEnv(StubEnv(), 4, skill_steps=2, seed=7)
         initial = env.reset()
@@ -273,6 +341,13 @@ class GAIFOASETests(unittest.TestCase):
             payload = load_resume_checkpoint(path)
             self.assertEqual(payload["config"]["architecture"], GAIFO_ASE_ARCHITECTURE)
             self.assertIn("skill_rng_state", payload)
+            damaged = copy.deepcopy(payload)
+            first_weight = next(iter(damaged["policy"].values()))
+            first_weight.flatten()[0] = float("nan")
+            damaged_path = root / "checkpoints" / "gaifo_invalid.pt"
+            th.save(damaged, damaged_path)
+            with self.assertRaisesRegex(ValueError, "non-finite policy.*earlier checkpoint"):
+                load_resume_checkpoint(damaged_path)
 
             with patch.object(sys, "argv", [
                 "gaifo.py", "--resume-checkpoint", str(path), "--timesteps", "32",
