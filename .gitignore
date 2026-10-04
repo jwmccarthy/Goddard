@@ -7,6 +7,9 @@ checkpoints/
 runs/
 .opencode
 
+# Local replay and project backups are archives, not source files.
+*.7z
+
 # Replay datasets can contain tens of thousands of large files.
 **/*replays/*
 !**/*replays/*.py

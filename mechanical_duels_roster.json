@@ -1,0 +1,89 @@
+{
+  "players": [
+    {
+      "name": "Zen",
+      "region": "EU",
+      "platform_ids": ["steam:76561198144145654"],
+      "evidence": "https://ballchasing.com/replay/a0b412e6-c8e3-456e-9bba-0b6952629961"
+    },
+    {
+      "name": "Atow",
+      "region": "EU",
+      "platform_ids": ["steam:76561198289610054"],
+      "evidence": "https://ballchasing.com/replay/88f2688e-89ef-4d55-b6c0-37feca84f0cf"
+    },
+    {
+      "name": "Warden",
+      "region": "MENA",
+      "platform_ids": ["steam:76561198830690672"],
+      "evidence": "https://ballchasing.com/replay/018774da-c255-423c-baa1-b78013e0a8ff"
+    },
+    {
+      "name": "Nass",
+      "region": "EU",
+      "platform_ids": ["steam:76561198838703744"],
+      "evidence": "https://ballchasing.com/replay/a0b412e6-c8e3-456e-9bba-0b6952629961"
+    },
+    {
+      "name": "Mawkzy",
+      "region": "EU",
+      "platform_ids": ["epic:6ea3d3d4f992494dacd7f757ff4e2b1a"],
+      "evidence": "https://ballchasing.com/replay/46e4df22-117f-4077-a2f2-1f8659ce9430"
+    },
+    {
+      "name": "Rw9",
+      "region": "MENA",
+      "platform_ids": ["steam:76561199017029799"],
+      "evidence": "https://ballchasing.com/replay/88f2688e-89ef-4d55-b6c0-37feca84f0cf"
+    },
+    {
+      "name": "Kiileerrz",
+      "region": "MENA",
+      "platform_ids": ["steam:76561198980777579"],
+      "evidence": "https://ballchasing.com/replay/88f2688e-89ef-4d55-b6c0-37feca84f0cf"
+    },
+    {
+      "name": "Dralii",
+      "region": "MENA",
+      "platform_ids": ["steam:76561199031413358"],
+      "evidence": "https://ballchasing.com/replay/c01eca0f-108d-47b7-a836-7e02aa104755"
+    },
+    {
+      "name": "Nwpo",
+      "region": "MENA",
+      "platform_ids": ["steam:76561199019981824"],
+      "evidence": "https://ballchasing.com/replay/5bb4008f-e23d-4f10-ad1d-ea3c9dd19307"
+    },
+    {
+      "name": "Diaz",
+      "region": "NA",
+      "platform_ids": ["steam:76561198880724484"],
+      "evidence": "https://ballchasing.com/replay/80887138-3033-4467-81c6-fc50b56c6c76"
+    },
+    {
+      "name": "Wahvey",
+      "region": "NA",
+      "platform_ids": ["steam:76561199056379402"],
+      "evidence": "https://ballchasing.com/replay/80887138-3033-4467-81c6-fc50b56c6c76"
+    },
+    {
+      "name": "Vatira",
+      "region": "EU",
+      "platform_ids": ["steam:76561198960239428"],
+      "evidence": "https://ballchasing.com/replay/b05d2086-908c-45c6-93b6-b76422c4f9f5"
+    },
+    {
+      "name": "Firstkiller",
+      "region": "NA",
+      "platform_ids": ["steam:76561198327846028"],
+      "evidence": "https://ballchasing.com/player/steam/76561198327846028"
+    },
+    {
+      "name": "Frosty",
+      "region": "NA",
+      "platform_ids": ["steam:76561198351218981"],
+      "evidence": "https://ballchasing.com/player/steam/76561198351218981"
+    }
+  ],
+  "unverified_candidates": ["Daniel", "trk511", "Joreuz", "ApparentlyJack", "Dark(?)"]
+}

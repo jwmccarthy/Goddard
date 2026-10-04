@@ -397,6 +397,15 @@ def _parse(
     frame_skip: int,
     pov_players: tuple[str, ...] | None = None,
 ) -> int:
+    if pov_players is not None:
+        selected = {str(player_id).lower() for player_id in pov_players}
+        available = {
+            str(player.get("online_id")).lower()
+            for player in replay.metadata.get("players", [])
+        }
+        missing = selected - available
+        if missing:
+            raise ValueError(f"requested POV IDs not present in replay: {sorted(missing)}")
     active_frames = _get_active_frames(replay)
 
     if not active_frames or not any(active_frames):
@@ -407,14 +416,15 @@ def _parse(
     times = replay.game_df["time"].to_numpy() * 120.0
 
     if pov_players is not None:
-        selected = set(pov_players)
         cars_by_id = {str(car_id): car_id for car_id in first.state.cars}
         ego_ids = [
             cars_by_id[str(player["unique_id"])]
             for player in replay.metadata.get("players", [])
-            if str(player.get("online_id")) in selected
+            if str(player.get("online_id")).lower() in selected
             and str(player["unique_id"]) in cars_by_id
         ]
+        if len(ego_ids) != len(selected):
+            raise ValueError("requested POV IDs must map to exactly one active car each")
 
     written = 0
 
@@ -549,19 +559,33 @@ def parse(
     workers:    int | None = None,
     pov_manifest: str | None = None,
     replay_glob: str = "*.replay",
+    replay_ids: set[str] | None = None,
+    require_pov_manifest: bool = False,
+    fail_on_errors: bool = False,
 ) -> None:
     replay_dir = Path(replay_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_path = Path(pov_manifest) if pov_manifest else replay_dir / "pov_players.json"
+    if require_pov_manifest and not manifest_path.is_file():
+        raise ValueError("selected-POV parsing requires a POV manifest")
     manifest = (
-        json.loads(manifest_path.read_text())
-        if manifest_path.exists()
-        else {}
+        {key.lower(): value for key, value in json.loads(manifest_path.read_text()).items()}
+        if manifest_path.exists() else {}
     )
+    if require_pov_manifest and replay_ids is None:
+        replay_ids = set(manifest)
 
     paths = list(replay_dir.glob(replay_glob))
+    if replay_ids is not None:
+        paths = [path for path in paths if path.stem.lower() in replay_ids]
+    if require_pov_manifest:
+        for path in paths:
+            selected = manifest.get(path.stem.lower())
+            if (not isinstance(selected, list) or len(selected) != 1
+                    or not isinstance(selected[0], str) or not selected[0]):
+                raise ValueError(f"exactly one selected POV ID required for {path.name}")
     paths.reverse()
     cores = workers or 1
     jobs = [
@@ -569,11 +593,12 @@ def parse(
             str(path),
             str(output_dir),
             frame_skip,
-            tuple(manifest[path.stem]) if path.stem in manifest else None,
+            tuple(manifest[path.stem.lower()]) if path.stem.lower() in manifest else None,
         )
         for path in paths
     ]
 
+    failures = []
     with Progress() as progress:
         overall = progress.add_task("Replays", total=len(paths))
 
@@ -581,9 +606,15 @@ def parse(
             for name, status in executor.map(_parse_path, jobs, chunksize=1):
                 if status.startswith("failed"):
                     progress.console.print(f"{status}: {name}")
+                    failures.append(f"{name}: {status}")
 
                 progress.update(overall, description=f"{status}: {name}")
                 progress.advance(overall)
+    if fail_on_errors and failures:
+        raise RuntimeError(
+            f"{len(failures)} of {len(paths)} selected replays failed to parse; "
+            f"first: {failures[0]}"
+        )
 
 
 if __name__ == "__main__":
@@ -597,6 +628,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--pov-manifest")
     parser.add_argument("--replay-glob", default="*.replay")
+    parser.add_argument("--require-pov-manifest", action="store_true")
     args = parser.parse_args()
     parse(
         args.replay_dir,
@@ -605,4 +637,5 @@ if __name__ == "__main__":
         workers=args.workers,
         pov_manifest=args.pov_manifest,
         replay_glob=args.replay_glob,
+        require_pov_manifest=args.require_pov_manifest,
     )
