@@ -58,6 +58,7 @@ from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
 )
 from replay_safety import infer_unsafe_start_mask, pre_goal_start_mask
+from reward_spec import CEILING_Z
 
 
 SCENE_SIZE = 51
@@ -67,6 +68,8 @@ GAIFO_ASE_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-ase"
 BALL_SIZE = 9
 CAR_SIZE = 21
 N_CARS = 2
+DOUBLES_N_CARS = 4
+DOUBLES_SCENE_SIZE = BALL_SIZE + DOUBLES_N_CARS * CAR_SIZE
 BLUE_START = 9
 ORANGE_START = 30
 CAR_BOOL_START = 16
@@ -95,6 +98,9 @@ LOW_AIR_HEIGHT = 350.0
 MID_AIR_HEIGHT = 900.0
 NEAR_CEILING_HEIGHT = 1_700.0
 CEILING_AIR_HEIGHT = 1_850.0
+AERIAL_SETUP_STEPS = 16
+AERIAL_RECOVERY_STEPS = 16
+AERIAL_MIN_CONTEXT_STEPS = 8
 MANEUVER_SETUP_STEPS = 8
 MANEUVER_RECOVERY_STEPS = 8
 MANEUVER_MAX_TRACKED_STEPS = 128
@@ -108,16 +114,25 @@ FLICK_MIN_VELOCITY_CHANGE = 500.0
 BALL_GATE_RADIUS = 200.0
 BALL_GATE_SCALE = 1_000.0
 BALL_GATE_FLOOR = 0.1
-RESET_MINING_CANDIDATES = 4
+RESET_MINING_CANDIDATES = 8
 RESET_MINING_FRACTION = 0.5
 RESET_MINING_MIN_CONFIDENCE = 0.6
 
 
-def noise_mask(device: str | th.device = "cpu") -> th.Tensor:
+def scene_car_count(scenes: th.Tensor) -> int:
+    if scenes.shape[-1] not in (SCENE_SIZE, DOUBLES_SCENE_SIZE):
+        raise ValueError("physical scenes must contain two or four cars")
+    return (scenes.shape[-1] - BALL_SIZE) // CAR_SIZE
+
+
+def noise_mask(device: str | th.device = "cpu", n_cars: int = N_CARS) -> th.Tensor:
     """Boolean mask that is True for continuous scene features and False for car booleans."""
-    mask = th.ones(SCENE_SIZE, dtype=th.bool, device=device)
-    mask[BLUE_START + CAR_BOOL_START : BLUE_START + CAR_BOOL_END] = False
-    mask[ORANGE_START + CAR_BOOL_START : ORANGE_START + CAR_BOOL_END] = False
+    if n_cars not in (N_CARS, DOUBLES_N_CARS):
+        raise ValueError("noise mask needs two or four cars")
+    mask = th.ones(BALL_SIZE + n_cars * CAR_SIZE, dtype=th.bool, device=device)
+    for car in range(n_cars):
+        start = BALL_SIZE + car * CAR_SIZE
+        mask[start + CAR_BOOL_START : start + CAR_BOOL_END] = False
     return mask
 
 
@@ -125,22 +140,22 @@ def add_scene_noise(windows: th.Tensor, std: float) -> th.Tensor:
     """Apply symmetric Gaussian noise only to continuous scene features."""
     if not math.isfinite(std) or std < 0.0:
         raise ValueError("scene noise standard deviation must be finite and nonnegative")
-    if windows.shape[-1] != SCENE_SIZE:
-        raise ValueError(f"scene windows must end in {SCENE_SIZE} features")
+    n_cars = scene_car_count(windows)
     if std <= 0.0:
         return windows
-    mask = noise_mask(windows.device).view(*((1,) * (windows.ndim - 1)), SCENE_SIZE)
+    mask = noise_mask(windows.device, n_cars).view(
+        *((1,) * (windows.ndim - 1)), windows.shape[-1]
+    )
     noise = th.randn_like(windows) * std * mask
     return windows + noise
 
 
 def nearest_ball_distance(windows: th.Tensor) -> th.Tensor:
     """Closest ego-car/ball distance in physical units over each causal window."""
-    if windows.ndim < 3 or windows.shape[-1] != SCENE_SIZE:
+    if windows.ndim < 3:
         raise ValueError("ball proximity needs scene windows")
-    relative = windows[..., :3] - windows[..., BLUE_START:BLUE_START + 3]
-    scale = windows.new_tensor(POSITION_SCALE)
-    return th.linalg.vector_norm(relative * scale, dim=-1).amin(dim=-1)
+    scene_car_count(windows)
+    return _ball_distances(windows, BLUE_START).amin(dim=-1)
 
 
 def _ball_distances(windows: th.Tensor, car_start: int) -> th.Tensor:
@@ -220,31 +235,41 @@ class GroundManeuver(SceneManeuver):
         return self.action_stop
 
 
+def _arena_surface_contact(
+    on_ground: th.Tensor, position: th.Tensor, up_z: th.Tensor,
+) -> th.Tensor:
+    """Distinguish floor and side walls from wheel contact with a ball or roof."""
+    x = position[..., 0].abs()
+    y = position[..., 1].abs()
+    z = position[..., 2]
+    floor = (z < 2 * BALL_RADIUS) & (up_z > 0.5)
+    near_wall = (
+        (x > 3_900) | (y > 4_900) | ((x > 3_000) & (y > 4_300))
+    )
+    wall = near_wall & (z < NEAR_CEILING_HEIGHT) & (up_z.abs() < 0.5)
+    return on_ground & (floor | wall)
+
+
 def recovery_surface_contact(
     scenes: th.Tensor, previous: th.Tensor, car_start: int = BLUE_START,
 ) -> th.Tensor:
     """Only floor and side-wall contacts end a flight, not ball or roof contacts."""
     car = scenes[..., car_start:car_start + CAR_SIZE]
     prior = previous[..., car_start:car_start + CAR_SIZE]
-    x = car[..., 0].abs() * POSITION_SCALE[0]
-    y = car[..., 1].abs() * POSITION_SCALE[1]
-    z = car[..., 2] * POSITION_SCALE[2]
-    up_z = car[..., 14]
-    floor = (z < 2 * BALL_RADIUS) & (up_z > 0.5)
-    near_wall = (
-        (x > 3_900) | (y > 4_900) | ((x > 3_000) & (y > 4_300))
+    position = car[..., :3] * scenes.new_tensor(POSITION_SCALE)
+    on_surface = _arena_surface_contact(
+        car[..., CAR_BOOL_START] > 0.5, position, car[..., 14],
     )
-    wall = near_wall & (z < NEAR_CEILING_HEIGHT) & (up_z.abs() < 0.5)
 
     # Wall contact restores a spent flip too. A nearby ball doing the restoring
     # is a flip reset, however, and must not truncate the active flight.
     spent_flip = (prior[..., 18] > 0.5) | (prior[..., 19] > 0.5)
     flip_available = (car[..., 18] < 0.5) & (car[..., 19] < 0.5)
     ball_reset = (
-        spent_flip & flip_available & (z > 3 * BALL_RADIUS)
+        spent_flip & flip_available & (position[..., 2] > 3 * BALL_RADIUS)
         & (_ball_distances(scenes, car_start) < 2 * BALL_RADIUS)
     )
-    return (car[..., CAR_BOOL_START] > 0.5) & (floor | wall) & ~ball_reset
+    return on_surface & ~ball_reset
 
 
 def air_maneuvers(
@@ -254,10 +279,10 @@ def air_maneuvers(
     up_z: np.ndarray,
     ball_distance: np.ndarray,
     *,
-    setup_steps: int = MANEUVER_SETUP_STEPS,
-    recovery_steps: int = MANEUVER_RECOVERY_STEPS,
+    setup_steps: int = AERIAL_SETUP_STEPS,
+    recovery_steps: int = AERIAL_RECOVERY_STEPS,
 ) -> list[AirManeuver]:
-    """Trace flights between floor/side-wall contacts within valid runs."""
+    """Trace genuinely elevated flights with ground/wall setup and recovery."""
     if (not all(len(values) == len(valid) for values in
                 (on_surface, height, up_z, ball_distance))
             or setup_steps < 1 or recovery_steps < 1):
@@ -284,6 +309,9 @@ def air_maneuvers(
             recovery_stop = min(len(run), landing + recovery_steps, next_takeoff)
             air = run[takeoff:landing]
             peak = float(height[air].max())
+            if peak <= 2 * BALL_RADIUS:
+                previous_landing = landing
+                continue  # A ground-level flick is not an aerial maneuver.
             roof = ((height[air] >= NEAR_CEILING_HEIGHT)
                     & ((up_z[air] <= -0.5) | (height[air] >= CEILING_AIR_HEIGHT)))
             if roof.any():
@@ -408,32 +436,49 @@ def ball_responsibility(windows: th.Tensor) -> th.Tensor:
     )
 
 
-def opponent_view(scenes: th.Tensor) -> th.Tensor:
-    """Convert a canonical physical scene into the opponent's ego viewpoint.
-
-    This rotates the world 180 degrees around the vertical axis by negating the
-    x and y components of every world-space vector, then swaps the two cars so
-    the opponent becomes the ego car.
-    """
-    if scenes.shape[-1] != SCENE_SIZE:
-        raise ValueError(f"scene must end in {SCENE_SIZE} features")
-
+def actor_view(scenes: th.Tensor, actor_index: int) -> th.Tensor:
+    """Make one actor the ego, followed by teammates and then opponents."""
+    n_cars = scene_car_count(scenes)
+    if not 0 <= actor_index < n_cars:
+        raise ValueError("actor index must identify a car in the scene")
+    team_size = n_cars // 2
     view = scenes.clone()
-    neg_xy = [0, 1, 3, 4, 6, 7]
-    view[..., neg_xy] *= -1.0
+    if actor_index >= team_size:
+        # Orange actors attack in the opposite direction in the stored view.
+        view[..., [0, 1, 3, 4, 6, 7]] *= -1.0
+        for car in range(n_cars):
+            start = BALL_SIZE + car * CAR_SIZE
+            for offset in (0, 3, 6, 9, 12):
+                view[..., start + offset : start + offset + 2] *= -1.0
 
-    for base in (BLUE_START, ORANGE_START):
-        for offset in (0, 3, 6, 9, 12):
-            view[..., base + offset : base + offset + 2] *= -1.0
+    own = range((actor_index // team_size) * team_size,
+                (actor_index // team_size + 1) * team_size)
+    order = [actor_index, *(car for car in own if car != actor_index),
+             *(car for car in range(n_cars) if car // team_size != actor_index // team_size)]
+    cars = view[..., BALL_SIZE:].reshape(*view.shape[:-1], n_cars, CAR_SIZE)
+    return th.cat((view[..., :BALL_SIZE], cars[..., order, :].flatten(-2)), dim=-1)
 
-    swapped = view.clone()
-    swapped[..., BLUE_START : BLUE_START + CAR_SIZE] = view[
-        ..., ORANGE_START : ORANGE_START + CAR_SIZE
-    ]
-    swapped[..., ORANGE_START : ORANGE_START + CAR_SIZE] = view[
-        ..., BLUE_START : BLUE_START + CAR_SIZE
-    ]
-    return swapped
+
+def opponent_view(scenes: th.Tensor) -> th.Tensor:
+    """Use the first opposing player as the ego (rotating the field)."""
+    return actor_view(scenes, scene_car_count(scenes) // 2)
+
+
+def teammate_view(scenes: th.Tensor) -> th.Tensor:
+    """Use the other player on the ego's team as the ego in a 2v2 scene."""
+    if scene_car_count(scenes) != DOUBLES_N_CARS:
+        raise ValueError("teammate view needs a four-car scene")
+    return actor_view(scenes, 1)
+
+
+def actor_views(scenes: th.Tensor) -> th.Tensor:
+    """Stack all actors' ego views without mixing the two teams' car roles."""
+    if scenes.ndim < 2:
+        raise ValueError("actor views need a window of scenes")
+    return th.stack(
+        [actor_view(scenes, actor) for actor in range(scene_car_count(scenes))],
+        dim=-3,
+    )
 
 
 def _resample_coordinates(
@@ -549,32 +594,13 @@ def _unsafe_replay_reset_frames(
 def advanced_touch_events(
     context: RewardContext,
 ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
-    """Score high, goal-directed touch impulses and airborne flip resets."""
+    """Reward every elevated aerial touch more at height; detect flip resets."""
     current = context.current
     previous = context.previous
     touches = current.car_ball_touches
     ball_to_car = current.ball_position[:, None, :] - current.car_position
     ball_height = current.ball_position[:, None, 2]
     car_height = current.car_position[..., 2]
-
-    aerial = (
-        touches
-        & ~current.car_on_ground
-        & car_height.gt(2.0 * BALL_RADIUS)
-        & ball_height.gt(GOAL_HEIGHT)
-    )
-    opponent_goal = th.zeros_like(current.car_position)
-    opponent_goal[..., 1] = current.team_sign * GOAL_Y
-    opponent_goal[..., 2] = GOAL_HEIGHT / 2.0
-    toward_goal = F.normalize(
-        opponent_goal - current.ball_position[:, None, :], dim=-1, eps=1e-6
-    )
-    ball_velocity_change = (
-        current.ball_velocity - previous.ball_velocity
-    )[:, None, :]
-    aerial_score = aerial.to(current.raw.dtype) * (
-        (ball_velocity_change * toward_goal).sum(dim=-1) / CAR_MAX_SPEED
-    ).clamp(0.0, 1.0)
 
     spent_flip = previous.car_has_flipped | previous.car_has_double_jumped
     flip_available = ~(current.car_has_flipped | current.car_has_double_jumped)
@@ -588,6 +614,13 @@ def advanced_touch_events(
             ball_to_car, -current.car_up, dim=-1, eps=1e-6
         ).gt(0.9)
     )
+    on_surface = _arena_surface_contact(
+        current.car_on_ground, current.car_position, current.car_up[..., 2],
+    )
+    aerial = touches & car_height.gt(2.0 * BALL_RADIUS) & (~on_surface | flip_reset)
+    # A low aerial earns a nonzero bonus; the configured weight caps it at the roof.
+    height_fraction = ((ball_height - BALL_RADIUS) / (CEILING_Z - BALL_RADIUS)).clamp(0, 1)
+    aerial_score = aerial.to(current.raw.dtype) * (0.5 + 0.5 * height_fraction)
     return aerial_score, aerial, flip_reset
 
 
@@ -1490,6 +1523,11 @@ class ExpertSceneDataset:
             for clip in clips:
                 actor = clip.actor
                 if category == 0:
+                    # Exclude flights cut short by a replay, split, or next
+                    # takeoff: a demonstration needs both its approach and landing.
+                    if (clip.action_start - clip.setup_start < AERIAL_MIN_CONTEXT_STEPS
+                            or clip.recovery_stop - clip.action_stop < AERIAL_MIN_CONTEXT_STEPS):
+                        continue
                     scored = np.arange(clip.action_start, clip.action_stop) + self.partition_span
                     near = (
                         (distances[actor][scored] < BALL_CLOSE_DISTANCE)
@@ -1789,6 +1827,8 @@ class SceneDiscriminator(nn.Module):
         self.head = nn.Linear(temporal_hidden, 1)
 
     def forward(self, windows: th.Tensor) -> th.Tensor:
+        if windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE:
+            raise ValueError("unified discriminator requires two-car scene windows")
         B, T, _ = windows.shape
         ball = windows[..., :BALL_SIZE]
         cars = windows[..., BALL_SIZE:SCENE_SIZE].view(B, T, N_CARS, CAR_SIZE)
@@ -1808,16 +1848,24 @@ class SceneDiscriminator(nn.Module):
 
 
 class FactorizedSceneDiscriminator(nn.Module):
-    """Separate car-motion and ball-control critics of the same short scene window."""
+    """Score each acting car's motion and attributable ball control separately.
+
+    Other cars, whether teammates or opponents, are excluded from the ego heads.
+    Use ``actor_view`` to score each player's own window in four-car scenes.
+    """
 
     factorized = True
 
     def __init__(
         self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
+        *, n_cars: int = N_CARS,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
             raise ValueError("discriminator dimensions must be positive")
+        if n_cars not in (N_CARS, DOUBLES_N_CARS):
+            raise ValueError("factorized discriminator needs two or four cars")
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.car_encoder = nn.Sequential(
             nn.Linear(CAR_SIZE + 6, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
@@ -1832,7 +1880,7 @@ class FactorizedSceneDiscriminator(nn.Module):
         self.ball_head = nn.Linear(temporal_hidden, 1)
 
     def forward(self, windows: th.Tensor) -> th.Tensor:
-        if windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE:
+        if windows.ndim != 3 or windows.shape[-1] != self.scene_size:
             raise ValueError("factorized discriminator needs [batch, frames, scene] windows")
         ball = windows[..., :BALL_SIZE]
         ego = windows[..., BLUE_START:BLUE_START + CAR_SIZE]
@@ -2111,9 +2159,14 @@ def generated_maneuver_pools(
             timelines[:, actor], grounded[:, actor], height[:, actor],
             up_z[:, actor], distance[:, actor],
         ), *ground_maneuvers(timelines[:, actor], control[:, actor])):
+            if (isinstance(maneuver, AirManeuver)
+                    and maneuver.recovery_stop - maneuver.action_stop < AERIAL_MIN_CONTEXT_STEPS):
+                continue
             # Short recovery at the rollout edge belongs to the cross-rollout tracker.
+            recovery_steps = (AERIAL_RECOVERY_STEPS if isinstance(maneuver, AirManeuver)
+                              else MANEUVER_RECOVERY_STEPS)
             if (timelines[-1, actor] and maneuver.recovery_stop == steps
-                    and maneuver.recovery_stop - maneuver.action_stop < MANEUVER_RECOVERY_STEPS):
+                    and maneuver.recovery_stop - maneuver.action_stop < recovery_steps):
                 continue
             groups[maneuver.situation].append(replace(
                 maneuver,
@@ -2143,17 +2196,24 @@ def aligned_maneuver_windows(
             (getattr(agent, end) - getattr(agent, start)) // agent.stride,
             (getattr(expert, end) - getattr(expert, start)) // expert.stride,
         ), maximum)
-        for start, end, maximum in zip(phases[:-1], phases[1:], (8, 64, 8))
+        for start, end, maximum in zip(
+            phases[:-1], phases[1:], (AERIAL_SETUP_STEPS, 64, AERIAL_RECOVERY_STEPS)
+        )
     ]
     counts = [1, 2, 1]
     if budget < sum(counts):
         empty = th.empty(0, dtype=th.long, device=device)
         return empty, empty.reshape(0, 1).expand(0, 2)
     remaining = budget - sum(counts)
-    for phase in (1, 0, 2):
-        extra = min(remaining, desired[phase] - counts[phase])
-        counts[phase] += extra
-        remaining -= extra
+    extra = min(remaining, desired[1] - counts[1])
+    counts[1] += extra
+    remaining -= extra
+    # Keep approach and recovery equally visible when the budget is tight.
+    while remaining and (counts[0] < desired[0] or counts[2] < desired[2]):
+        for phase in (0, 2):
+            if remaining and counts[phase] < desired[phase]:
+                counts[phase] += 1
+                remaining -= 1
 
     def indices(flight: SceneManeuver) -> th.Tensor:
         segments = []
@@ -2271,8 +2331,9 @@ class GeneratedManeuverTracker:
                 np.ones(len(joined), dtype=bool), on_ground, z, up, near,
             ) if flight.action_start == partial.action_start), None)
             if (completed is not None and
-                    (completed.recovery_stop - completed.action_stop >= MANEUVER_RECOVERY_STEPS
-                     or completed.recovery_stop < len(joined) or count < steps)):
+                    completed.recovery_stop - completed.action_stop >= AERIAL_MIN_CONTEXT_STEPS
+                    and (completed.recovery_stop - completed.action_stop >= AERIAL_RECOVERY_STEPS
+                         or completed.recovery_stop < len(joined) or count < steps)):
                 self._archive(joined, completed)
             elif count == steps and len(joined) < MANEUVER_MAX_TRACKED_STEPS:
                 self.pending[actor] = PendingAirManeuver(
@@ -2316,13 +2377,13 @@ class GeneratedManeuverTracker:
                 continue
             takeoff = run_start + int(possible[-1]) + 1
             landings = np.flatnonzero(grounded[takeoff:, actor])
-            if len(landings) and takeoff + int(landings[0]) + MANEUVER_RECOVERY_STEPS <= steps:
+            if len(landings) and takeoff + int(landings[0]) + AERIAL_RECOVERY_STEPS <= steps:
                 continue
             previous_air = np.flatnonzero(~grounded[run_start:takeoff, actor])
             previous_landing = (
                 run_start + int(previous_air[-1]) + 1 if len(previous_air) else run_start
             )
-            setup = max(previous_landing, takeoff - MANEUVER_SETUP_STEPS)
+            setup = max(previous_landing, takeoff - AERIAL_SETUP_STEPS)
             unfinished.append((int(actor), setup, takeoff))
 
         slots = max(0, MANEUVER_MAX_PENDING - len(self.pending))
@@ -3694,7 +3755,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--aerial-touch-reward-weight", type=float, default=0.5,
-        help="reward positive ball-velocity change toward goal on airborne touches above goal height (0 disables it)",
+        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (0 disables it)",
     )
     parser.add_argument(
         "--flip-reset-reward-weight", type=float, default=1.0,

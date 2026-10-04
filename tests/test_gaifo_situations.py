@@ -10,7 +10,7 @@ import torch as th
 from gaifo import (
     BLUE_START, CAR_SITUATIONS, DISTANCE_BANDS, ORANGE_START, POSITION_SCALE,
     ExpertSceneDataset, GeneratedManeuverTracker, SceneGAIFOMinibatches, air_maneuvers,
-    generated_maneuver_pools, opponent_view, recovery_surface_contact,
+    aligned_maneuver_windows, generated_maneuver_pools, opponent_view, recovery_surface_contact,
     scene_situation_ids,
 )
 
@@ -167,6 +167,79 @@ class SituationBalanceTests(unittest.TestCase):
                                        grounded, roof, np.ones(len(grounded)),
                                        distance)[0].situation, 16)
 
+        ground_jump = height.copy()
+        ground_jump[4:6] = 17
+        self.assertFalse(air_maneuvers(np.ones(len(grounded), dtype=bool),
+                                       grounded, ground_jump,
+                                       np.ones(len(grounded)), distance))
+
+    def test_aerial_context_spans_setup_and_recovery_without_crossing_flights(self):
+        grounded = np.ones(70, dtype=bool)
+        grounded[20:30] = grounded[38:44] = False
+        valid = np.ones(len(grounded), dtype=bool)
+        valid[52] = False  # A discontinuity must not supply later recovery frames.
+        flights = air_maneuvers(
+            valid, grounded, np.where(grounded, 17., 650.),
+            np.ones(len(grounded)), np.full(len(grounded), 100.),
+        )
+        self.assertEqual([
+            (flight.setup_start, flight.takeoff, flight.landing, flight.recovery_stop)
+            for flight in flights
+        ], [(4, 20, 30, 38), (30, 38, 44, 52)])
+
+        ample = air_maneuvers(
+            np.ones(60, dtype=bool),
+            np.r_[np.ones(20, bool), np.zeros(10, bool), np.ones(30, bool)],
+            np.r_[np.full(20, 17.), np.full(10, 650.), np.full(30, 17.)],
+            np.ones(60), np.full(60, 100.),
+        )[0]
+        self.assertEqual((ample.setup_start, ample.takeoff, ample.landing,
+                          ample.recovery_stop), (4, 20, 30, 46))
+        sampled, pairs = aligned_maneuver_windows(ample, ample, 26, th.device("cpu"))
+        th.testing.assert_close(sampled, pairs[:, 0])
+        self.assertEqual((int((sampled < 20).sum()), int((sampled >= 30).sum())), (8, 8))
+        self.assertTrue({4, 19, 20, 29, 30, 45}.issubset(sampled.tolist()))
+
+    def test_curated_aerials_require_grounded_context_on_both_sides(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            for name, before, after in (
+                ("ample", 20, 24), ("minimal", 8, 8),
+                ("short-setup", 3, 24), ("short-recovery", 20, 3),
+            ):
+                frames = [scene(100, "grounded") for _ in range(before)]
+                frames += [scene(100, "mid_air") for _ in range(10)]
+                frames += [scene(100, "grounded") for _ in range(after)]
+                rows = np.zeros((len(frames), 161), dtype=np.float32)
+                rows[:, :51] = th.stack(frames).numpy()
+                rows[:, 2] = 92 / POSITION_SCALE[2]
+                rows[before:before + 10, 2] = 750 / POSITION_SCALE[2]
+                rows[before + 4, 156] = 1  # A genuine airborne ego touch.
+                path = folder / f"100-0-{name}.npy"
+                np.save(path, rows)
+                np.savez_compressed(
+                    path.with_suffix(".unsafe-starts.npz"),
+                    unsafe=np.zeros(len(rows), dtype=bool),
+                    pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+                )
+
+            expert = ExpertSceneDataset(
+                folder, trajectory_length=8, frame_skip=4,
+                reject_discontinuities=True, skill_sampling=True,
+            )
+            clips = [clip for group in expert._curated_maneuvers[False][:18]
+                     for clip in group]
+            self.assertEqual(len(clips), 2)
+            self.assertEqual(sorted((clip.action_start - clip.setup_start,
+                                     clip.recovery_stop - clip.action_stop)
+                                    for clip in clips), [(8, 8), (16, 16)])
+            eligible = expert.curated_pools()[0][:, 0]
+            for clip in clips:
+                self.assertTrue(th.isin(th.arange(clip.setup_start, clip.recovery_stop),
+                                        eligible).all())
+                self.assertTrue(th.isin(th.arange(clip.setup_start, clip.recovery_stop),
+                                        expert.train_window_starts).all())
+
     def test_flip_resets_and_ceiling_contacts_do_not_start_recovery(self):
         frames = []
         for step in range(36):
@@ -207,7 +280,7 @@ class SituationBalanceTests(unittest.TestCase):
         ) for clip in pool]
         self.assertEqual(len(generated), 1)
         self.assertEqual((generated[0].action_start, generated[0].action_stop,
-                          generated[0].recovery_stop), (4, 20, 28))
+                          generated[0].recovery_stop), (4, 20, 36))
 
         tracker = GeneratedManeuverTracker()
         tracker.feed(windows[:20], th.arange(20), n_envs=1)
@@ -217,7 +290,7 @@ class SituationBalanceTests(unittest.TestCase):
         archived = [clip for pool in tracker.ready for clip in pool]
         self.assertEqual(len(archived), 1)
         self.assertEqual((archived[0].span.action_stop,
-                          archived[0].span.recovery_stop), (20, 28))
+                          archived[0].span.recovery_stop), (20, 36))
 
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
@@ -227,7 +300,7 @@ class SituationBalanceTests(unittest.TestCase):
             clips = [clip for pool in expert.maneuver_pools() for clip in pool]
             self.assertEqual(len(clips), 1)
             self.assertEqual(clips[0].action_stop - clips[0].action_start, 16)
-            self.assertEqual(clips[0].recovery_stop - clips[0].action_stop, 8)
+            self.assertEqual(clips[0].recovery_stop - clips[0].action_stop, 16)
 
     def test_stored_pov_and_heldout_boundaries_for_whole_flights(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
@@ -304,9 +377,8 @@ class SituationBalanceTests(unittest.TestCase):
             self.assertGreaterEqual(int(mask.sum()), 18)
             agent_markers = sample["window"][:96, -1, 3][mask].tolist()
             expert_markers = sample["window"][96:, -1, 3][mask].tolist()
-            self.assertTrue(any(agent_markers[index:index + 18] == list(range(1, 19))
-                                for index in range(len(agent_markers) - 17)))
-            self.assertTrue(set(range(101, 118)).issubset(expert_markers))
+            self.assertTrue({1, 6, 10, 11, 26}.issubset(agent_markers))
+            self.assertTrue({100, 105, 109, 110, 125}.issubset(expert_markers))
             th.testing.assert_close(generated, original)
 
     def test_cross_rollout_flights_are_archived_only_after_full_recovery(self):
@@ -318,13 +390,16 @@ class SituationBalanceTests(unittest.TestCase):
         self.assertFalse(any(tracker.ready))
         self.assertFalse(any(generated_maneuver_pools(second, th.arange(32), 2)))
         tracker.feed(second, th.arange(32), n_envs=2)
+        self.assertIn(0, tracker.pending)
+        self.assertFalse(any(tracker.ready))
+        tracker.feed(generated_rollout(32, 48), th.arange(32), n_envs=2)
         self.assertNotIn(0, tracker.pending)
         self.assertEqual(len(tracker.ready[7]), 1)
         complete = tracker.ready[7][0]
         self.assertEqual((complete.span.setup_start, complete.span.takeoff,
-                          complete.span.landing, complete.span.recovery_stop),
-                         (0, 4, 19, 27))
-        th.testing.assert_close(complete.windows[:, -1, 3], th.arange(1, 28).float())
+                           complete.span.landing, complete.span.recovery_stop),
+                          (0, 4, 19, 35))
+        th.testing.assert_close(complete.windows[:, -1, 3], th.arange(1, 36).float())
 
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             expert_frames = [
@@ -354,11 +429,16 @@ class SituationBalanceTests(unittest.TestCase):
 
         partial_recovery = generated_rollout(0, 16, landing=10)
         self.assertFalse(any(generated_maneuver_pools(partial_recovery, th.arange(32), 2)))
+        early_end = th.zeros(16, 2, dtype=th.bool)
+        early_end[14, 0] = True  # Only four landing frames before this reset.
+        self.assertFalse(any(generated_maneuver_pools(
+            partial_recovery, th.arange(32), 2, episode_end=early_end,
+        )))
         recovering = GeneratedManeuverTracker()
         recovering.feed(partial_recovery, th.arange(32), n_envs=2)
         self.assertIn(0, recovering.pending)
         recovering.feed(generated_rollout(16, 32, landing=10), th.arange(32), n_envs=2)
-        self.assertEqual(recovering.ready[7][0].span.recovery_stop, 18)
+        self.assertEqual(recovering.ready[7][0].span.recovery_stop, 26)
 
     def test_short_flight_is_found_even_when_closest_approach_precedes_takeoff(self):
         frames = [

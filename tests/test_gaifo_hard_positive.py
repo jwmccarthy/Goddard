@@ -117,6 +117,27 @@ class HardPositiveMiningTests(unittest.TestCase):
             self.assertIsNone(discriminator.scale.grad)
             self.assertFalse(any(discriminator.grad_modes))
 
+    def test_selective_mining_favors_the_easiest_expert_without_dropping_uniform_resets(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = make_expert(Path(directory), heldout_size=0)
+            for frames, logit in zip(expert.segment_frame_indices, (-0.9, -0.15, 0.9)):
+                expert.frames[frames, 5] = logit
+            dataset = expert.reset_dataset()
+            miner = ConfidentExpertResetTransform(
+                expert, dataset, ScoreDiscriminator(), 128,
+            )
+            miner.ready = True
+            selected = DatasetResetSampler(
+                dataset, transforms=(miner,), seed=3,
+            )(th.ones(8_192, dtype=th.bool))
+            easiest = (expert.frames[frame_ids(selected), 5] == -0.9).float().mean()
+            # Eight-way selection makes the easy third a majority overall,
+            # even while half of resets still follow ordinary replay sampling.
+            self.assertGreater(easiest.item(), 0.62)
+            self.assertLess(easiest.item(), 0.70)
+            self.assertTrue(th.isin(frame_ids(selected), expert.reset_indices).all())
+            self.assertAlmostEqual(miner.take_mined_fraction(), 0.5, delta=0.02)
+
     def test_factorized_resets_prioritize_near_ball_control(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             expert = make_expert(Path(directory))

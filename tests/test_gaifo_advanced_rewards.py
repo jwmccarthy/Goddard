@@ -23,7 +23,7 @@ from gaifo import (
 )
 from jarl.data import TensorBatch
 from jarl.transform import PrepareContext
-from reward_spec import CAR_MAX_SPEED, GOAL_HEIGHT, GOAL_Y
+from reward_spec import BALL_RADIUS, CEILING_Z, GOAL_HEIGHT
 
 
 class ZeroDiscriminator(th.nn.Module):
@@ -47,14 +47,14 @@ def touch_context() -> RewardContext:
     cars[0, 0, 2] = 600.0
     cars[0, 0, 21] = 1.0
 
-    # Touching a high ball from the ground is not an aerial touch.
-    raw[1, 2] = 700.0
+    # A grounded touch is not an aerial touch.
+    raw[1, 2] = BALL_RADIUS
     raw[1, 4] = 1200.0
-    cars[1, 0, 2] = 600.0
+    cars[1, 0, 2] = 17.0
     cars[1, 0, 16] = 1.0
     cars[1, 0, 21] = 1.0
 
-    # Orange recovers a spent flip below crossbar height; no aerial bonus.
+    # Orange resets a spent flip with its wheels against a low airborne ball.
     raw[2, 2] = 350.0
     raw[2, 4] = -1200.0
     cars[2, 1, 2] = 500.0
@@ -62,7 +62,7 @@ def touch_context() -> RewardContext:
     cars[2, 1, 16] = 1.0  # A wheel-contact ground flag does not suppress a reset.
     cars[2, 1, 21] = 1.0
 
-    # Orange accelerates a high ball toward its goal, without a flip reset.
+    # Orange accelerates an aerial ball toward its goal, without a flip reset.
     raw[3, 2] = 650.0
     raw[3, 4] = -1200.0
     cars[3, 1, 2] = 500.0
@@ -104,22 +104,13 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         captured = AdvancedTouchCapture(gameplay)(None)
         aerial = captured["aerial_touch_score"].view(4, 2)
         flip = captured["flip_reset_event"].view(4, 2)
-        blue_score = (
-            900.0 * GOAL_Y
-            / math.hypot(GOAL_Y, GOAL_HEIGHT / 2 - 700.0)
-            / CAR_MAX_SPEED
-        )
-        orange_score = (
-            900.0 * GOAL_Y
-            / math.hypot(GOAL_Y, GOAL_HEIGHT / 2 - 650.0)
-            / CAR_MAX_SPEED
-        )
-        self.assertAlmostEqual(aerial[0, 0].item(), blue_score)
-        self.assertAlmostEqual(aerial[0, 1].item(), -blue_score)
+        self.assertGreater(aerial[0, 0].item(), aerial[3, 1].item())
+        self.assertGreater(aerial[3, 1].item(), aerial[2, 1].item())
+        self.assertGreater(aerial[2, 1].item(), 0.5)
+        self.assertAlmostEqual(aerial[0, 1].item(), -aerial[0, 0].item())
         th.testing.assert_close(aerial[1], th.zeros(2))
-        th.testing.assert_close(aerial[2], th.zeros(2))
-        self.assertAlmostEqual(aerial[3, 1].item(), orange_score)
-        self.assertAlmostEqual(aerial[3, 0].item(), -orange_score)
+        self.assertAlmostEqual(aerial[2, 0].item(), -aerial[2, 1].item())
+        self.assertAlmostEqual(aerial[3, 0].item(), -aerial[3, 1].item())
         th.testing.assert_close(flip[2], th.tensor([-1.0, 1.0]))
         th.testing.assert_close(flip[3], th.zeros(2))
         touches = ASEBallTouchCapture(gameplay)(None)
@@ -164,7 +155,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         )
 
         metrics = gameplay.diagnostic_metrics()["Gameplay"]
-        self.assertEqual(metrics["aerial_touches_per_1000_steps"], 250.0)
+        self.assertEqual(metrics["aerial_touches_per_1000_steps"], 375.0)
         self.assertEqual(metrics["flip_resets_per_1000_steps"], 125.0)
 
         # Continuing ball contact cannot award a second flip reset.
@@ -218,22 +209,36 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         )
         self.assertTrue(result["learner_mask"].all())
 
-    def test_aerial_bonus_requires_height_and_goalward_acceleration(self):
+    def test_aerial_bonus_increases_with_height_without_goalward_acceleration(self):
         context = touch_context()
         raw = context.current.raw.clone()
         raw[0, 4] = context.previous.ball_velocity[0, 1]  # No velocity gain.
-        raw[3, 4] = 300.0  # Velocity gain away from orange's goal.
+        raw[0, 2] = 250.0
+        raw[0, 9 + 2] = 210.0
+        raw[3, 4] = 300.0  # Ball velocity gain away from orange's goal.
+        raw[3, 2] = GOAL_HEIGHT
         current = replace(context.current, raw=raw)
         scores, touches, _ = advanced_touch_events(replace(context, current=current))
         self.assertTrue(touches[0, 0])
         self.assertTrue(touches[3, 1])
-        th.testing.assert_close(scores, th.zeros(4, 2))
+        self.assertAlmostEqual(scores[0, 0].item(),
+                               0.5 + 0.5 * (250 - BALL_RADIUS) / (CEILING_Z - BALL_RADIUS))
+        self.assertGreater(scores[3, 1].item(), scores[0, 0].item())
 
-        raw[3, 2] = GOAL_HEIGHT  # Exactly at the crossbar is not above it.
-        raw[3, 4] = -1200.0
+        raw[0, 9 + 2] = 2 * BALL_RADIUS  # Exactly at the minimum is not airborne.
+        raw[3, 9 + 22 + 0] = 4_070.0
+        raw[3, 9 + 22 + 14] = 0.0
+        raw[3, 9 + 22 + 16] = 1.0  # A side-wall touch is not an aerial touch.
         scores, touches, _ = advanced_touch_events(replace(context, current=current))
+        self.assertFalse(touches[0, 0])
         self.assertFalse(touches[3, 1])
         th.testing.assert_close(scores[3], th.zeros(2))
+
+        raw[0, 2] = CEILING_Z
+        raw[0, 9 + 2] = CEILING_Z - 100
+        scores, touches, _ = advanced_touch_events(replace(context, current=current))
+        self.assertTrue(touches[0, 0])
+        self.assertEqual(scores[0, 0].item(), 1.0)
 
     def test_reward_weight_flags(self):
         with patch.object(sys, "argv", [
