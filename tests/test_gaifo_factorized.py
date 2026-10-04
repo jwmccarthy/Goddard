@@ -148,6 +148,8 @@ class FactorizedGAIFOTests(unittest.TestCase):
             rows = np.zeros((32, 161), dtype=np.float32)
             rows[:, BLUE_START] = 2_500 / 4_108
             rows[:, 30] = 3_000 / 4_108
+            rows[:, BLUE_START + 14] = rows[:, 30 + 14] = 1
+            rows[:, BLUE_START + 16] = rows[:, 30 + 16] = 1
             rows[8:13, BLUE_START] = 0
             np.save(folder / "replay.npy", rows)
             expert = ExpertSceneDataset(folder, 2, device="cpu", frame_skip=4, heldout_size=4)
@@ -157,14 +159,17 @@ class FactorizedGAIFOTests(unittest.TestCase):
 
             generated = th.zeros(4, 2, 51)
             generated[:, :, BLUE_START] = 2_500 / 4_108
+            generated[:, :, BLUE_START + 14] = 1
+            generated[:, :, BLUE_START + 16] = 1
             generated[:1, :, BLUE_START] = 0
             untouched = generated.clone()
             sampler = SceneGAIFOMinibatches(expert, 4, 1, 0, factorize=True)
             sample = next(sampler.sample_windows(generated, th.arange(4)))
             th.testing.assert_close(generated, untouched)
-            self.assertTrue((nearest_ball_distance(sample["window"][:2])
+            self.assertEqual(int(sample["situation_matched"][:4].sum()), 1)
+            self.assertTrue((nearest_ball_distance(sample["window"][:1])
                              <= BALL_NEAR_DISTANCE).all())
-            self.assertTrue((nearest_ball_distance(sample["window"][4:6])
+            self.assertTrue((nearest_ball_distance(sample["window"][4:5])
                              <= BALL_NEAR_DISTANCE).all())
 
             discriminator = FactorizedSceneDiscriminator(8, 8, 16)

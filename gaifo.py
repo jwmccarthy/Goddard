@@ -1,6 +1,6 @@
 import argparse
 import math
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -80,6 +80,28 @@ GOAL_HEIGHT = 642.775
 CAR_MAX_SPEED = 2300.0
 INTERNAL_BOOL_INDICES = (0, 2, 3, 4, 5, 7, 8, 9, 11, 17)
 BALL_NEAR_DISTANCE = 1_500.0
+BALL_CLOSE_DISTANCE = 350.0
+SITUATION_MATCH_FRACTION = 0.25
+GROUND_RANDOM_FRACTION = 0.05
+DISTANCE_BANDS = ("close", "approach", "far")
+CAR_SITUATIONS = ("grounded", "wall", "low_air", "mid_air", "high_air", "ceiling")
+GROUND_MANEUVERS = ("dribble", "flick")
+GROUND_MANEUVER_START = len(DISTANCE_BANDS) * len(CAR_SITUATIONS)
+N_SITUATIONS = GROUND_MANEUVER_START + len(GROUND_MANEUVERS)
+LOW_AIR_HEIGHT = 350.0
+MID_AIR_HEIGHT = 900.0
+NEAR_CEILING_HEIGHT = 1_700.0
+CEILING_AIR_HEIGHT = 1_850.0
+MANEUVER_SETUP_STEPS = 8
+MANEUVER_RECOVERY_STEPS = 8
+MANEUVER_MAX_TRACKED_STEPS = 128
+GROUND_MAX_TRACKED_STEPS = 256
+MANEUVER_MAX_PENDING = 2_048
+MANEUVER_ARCHIVE_PER_SITUATION = 32
+DRIBBLE_MIN_STEPS = 5
+DRIBBLE_MAX_HORIZONTAL_DISTANCE = 180.0
+DRIBBLE_MAX_RELATIVE_SPEED = 1_200.0
+FLICK_MIN_VELOCITY_CHANGE = 500.0
 BALL_GATE_RADIUS = 200.0
 BALL_GATE_SCALE = 1_000.0
 BALL_GATE_FLOOR = 0.1
@@ -116,6 +138,236 @@ def nearest_ball_distance(windows: th.Tensor) -> th.Tensor:
     relative = windows[..., :3] - windows[..., BLUE_START:BLUE_START + 3]
     scale = windows.new_tensor(POSITION_SCALE)
     return th.linalg.vector_norm(relative * scale, dim=-1).amin(dim=-1)
+
+
+def _ball_distances(windows: th.Tensor, car_start: int) -> th.Tensor:
+    relative = windows[..., :3] - windows[..., car_start:car_start + 3]
+    return th.linalg.vector_norm(relative * windows.new_tensor(POSITION_SCALE), dim=-1)
+
+
+def scene_situation_ids(windows: th.Tensor, car_start: int = BLUE_START) -> th.Tensor:
+    """Distance and ego-car situation at the closest approach in each 1v1 window.
+
+    Six car situations are crossed with close (<350), approach (<1500), and
+    far (>=1500) ball-distance bands. Near-roof airborne play counts as ceiling;
+    a car with its wheels on a vertical surface counts as wall instead.
+    """
+    if windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE:
+        raise ValueError("situation labels need [batch, frames, 1v1 scene] windows")
+    if car_start not in (BLUE_START, ORANGE_START):
+        raise ValueError("situation car must be one of the stored 1v1 actors")
+    distance = _ball_distances(windows, car_start)
+    closest = distance.argmin(dim=1)
+    rows = th.arange(len(windows), device=windows.device)
+    car = windows[rows, closest, car_start:car_start + CAR_SIZE]
+    height = car[:, 2] * POSITION_SCALE[2]
+    up_z = car[:, 14]
+    grounded = car[:, CAR_BOOL_START] > 0.5
+    wall_contact = grounded & (up_z < 0.5) & (up_z > -0.5)
+    ceiling = (height >= NEAR_CEILING_HEIGHT) & (
+        (up_z <= -0.5) | ((height >= CEILING_AIR_HEIGHT) & ~wall_contact)
+    )
+
+    situation = th.zeros_like(closest)
+    situation[grounded & (up_z < 0.5)] = 1
+    situation[~grounded & (height < LOW_AIR_HEIGHT)] = 2
+    situation[~grounded & (height >= LOW_AIR_HEIGHT)
+              & (height < MID_AIR_HEIGHT)] = 3
+    situation[~grounded & (height >= MID_AIR_HEIGHT)] = 4
+    situation[ceiling] = 5
+    approach_distance = distance[rows, closest]
+    band = th.where(approach_distance < BALL_CLOSE_DISTANCE, 0,
+                    th.where(approach_distance < BALL_NEAR_DISTANCE, 1, 2))
+    return situation * len(DISTANCE_BANDS) + band
+
+
+@dataclass(frozen=True)
+class SceneManeuver:
+    """An actor's setup, active ball/car control, and recovery window indices."""
+
+    situation: int
+    setup_start: int
+    action_start: int
+    action_stop: int
+    recovery_stop: int
+    actor: int = 0
+    stride: int = 1
+
+
+@dataclass(frozen=True)
+class AirManeuver(SceneManeuver):
+    @property
+    def takeoff(self) -> int:
+        return self.action_start
+
+    @property
+    def landing(self) -> int:
+        return self.action_stop
+
+
+@dataclass(frozen=True)
+class GroundManeuver(SceneManeuver):
+    @property
+    def carry_start(self) -> int:
+        return self.action_start
+
+    @property
+    def release(self) -> int:
+        """First recovery frame, after the flick impulse when present."""
+        return self.action_stop
+
+
+def air_maneuvers(
+    valid: np.ndarray,
+    on_ground: np.ndarray,
+    height: np.ndarray,
+    up_z: np.ndarray,
+    ball_distance: np.ndarray,
+    *,
+    setup_steps: int = MANEUVER_SETUP_STEPS,
+    recovery_steps: int = MANEUVER_RECOVERY_STEPS,
+) -> list[AirManeuver]:
+    """Trace complete ground/surface -> air -> ground flights within valid runs."""
+    if (not all(len(values) == len(valid) for values in
+                (on_ground, height, up_z, ball_distance))
+            or setup_steps < 1 or recovery_steps < 1):
+        raise ValueError("maneuver timelines must agree and include setup/recovery")
+    active = np.flatnonzero(valid)
+    if not len(active):
+        return []
+    flights: list[AirManeuver] = []
+    for run in np.split(active, np.flatnonzero(np.diff(active) != 1) + 1):
+        grounded = on_ground[run]
+        takeoffs = np.flatnonzero(grounded[:-1] & ~grounded[1:]) + 1
+        landings = np.flatnonzero(grounded)
+        previous_landing = int(landings[0]) if len(landings) else 0
+        for index, takeoff in enumerate(takeoffs):
+            next_landing = np.searchsorted(landings, takeoff)
+            if next_landing == len(landings):
+                break  # An incomplete airborne span cannot provide recovery.
+            landing = int(landings[next_landing])
+            if landing - takeoff < 2:
+                previous_landing = landing
+                continue
+            next_takeoff = int(takeoffs[index + 1]) if index + 1 < len(takeoffs) else len(run)
+            setup_start = max(previous_landing, takeoff - setup_steps)
+            recovery_stop = min(len(run), landing + recovery_steps, next_takeoff)
+            air = run[takeoff:landing]
+            peak = float(height[air].max())
+            roof = ((height[air] >= NEAR_CEILING_HEIGHT)
+                    & ((up_z[air] <= -0.5) | (height[air] >= CEILING_AIR_HEIGHT)))
+            if roof.any():
+                situation = 5
+            elif peak >= MID_AIR_HEIGHT:
+                situation = 4
+            elif peak >= LOW_AIR_HEIGHT:
+                situation = 3
+            else:
+                situation = 2
+            closest = float(ball_distance[air].min())
+            band = 0 if closest < BALL_CLOSE_DISTANCE else (
+                1 if closest < BALL_NEAR_DISTANCE else 2
+            )
+            flights.append(AirManeuver(
+                situation=situation * len(DISTANCE_BANDS) + band,
+                setup_start=int(run[setup_start]),
+                action_start=int(run[takeoff]),
+                action_stop=int(run[landing]),
+                recovery_stop=int(run[recovery_stop - 1]) + 1,
+            ))
+            previous_landing = landing
+    return flights
+
+
+def ground_feature_indices(car_start: int) -> tuple[int, ...]:
+    """Scene columns needed to recognize an ego-car carry and its release."""
+    return (*range(6), *range(car_start, car_start + 5),
+            car_start + 14, car_start + 16, car_start + 18)
+
+
+def dribble_control_mask(features: np.ndarray) -> np.ndarray:
+    """Upright ground car carrying a nearby elevated ball at similar speed."""
+    if features.shape[-1] != 14:
+        raise ValueError("ground ball-control features must contain 14 values")
+    ball = features[..., :3] * POSITION_SCALE
+    car = features[..., 6:9] * POSITION_SCALE
+    horizontal = np.linalg.norm(ball[..., :2] - car[..., :2], axis=-1)
+    relative_velocity = np.linalg.norm(
+        features[..., 3:5] * BALL_MAX_SPEED
+        - features[..., 9:11] * CAR_MAX_SPEED, axis=-1,
+    )
+    return (
+        (features[..., 12] > 0.5) & (features[..., 11] > 0.65)
+        & (car[..., 2] < 130) & (ball[..., 2] >= 120)
+        & (ball[..., 2] < 320) & (ball[..., 2] - car[..., 2] >= 100)
+        & (ball[..., 2] - car[..., 2] < 270)
+        & (horizontal < DRIBBLE_MAX_HORIZONTAL_DISTANCE)
+        & (relative_velocity < DRIBBLE_MAX_RELATIVE_SPEED)
+    )
+
+
+def ground_maneuvers(
+    valid: np.ndarray,
+    features: np.ndarray,
+    *,
+    setup_steps: int = MANEUVER_SETUP_STEPS,
+    recovery_steps: int = MANEUVER_RECOVERY_STEPS,
+) -> list[GroundManeuver]:
+    """Trace sustained dribbles and flip-driven flick releases in one timeline."""
+    if features.shape != (len(valid), 14) or setup_steps < 1 or recovery_steps < 1:
+        raise ValueError("ground control needs aligned scenes and setup/recovery")
+    raw = dribble_control_mask(features) & valid
+    carrying = raw.copy()
+    carrying[1:-1] |= raw[:-2] & raw[2:] & valid[1:-1]
+    active = np.flatnonzero(valid)
+    if not len(active):
+        return []
+    maneuvers: list[GroundManeuver] = []
+    for run in np.split(active, np.flatnonzero(np.diff(active) != 1) + 1):
+        in_control = carrying[run]
+        changes = np.flatnonzero(np.diff(np.pad(in_control.astype(np.int8), (1, 1))))
+        starts, stops = changes[::2], changes[1::2]
+        previous_stop = 0
+        for index, (start, stop) in enumerate(zip(starts, stops)):
+            next_start = int(starts[index + 1]) if index + 1 < len(starts) else len(run)
+            setup_start = max(previous_stop, int(start) - setup_steps)
+            previous_stop = int(stop)
+            if stop - start < DRIBBLE_MIN_STEPS or setup_start == start or stop == len(run):
+                continue
+            release_end = min(len(run), int(stop) + recovery_steps, next_start)
+            flip_begin = max(0, int(stop) - 3)
+            flips = features[run[flip_begin:release_end], 13] > 0.5
+            flip_frames = np.flatnonzero(flips[1:] & ~flips[:-1]) + flip_begin + 1
+            post = features[run[stop:release_end]]
+            if not len(post):
+                continue
+            previous_velocity = features[run[stop - 1:release_end - 1], 3:6]
+            launch = np.linalg.norm(
+                (post[:, 3:6] - previous_velocity) * BALL_MAX_SPEED, axis=-1,
+            )
+            impulse_frames = np.flatnonzero(
+                (launch >= FLICK_MIN_VELOCITY_CHANGE)
+                & (post[:, 5] * BALL_MAX_SPEED > 100)
+            ) + int(stop)
+            jumped = (post[:4, 12] < 0.5).any()
+            release_action = next((
+                max(int(flip), int(impulse)) + 1
+                for flip in flip_frames for impulse in impulse_frames
+                if abs(int(flip) - int(impulse)) <= 2
+            ), None) if jumped else None
+            action_stop = release_action if release_action is not None else int(stop)
+            recovery_stop = min(len(run), action_stop + recovery_steps, next_start)
+            if recovery_stop <= action_stop:
+                continue
+            maneuvers.append(GroundManeuver(
+                situation=GROUND_MANEUVER_START + int(release_action is not None),
+                setup_start=int(run[setup_start]),
+                action_start=int(run[start]),
+                action_stop=int(run[action_stop]) if action_stop < len(run)
+                else int(run[-1]) + 1,
+                recovery_stop=int(run[recovery_stop - 1]) + 1,
+            ))
+    return maneuvers
 
 
 def ball_responsibility(windows: th.Tensor) -> th.Tensor:
@@ -453,6 +705,14 @@ class SceneWindowCapture(CaptureBase):
         assert self.history_age is not None
         assert self.history_pos is not None
 
+        # A new episode begins at its kickoff state. Left-pad causal context
+        # with that state so its first actions can receive imitation reward.
+        fresh = self.history_age == 0
+        if fresh.any():
+            self.history[fresh] = current_scene[fresh, None].expand(-1, capacity, -1)
+            self.history_pos[fresh] = 0
+            self.history_age[fresh] = capacity - 1
+
         env_indices = th.arange(n_envs, device=observation.device)
         self.history[env_indices, self.history_pos] = current_scene
         self.history_pos = (self.history_pos + 1) % capacity
@@ -522,7 +782,7 @@ class SceneWindowCapture(CaptureBase):
 
 
 class ExpertSceneDataset:
-    """Expert scene windows extracted from raw 1v1 replay .npy files."""
+    """Expert windows from stored 1v1 POVs, never from an unstored opponent."""
 
     def __init__(
         self,
@@ -564,6 +824,7 @@ class ExpertSceneDataset:
 
         frames: list[th.Tensor] = []
         internal_states: list[th.Tensor] = []
+        opponent_povs: list[th.Tensor] = []
         invalid_frames: list[th.Tensor] = []
         contact_frames: list[th.Tensor] = []
         lengths: list[int] = []
@@ -650,13 +911,24 @@ class ExpertSceneDataset:
                 if reject_discontinuities:
                     invalid = invalid[:keep]
                     contact = contact[:keep]
+            real_length = len(source)
+            # Every kickoff belongs to a causal window, including the first
+            # frame of each replay period. Repeating its initial state provides
+            # history without borrowing frames from another segment or the future.
+            pad = trajectory_length - 1
+            source = np.concatenate((np.repeat(source[:1], pad, axis=0), source))
+            internal = np.concatenate((np.repeat(internal[:1], pad, axis=0), internal))
+            if reject_discontinuities:
+                invalid = np.concatenate((np.repeat(invalid[:1], pad), invalid))
+                contact = np.concatenate((np.repeat(contact[:1], pad), contact))
             frames.append(th.from_numpy(source))
             internal_states.append(th.from_numpy(internal))
+            opponent_povs.append(th.full((len(source),), len(group) > 1, dtype=th.bool))
             if reject_discontinuities:
                 invalid_frames.append(th.from_numpy(invalid.copy()))
                 contact_frames.append(th.from_numpy(contact.copy()))
             lengths.append(len(source))
-            total += len(source)
+            total += real_length
             if limit is not None and total >= limit:
                 break
 
@@ -665,6 +937,7 @@ class ExpertSceneDataset:
 
         self.frames = th.cat(frames).to(device)
         self.internal_states = th.cat(internal_states).to(device)
+        self.opponent_pov_available = th.cat(opponent_povs).to(device)
         self.contact_frames = (
             th.cat(contact_frames).to(device) if reject_discontinuities else None
         )
@@ -675,7 +948,10 @@ class ExpertSceneDataset:
         offset = 0
         for length in lengths:
             count = max(0, length - trajectory_length + 1)
-            segment_frame_indices.append(th.arange(offset, offset + length))
+            # Prefix copies are context, not additional physical reset states.
+            segment_frame_indices.append(th.arange(
+                offset + self.partition_span, offset + length,
+            ))
             starts = th.arange(offset, offset + count)
             segment_window_starts.append(starts)
             if count:
@@ -688,6 +964,7 @@ class ExpertSceneDataset:
         self.window_starts = th.cat(window_starts).to(device)
         self.segment_window_starts = [starts.to(device) for starts in segment_window_starts]
         self.segment_frame_indices = [indices.to(device) for indices in segment_frame_indices]
+        self.real_frame_indices = th.cat(segment_frame_indices).to(device)
         self.window_offsets = th.arange(trajectory_length, device=device)
         self.total_windows = len(self.window_starts)
 
@@ -707,6 +984,10 @@ class ExpertSceneDataset:
         self._near_frames: th.Tensor | None = None
         self._train_near_pairs: th.Tensor | None = None
         self._heldout_near_pairs: th.Tensor | None = None
+        self._train_situation_pools: tuple[th.Tensor, ...] | None = None
+        self._heldout_situation_pools: tuple[th.Tensor, ...] | None = None
+        self._train_maneuvers: tuple[list[SceneManeuver], ...] | None = None
+        self._train_grounded_choices: tuple[th.Tensor, th.Tensor] | None = None
 
     def _split_heldout(self, device: str | th.device, seed: int) -> None:
         split_rng = th.Generator(device=device).manual_seed(seed)
@@ -760,13 +1041,13 @@ class ExpertSceneDataset:
             self.train_window_starts = self.window_starts[
                 self.window_starts < train_stop
             ]
-            self.reset_indices = th.arange(
-                int(first_heldout.item()), device=device
-            )
+            self.reset_indices = self.real_frame_indices[
+                self.real_frame_indices < first_heldout
+            ]
         else:
             self.heldout_window_starts = self.window_starts[:0]
             self.train_window_starts = self.window_starts
-            self.reset_indices = th.arange(len(self.frames), device=device)
+            self.reset_indices = self.real_frame_indices
         self._train_generator = th.Generator(device=device).manual_seed(seed)
         self._heldout_generator = th.Generator(device=device).manual_seed(seed + 1)
 
@@ -809,38 +1090,33 @@ class ExpertSceneDataset:
             device=self.frames.device,
             generator=generator,
         )
-        indices = starts[selected, None] + self.window_offsets
-        return self.frames[indices]
-
-    def _sample_dual(
-        self,
-        starts: th.Tensor,
-        n: int,
-        device: str | th.device,
-        generator: th.Generator,
-    ) -> th.Tensor:
-        canonical = self._sample_windows(starts, (n + 1) // 2, device, generator)
-        opponent = opponent_view(canonical)
-        return th.stack((canonical, opponent), dim=1).flatten(0, 1)[:n]
+        chosen_starts = starts[selected]
+        windows = self.frames[chosen_starts[:, None] + self.window_offsets]
+        paired = self.opponent_pov_available[chosen_starts]
+        if paired.any():
+            opponent = paired & (th.rand(n, device=self.frames.device, generator=generator) < 0.5)
+            if opponent.any():
+                windows[opponent] = opponent_view(windows[opponent])
+        return windows
 
     def sample(self, n: int, device: str | th.device) -> th.Tensor:
         """Sample ``n`` training scene windows without crossing file boundaries.
 
-        The returned windows include both canonical and opponent ego viewpoints
-        derived from the stored canonical physical scene.
+        A second ego viewpoint is eligible only if that replay segment has a
+        second stored expert POV. Physical scenes are shared between paired POVs.
         """
-        return self._sample_dual(
+        return self._sample_windows(
             self.train_window_starts, n, device, self._train_generator
         )
 
     def sample_heldout(self, n: int, device: str | th.device) -> th.Tensor:
         """Sample ``n`` held-out expert windows for discriminator evaluation."""
-        return self._sample_dual(
+        return self._sample_windows(
             self.heldout_window_starts, n, device, self._heldout_generator
         )
 
     def _near_pairs(self, heldout: bool = False) -> th.Tensor:
-        """Cache eligible (start, focal car) windows near the ball."""
+        """Cache near-ball windows only for actors with a stored expert POV."""
         cached = self._heldout_near_pairs if heldout else self._train_near_pairs
         if cached is not None:
             return cached
@@ -855,6 +1131,7 @@ class ExpertSceneDataset:
         found = []
         for chunk in starts.split(32_768):
             near = self._near_frames[chunk[:, None] + self.window_offsets].any(dim=1)
+            near[:, 1] &= self.opponent_pov_available[chunk]
             choices = near.nonzero(as_tuple=False)
             if len(choices):
                 found.append(th.stack((chunk[choices[:, 0]], choices[:, 1]), dim=-1))
@@ -876,7 +1153,7 @@ class ExpertSceneDataset:
     def sample_near(
         self, n: int, device: str | th.device, *, heldout: bool = False,
     ) -> th.Tensor:
-        """Sample near-ball windows only for the focal car, without held-out leakage."""
+        """Sample near-ball windows only from stored POVs in the requested split."""
         if n < 1 or th.device(device) != self.frames.device:
             raise ValueError("near-ball sample count must be positive and use the expert device")
         pairs = self._near_pairs(heldout)
@@ -884,11 +1161,140 @@ class ExpertSceneDataset:
             raise ValueError("no near-ball expert windows in this split")
         generator = self._heldout_generator if heldout else self._train_generator
         chosen = pairs[th.randint(len(pairs), (n,), device=self.frames.device, generator=generator)]
+        return self._windows_for_povs(chosen)
+
+    def _windows_for_povs(self, chosen: th.Tensor) -> th.Tensor:
         windows = self.frames[chosen[:, 0, None] + self.window_offsets]
         opponent = chosen[:, 1].bool()
         if opponent.any():
             windows[opponent] = opponent_view(windows[opponent])
         return windows
+
+    def situation_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
+        """Eligible (window start, focal actor) pairs for each situation band."""
+        cached = self._heldout_situation_pools if heldout else self._train_situation_pools
+        if cached is not None:
+            return cached
+        starts = self.heldout_window_starts if heldout else self.train_window_starts
+        groups: list[list[th.Tensor]] = [[] for _ in range(N_SITUATIONS)]
+        for chunk in starts.split(8_192):
+            scenes = self.frames[chunk[:, None] + self.window_offsets]
+            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START)):
+                focal_starts = chunk
+                focal_scenes = scenes
+                if actor:
+                    available = self.opponent_pov_available[chunk]
+                    if not available.any():
+                        continue
+                    focal_starts = chunk[available]
+                    focal_scenes = scenes[available]
+                labels = scene_situation_ids(focal_scenes, car_start)
+                on_surface = focal_scenes[:, -1, car_start + CAR_BOOL_START] > 0.5
+                for label in labels.unique().tolist():
+                    if label < 2 * len(DISTANCE_BANDS):
+                        selected = focal_starts[(labels == label) & on_surface]
+                    else:
+                        selected = focal_starts[labels == label]
+                    if not len(selected):
+                        continue
+                    groups[label].append(th.stack((
+                        selected, th.full_like(selected, actor),
+                    ), dim=-1))
+        pools = tuple(
+            th.cat(group) if group else starts.new_empty((0, 2))
+            for group in groups
+        )
+        if heldout:
+            self._heldout_situation_pools = pools
+        else:
+            self._train_situation_pools = pools
+        return pools
+
+    def _grounded_choices(self) -> tuple[th.Tensor, th.Tensor]:
+        """Cache physical training frames and eligible flat-ground POV flags."""
+        if self._train_grounded_choices is None:
+            starts = self.train_window_starts
+            scored = starts + self.trajectory_length - 1
+            blue = ((self.frames[scored, BLUE_START + CAR_BOOL_START] > 0.5)
+                    & (self.frames[scored, BLUE_START + 14] > 0.65))
+            orange = ((self.frames[scored, ORANGE_START + CAR_BOOL_START] > 0.5)
+                      & (self.frames[scored, ORANGE_START + 14] > 0.65)
+                      & self.opponent_pov_available[starts])
+            eligible = blue | orange
+            self._train_grounded_choices = (
+                starts[eligible], th.stack((blue[eligible], orange[eligible]), dim=-1),
+            )
+        return self._train_grounded_choices
+
+    def random_grounded_povs(self, n: int) -> th.Tensor:
+        """Choose physical training frames uniformly, then a stored grounded POV."""
+        starts, available = self._grounded_choices()
+        if not len(starts):
+            return starts.new_empty((0, 2))
+        selected = th.randint(
+            len(starts), (n,), device=starts.device, generator=self._train_generator,
+        )
+        choices = available[selected]
+        actor = (~choices[:, 0]) | (
+            choices[:, 1] & (th.rand(
+                n, device=starts.device, generator=self._train_generator,
+            ) < 0.5)
+        )
+        return th.stack((starts[selected], actor.long()), dim=-1)
+
+    def maneuver_pools(self) -> tuple[list[SceneManeuver], ...]:
+        """Complete aerial, dribble, and flick sequences from stored training POVs."""
+        if self._train_maneuvers is not None:
+            return self._train_maneuvers
+        allowed = np.zeros(len(self.frames), dtype=bool)
+        allowed[self.train_window_starts.cpu().numpy()] = True
+        stored_opponent = self.opponent_pov_available.cpu().numpy()
+        frame_distance = {
+            actor: _ball_distances(self.frames, car_start).cpu().numpy()
+            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+        }
+        frame_pose = {
+            actor: (
+                (self.frames[:, car_start + CAR_BOOL_START].cpu().numpy() > 0.5),
+                self.frames[:, car_start + 2].cpu().numpy() * POSITION_SCALE[2],
+                self.frames[:, car_start + 14].cpu().numpy(),
+            )
+            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+        }
+        control_features = {
+            actor: self.frames[:, list(ground_feature_indices(car_start))].cpu().numpy()
+            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+        }
+        groups: list[list[SceneManeuver]] = [[] for _ in range(N_SITUATIONS)]
+        offset = 0
+        for length in self.lengths:
+            count = max(0, length - self.trajectory_length + 1)
+            if count and allowed[offset:offset + count].any():
+                actors = (0, 1) if stored_opponent[offset] else (0,)
+                for actor in actors:
+                    surface, height, up_z = frame_pose[actor]
+                    scored = slice(offset + self.trajectory_length - 1, offset + length)
+                    frame_dist = frame_distance[actor][offset:offset + length]
+                    distance = frame_dist[:count].copy()
+                    for step in range(1, self.trajectory_length):
+                        np.minimum(distance, frame_dist[step:step + count], out=distance)
+                    for maneuver in (*air_maneuvers(
+                        allowed[offset:offset + count], surface[scored],
+                        height[scored], up_z[scored], distance,
+                    ), *ground_maneuvers(
+                        allowed[offset:offset + count], control_features[actor][scored],
+                    )):
+                        groups[maneuver.situation].append(replace(
+                            maneuver,
+                            setup_start=offset + maneuver.setup_start,
+                            action_start=offset + maneuver.action_start,
+                            action_stop=offset + maneuver.action_stop,
+                            recovery_stop=offset + maneuver.recovery_stop,
+                            actor=actor,
+                        ))
+            offset += length
+        self._train_maneuvers = tuple(groups)
+        return self._train_maneuvers
 
     def reset_dataset(self) -> TensorDataset:
         """Sample eligible training frame IDs without copying expert scenes."""
@@ -1175,6 +1581,11 @@ class ConfidentExpertResetTransform:
         self.dataset = dataset
         self.discriminator = discriminator
         self.microbatch_size = microbatch_size
+        resettable = th.zeros(len(expert.frames), dtype=th.bool, device=expert.frames.device)
+        resettable[expert.reset_indices] = True
+        self.candidate_starts = expert.train_window_starts[
+            resettable[expert.train_window_starts]
+        ]
         self.ready = False
         self._total = 0
         self._mined = 0
@@ -1197,18 +1608,21 @@ class ConfidentExpertResetTransform:
             try:
                 for chunk in starts.split(self.microbatch_size):
                     windows = self.expert.frames[chunk[:, None] + self.expert.window_offsets]
-                    # Both players will act from the same physical reset state.
-                    scores.append(th.maximum(
-                        self._confidence(windows),
-                        self._confidence(opponent_view(windows)),
-                    ))
+                    confidence = self._confidence(windows)
+                    paired = self.expert.opponent_pov_available[chunk]
+                    if paired.any():
+                        confidence[paired] = th.maximum(
+                            confidence[paired],
+                            self._confidence(opponent_view(windows[paired])),
+                        )
+                    scores.append(confidence)
             finally:
                 self.discriminator.train(was_training)
         return th.cat(scores)
 
     def __call__(self, sample: TensorBatch, context: ResetContext) -> TensorBatch:
         self._total += len(sample)
-        if not self.ready:
+        if not self.ready or not len(self.candidate_starts):
             return sample
 
         device = self.dataset.device
@@ -1218,8 +1632,8 @@ class ConfidentExpertResetTransform:
         if not len(selected):
             return sample
 
-        starts = self.expert.train_window_starts[th.randint(
-            self.expert.train_total,
+        starts = self.candidate_starts[th.randint(
+            len(self.candidate_starts),
             (len(selected), RESET_MINING_CANDIDATES),
             device=device, generator=context.generator,
         )]
@@ -1301,8 +1715,310 @@ class SceneDiscriminatorLoss:
         )
 
 
+def generated_maneuver_pools(
+    windows: th.Tensor,
+    indices: th.Tensor,
+    n_envs: int,
+    episode_end: th.Tensor | None = None,
+) -> tuple[list[SceneManeuver], ...]:
+    """Find complete aerial and ground-control maneuvers per valid actor timeline."""
+    if n_envs < 1 or len(windows) % n_envs:
+        raise ValueError("generated windows must be time-major by actor")
+    steps = len(windows) // n_envs
+    if episode_end is not None and episode_end.shape != (steps, n_envs):
+        raise ValueError("episode ends must match the generated actor timeline")
+    valid = th.zeros(len(windows), dtype=th.bool, device=windows.device)
+    valid[indices] = True
+    if episode_end is not None:
+        valid &= ~episode_end.reshape(-1)
+    timelines = valid.reshape(steps, n_envs).cpu().numpy()
+    scored = windows[:, -1]
+    grounded = (scored[:, BLUE_START + CAR_BOOL_START] > 0.5).reshape(
+        steps, n_envs,
+    ).cpu().numpy()
+    height = (scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
+        steps, n_envs,
+    ).cpu().numpy()
+    up_z = scored[:, BLUE_START + 14].reshape(steps, n_envs).cpu().numpy()
+    distance = nearest_ball_distance(windows).reshape(steps, n_envs).cpu().numpy()
+    control = scored[:, list(ground_feature_indices(BLUE_START))].reshape(
+        steps, n_envs, 14,
+    ).cpu().numpy()
+    groups: list[list[SceneManeuver]] = [[] for _ in range(N_SITUATIONS)]
+    for actor in range(n_envs):
+        if timelines[:, actor].sum() < 4:
+            continue
+        for maneuver in (*air_maneuvers(
+            timelines[:, actor], grounded[:, actor], height[:, actor],
+            up_z[:, actor], distance[:, actor],
+        ), *ground_maneuvers(timelines[:, actor], control[:, actor])):
+            # Short recovery at the rollout edge belongs to the cross-rollout tracker.
+            if (timelines[-1, actor] and maneuver.recovery_stop == steps
+                    and maneuver.recovery_stop - maneuver.action_stop < MANEUVER_RECOVERY_STEPS):
+                continue
+            groups[maneuver.situation].append(replace(
+                maneuver,
+                setup_start=maneuver.setup_start * n_envs + actor,
+                action_start=maneuver.action_start * n_envs + actor,
+                action_stop=maneuver.action_stop * n_envs + actor,
+                recovery_stop=maneuver.recovery_stop * n_envs + actor,
+                stride=n_envs,
+            ))
+    return tuple(groups)
+
+
+def aligned_maneuver_windows(
+    agent: SceneManeuver,
+    expert: SceneManeuver,
+    budget: int,
+    device: th.device,
+) -> tuple[th.Tensor, th.Tensor]:
+    """Pair causal windows covering setup, the entire action, and recovery.
+
+    Long phases are spaced across their entire span. Short phases can repeat a
+    window so both actors contribute the same number at each relative phase.
+    """
+    phases = ("setup_start", "action_start", "action_stop", "recovery_stop")
+    desired = [
+        min(max(
+            (getattr(agent, end) - getattr(agent, start)) // agent.stride,
+            (getattr(expert, end) - getattr(expert, start)) // expert.stride,
+        ), maximum)
+        for start, end, maximum in zip(phases[:-1], phases[1:], (8, 64, 8))
+    ]
+    counts = [1, 2, 1]
+    if budget < sum(counts):
+        empty = th.empty(0, dtype=th.long, device=device)
+        return empty, empty.reshape(0, 1).expand(0, 2)
+    remaining = budget - sum(counts)
+    for phase in (1, 0, 2):
+        extra = min(remaining, desired[phase] - counts[phase])
+        counts[phase] += extra
+        remaining -= extra
+
+    def indices(flight: SceneManeuver) -> th.Tensor:
+        segments = []
+        for start, end, count in zip(phases[:-1], phases[1:], counts):
+            length = (getattr(flight, end) - getattr(flight, start)) // flight.stride
+            offsets = th.linspace(0, length - 1, count, device=device).round().long()
+            segments.append(getattr(flight, start) + offsets * flight.stride)
+        return th.cat(segments)
+
+    agent_indices = indices(agent)
+    expert_indices = indices(expert)
+    expert_pairs = th.stack((
+        expert_indices, th.full_like(expert_indices, expert.actor),
+    ), dim=-1)
+    return agent_indices, expert_pairs
+
+
+@dataclass(frozen=True)
+class CompletedSceneManeuver:
+    windows: th.Tensor
+    span: SceneManeuver
+
+
+@dataclass(frozen=True)
+class PendingAirManeuver:
+    windows: th.Tensor
+    action_start: int
+    grounded: np.ndarray
+    height: np.ndarray
+    up_z: np.ndarray
+    distance: np.ndarray
+
+
+@dataclass(frozen=True)
+class PendingGroundManeuver:
+    windows: th.Tensor
+    action_start: int
+    features: np.ndarray
+
+
+class GeneratedManeuverTracker:
+    """Keep unfinished aerial and ball-control maneuvers across rollouts."""
+
+    def __init__(self) -> None:
+        self.n_envs: int | None = None
+        self.pending: dict[int, PendingAirManeuver] = {}
+        self.pending_ground: dict[int, PendingGroundManeuver] = {}
+        self.ready: tuple[list[CompletedSceneManeuver], ...] = tuple(
+            [] for _ in range(N_SITUATIONS)
+        )
+
+    def clear_ready(self) -> None:
+        self.ready = tuple([] for _ in range(N_SITUATIONS))
+
+    def _archive(self, windows: th.Tensor, flight: SceneManeuver) -> None:
+        start = flight.setup_start
+        scene_windows = windows[start:flight.recovery_stop].detach().clone()
+        span = replace(
+            flight, setup_start=0, action_start=flight.action_start - start,
+            action_stop=flight.action_stop - start,
+            recovery_stop=flight.recovery_stop - start,
+        )
+        group = self.ready[span.situation]
+        group.append(CompletedSceneManeuver(scene_windows, span))
+        if len(group) > MANEUVER_ARCHIVE_PER_SITUATION:
+            group.pop(0)
+
+    def feed(
+        self, windows: th.Tensor, indices: th.Tensor, n_envs: int,
+        episode_end: th.Tensor | None = None,
+    ) -> None:
+        """Accumulate train-split maneuvers; a reset or invalid window breaks one."""
+        if n_envs < 1 or len(windows) % n_envs:
+            raise ValueError("generated windows must be time-major by actor")
+        steps = len(windows) // n_envs
+        if episode_end is not None and episode_end.shape != (steps, n_envs):
+            raise ValueError("episode ends must match the generated actor timeline")
+        if self.n_envs != n_envs:
+            self.n_envs = n_envs
+            self.pending.clear()
+            self.pending_ground.clear()
+            self.clear_ready()
+        valid = th.zeros(len(windows), dtype=th.bool, device=windows.device)
+        valid[indices] = True
+        if episode_end is not None:
+            valid &= ~episode_end.reshape(-1)
+        valid = valid.reshape(steps, n_envs).cpu().numpy()
+        scored = windows[:, -1]
+        grounded = (scored[:, BLUE_START + CAR_BOOL_START] > 0.5).reshape(
+            steps, n_envs,
+        ).cpu().numpy()
+        height = (scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
+            steps, n_envs,
+        ).cpu().numpy()
+        up_z = scored[:, BLUE_START + 14].reshape(steps, n_envs).cpu().numpy()
+        distance = nearest_ball_distance(windows).reshape(steps, n_envs).cpu().numpy()
+        control = scored[:, list(ground_feature_indices(BLUE_START))].reshape(
+            steps, n_envs, 14,
+        ).cpu().numpy()
+        scenes = windows.reshape(steps, n_envs, *windows.shape[1:])
+
+        previous = self.pending
+        self.pending = {}
+        for actor, partial in previous.items():
+            invalid = np.flatnonzero(~valid[:, actor])
+            count = int(invalid[0]) if len(invalid) else steps
+            if not count:
+                continue
+            joined = th.cat((partial.windows, scenes[:count, actor]), dim=0)
+            on_ground = np.concatenate((partial.grounded, grounded[:count, actor]))
+            z = np.concatenate((partial.height, height[:count, actor]))
+            up = np.concatenate((partial.up_z, up_z[:count, actor]))
+            near = np.concatenate((partial.distance, distance[:count, actor]))
+            completed = next((flight for flight in air_maneuvers(
+                np.ones(len(joined), dtype=bool), on_ground, z, up, near,
+            ) if flight.action_start == partial.action_start), None)
+            if (completed is not None and
+                    (completed.recovery_stop - completed.action_stop >= MANEUVER_RECOVERY_STEPS
+                     or completed.recovery_stop < len(joined) or count < steps)):
+                self._archive(joined, completed)
+            elif count == steps and len(joined) < MANEUVER_MAX_TRACKED_STEPS:
+                self.pending[actor] = PendingAirManeuver(
+                    joined, partial.action_start, on_ground, z, up, near,
+                )
+
+        previous_ground = self.pending_ground
+        self.pending_ground = {}
+        for actor, partial in previous_ground.items():
+            invalid = np.flatnonzero(~valid[:, actor])
+            count = int(invalid[0]) if len(invalid) else steps
+            if not count:
+                continue
+            joined = th.cat((partial.windows, scenes[:count, actor]), dim=0)
+            features = np.concatenate((partial.features, control[:count, actor]))
+            completed = next((maneuver for maneuver in ground_maneuvers(
+                np.ones(len(joined), dtype=bool), features,
+            ) if maneuver.action_start == partial.action_start), None)
+            if (completed is not None and
+                    (completed.recovery_stop - completed.action_stop >= MANEUVER_RECOVERY_STEPS
+                     or completed.recovery_stop < len(joined) or count < steps)):
+                self._archive(joined, completed)
+            elif (count == steps and len(joined) < GROUND_MAX_TRACKED_STEPS
+                  and dribble_control_mask(features)[-MANEUVER_RECOVERY_STEPS:].any()):
+                self.pending_ground[actor] = PendingGroundManeuver(
+                    joined, partial.action_start, features,
+                )
+
+        if steps < 2:
+            return
+        takeoffs = grounded[:-1] & ~grounded[1:] & valid[:-1] & valid[1:]
+        candidates = np.flatnonzero(valid[-1] & takeoffs.any(axis=0))
+        unfinished = []
+        for actor in candidates:
+            if actor in self.pending:
+                continue
+            invalid = np.flatnonzero(~valid[:, actor])
+            run_start = int(invalid[-1] + 1) if len(invalid) else 0
+            possible = np.flatnonzero(takeoffs[run_start:, actor])
+            if not len(possible):
+                continue
+            takeoff = run_start + int(possible[-1]) + 1
+            landings = np.flatnonzero(grounded[takeoff:, actor])
+            if len(landings) and takeoff + int(landings[0]) + MANEUVER_RECOVERY_STEPS <= steps:
+                continue
+            previous_air = np.flatnonzero(~grounded[run_start:takeoff, actor])
+            previous_landing = (
+                run_start + int(previous_air[-1]) + 1 if len(previous_air) else run_start
+            )
+            setup = max(previous_landing, takeoff - MANEUVER_SETUP_STEPS)
+            unfinished.append((int(actor), setup, takeoff))
+
+        slots = max(0, MANEUVER_MAX_PENDING - len(self.pending))
+        if len(unfinished) > slots:
+            choice = th.randperm(len(unfinished), device=windows.device)[:slots].tolist()
+            unfinished = [unfinished[index] for index in choice]
+        for actor, setup, takeoff in unfinished:
+            self.pending[actor] = PendingAirManeuver(
+                scenes[setup:, actor].detach().clone(), takeoff - setup,
+                grounded[setup:, actor].copy(), height[setup:, actor].copy(),
+                up_z[setup:, actor].copy(), distance[setup:, actor].copy(),
+            )
+
+        carrying = dribble_control_mask(control) & valid
+        raw = carrying.copy()
+        carrying[1:-1] |= raw[:-2] & raw[2:] & valid[1:-1]
+        possible = np.flatnonzero(
+            valid[-1] & carrying[-MANEUVER_RECOVERY_STEPS:].any(axis=0)
+        )
+        unfinished_ground = []
+        for actor in possible:
+            if actor in self.pending_ground:
+                continue
+            invalid = np.flatnonzero(~valid[:, actor])
+            run_start = int(invalid[-1] + 1) if len(invalid) else 0
+            local = carrying[run_start:, actor].astype(np.int8)
+            edges = np.flatnonzero(np.diff(np.pad(local, (1, 1))))
+            if not len(edges):
+                continue
+            starts, stops = edges[::2], edges[1::2]
+            begin = run_start + int(starts[-1])
+            stop = run_start + int(stops[-1])
+            if stop < steps and stop + MANEUVER_RECOVERY_STEPS <= steps:
+                continue
+            previous_end = (
+                run_start + int(stops[-2]) if len(stops) > 1 else run_start
+            )
+            setup = max(previous_end, begin - MANEUVER_SETUP_STEPS)
+            if setup == begin:
+                continue
+            unfinished_ground.append((int(actor), setup, begin))
+
+        slots = max(0, min(512, MANEUVER_MAX_PENDING) - len(self.pending_ground))
+        if len(unfinished_ground) > slots:
+            choice = th.randperm(len(unfinished_ground), device=windows.device)[:slots].tolist()
+            unfinished_ground = [unfinished_ground[index] for index in choice]
+        for actor, setup, begin in unfinished_ground:
+            self.pending_ground[actor] = PendingGroundManeuver(
+                scenes[setup:, actor].detach().clone(), begin - setup,
+                control[setup:, actor].copy(),
+            )
+
+
 class SceneGAIFOMinibatches:
-    """Sample generated and expert scene windows for the discriminator."""
+    """Keep natural windows while matching a small fraction by game situation."""
 
     def __init__(
         self,
@@ -1330,18 +2046,102 @@ class SceneGAIFOMinibatches:
     def set_epoch_callback(self, callback) -> None:
         self._epoch_callback = callback
 
-    def sample_windows(self, windows: th.Tensor, indices: th.Tensor):
-        near_indices = indices[:0]
-        if self.factorize:
-            near = []
+    def sample_windows(
+        self,
+        windows: th.Tensor,
+        indices: th.Tensor,
+        *,
+        n_envs: int = 1,
+        episode_end: th.Tensor | None = None,
+        archived_flights: tuple[list[CompletedSceneManeuver], ...] | None = None,
+    ):
+        agent_groups: list[th.Tensor] = [indices[:0] for _ in range(N_SITUATIONS)]
+        grounded_agent = indices[:0]
+        grounded_expert_available = False
+        expert_groups: tuple[th.Tensor, ...] = ()
+        agent_flights: tuple[list[SceneManeuver], ...] = tuple([] for _ in range(N_SITUATIONS))
+        expert_flights: tuple[list[SceneManeuver], ...] = tuple([] for _ in range(N_SITUATIONS))
+        archived_windows = None
+        if self.factorize and len(indices) >= 1 / SITUATION_MATCH_FRACTION:
+            grouped: list[list[th.Tensor]] = [[] for _ in range(N_SITUATIONS)]
             for chunk in indices.split(8_192):
-                eligible = chunk[nearest_ball_distance(windows[chunk]) <= BALL_NEAR_DISTANCE]
-                if len(eligible):
-                    near.append(eligible)
-            if near and self.expert.near_total:
-                near_indices = th.cat(near)
+                situations = scene_situation_ids(windows[chunk])
+                on_surface = windows[chunk, -1, BLUE_START + CAR_BOOL_START] > 0.5
+                for label in situations.unique().tolist():
+                    if label // len(DISTANCE_BANDS) < 2:
+                        grouped[label].append(chunk[(situations == label) & on_surface])
+            agent_groups = [
+                th.cat(group) if group else indices[:0] for group in grouped
+            ]
+            expert_groups = self.expert.situation_pools()
+            grounded_agent = indices[
+                (windows[indices, -1, BLUE_START + CAR_BOOL_START] > 0.5)
+                & (windows[indices, -1, BLUE_START + 14] > 0.65)
+            ]
+            grounded_expert_available = len(self.expert._grounded_choices()[0]) > 0
+            agent_flights = generated_maneuver_pools(
+                windows, indices, n_envs, episode_end,
+            )
+            if archived_flights is not None:
+                if len(archived_flights) != N_SITUATIONS:
+                    raise ValueError("archived flights must have one pool per situation")
+                saved = []
+                next_start = len(windows)
+                for label, group in enumerate(archived_flights):
+                    for complete in group:
+                        flight = complete.span
+                        if flight.situation != label:
+                            raise ValueError("archived flight has the wrong situation")
+                        agent_flights[label].append(replace(
+                            flight,
+                            setup_start=next_start + flight.setup_start,
+                            action_start=next_start + flight.action_start,
+                            action_stop=next_start + flight.action_stop,
+                            recovery_stop=next_start + flight.recovery_stop,
+                        ))
+                        saved.append(complete.windows)
+                        next_start += len(complete.windows)
+                if saved:
+                    archived_windows = th.cat(saved)
+            if any(agent_flights):
+                expert_flights = self.expert.maneuver_pools()
+        surface_labels = 2 * len(DISTANCE_BANDS)
+        eligible = []
+        for label in range(N_SITUATIONS):
+            if label < surface_labels and expert_groups:
+                if len(agent_groups[label]) and len(expert_groups[label]):
+                    eligible.append(label)
+            elif (label >= surface_labels and len(agent_flights[label])
+                  and len(expert_flights[label])):
+                eligible.append(label)
         for _ in range(self.epochs):
             order = indices[th.randperm(len(indices), device=indices.device)]
+            agent_queues = [
+                group[th.randperm(len(group), device=indices.device)]
+                for group in agent_groups
+            ]
+            expert_queues = [
+                group[th.randperm(len(group), device=indices.device)]
+                for group in expert_groups
+            ]
+            agent_flight_queues = [
+                [group[index] for index in th.randperm(len(group), device=indices.device).tolist()]
+                for group in agent_flights
+            ]
+            expert_flight_queues = [
+                [group[index] for index in th.randperm(len(group), device=indices.device).tolist()]
+                for group in expert_flights
+            ]
+            capacities = {
+                label: min(
+                    len(agent_queues[label]) if label < surface_labels
+                    else len(agent_flight_queues[label]),
+                    len(expert_queues[label]) if label < surface_labels
+                    else len(expert_flight_queues[label]),
+                ) for label in eligible
+            }
+            used = [0] * N_SITUATIONS
+            next_label = 0
             for start in range(0, len(order), self.batch_size):
                 selected = order[start : start + self.batch_size]
                 sample_count = len(selected)
@@ -1356,11 +2156,59 @@ class SceneGAIFOMinibatches:
                 n_current = sample_count - n_history
 
                 agent_windows = current_windows[:n_current]
-                n_near = min(n_current, sample_count // 2) if len(near_indices) else 0
-                if n_near:
+                agent_parts = []
+                expert_parts = []
+                matched = 0
+                quota = min(n_current, int(sample_count * SITUATION_MATCH_FRACTION))
+                grounded_count = min(
+                    int(sample_count * GROUND_RANDOM_FRACTION), quota,
+                ) if len(grounded_agent) and grounded_expert_available else 0
+                situation_quota = quota - grounded_count
+                exhausted = 0
+                while matched < situation_quota and eligible and exhausted < len(eligible):
+                    label = eligible[next_label]
+                    next_label = (next_label + 1) % len(eligible)
+                    if used[label] >= capacities[label]:
+                        exhausted += 1
+                        continue
+                    if label < surface_labels:
+                        agent_parts.append(agent_queues[label][used[label]:used[label] + 1])
+                        expert_parts.append(expert_queues[label][used[label]:used[label] + 1])
+                        matched += 1
+                    else:
+                        agent_ids, expert_pairs = aligned_maneuver_windows(
+                            agent_flight_queues[label][used[label]],
+                            expert_flight_queues[label][used[label]],
+                            situation_quota - matched, indices.device,
+                        )
+                        if not len(agent_ids):
+                            exhausted += 1
+                            continue
+                        agent_parts.append(agent_ids)
+                        expert_parts.append(expert_pairs)
+                        matched += len(agent_ids)
+                    used[label] += 1
+                    exhausted = 0
+                if grounded_count:
+                    grounded_indices = th.randint(
+                        len(grounded_agent), (grounded_count,), device=indices.device,
+                    )
+                    agent_parts.append(grounded_agent[grounded_indices])
+                    expert_parts.append(self.expert.random_grounded_povs(grounded_count))
+                selected_count = matched + grounded_count
+                if selected_count:
+                    agent_indices = th.cat(agent_parts)
+                    expert_pairs = th.cat(expert_parts)
                     agent_windows = agent_windows.clone()
-                    choices = th.randint(len(near_indices), (n_near,), device=indices.device)
-                    agent_windows[:n_near] = windows[near_indices[choices]]
+                    if archived_windows is None:
+                        agent_windows[:selected_count] = windows[agent_indices]
+                    else:
+                        current = agent_indices < len(windows)
+                        matched_windows = agent_windows[:selected_count]
+                        matched_windows[current] = windows[agent_indices[current]]
+                        matched_windows[~current] = archived_windows[
+                            agent_indices[~current] - len(windows)
+                        ]
                 if n_history > 0:
                     historical = self.history.sample(
                         n_history,
@@ -1370,8 +2218,8 @@ class SceneGAIFOMinibatches:
 
                 agent_windows = add_scene_noise(agent_windows, self.noise_std)
                 expert_windows = self.expert.sample(sample_count, agent_windows.device)
-                if n_near:
-                    expert_windows[:n_near] = self.expert.sample_near(n_near, agent_windows.device)
+                if selected_count:
+                    expert_windows[:selected_count] = self.expert._windows_for_povs(expert_pairs)
                 expert_windows = add_scene_noise(expert_windows, self.noise_std)
                 is_agent = th.cat(
                     [
@@ -1379,11 +2227,17 @@ class SceneGAIFOMinibatches:
                         th.zeros(sample_count, device=agent_windows.device),
                     ]
                 )
+                matched_mask = th.arange(sample_count, device=agent_windows.device) < matched
+                grounded_mask = ((th.arange(sample_count, device=agent_windows.device) >= matched)
+                                 & (th.arange(sample_count, device=agent_windows.device)
+                                    < selected_count))
 
                 yield TensorBatch(
                     {
                         "window": th.cat([agent_windows, expert_windows]),
                         "is_agent": is_agent,
+                        "situation_matched": th.cat([matched_mask, matched_mask]),
+                        "grounded_random": th.cat([grounded_mask, grounded_mask]),
                     }
                 )
 
@@ -1410,6 +2264,14 @@ def train_discriminator_minibatch(
 
     optimizer.zero_grad(set_to_none=True)
     metrics: dict[str, th.Tensor] = {}
+    if "situation_matched" in sample:
+        metrics["matched_situation_fraction"] = (
+            sample["situation_matched"][:n_agent].float().mean()
+        )
+    if "grounded_random" in sample:
+        metrics["grounded_random_fraction"] = (
+            sample["grounded_random"][:n_agent].float().mean()
+        )
     ball_weights = None
     if getattr(discriminator, "factorized", False):
         ball_weights = ball_responsibility(windows).square()
@@ -1695,6 +2557,10 @@ class AdaptiveDiscriminatorUpdate:
         self._has_updated = False
         self._rollouts_since_update = 0
 
+        self.maneuver_tracker = (
+            GeneratedManeuverTracker() if getattr(discriminator, "factorized", False) else None
+        )
+
     def set_progress_callback(self, callback) -> None:
         self._progress_callback = callback
 
@@ -1713,6 +2579,14 @@ class AdaptiveDiscriminatorUpdate:
             -1, self.expert.trajectory_length, SCENE_SIZE
         )
         train_indices, heldout_indices = self._split_generated(valid)
+        terminal = batch.get("terminated")
+        truncated = batch.get("truncated")
+        if truncated is not None:
+            terminal = truncated.bool() if terminal is None else terminal.bool() | truncated.bool()
+        if self.maneuver_tracker is not None:
+            self.maneuver_tracker.feed(
+                flat_windows, train_indices, valid.shape[1], terminal,
+            )
         heldout_generated = flat_windows[heldout_indices]
         heldout_near = None
         if (getattr(self.discriminator, "factorized", False)
@@ -1751,7 +2625,11 @@ class AdaptiveDiscriminatorUpdate:
             if callback is not None:
                 callback.start(self.epochs, self.section)
             try:
-                for sample in sampler.sample_windows(flat_windows, train_indices):
+                for sample in sampler.sample_windows(
+                    flat_windows, train_indices, n_envs=valid.shape[1], episode_end=terminal,
+                    archived_flights=(self.maneuver_tracker.ready
+                                      if self.maneuver_tracker is not None else None),
+                ):
                     minibatch_metrics = train_discriminator_minibatch(
                         sample, self.discriminator, self.optimizer, self.loss,
                         self.microbatch_size, self.max_grad_norm,
@@ -1773,6 +2651,8 @@ class AdaptiveDiscriminatorUpdate:
                     callback.finish()
 
             if minibatch_count > 0:
+                if self.maneuver_tracker is not None:
+                    self.maneuver_tracker.clear_ready()
                 self._has_updated = True
                 if self.reset_miner is not None:
                     self.reset_miner.ready = True
