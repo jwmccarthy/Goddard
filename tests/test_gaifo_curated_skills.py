@@ -10,10 +10,11 @@ import numpy as np
 import torch as th
 
 from gaifo import (
+    AERIAL_MANEUVER_SKILL, AERIAL_TOUCH_SKILL, DRIVING_SKILL,
     BLUE_START, ORANGE_START, POSITION_SCALE, ConfidentExpertResetTransform,
     CuratedReplayResetTransform, ExpertSceneDataset, GeneratedManeuverTracker,
     ReplayResetProvider, SceneGAIFOMinibatches,
-    parse_args, scene_situation_ids,
+    generated_maneuver_pools, parse_args, scene_situation_ids,
 )
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.data import TensorBatch
@@ -32,7 +33,7 @@ def _period(folder: Path, kind: str, index: int) -> None:
     rows[:, 8] = (index + 1) / 10 + np.arange(48) / 10_000
     rows[:, 137] = 1
 
-    if kind == "aerial":
+    if kind in ("aerial", "aerial_touch"):
         rows[8:25, BLUE_START + 16] = 0
         rows[8:25, BLUE_START + 2] = 650 / POSITION_SCALE[2]
         rows[8:25, ORANGE_START + 16] = 0
@@ -40,7 +41,11 @@ def _period(folder: Path, kind: str, index: int) -> None:
         rows[8:25, ORANGE_START + 2] = 650 / POSITION_SCALE[2]
         rows[8:25, 2] = 750 / POSITION_SCALE[2]
         rows[8:25, 0] = 100 / POSITION_SCALE[0]
-        rows[10, 156] = rows[16, 156] = 1  # Two separate airborne touches.
+        if kind == "aerial":
+            rows[8:25, 1] = (np.arange(8, 25) - 8) * 20 / POSITION_SCALE[1]
+            rows[10, 156] = rows[16, 156] = 1  # Two controlled airborne touches.
+        else:
+            rows[10, 156] = 1
     elif kind in ("dribble", "flick"):
         for step in range(48):
             if 5 <= step < 12:
@@ -60,7 +65,7 @@ def _period(folder: Path, kind: str, index: int) -> None:
 
     unsafe = np.zeros(len(rows), dtype=bool)
     pre_goal = np.zeros(len(rows), dtype=bool)
-    if kind == "aerial":
+    if kind in ("aerial", "aerial_touch"):
         unsafe[12] = True  # Exclude the reset, not its valid touch trajectory.
         pre_goal[13] = True
     if kind == "driving":
@@ -74,7 +79,7 @@ def _period(folder: Path, kind: str, index: int) -> None:
 
 
 def _expert(folder: Path, driving_fraction: float = 0.05) -> ExpertSceneDataset:
-    for index, kind in enumerate(("aerial", "dribble", "flick", "driving")):
+    for index, kind in enumerate(("aerial", "aerial_touch", "dribble", "flick", "driving")):
         _period(folder, kind, index)
     return ExpertSceneDataset(
         folder, trajectory_length=8, reject_discontinuities=True,
@@ -124,7 +129,9 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             self.assertTrue(all(len(pool) for pool in pools))
             self.assertTrue(all(len(pool) for pool in expert._curated_reset_pools))
             self.assertFalse(th.isin(expert.frames[pools[0][:, 0] + 7, 8],
-                                     expert.frames[pools[3][:, 0] + 7, 8]).any())
+                                     expert.frames[pools[1][:, 0] + 7, 8]).any())
+            self.assertAlmostEqual(expert.curated_weights()[AERIAL_TOUCH_SKILL].item(),
+                                   expert.curated_weights()[AERIAL_MANEUVER_SKILL].item())
 
             transform = CuratedReplayResetTransform(expert)
             sample = DatasetResetSampler(
@@ -134,13 +141,16 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                 chosen = sample["frame_index"][sample["skill_category"] == category]
                 self.assertTrue(th.isin(chosen, pool).all())
                 self.assertTrue((~expert.unsafe_reset_frames[chosen]).all())
-            self.assertAlmostEqual((sample["skill_category"] == 3).float().mean().item(),
+            self.assertAlmostEqual((sample["skill_category"] == DRIVING_SKILL).float().mean().item(),
                                    .05, delta=.02)
+            for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL):
+                self.assertAlmostEqual((sample["skill_category"] == category).float().mean().item(),
+                                       .95 / 3, delta=.025)
             self.assertAlmostEqual(transform.take_skill_fractions()["reset_driving_fraction"],
                                    .05, delta=.02)
             self.assertEqual(transform.take_skill_fractions(), {})
 
-            for category in (0, 3):
+            for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL, DRIVING_SKILL):
                 safe = expert._curated_reset_pools[category]
                 self.assertFalse(th.isin(expert.frames[safe, 8], th.tensor([
                     expert.frames[expert.segment_frame_indices[0][12], 8],
@@ -150,9 +160,9 @@ class CuratedSkillSamplingTests(unittest.TestCase):
 
             generated = th.cat([
                 expert._windows_for_povs(pool[:32]) for pool in pools
-            ])
+            ]).repeat(6, 1, 1)
             batch = next(SceneGAIFOMinibatches(
-                expert, batch_size=1_024, epochs=1, noise_std=0, factorize=True,
+                expert, batch_size=len(generated), epochs=1, noise_std=0, factorize=True,
             ).sample_windows(
                 generated, th.arange(len(generated)),
                 episode_end=th.ones(len(generated), 1, dtype=th.bool),
@@ -160,6 +170,11 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             n = len(generated)
             self.assertTrue(batch["situation_matched"].all())
             self.assertFalse(batch["phase_aligned"].any())
+            for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL):
+                self.assertAlmostEqual(
+                    (batch["skill_category"][:n] == category).float().mean().item(),
+                    .95 / 3, delta=.05,
+                )
             not_phase = ~batch["phase_aligned"][:n]
             self.assertTrue(th.equal(
                 scene_situation_ids(batch["window"][:n])[not_phase],
@@ -189,16 +204,16 @@ class CuratedSkillSamplingTests(unittest.TestCase):
     @unittest.skipUnless(th.cuda.is_available(), "CARL reset integration requires CUDA")
     def test_carl_resets_preserve_unpaired_opponent_controls(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            for index, kind in enumerate(("aerial", "dribble", "flick", "driving")):
+            for index, kind in enumerate(("aerial", "aerial_touch", "dribble", "flick", "driving")):
                 _period(Path(directory), kind, index)
             expert = ExpertSceneDataset(
                 Path(directory), trajectory_length=8, device="cuda:0",
                 reject_discontinuities=True, skill_sampling=True,
             )
-            aerial = expert._curated_reset_pools[0]
+            aerial = expert._curated_reset_pools[AERIAL_MANEUVER_SKILL]
             flip = aerial[expert.frames[aerial, ORANGE_START + 18] > .5][0]
-            ground = expert._curated_reset_pools[3][
-                expert.frames[expert._curated_reset_pools[3], ORANGE_START + 16] > .5
+            ground = expert._curated_reset_pools[DRIVING_SKILL][
+                expert.frames[expert._curated_reset_pools[DRIVING_SKILL], ORANGE_START + 16] > .5
             ][0]
 
             class FixedStart:
@@ -260,7 +275,7 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                 folder, trajectory_length=8, reject_discontinuities=True,
                 skill_sampling=True,
             )
-            generated = expert._windows_for_povs(expert.curated_pools()[3][:16]).clone()
+            generated = expert._windows_for_povs(expert.curated_pools()[DRIVING_SKILL][:16]).clone()
             generated[:, :, BLUE_START + 16] = 0
             generated[:, :, BLUE_START + 2] = 200 / POSITION_SCALE[2]
             samples = list(SceneGAIFOMinibatches(
@@ -278,14 +293,30 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             starts = th.arange(clip.setup_start, clip.recovery_stop)
             pairs = th.stack((starts, th.full_like(starts, clip.actor)), dim=-1)
             generated = expert._windows_for_povs(pairs)
+            touches = expert.ego_touches[starts + expert.partition_span, clip.actor, None]
+            matched = [flight for pool in generated_maneuver_pools(
+                generated, th.arange(len(generated)), n_envs=1,
+                ego_ball_touch=touches,
+            ) for flight in pool]
+            self.assertEqual(len(matched), 1)
+            self.assertEqual(matched[0].skill_category, clip.skill_category)
+            without_events = [flight for pool in generated_maneuver_pools(
+                generated, th.arange(len(generated)), n_envs=1,
+            ) for flight in pool]
+            self.assertEqual(without_events[0].skill_category, AERIAL_TOUCH_SKILL)
+            # A category needs at least 16 examples to reserve four for phase alignment.
+            generated = th.cat((generated, generated[-1:].expand(120, -1, -1)))
+            touches = th.cat((touches, th.zeros(120, 1, dtype=th.bool)))
             sample = next(SceneGAIFOMinibatches(
                 expert, batch_size=len(generated), epochs=1, noise_std=0,
                 factorize=True,
-            ).sample_windows(generated, th.arange(len(generated)), n_envs=1))
+            ).sample_windows(generated, th.arange(len(generated)), n_envs=1,
+                             ego_ball_touch=touches))
             aligned = sample["phase_aligned"][:len(generated)]
             self.assertGreaterEqual(int(aligned.sum()), 4)
-            self.assertTrue((sample["skill_category"][:len(generated)][aligned] == 0).all())
-            allowed = expert.frames[expert.curated_pools()[0][:, 0] + 7, 8]
+            self.assertTrue((sample["skill_category"][:len(generated)][aligned]
+                             == clip.skill_category).all())
+            allowed = expert.frames[expert.curated_pools()[clip.skill_category][:, 0] + 7, 8]
             self.assertTrue(th.isin(
                 sample["window"][len(generated):, -1, 8][aligned], allowed,
             ).all())
@@ -300,14 +331,20 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                 starts, th.full_like(starts, clip.actor),
             ), dim=-1)).clone()
             flight[:, :, 8] = .973  # Identify archive frames after the rollout changes.
+            touches = expert.ego_touches[starts + expert.partition_span, clip.actor, None]
             split = clip.action_start - clip.setup_start + 3
             tracker = GeneratedManeuverTracker()
-            tracker.feed(flight[:split], th.arange(split), n_envs=1)
+            tracker.feed(flight[:split], th.arange(split), n_envs=1,
+                         ego_ball_touch=touches[:split])
             self.assertFalse(any(tracker.ready))
-            tracker.feed(flight[split:], th.arange(len(flight) - split), n_envs=1)
+            tracker.feed(flight[split:], th.arange(len(flight) - split), n_envs=1,
+                         ego_ball_touch=touches[split:])
             self.assertTrue(tracker.ready[clip.situation])
+            self.assertEqual(tracker.ready[clip.situation][0].span.skill_category,
+                             clip.skill_category)
 
-            driving = expert._windows_for_povs(expert.curated_pools()[3][:40])
+            driving = expert._windows_for_povs(expert.curated_pools()[DRIVING_SKILL][:40])
+            driving = driving.repeat(3, 1, 1)
             batch = next(SceneGAIFOMinibatches(
                 expert, batch_size=len(driving), epochs=1, noise_std=0,
                 factorize=True,
@@ -318,7 +355,7 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             phase = batch["phase_aligned"][:len(driving)]
             self.assertGreaterEqual(int(phase.sum()), 4)
             self.assertTrue((batch["window"][:len(driving), -1, 8][phase] == .973).all())
-            allowed = expert.frames[expert.curated_pools()[0][:, 0] + 7, 8]
+            allowed = expert.frames[expert.curated_pools()[clip.skill_category][:, 0] + 7, 8]
             self.assertTrue(th.isin(
                 batch["window"][len(driving):, -1, 8][phase], allowed,
             ).all())
@@ -334,13 +371,14 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                 folder, trajectory_length=8, reject_discontinuities=True,
                 skill_sampling=True,
             )
-            self.assertFalse(len(expert.curated_pools()[0]))
-            self.assertFalse(len(expert._curated_reset_pools[0]))
-            self.assertTrue(len(expert.curated_pools()[3]))
+            self.assertFalse(len(expert.curated_pools()[AERIAL_TOUCH_SKILL]))
+            self.assertFalse(len(expert.curated_pools()[AERIAL_MANEUVER_SKILL]))
+            self.assertFalse(len(expert._curated_reset_pools[AERIAL_TOUCH_SKILL]))
+            self.assertTrue(len(expert.curated_pools()[DRIVING_SKILL]))
 
     def test_heldout_curated_windows_never_become_reset_or_training_examples(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            for index, kind in enumerate(("aerial", "dribble", "flick", "driving")):
+            for index, kind in enumerate(("aerial", "aerial_touch", "dribble", "flick", "driving")):
                 _period(Path(directory), kind, index)
             heldout = ExpertSceneDataset(
                 Path(directory), trajectory_length=8, heldout_size=16,

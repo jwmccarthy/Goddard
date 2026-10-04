@@ -300,7 +300,7 @@ function listCard(item) {
   top.className = 'item-top';
   const name = document.createElement('span');
   name.className = 'item-skill';
-  name.textContent = `${item.skill} / ${String(item.id).padStart(4, '0')}`;
+  name.textContent = `${item.skill.replaceAll('_', ' ')} / ${String(item.id).padStart(4, '0')}`;
   const score = document.createElement('span');
   score.className = `item-score ${scoreColor(item.mean_agent)}`;
   score.textContent = percent(item.mean_agent);
@@ -377,12 +377,12 @@ async function selectSequence(id) {
     progressFrame = 0;
     ball.visible = true;
     $('frameSlider').max = Math.max(0, clip.frames.length - 1);
-    $('stageTitle').textContent = `${clip.skill[0].toUpperCase()}${clip.skill.slice(1)} · expert #${clip.id}`;
+    $('stageTitle').textContent = `${clip.skill[0].toUpperCase()}${clip.skill.slice(1).replaceAll('_', ' ')} · expert #${clip.id}`;
     $('stageSubtitle').textContent = `${clip.split} · ${clip.source} · ${clip.frames.length} frames`;
     for (const card of document.querySelectorAll('.sequence-item')) {
       card.classList.toggle('selected', Number(card.dataset.id) === id);
     }
-    $('clipTitle').textContent = `${clip.skill} / #${clip.id}`;
+    $('clipTitle').textContent = `${clip.skill.replaceAll('_', ' ')} / #${clip.id}`;
     $('clipSource').textContent = clip.source;
     $('clipActor').textContent = clip.actor === 0 ? 'Blue' : 'Orange';
     $('clipSplit').textContent = clip.split === 'heldout' ? 'Held-out' : 'Training';

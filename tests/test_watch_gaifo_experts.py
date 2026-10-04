@@ -46,6 +46,7 @@ def write_periods(folder: Path) -> None:
             rows[8:25, ORANGE_START] = 0
             rows[8:25, 0] = 100 / POSITION_SCALE[0]
             rows[8:25, 2] = 750 / POSITION_SCALE[2]
+            rows[8:25, 1] = (np.arange(8, 25) - 8) * 20 / POSITION_SCALE[1]
             rows[10, 156] = rows[16, 156] = 1
         elif skill in ("dribble", "flick"):
             for step in range(len(rows)):
@@ -160,10 +161,11 @@ class ExpertInspectorTests(unittest.TestCase):
                 reject_discontinuities=True, skill_sampling=True,
             )
             records = collect_sequences(expert, folder, seed=0, limit=None, max_driving=1)
-            self.assertEqual({"aerial", "dribble", "flick", "driving"},
+            self.assertEqual({"aerial_touch", "aerial_maneuver", "dribble", "flick", "driving"},
                              {record.skill for record in records})
             self.assertEqual({"train", "heldout"}, {record.split for record in records})
-            aerial_povs = {record.actor for record in records if record.skill == "aerial"}
+            aerial_povs = {record.actor for record in records
+                           if record.skill.startswith("aerial_")}
             self.assertEqual(aerial_povs, {0, 1})
 
             progress = []
@@ -176,7 +178,8 @@ class ExpertInspectorTests(unittest.TestCase):
                                             sum(record.length for record in records)))
             for record in records:
                 if record.skill != "driving":
-                    self.assertTrue(record.source.endswith(f"-{record.skill}.npy"))
+                    source_skill = "aerial" if record.skill.startswith("aerial_") else record.skill
+                    self.assertTrue(record.source.endswith(f"-{source_skill}.npy"))
                 self.assertTrue(0 <= record.source_start < 48)
                 eligible = (expert.heldout_window_starts if record.split == "heldout"
                             else expert.train_window_starts)
@@ -200,7 +203,10 @@ class ExpertInspectorTests(unittest.TestCase):
                 skill="flick", head="car", order="most",
             )["items"][0]["miss_fraction"], 1.0)
             self.assertEqual(inspection.list_sequences(
-                skill="aerial", head="car", order="most",
+                skill="aerial_touch", head="car", order="most",
+            )["items"][0]["miss_fraction"], 0.0)
+            self.assertEqual(inspection.list_sequences(
+                skill="aerial_maneuver", head="car", order="most",
             )["items"][0]["miss_fraction"], 0.0)
             self.assertEqual(inspection.list_sequences(
                 skill="dribble", order="most",
@@ -215,9 +221,9 @@ class ExpertInspectorTests(unittest.TestCase):
                                 inspection.list_sequences(split="heldout")["items"]))
 
             orange = next(record for record in records
-                          if record.skill == "aerial" and record.actor == 1)
+                          if record.skill == "aerial_touch" and record.actor == 1)
             blue = next(record for record in records
-                        if record.skill == "aerial" and record.actor == 0)
+                        if record.skill == "aerial_maneuver" and record.actor == 0)
             for record, x, contact in ((blue, 100, 10), (orange, -100, 11)):
                 detail = inspection.sequence(record.id)
                 self.assertEqual(len(detail["scores"]["car"]), len(detail["frames"]))
@@ -275,13 +281,13 @@ class ExpertInspectorTests(unittest.TestCase):
             try:
                 self.assertEqual(get("/api/status")["phase"], "ready")
                 self.assertEqual(len(get("/api/checkpoints")), 1)
-                results = get("/api/sequences?skill=aerial&head=car&order=most")
+                results = get("/api/sequences?skill=aerial_maneuver&head=car&order=most")
                 self.assertGreater(results["total"], 0)
                 selected = get(f"/api/sequence/{results['items'][0]['id']}")
                 self.assertEqual(len(selected["frames"]), len(selected["scores"]["car"]))
                 self.assertTrue(all(score == .5 for score in selected["scores"]["combined"]))
                 self.assertEqual(results["items"][0]["miss_fraction"], 1.0)
-                self.assertEqual(get("/api/sequences?skill=aerial&head=ball")
+                self.assertEqual(get("/api/sequences?skill=aerial_maneuver&head=ball")
                                  ["items"][0]["miss_fraction"], 0.0)
                 with urlopen(base + "/", timeout=5) as response:
                     self.assertIn(b"Expert Signal", response.read())

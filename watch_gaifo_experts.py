@@ -26,7 +26,8 @@ import torch as th
 from gaifo import (
     BALL_RADIUS, BLUE_START, CAR_SIZE, GAIFO_ARCHITECTURE,
     GAIFO_ASE_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GROUND_MANEUVERS,
-    GROUND_MANEUVER_START, ORANGE_START, POSITION_SCALE, SKILL_CATEGORIES,
+    GROUND_MANEUVER_START, DRIVING_SKILL, ORANGE_START, POSITION_SCALE,
+    SKILL_CATEGORIES,
     ExpertSceneDataset, build_discriminator, opponent_view,
 )
 from watch_checkpoints import CheckpointRegistry
@@ -187,14 +188,15 @@ def collect_sequences(
         expert.curated_pools(heldout=heldout)
         split = "heldout" if heldout else "train"
         for label, group in enumerate(expert._curated_maneuvers[heldout]):
-            skill = ("aerial" if label < GROUND_MANEUVER_START
-                     else GROUND_MANEUVERS[label - GROUND_MANEUVER_START])
             for clip in group:
+                skill = (SKILL_CATEGORIES[clip.skill_category]
+                         if label < GROUND_MANEUVER_START
+                         else GROUND_MANEUVERS[label - GROUND_MANEUVER_START])
                 append(skill, split, clip.actor, clip.setup_start,
                        clip.action_start, clip.action_stop, clip.recovery_stop)
         if max_driving:
             candidates = driving_spans(
-                expert.curated_pools(heldout=heldout)[3],
+                expert.curated_pools(heldout=heldout)[DRIVING_SKILL],
                 min(expert.trajectory_length, DRIVING_SPAN),
             )
             if len(candidates) > max_driving:

@@ -8,9 +8,11 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    BLUE_START, CAR_SITUATIONS, DISTANCE_BANDS, ORANGE_START, POSITION_SCALE,
+    AERIAL_MANEUVER_SKILL, AERIAL_TOUCH_SKILL, BLUE_START, CAR_SITUATIONS,
+    DISTANCE_BANDS, ORANGE_START, POSITION_SCALE,
     ExpertSceneDataset, GeneratedManeuverTracker, SceneGAIFOMinibatches, air_maneuvers,
-    aligned_maneuver_windows, generated_maneuver_pools, opponent_view, recovery_surface_contact,
+    aerial_skill_category, aligned_maneuver_windows, generated_maneuver_pools,
+    opponent_view, recovery_surface_contact,
     scene_situation_ids,
 )
 
@@ -200,6 +202,37 @@ class SituationBalanceTests(unittest.TestCase):
         self.assertEqual((int((sampled < 20).sum()), int((sampled >= 30).sum())), (8, 8))
         self.assertTrue({4, 19, 20, 29, 30, 45}.issubset(sampled.tolist()))
 
+    def test_controlled_aerial_needs_separate_elevated_touches_and_ball_movement(self):
+        touches = np.zeros(12, dtype=bool)
+        touches[3:5] = touches[8:10] = True
+        car_height = np.full(12, 650.)
+        ball = np.zeros((12, 3))
+        ball[:, 1] = np.arange(12) * 30 / POSITION_SCALE[1]
+        ball[:, 2] = 750 / POSITION_SCALE[2]
+        distance = np.full(12, 150.)
+
+        classify = lambda: aerial_skill_category(touches, car_height, ball, distance)
+        self.assertEqual(classify(), AERIAL_MANEUVER_SKILL)
+        touches[8:10] = False
+        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
+        touches[5:10] = True  # One sustained contact, not six separate touches.
+        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
+        touches[5:8] = False
+        ball[:, 1] = 0  # Two hits on a stationary ball are not a controlled carry.
+        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
+        ball[:, 1] = np.arange(12) * 30 / POSITION_SCALE[1]
+        distance[6] = 1_600  # Lost the ball entirely between hits.
+        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
+        distance[6] = 150
+        ball[6, 2] = 92 / POSITION_SCALE[2]  # Ball landed between hits.
+        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
+        ball[6, 2] = 750 / POSITION_SCALE[2]
+        touches[:] = False
+        self.assertIsNone(classify())
+        touches[3] = True
+        car_height[3] = 17
+        self.assertIsNone(classify())
+
     def test_curated_aerials_require_grounded_context_on_both_sides(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
@@ -233,7 +266,7 @@ class SituationBalanceTests(unittest.TestCase):
             self.assertEqual(sorted((clip.action_start - clip.setup_start,
                                      clip.recovery_stop - clip.action_stop)
                                     for clip in clips), [(8, 8), (16, 16)])
-            eligible = expert.curated_pools()[0][:, 0]
+            eligible = expert.curated_pools()[AERIAL_TOUCH_SKILL][:, 0]
             for clip in clips:
                 self.assertTrue(th.isin(th.arange(clip.setup_start, clip.recovery_stop),
                                         eligible).all())

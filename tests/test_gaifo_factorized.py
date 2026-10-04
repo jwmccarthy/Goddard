@@ -22,6 +22,7 @@ from gaifo import (
     SceneGAIFOMinibatches,
     ball_responsibility,
     build_discriminator,
+    generated_scene_timeline,
     load_resume_checkpoint,
     nearest_ball_distance,
     opponent_view,
@@ -237,6 +238,53 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertEqual(result["car_heldout_accuracy"], 1.0)
             self.assertEqual(result["ball_near_heldout_accuracy"], 0.0)
             self.assertEqual(result["heldout_accuracy"], 0.0)
+
+    def test_heldout_examples_are_reused_and_scored_together_within_update(self):
+        class CountingHeads(th.nn.Module):
+            factorized = True
+
+            def __init__(self):
+                super().__init__()
+                self.bias = th.nn.Parameter(th.tensor(0.))
+                self.validation_batch_sizes = []
+
+            def forward(self, windows):
+                if th.is_inference_mode_enabled():
+                    self.validation_batch_sizes.append(len(windows))
+                return self.bias.expand(len(windows), 2)
+
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            rows = np.zeros((32, 161), dtype=np.float32)
+            rows[:, BLUE_START] = 3_000 / 4_108
+            rows[:, 30] = 3_000 / 4_108
+            rows[8:13, BLUE_START] = 0
+            for name in ("first", "second"):
+                np.save(folder / f"{name}.npy", rows)
+            expert = ExpertSceneDataset(folder, 2, device="cpu", frame_skip=4, heldout_size=4)
+            self.assertGreater(expert.heldout_near_total, 0)
+            discriminator = CountingHeads()
+            update = AdaptiveDiscriminatorUpdate(
+                expert=expert, history=None, batch_size=4, epochs=1, noise_std=0,
+                heldout_size=4, accuracy_target=0.8, history_add_size=0,
+                history_mix_fraction=0, max_grad_norm=1, discriminator=discriminator,
+                optimizer=th.optim.SGD(discriminator.parameters(), lr=0),
+                loss=SceneDiscriminatorLoss(discriminator), microbatch_size=2,
+            )
+            windows = th.zeros(4, 4, 2, 51)
+            valid = th.ones(4, 4, dtype=th.bool)
+            with (patch.object(expert, "sample_heldout", wraps=expert.sample_heldout) as heldout,
+                  patch.object(expert, "sample_near", wraps=expert.sample_near) as near,
+                  patch("gaifo.generated_scene_timeline", wraps=generated_scene_timeline) as timeline):
+                _, result = update.run(TensorBatch({
+                    "scene_window": windows, "scene_window_valid": valid,
+                }))
+            self.assertEqual(result["Discriminator"]["minibatches"], 2)
+            self.assertEqual(result["Discriminator"]["heldout_accuracy"], 0.5)
+            self.assertEqual(heldout.call_count, 1)
+            self.assertEqual(near.call_count, 1)
+            self.assertEqual(timeline.call_count, 1)
+            self.assertEqual(discriminator.validation_batch_sizes, [4] * 12)
 
     def test_flag_defaults_to_unified_and_checkpoint_resume_keeps_mode(self):
         with patch.object(sys, "argv", ["gaifo.py", "--replay-dir", "parsed_replays"]):

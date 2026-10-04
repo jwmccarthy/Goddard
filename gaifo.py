@@ -92,8 +92,10 @@ CAR_SITUATIONS = ("grounded", "wall", "low_air", "mid_air", "high_air", "ceiling
 GROUND_MANEUVERS = ("dribble", "flick")
 GROUND_MANEUVER_START = len(DISTANCE_BANDS) * len(CAR_SITUATIONS)
 N_SITUATIONS = GROUND_MANEUVER_START + len(GROUND_MANEUVERS)
-SKILL_CATEGORIES = ("aerial", "dribble", "flick", "driving")
+SKILL_CATEGORIES = ("aerial_touch", "aerial_maneuver", "dribble", "flick", "driving")
+AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL, DRIBBLE_SKILL, FLICK_SKILL, DRIVING_SKILL = range(5)
 SKILL_AERIAL_NEAR_STEPS = 4
+SKILL_AERIAL_TOUCH_SEPARATION = 3
 LOW_AIR_HEIGHT = 350.0
 MID_AIR_HEIGHT = 900.0
 NEAR_CEILING_HEIGHT = 1_700.0
@@ -214,6 +216,8 @@ class SceneManeuver:
 
 @dataclass(frozen=True)
 class AirManeuver(SceneManeuver):
+    skill_category: int = AERIAL_TOUCH_SKILL
+
     @property
     def takeoff(self) -> int:
         return self.action_start
@@ -335,6 +339,62 @@ def air_maneuvers(
             ))
             previous_landing = landing
     return flights
+
+
+def aerial_skill_category(
+    touches: np.ndarray, car_height: np.ndarray,
+    ball_position: np.ndarray, ball_distance: np.ndarray,
+) -> int | None:
+    """An aerial touch is one contact; a carry needs separate, controlled contacts.
+
+    Consecutive sampled touch flags are one contact, even if the near-ball mask
+    fluctuates. Between separate touches the ball must remain aloft and in reach,
+    stay close at least half the time, and travel farther than its radius.
+    """
+    ball_height = ball_position[:, 2] * POSITION_SCALE[2]
+    close = ((car_height > 2 * BALL_RADIUS) & (ball_height > 250)
+             & (ball_distance < BALL_CLOSE_DISTANCE))
+    edges = np.flatnonzero(np.diff(np.pad(close.astype(np.int8), (1, 1))))
+    if not len(edges) or max(edges[1::2] - edges[::2]) < SKILL_AERIAL_NEAR_STEPS:
+        return None
+
+    touch_edges = np.flatnonzero(np.diff(np.pad(touches.astype(np.int8), (1, 1))))
+    events = []
+    for begin, end in zip(touch_edges[::2], touch_edges[1::2]):
+        contact = np.flatnonzero(close[begin:end])
+        if len(contact):
+            events.append(int(begin + contact[0]))
+    if not events:
+        return None
+
+    for first, second in zip(events, events[1:]):
+        between = slice(first, second + 1)
+        if (second - first >= SKILL_AERIAL_TOUCH_SEPARATION
+                and (ball_height[between] > 250).all()
+                and (ball_distance[between] < BALL_NEAR_DISTANCE).all()
+                and (ball_distance[between] < BALL_CLOSE_DISTANCE).mean() >= 0.5
+                and np.linalg.norm(
+                    (ball_position[second] - ball_position[first]) * POSITION_SCALE
+                ) > BALL_RADIUS):
+            return AERIAL_MANEUVER_SKILL
+    return AERIAL_TOUCH_SKILL
+
+
+def generated_air_skill(
+    windows: th.Tensor, flight: AirManeuver, touches: np.ndarray,
+) -> int:
+    """Label a generated flight from actual ball-contact events, when available."""
+    active = slice(flight.action_start, flight.action_stop)
+    if not touches[active].any():
+        return AERIAL_TOUCH_SKILL
+    scored = windows[active, -1]
+    category = aerial_skill_category(
+        touches[active],
+        (scored[:, BLUE_START + 2] * POSITION_SCALE[2]).cpu().numpy(),
+        scored[:, :3].cpu().numpy(),
+        _ball_distances(scored, BLUE_START).cpu().numpy(),
+    )
+    return AERIAL_TOUCH_SKILL if category is None else category
 
 
 def ground_feature_indices(car_start: int) -> tuple[int, ...]:
@@ -1494,8 +1554,8 @@ class ExpertSceneDataset:
     def curated_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
         """The same complete skill clips and limited driving used by D and resets.
 
-        Aerial clips require a real airborne near-ball run and an ego ball touch;
-        proximity in a past frame of an eight-frame window alone is insufficient.
+        Aerial touches need a real elevated contact; an aerial maneuver needs
+        separate contacts while carrying a moving ball through the air.
         Touches remain *inside* expert discriminator windows, but cannot be reset
         targets. Each pair is a window start and a stored focal-player viewpoint.
         """
@@ -1508,7 +1568,7 @@ class ExpertSceneDataset:
         kept_clips: list[list[SceneManeuver]] = [[] for _ in range(N_SITUATIONS)]
         used = np.zeros((len(self.frames), N_CARS), dtype=bool)
         touches = self.ego_touches.cpu().numpy()
-        ball_height = self.frames[:, 2].cpu().numpy() * POSITION_SCALE[2]
+        ball_position = self.frames[:, :3].cpu().numpy()
         distances = {
             actor: _ball_distances(self.frames, car).cpu().numpy()
             for actor, car in enumerate((BLUE_START, ORANGE_START))
@@ -1518,27 +1578,24 @@ class ExpertSceneDataset:
             for actor, car in enumerate((BLUE_START, ORANGE_START))
         }
         for label, clips in enumerate(self.maneuver_pools(heldout=heldout)):
-            category = (1 + label - GROUND_MANEUVER_START
-                        if label >= GROUND_MANEUVER_START else 0)
             for clip in clips:
                 actor = clip.actor
-                if category == 0:
+                if isinstance(clip, AirManeuver):
                     # Exclude flights cut short by a replay, split, or next
                     # takeoff: a demonstration needs both its approach and landing.
                     if (clip.action_start - clip.setup_start < AERIAL_MIN_CONTEXT_STEPS
                             or clip.recovery_stop - clip.action_stop < AERIAL_MIN_CONTEXT_STEPS):
                         continue
                     scored = np.arange(clip.action_start, clip.action_stop) + self.partition_span
-                    near = (
-                        (distances[actor][scored] < BALL_CLOSE_DISTANCE)
-                        & (heights[actor][scored] > 2 * BALL_RADIUS)
-                        & (ball_height[scored] > 250)
+                    category = aerial_skill_category(
+                        touches[scored, actor], heights[actor][scored],
+                        ball_position[scored], distances[actor][scored],
                     )
-                    edges = np.diff(np.pad(near.astype(np.int8), (1, 1)))
-                    close_runs = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
-                    if (not len(close_runs) or close_runs.max() < SKILL_AERIAL_NEAR_STEPS
-                            or not touches[scored, actor].any()):
+                    if category is None:
                         continue
+                    clip = replace(clip, skill_category=category)
+                else:
+                    category = DRIBBLE_SKILL + label - GROUND_MANEUVER_START
                 kept_clips[label].append(clip)
                 indices = th.arange(clip.setup_start, clip.recovery_stop)
                 used[indices.numpy(), actor] = True
@@ -1560,7 +1617,7 @@ class ExpertSceneDataset:
             )
             chosen = eligible[driving].cpu()
             if len(chosen):
-                pools[3].append(th.stack((
+                pools[DRIVING_SKILL].append(th.stack((
                     chosen, th.full_like(chosen, actor),
                 ), dim=-1))
 
@@ -1610,16 +1667,20 @@ class ExpertSceneDataset:
         return result
 
     def curated_weights(self, *, heldout: bool = False) -> th.Tensor:
-        """Reserve a small driving share; allocate the remaining skills 6:2:1."""
+        """Split the aerial share evenly between touches and maneuvers."""
         driving = self.driving_fraction
         weights = th.tensor((
-            (1 - driving) * 2 / 3, (1 - driving) * 2 / 9,
-            (1 - driving) / 9, driving,
+            (1 - driving) / 3, (1 - driving) / 3,
+            (1 - driving) * 2 / 9, (1 - driving) / 9, driving,
         ), device=self.frames.device)
         available = self.curated_pools(heldout=heldout)
-        weights *= th.tensor(
+        present = th.tensor(
             [bool(len(pool)) for pool in available], device=weights.device,
         )
+        # Keep the total aerial share when only one type is represented.
+        if present[:2].any():
+            weights[:2] *= 2 / present[:2].sum()
+        weights *= present
         if not bool(weights.sum()):
             raise ValueError("no eligible curated aerial, dribble, flick, or driving windows")
         return weights / weights.sum()
@@ -1902,7 +1963,7 @@ class FactorizedSceneDiscriminator(nn.Module):
 
 
 class CuratedReplayResetTransform:
-    """Draw only safe states from the same aerial/control/driving expert clips."""
+    """Draw safe states from balanced aerial-touch, carry and ground skill clips."""
 
     def __init__(self, expert: ExpertSceneDataset) -> None:
         if not expert.skill_sampling or expert._curated_reset_pools is None:
@@ -2122,43 +2183,79 @@ class SceneDiscriminatorLoss:
         )
 
 
-def generated_maneuver_pools(
-    windows: th.Tensor,
-    indices: th.Tensor,
-    n_envs: int,
+@dataclass(frozen=True)
+class GeneratedSceneTimeline:
+    """CPU maneuver features shared by the rollout tracker and replay sampler."""
+
+    valid: np.ndarray
+    touches: np.ndarray
+    grounded: np.ndarray
+    height: np.ndarray
+    up_z: np.ndarray
+    distance: np.ndarray
+    control: np.ndarray
+
+
+def generated_scene_timeline(
+    windows: th.Tensor, indices: th.Tensor, n_envs: int,
     episode_end: th.Tensor | None = None,
-) -> tuple[list[SceneManeuver], ...]:
-    """Find complete aerial and ground-control maneuvers per valid actor timeline."""
+    ego_ball_touch: th.Tensor | None = None,
+) -> GeneratedSceneTimeline:
     if n_envs < 1 or len(windows) % n_envs:
         raise ValueError("generated windows must be time-major by actor")
     steps = len(windows) // n_envs
     if episode_end is not None and episode_end.shape != (steps, n_envs):
         raise ValueError("episode ends must match the generated actor timeline")
+    if ego_ball_touch is not None and ego_ball_touch.shape != (steps, n_envs):
+        raise ValueError("ball touches must match the generated actor timeline")
     valid = th.zeros(len(windows), dtype=th.bool, device=windows.device)
     valid[indices] = True
     if episode_end is not None:
         valid &= ~episode_end.reshape(-1)
-    timelines = valid.reshape(steps, n_envs).cpu().numpy()
     scored = windows[:, -1]
-    grounded = recovery_surface_contact(scored, windows[:, -2]).reshape(
-        steps, n_envs,
-    ).cpu().numpy()
-    height = (scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
-        steps, n_envs,
-    ).cpu().numpy()
-    up_z = scored[:, BLUE_START + 14].reshape(steps, n_envs).cpu().numpy()
-    distance = nearest_ball_distance(windows).reshape(steps, n_envs).cpu().numpy()
-    control = scored[:, list(ground_feature_indices(BLUE_START))].reshape(
-        steps, n_envs, 14,
-    ).cpu().numpy()
+    return GeneratedSceneTimeline(
+        valid=valid.reshape(steps, n_envs).cpu().numpy(),
+        touches=(ego_ball_touch.bool().cpu().numpy() if ego_ball_touch is not None
+                 else np.zeros((steps, n_envs), dtype=bool)),
+        grounded=recovery_surface_contact(scored, windows[:, -2]).reshape(
+            steps, n_envs,
+        ).cpu().numpy(),
+        height=(scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
+            steps, n_envs,
+        ).cpu().numpy(),
+        up_z=scored[:, BLUE_START + 14].reshape(steps, n_envs).cpu().numpy(),
+        distance=nearest_ball_distance(windows).reshape(steps, n_envs).cpu().numpy(),
+        control=scored[:, list(ground_feature_indices(BLUE_START))].reshape(
+            steps, n_envs, 14,
+        ).cpu().numpy(),
+    )
+
+
+def generated_maneuver_pools(
+    windows: th.Tensor,
+    indices: th.Tensor,
+    n_envs: int,
+    episode_end: th.Tensor | None = None,
+    *,
+    ego_ball_touch: th.Tensor | None = None,
+    timeline: GeneratedSceneTimeline | None = None,
+) -> tuple[list[SceneManeuver], ...]:
+    """Find complete aerial and ground-control maneuvers per valid actor timeline."""
+    if timeline is None:
+        timeline = generated_scene_timeline(
+            windows, indices, n_envs, episode_end, ego_ball_touch,
+        )
+    steps = len(windows) // n_envs
+    timelines = timeline.valid
+    scenes = windows.reshape(steps, n_envs, *windows.shape[1:])
     groups: list[list[SceneManeuver]] = [[] for _ in range(N_SITUATIONS)]
     for actor in range(n_envs):
         if timelines[:, actor].sum() < 4:
             continue
         for maneuver in (*air_maneuvers(
-            timelines[:, actor], grounded[:, actor], height[:, actor],
-            up_z[:, actor], distance[:, actor],
-        ), *ground_maneuvers(timelines[:, actor], control[:, actor])):
+            timelines[:, actor], timeline.grounded[:, actor], timeline.height[:, actor],
+            timeline.up_z[:, actor], timeline.distance[:, actor],
+        ), *ground_maneuvers(timelines[:, actor], timeline.control[:, actor])):
             if (isinstance(maneuver, AirManeuver)
                     and maneuver.recovery_stop - maneuver.action_stop < AERIAL_MIN_CONTEXT_STEPS):
                 continue
@@ -2168,6 +2265,12 @@ def generated_maneuver_pools(
             if (timelines[-1, actor] and maneuver.recovery_stop == steps
                     and maneuver.recovery_stop - maneuver.action_stop < recovery_steps):
                 continue
+            if isinstance(maneuver, AirManeuver):
+                maneuver = replace(
+                    maneuver, skill_category=generated_air_skill(
+                        scenes[:, actor], maneuver, timeline.touches[:, actor],
+                    ),
+                )
             groups[maneuver.situation].append(replace(
                 maneuver,
                 setup_start=maneuver.setup_start * n_envs + actor,
@@ -2245,6 +2348,7 @@ class PendingAirManeuver:
     height: np.ndarray
     up_z: np.ndarray
     distance: np.ndarray
+    touches: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -2284,35 +2388,27 @@ class GeneratedManeuverTracker:
     def feed(
         self, windows: th.Tensor, indices: th.Tensor, n_envs: int,
         episode_end: th.Tensor | None = None,
+        *, ego_ball_touch: th.Tensor | None = None,
+        timeline: GeneratedSceneTimeline | None = None,
     ) -> None:
         """Accumulate train-split maneuvers; a reset or invalid window breaks one."""
-        if n_envs < 1 or len(windows) % n_envs:
-            raise ValueError("generated windows must be time-major by actor")
+        if timeline is None:
+            timeline = generated_scene_timeline(
+                windows, indices, n_envs, episode_end, ego_ball_touch,
+            )
         steps = len(windows) // n_envs
-        if episode_end is not None and episode_end.shape != (steps, n_envs):
-            raise ValueError("episode ends must match the generated actor timeline")
+        touches = timeline.touches
         if self.n_envs != n_envs:
             self.n_envs = n_envs
             self.pending.clear()
             self.pending_ground.clear()
             self.clear_ready()
-        valid = th.zeros(len(windows), dtype=th.bool, device=windows.device)
-        valid[indices] = True
-        if episode_end is not None:
-            valid &= ~episode_end.reshape(-1)
-        valid = valid.reshape(steps, n_envs).cpu().numpy()
-        scored = windows[:, -1]
-        grounded = recovery_surface_contact(scored, windows[:, -2]).reshape(
-            steps, n_envs,
-        ).cpu().numpy()
-        height = (scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
-            steps, n_envs,
-        ).cpu().numpy()
-        up_z = scored[:, BLUE_START + 14].reshape(steps, n_envs).cpu().numpy()
-        distance = nearest_ball_distance(windows).reshape(steps, n_envs).cpu().numpy()
-        control = scored[:, list(ground_feature_indices(BLUE_START))].reshape(
-            steps, n_envs, 14,
-        ).cpu().numpy()
+        valid = timeline.valid
+        grounded = timeline.grounded
+        height = timeline.height
+        up_z = timeline.up_z
+        distance = timeline.distance
+        control = timeline.control
         scenes = windows.reshape(steps, n_envs, *windows.shape[1:])
 
         previous = self.pending
@@ -2327,6 +2423,7 @@ class GeneratedManeuverTracker:
             z = np.concatenate((partial.height, height[:count, actor]))
             up = np.concatenate((partial.up_z, up_z[:count, actor]))
             near = np.concatenate((partial.distance, distance[:count, actor]))
+            touch_events = np.concatenate((partial.touches, touches[:count, actor]))
             completed = next((flight for flight in air_maneuvers(
                 np.ones(len(joined), dtype=bool), on_ground, z, up, near,
             ) if flight.action_start == partial.action_start), None)
@@ -2334,10 +2431,15 @@ class GeneratedManeuverTracker:
                     completed.recovery_stop - completed.action_stop >= AERIAL_MIN_CONTEXT_STEPS
                     and (completed.recovery_stop - completed.action_stop >= AERIAL_RECOVERY_STEPS
                          or completed.recovery_stop < len(joined) or count < steps)):
-                self._archive(joined, completed)
+                self._archive(joined, replace(
+                    completed, skill_category=generated_air_skill(
+                        joined, completed, touch_events,
+                    ),
+                ))
             elif count == steps and len(joined) < MANEUVER_MAX_TRACKED_STEPS:
                 self.pending[actor] = PendingAirManeuver(
                     joined, partial.action_start, on_ground, z, up, near,
+                    touch_events,
                 )
 
         previous_ground = self.pending_ground
@@ -2395,6 +2497,7 @@ class GeneratedManeuverTracker:
                 scenes[setup:, actor].detach().clone(), takeoff - setup,
                 grounded[setup:, actor].copy(), height[setup:, actor].copy(),
                 up_z[setup:, actor].copy(), distance[setup:, actor].copy(),
+                touches[setup:, actor].copy(),
             )
 
         carrying = dribble_control_mask(control) & valid
@@ -2470,6 +2573,8 @@ class SceneGAIFOMinibatches:
         self, windows: th.Tensor, indices: th.Tensor, n_envs: int,
         episode_end: th.Tensor | None,
         archived_flights: tuple[list[CompletedSceneManeuver], ...] | None,
+        ego_ball_touch: th.Tensor | None,
+        timeline: GeneratedSceneTimeline | None,
     ):
         """Pair curated experts by exact scene bin or complete-maneuver phase."""
         if not len(indices):
@@ -2477,7 +2582,10 @@ class SceneGAIFOMinibatches:
         expert_groups = self.expert.curated_labeled_pools()
         weights = self.expert.curated_weights()
         agent_flights = (
-            generated_maneuver_pools(windows, indices, n_envs, episode_end)
+            generated_maneuver_pools(
+                windows, indices, n_envs, episode_end,
+                ego_ball_touch=ego_ball_touch, timeline=timeline,
+            )
             if self.factorize else tuple([] for _ in range(N_SITUATIONS))
         )
         archived_windows = None
@@ -2503,13 +2611,21 @@ class SceneGAIFOMinibatches:
             if saved:
                 archived_windows = th.cat(saved)
         expert_flights = self.expert._curated_maneuvers[False]
-        aligned_labels = [
-            [label for label in range(6, N_SITUATIONS)
-             if (0 if label < GROUND_MANEUVER_START else
-                 label - GROUND_MANEUVER_START + 1) == category
-             and agent_flights[label] and expert_flights[label]]
-            for category in range(3)
-        ]
+        aligned_flights = [[] for _ in range(DRIVING_SKILL)]
+        for label in range(6, N_SITUATIONS):
+            if label < GROUND_MANEUVER_START:
+                for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL):
+                    agents = [clip for clip in agent_flights[label]
+                              if clip.skill_category == category]
+                    experts = [clip for clip in expert_flights[label]
+                               if clip.skill_category == category]
+                    if agents and experts:
+                        aligned_flights[category].append((agents, experts))
+            else:
+                if agent_flights[label] and expert_flights[label]:
+                    aligned_flights[DRIBBLE_SKILL + label - GROUND_MANEUVER_START].append((
+                        agent_flights[label], expert_flights[label],
+                    ))
         for _ in range(self.epochs):
             shuffled = indices[th.randperm(len(indices), device=indices.device)]
             for start in range(0, len(shuffled), self.batch_size):
@@ -2571,21 +2687,24 @@ class SceneGAIFOMinibatches:
                 # Keep full takeoff/carry -> action -> recovery alignment when
                 # the policy has completed a maneuver. The remaining examples
                 # are still matched by scene bin to the same curated pools.
-                for category, labels in enumerate(aligned_labels):
-                    if not labels:
+                for category, flight_groups in enumerate(aligned_flights):
+                    if not flight_groups:
                         continue
                     positions = (categories == category).nonzero(as_tuple=True)[0]
                     budget = len(positions) // 4
                     consumed = 0
                     while budget - consumed >= 4:
-                        label = labels[th.randint(
-                            len(labels), (1,), device=agents.device,
+                        # These are Python list indices, not GPU tensor indices.
+                        # Draw on the CPU rather than synchronizing CUDA for
+                        # every clip choice during discriminator training.
+                        agent_group, expert_group = flight_groups[th.randint(
+                            len(flight_groups), (1,), device="cpu",
                         ).item()]
-                        agent_clip = agent_flights[label][th.randint(
-                            len(agent_flights[label]), (1,), device=agents.device,
+                        agent_clip = agent_group[th.randint(
+                            len(agent_group), (1,), device="cpu",
                         ).item()]
-                        expert_clip = expert_flights[label][th.randint(
-                            len(expert_flights[label]), (1,), device=agents.device,
+                        expert_clip = expert_group[th.randint(
+                            len(expert_group), (1,), device="cpu",
                         ).item()]
                         agent_ids, expert_pairs = aligned_maneuver_windows(
                             agent_clip, expert_clip, budget - consumed,
@@ -2622,7 +2741,8 @@ class SceneGAIFOMinibatches:
                     "skill_category": th.cat((categories, categories)),
                     "situation_matched": th.cat((exactly_matched, exactly_matched)),
                     "phase_aligned": th.cat((phase_aligned, phase_aligned)),
-                    "grounded_random": th.cat((categories == 3, categories == 3)),
+                    "grounded_random": th.cat((categories == DRIVING_SKILL,
+                                                categories == DRIVING_SKILL)),
                 })
             if self._epoch_callback is not None:
                 self._epoch_callback()
@@ -2635,10 +2755,13 @@ class SceneGAIFOMinibatches:
         n_envs: int = 1,
         episode_end: th.Tensor | None = None,
         archived_flights: tuple[list[CompletedSceneManeuver], ...] | None = None,
+        ego_ball_touch: th.Tensor | None = None,
+        timeline: GeneratedSceneTimeline | None = None,
     ):
         if self.expert.skill_sampling:
             yield from self._sample_curated_windows(
                 windows, indices, n_envs, episode_end, archived_flights,
+                ego_ball_touch, timeline,
             )
             return
         agent_groups: list[th.Tensor] = [indices[:0] for _ in range(N_SITUATIONS)]
@@ -2666,7 +2789,7 @@ class SceneGAIFOMinibatches:
             ]
             grounded_expert_available = len(self.expert._grounded_choices()[0]) > 0
             agent_flights = generated_maneuver_pools(
-                windows, indices, n_envs, episode_end,
+                windows, indices, n_envs, episode_end, timeline=timeline,
             )
             if archived_flights is not None:
                 if len(archived_flights) != N_SITUATIONS:
@@ -3178,9 +3301,15 @@ class AdaptiveDiscriminatorUpdate:
         truncated = batch.get("truncated")
         if truncated is not None:
             terminal = truncated.bool() if terminal is None else terminal.bool() | truncated.bool()
+        touch_events = batch.get("ego_ball_touch")
+        timeline = None
         if self.maneuver_tracker is not None:
+            timeline = generated_scene_timeline(
+                flat_windows, train_indices, valid.shape[1], terminal, touch_events,
+            )
             self.maneuver_tracker.feed(
                 flat_windows, train_indices, valid.shape[1], terminal,
+                timeline=timeline,
             )
         heldout_generated = flat_windows[heldout_indices]
         heldout_near = None
@@ -3190,7 +3319,11 @@ class AdaptiveDiscriminatorUpdate:
                 nearest_ball_distance(heldout_generated) <= BALL_NEAR_DISTANCE
             ]
 
-        evaluation = self._evaluate(heldout_generated, heldout_near)
+        # Use the same held-out examples to check every minibatch in this update.
+        # Resampling and gathering the full validation set on every check was
+        # nearly as costly as training the discriminator itself.
+        validation = self._heldout_pairs(heldout_generated, heldout_near)
+        evaluation = self._evaluate(heldout_generated, heldout_near, validation=validation)
         if self._has_updated:
             self._rollouts_since_update += 1
         scheduled = (
@@ -3224,6 +3357,7 @@ class AdaptiveDiscriminatorUpdate:
                     flat_windows, train_indices, n_envs=valid.shape[1], episode_end=terminal,
                     archived_flights=(self.maneuver_tracker.ready
                                       if self.maneuver_tracker is not None else None),
+                    ego_ball_touch=touch_events, timeline=timeline,
                 ):
                     minibatch_metrics = train_discriminator_minibatch(
                         sample, self.discriminator, self.optimizer, self.loss,
@@ -3234,7 +3368,9 @@ class AdaptiveDiscriminatorUpdate:
                         metric_totals[key] = metric_totals.get(key, 0.0) + value
                     minibatch_count += 1
 
-                    evaluation = self._evaluate(heldout_generated, heldout_near)
+                    evaluation = self._evaluate(
+                        heldout_generated, heldout_near, validation=validation,
+                    )
                     if evaluation["heldout_accuracy"] >= self.accuracy_target:
                         metrics["updated"] = 1.0
                         break
@@ -3328,14 +3464,35 @@ class AdaptiveDiscriminatorUpdate:
             th.nonzero(heldout_mask, as_tuple=False).squeeze(-1),
         )
 
+    def _heldout_pairs(
+        self, heldout_generated: th.Tensor, heldout_near: th.Tensor | None,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor | None, th.Tensor | None] | None:
+        n = min(len(heldout_generated), self.expert.heldout_total, self.heldout_size)
+        if not n:
+            return None
+        device = heldout_generated.device
+        generated = heldout_generated[th.randperm(len(heldout_generated), device=device)[:n]]
+        expert = self.expert.sample_heldout(n, device)
+        near_generated = near_expert = None
+        if (getattr(self.discriminator, "factorized", False)
+                and heldout_near is not None and len(heldout_near)):
+            n_near = min(len(heldout_near), self.heldout_size)
+            near_generated = heldout_near[
+                th.randperm(len(heldout_near), device=device)[:n_near]
+            ]
+            near_expert = self.expert.sample_near(n_near, device, heldout=True)
+        return generated, expert, near_generated, near_expert
+
     def _evaluate(
         self, heldout_generated: th.Tensor, heldout_near: th.Tensor | None = None,
+        *, validation: tuple[th.Tensor, th.Tensor, th.Tensor | None, th.Tensor | None]
+        | None = None,
     ) -> dict[str, float]:
-        n_gen = len(heldout_generated)
-        n_exp = self.expert.heldout_total
+        if validation is None:
+            validation = self._heldout_pairs(heldout_generated, heldout_near)
         factorize = getattr(self.discriminator, "factorized", False)
         head_names = ("car", "ball") if factorize else ("unified",)
-        if n_gen == 0 or n_exp == 0:
+        if validation is None:
             metrics = {
                 "loss": 0.0,
                 "agent_score": 0.0,
@@ -3348,34 +3505,46 @@ class AdaptiveDiscriminatorUpdate:
                 metrics.update({f"{name}_heldout_accuracy": 0.0 for name in head_names})
             return metrics
 
-        n = min(n_gen, n_exp, self.heldout_size)
-        gen_indices = th.randperm(n_gen, device=heldout_generated.device)[:n]
-        totals = th.zeros(5, len(head_names), device=heldout_generated.device)
+        generated, expert, near_generated, near_expert = validation
+        n = len(generated)
+        totals = th.zeros(5, len(head_names), device=generated.device)
 
-        with th.no_grad():
+        was_training = self.discriminator.training
+        with th.inference_mode():
             self.discriminator.eval()
-            for start in range(0, n, self.microbatch_size):
-                stop = min(start + self.microbatch_size, n)
-                generated = heldout_generated[gen_indices[start:stop]]
-                expert = self.expert.sample_heldout(
-                    stop - start, heldout_generated.device
-                )
-                generated_logits = self.discriminator(
-                    add_scene_noise(generated, self.noise_std)
-                )
-                expert_logits = self.discriminator(
-                    add_scene_noise(expert, self.noise_std)
-                )
-                if not factorize:
-                    generated_logits = generated_logits[:, None]
-                    expert_logits = expert_logits[:, None]
-                totals[0] += F.softplus(-generated_logits).sum(dim=0)
-                totals[0] += F.softplus(expert_logits).sum(dim=0)
-                totals[1] += th.sigmoid(generated_logits).sum(dim=0)
-                totals[2] += th.sigmoid(expert_logits).sum(dim=0)
-                totals[3] += (generated_logits > 0.0).sum(dim=0)
-                totals[4] += (expert_logits <= 0.0).sum(dim=0)
-        self.discriminator.train()
+            try:
+                for start in range(0, n, self.microbatch_size):
+                    stop = min(start + self.microbatch_size, n)
+                    logits = self.discriminator(add_scene_noise(
+                        th.cat((generated[start:stop], expert[start:stop])),
+                        self.noise_std,
+                    ))
+                    generated_logits, expert_logits = logits.split(stop - start)
+                    if not factorize:
+                        generated_logits = generated_logits[:, None]
+                        expert_logits = expert_logits[:, None]
+                    totals[0] += F.softplus(-generated_logits).sum(dim=0)
+                    totals[0] += F.softplus(expert_logits).sum(dim=0)
+                    totals[1] += th.sigmoid(generated_logits).sum(dim=0)
+                    totals[2] += th.sigmoid(expert_logits).sum(dim=0)
+                    totals[3] += (generated_logits > 0.0).sum(dim=0)
+                    totals[4] += (expert_logits <= 0.0).sum(dim=0)
+                near_accuracy = None
+                if factorize and near_generated is not None:
+                    n_near = len(near_generated)
+                    near_correct = th.zeros(2, device=generated.device)
+                    for start in range(0, n_near, self.microbatch_size):
+                        stop = min(start + self.microbatch_size, n_near)
+                        logits = self.discriminator(add_scene_noise(
+                            th.cat((near_generated[start:stop], near_expert[start:stop])),
+                            self.noise_std,
+                        ))[:, 1]
+                        generated_logit, expert_logit = logits.split(stop - start)
+                        near_correct[0] += (generated_logit > 0).sum()
+                        near_correct[1] += (expert_logit <= 0).sum()
+                    near_accuracy = near_correct.sum().item() / (2 * n_near)
+            finally:
+                self.discriminator.train(was_training)
         loss, agent_score, expert_score, agent_correct, expert_correct = totals.tolist()
         head_accuracies = [
             (agent_correct[index] + expert_correct[index]) / (2 * n)
@@ -3394,28 +3563,7 @@ class AdaptiveDiscriminatorUpdate:
                 f"{name}_heldout_accuracy": head_accuracies[index]
                 for index, name in enumerate(head_names)
             })
-            n_near = min(len(heldout_near), self.heldout_size) if heldout_near is not None else 0
-            if n_near:
-                near_indices = th.randperm(len(heldout_near), device=heldout_near.device)[:n_near]
-                near_correct = th.zeros(2, device=heldout_generated.device)
-                with th.no_grad():
-                    self.discriminator.eval()
-                    for start in range(0, n_near, self.microbatch_size):
-                        stop = min(start + self.microbatch_size, n_near)
-                        generated = heldout_near[near_indices[start:stop]]
-                        expert = self.expert.sample_near(
-                            stop - start, heldout_generated.device, heldout=True,
-                        )
-                        generated_logit = self.discriminator(
-                            add_scene_noise(generated, self.noise_std)
-                        )[:, 1]
-                        expert_logit = self.discriminator(
-                            add_scene_noise(expert, self.noise_std)
-                        )[:, 1]
-                        near_correct[0] += (generated_logit > 0).sum()
-                        near_correct[1] += (expert_logit <= 0).sum()
-                self.discriminator.train()
-                near_accuracy = near_correct.sum().item() / (2 * n_near)
+            if near_accuracy is not None:
                 metrics["ball_near_heldout_accuracy"] = near_accuracy
                 metrics["heldout_accuracy"] = min(metrics["heldout_accuracy"], near_accuracy)
         return metrics
@@ -4124,7 +4272,7 @@ def build_runner(
         captures.append(CriticCapture(critic))
     if gameplay is not None:
         captures.append(AdvancedTouchCapture(gameplay))
-        if getattr(args, "ase_diversity", False):
+        if getattr(args, "ase_diversity", False) or getattr(args, "factorize", False):
             captures.append(ASEBallTouchCapture(gameplay))
     captures.append(SceneWindowCapture(args.trajectory_length))
     return Runner(env, policy, buffer, captures=captures)
