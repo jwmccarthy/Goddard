@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Goddard · Expert Signal</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #09121d;
+      --panel: #101e2b;
+      --panel-soft: #152636;
+      --line: #29404b;
+      --text: #e8f1ee;
+      --muted: #8ea6ae;
+      --accent: #7aead2;
+      --warning: #fba083;
+      --blue: #5e9dfb;
+      --orange: #ff955b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+    button, select, input { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
+    .eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: .16em; font-size: 10px; font-weight: 800; }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); }
+    .topbar {
+      display: flex; align-items: center; gap: 18px; min-height: 78px;
+      padding: 13px 24px; border-bottom: 1px solid var(--line);
+      background: #0c1925;
+    }
+    .brand { display: flex; gap: 12px; align-items: center; min-width: 290px; }
+    .brand-mark {
+      display: grid; place-items: center; width: 39px; height: 39px;
+      border: 1px solid #83d5c5; border-radius: 12px 3px 12px 3px;
+      color: var(--accent); font: 900 19px var(--mono);
+      box-shadow: 0 0 28px #5acbb21c;
+    }
+    .brand strong { display: block; font-size: 17px; letter-spacing: -.04em; }
+    .brand small { display: block; margin-top: 2px; color: var(--muted); font: 600 10px var(--mono); }
+    .checkpoint-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 0; }
+    .checkpoint-controls select { width: min(360px, 30vw); }
+    .checkpoint-controls button { white-space: nowrap; }
+    select, input[type=search] {
+      border: 1px solid var(--line); border-radius: 9px;
+      background: #122431; color: var(--text); min-height: 36px; padding: 6px 10px;
+    }
+    select:hover, input[type=search]:hover { border-color: #547786; }
+    .button {
+      min-height: 36px; padding: 7px 13px; border: 1px solid #36595c;
+      border-radius: 9px; background: #193834; color: var(--accent);
+      font-size: 12px; font-weight: 700;
+    }
+    .button:hover { background: #225149; }
+    .button.secondary { background: #1a2938; color: var(--text); border-color: var(--line); }
+    .button.secondary:hover { background: #263c4b; }
+    .status-pill {
+      display: flex; align-items: center; gap: 7px; min-width: 130px; max-width: 230px;
+      padding: 8px 11px; border: 1px solid var(--line); border-radius: 30px;
+      color: var(--muted); font: 700 11px var(--mono); white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .status-pill::before { content: ""; width: 7px; height: 7px; flex: none; border-radius: 50%; background: #cfab5f; }
+    .status-pill.ready::before { background: var(--accent); box-shadow: 0 0 9px var(--accent); }
+    .status-pill.error::before { background: var(--warning); }
+    .layout { display: grid; grid-template-columns: 320px minmax(420px, 1fr) 275px; height: calc(100dvh - 78px); min-height: 600px; }
+    .sidebar {
+      display: flex; flex-direction: column; min-height: 0;
+      padding: 23px 17px; border-right: 1px solid var(--line); background: var(--panel);
+    }
+    .sidebar h1 { margin: 5px 0 4px; font-size: 25px; letter-spacing: -.06em; line-height: 1.1; }
+    .sidebar .intro { margin: 0 0 17px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .skills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 15px; }
+    .skill-button {
+      padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px;
+      background: #152735; color: var(--muted); font-size: 11px; font-weight: 700;
+    }
+    .skill-button:hover { border-color: var(--accent); color: var(--text); }
+    .skill-button.active { border-color: var(--accent); background: #28554c; color: #e7fff9; }
+    .filters { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .filters label { display: grid; gap: 5px; color: var(--muted); font: 700 10px var(--mono); }
+    .filters select { width: 100%; font-size: 12px; }
+    .filters .wide { grid-column: 1 / -1; }
+    .filter-search { width: 100%; margin: 10px 0 14px; font-size: 12px; }
+    .result-count {
+      display: flex; justify-content: space-between; margin-bottom: 9px;
+      color: var(--muted); font: 700 10px var(--mono); text-transform: uppercase; letter-spacing: .09em;
+    }
+    .sequence-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; flex: 1; padding-right: 4px; }
+    .sequence-list::-webkit-scrollbar { width: 5px; }
+    .sequence-list::-webkit-scrollbar-thumb { background: #355061; border-radius: 8px; }
+    .sequence-item {
+      width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px;
+      background: #152635; color: var(--text); text-align: left;
+    }
+    .sequence-item:hover { border-color: #77aaaf; background: #1c3140; }
+    .sequence-item.selected { border-color: var(--accent); background: #1c383d; box-shadow: inset 3px 0 var(--accent); }
+    .item-top, .item-bottom { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .item-skill { font: 800 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+    .item-score { font: 800 20px var(--mono); letter-spacing: -.07em; }
+    .item-score.error { color: var(--warning); }
+    .item-score.good { color: var(--accent); }
+    .item-source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: 11px var(--mono); }
+    .item-bottom { margin-top: 6px; color: var(--muted); font: 10px var(--mono); }
+    .chip { padding: 3px 6px; border-radius: 5px; background: #294252; color: #bdd5d5; }
+    .chip.heldout { background: #5b3d32; color: #ffd4b7; }
+    #loadMore { width: 100%; margin-top: 9px; }
+    .workspace { display: grid; grid-template-rows: minmax(340px, 1fr) 245px; min-width: 0; min-height: 0; background: #0b1924; }
+    .stage { position: relative; overflow: hidden; min-height: 0; background: radial-gradient(ellipse at 50% 54%, #193240, #0b1824 72%); }
+    #view { position: absolute; inset: 0; }
+    .stage-top { position: absolute; z-index: 2; top: 20px; left: 23px; right: 23px; pointer-events: none; }
+    .stage-top h2 { margin: 4px 0 0; font-size: clamp(17px, 2vw, 23px); letter-spacing: -.045em; }
+    .stage-top p { margin: 5px 0 0; color: #a4c2c6; font: 11px var(--mono); }
+    .stage-bottom {
+      position: absolute; z-index: 2; left: 20px; right: 20px; bottom: 18px;
+      padding: 13px 15px; background: #0b1720e8; border: 1px solid #42617199;
+      border-radius: 13px; backdrop-filter: blur(9px);
+    }
+    .playback-top { display: flex; align-items: center; gap: 11px; }
+    .playback-top button { border: 0; background: #254e4a; color: var(--accent); width: 36px; height: 34px; border-radius: 8px; font-size: 16px; }
+    .playback-top button:hover { background: #337367; }
+    .playback-top input { flex: 1; min-width: 0; accent-color: var(--accent); cursor: pointer; }
+    .playback-top output { min-width: 89px; color: var(--text); font: 12px var(--mono); text-align: right; }
+    .playback-bottom { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 7px; color: var(--muted); font: 11px var(--mono); }
+    .playback-bottom button { background: none; border: none; color: var(--accent); font: inherit; }
+    .analysis { padding: 18px 24px 14px; border-top: 1px solid var(--line); min-height: 0; }
+    .analysis-header { display: flex; gap: 20px; align-items: start; justify-content: space-between; }
+    .analysis h2 { margin: 4px 0 0; font-size: 17px; letter-spacing: -.035em; }
+    .metrics { display: flex; gap: 20px; flex-wrap: wrap; }
+    .metric { display: grid; gap: 3px; min-width: 77px; }
+    .metric span { color: var(--muted); font: 700 9px var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+    .metric strong { font: 800 20px var(--mono); }
+    .metric strong.warning { color: var(--warning); }
+    .chart-wrap { position: relative; height: 112px; margin-top: 12px; }
+    #scoreChart { display: block; width: 100%; height: 100%; cursor: crosshair; }
+    #chartTooltip {
+      position: absolute; z-index: 5; display: none; pointer-events: none;
+      padding: 7px 9px; border: 1px solid #4a6975; border-radius: 7px;
+      background: #0a1923; color: var(--text); font: 11px var(--mono);
+    }
+    .chart-legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font: 10px var(--mono); }
+    .swatch { display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 2px; background: var(--warning); }
+    .swatch.good { background: var(--accent); }
+    .swatch.action { background: #34618b; }
+    .details { padding: 23px 19px; border-left: 1px solid var(--line); background: var(--panel); overflow: auto; }
+    .details h2 { margin: 8px 0 5px; font-size: 21px; letter-spacing: -.055em; text-transform: capitalize; }
+    .details .file { overflow-wrap: anywhere; font: 11px/1.5 var(--mono); color: #b6d7d6; }
+    .divider { border: 0; border-top: 1px solid var(--line); margin: 22px 0; }
+    .detail-row { display: flex; align-items: start; justify-content: space-between; gap: 10px; margin: 12px 0; font-size: 12px; }
+    .detail-row span { color: var(--muted); }
+    .detail-row strong { font: 700 11px var(--mono); text-align: right; }
+    .phase-bar { display: flex; height: 8px; border-radius: 6px; overflow: hidden; background: #2f4950; }
+    .phase-bar i { display: block; background: #447e7b; }
+    .phase-bar i.action { background: #749ddf; }
+    .phase-bar i.recovery { background: #8a6974; }
+    .phase-key { display: flex; justify-content: space-between; margin: 7px 0 0; color: var(--muted); font: 10px var(--mono); }
+    .note { color: var(--muted); font-size: 11px; line-height: 1.65; }
+    .scan-screen {
+      position: absolute; z-index: 4; display: grid; place-items: center; inset: 0;
+      background: #091722bb; backdrop-filter: blur(6px); padding: 22px;
+    }
+    .scan-screen.hidden { display: none; }
+    .scan-card { width: min(390px, 100%); padding: 25px; border: 1px solid #49667a; border-radius: 15px; background: #152735f5; box-shadow: 0 20px 60px #050d16bb; }
+    .scan-card h2 { margin: 8px 0 7px; letter-spacing: -.04em; }
+    .scan-card p { color: var(--muted); font: 12px/1.5 var(--mono); overflow-wrap: anywhere; }
+    .progress { height: 6px; margin: 19px 0 0; border-radius: 6px; background: #344653; overflow: hidden; }
+    .progress b { display: block; width: 8%; height: 100%; background: var(--accent); transition: width 250ms ease; }
+    @media (max-width: 1190px) {
+      .layout {
+        grid-template-columns: 290px minmax(390px, 1fr);
+        grid-template-rows: minmax(600px, 1fr) auto;
+        height: auto; min-height: calc(100dvh - 78px);
+      }
+      .sidebar { grid-row: 1 / 3; }
+      .details { grid-column: 2; border-top: 1px solid var(--line); }
+      .brand { min-width: 210px; }
+    }
+    @media (max-width: 760px) {
+      .topbar { flex-wrap: wrap; gap: 10px; padding: 12px; }
+      .brand { min-width: 0; flex: 1; }
+      .checkpoint-controls { width: 100%; margin: 0; }
+      .checkpoint-controls select { width: 100%; flex: 1; }
+      .status-pill { max-width: 130px; min-width: 105px; font-size: 10px; }
+      .layout { display: flex; flex-direction: column; height: auto; min-height: 0; }
+      .sidebar { height: 380px; flex: none; border-right: 0; border-bottom: 1px solid var(--line); }
+      .workspace { height: 710px; flex: none; grid-template-rows: minmax(340px, 1fr) 250px; }
+      .details { border-left: 0; }
+      .analysis { padding: 14px; }
+      .metrics { gap: 9px; }
+      .metric { min-width: 62px; }
+      .metric strong { font-size: 16px; }
+      .stage-top { top: 12px; left: 13px; }
+      .stage-bottom { left: 10px; right: 10px; bottom: 10px; }
+    }
+  </style>
+  <script type="importmap">
+    {"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><div class="brand-mark">G</div><div><strong>Expert Signal</strong><small>GODDARD · DISCRIMINATOR LAB</small></div></div>
+    <div class="checkpoint-controls">
+      <select id="checkpointSelect" aria-label="GAIFO checkpoint"></select>
+      <button class="button secondary" id="scanSelected" title="Score the selected checkpoint">Load</button>
+      <button class="button" id="scanLatest" title="Score the latest GAIFO checkpoint">Latest ↗</button>
+    </div>
+    <div id="statusPill" class="status-pill" aria-live="polite">Starting…</div>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="eyebrow">01 / Replay catalog</div>
+      <h1>Find the blind spots.</h1>
+      <p class="intro">Complete expert plays ranked by how strongly the discriminator calls them agent play.</p>
+      <nav class="skills" aria-label="Sequence skill">
+        <button class="skill-button active" data-skill="all">All skills</button>
+        <button class="skill-button" data-skill="aerial">Aerial</button>
+        <button class="skill-button" data-skill="dribble">Dribble</button>
+        <button class="skill-button" data-skill="flick">Flick</button>
+        <button class="skill-button" data-skill="driving">Driving</button>
+      </nav>
+      <div class="filters">
+        <label>DATA SPLIT<select id="splitSelect"><option value="all">All splits</option><option value="heldout">Held-out</option><option value="train">Training</option></select></label>
+        <label>SCORE HEAD<select id="headSelect"><option value="combined">Combined</option></select></label>
+        <label class="wide">RANK BY<select id="orderSelect"><option value="most">Most misclassified · average</option><option value="least">Least misclassified · average</option><option value="misses">Most windows misclassified</option><option value="peak">Highest single-window error</option></select></label>
+      </div>
+      <input id="searchInput" class="filter-search" type="search" placeholder="Search replay name or ID…" aria-label="Search replay name or sequence ID">
+      <div class="result-count"><span id="resultCount">Waiting for results</span><span id="scannedCount">—</span></div>
+      <div id="sequenceList" class="sequence-list" aria-label="Ranked expert sequences"></div>
+      <button id="loadMore" class="button secondary" hidden>Load more</button>
+    </aside>
+    <main class="workspace">
+      <section class="stage">
+        <div id="view" aria-label="3D replay of the selected expert sequence"></div>
+        <div class="stage-top"><div class="eyebrow">02 / Expert replay</div><h2 id="stageTitle">Select a sequence</h2><p id="stageSubtitle">Orbit: drag · Zoom: scroll · Playback: space / arrow keys</p></div>
+        <div class="stage-bottom">
+          <div class="playback-top"><button id="playButton" title="Play or pause (space)">▶</button><input id="frameSlider" type="range" min="0" max="0" value="0" aria-label="Replay frame"><output id="frameTime">0.00 s</output></div>
+          <div class="playback-bottom"><span id="frameLabel">No replay selected</span><button id="speedButton" title="Change playback speed">1× speed</button></div>
+        </div>
+        <div class="scan-screen" id="scanScreen" aria-live="polite"><div class="scan-card"><div class="eyebrow">Analyzing replay evidence</div><h2 id="scanTitle">Loading checkpoint…</h2><p id="scanText">The catalog will appear as soon as expert sequences are scored.</p><div class="progress"><b id="scanProgress"></b></div></div></div>
+      </section>
+      <section class="analysis">
+        <div class="analysis-header"><div><div class="eyebrow">03 / Classifier confidence</div><h2>Expert called agent <span class="muted">· per window</span></h2></div>
+          <div class="metrics"><div class="metric"><span>Avg P(agent)</span><strong id="meanScore">—</strong></div><div class="metric"><span>False negatives</span><strong id="missScore">—</strong></div><div class="metric"><span>Peak P(agent)</span><strong id="peakScore">—</strong></div></div>
+        </div>
+        <div class="chart-wrap"><canvas id="scoreChart" role="img" aria-label="Discriminator P(agent) for each expert window"></canvas><div id="chartTooltip"></div></div>
+        <div class="chart-legend"><span><i class="swatch"></i>Misclassified &gt; 50%</span><span><i class="swatch good"></i>Recognized expert</span><span><i class="swatch action"></i>Skill action</span></div>
+      </section>
+    </main>
+    <aside class="details">
+      <div class="eyebrow">04 / Sequence notes</div>
+      <h2 id="clipTitle">No selection</h2>
+      <div id="clipSource" class="file">Choose a play to inspect its source and decision trace.</div>
+      <hr class="divider">
+      <div class="detail-row"><span>Expert POV</span><strong id="clipActor">—</strong></div>
+      <div class="detail-row"><span>Dataset split</span><strong id="clipSplit">—</strong></div>
+          <div class="detail-row"><span>Dataset rows</span><strong id="clipRows">—</strong></div>
+      <div class="detail-row"><span>Duration</span><strong id="clipDuration">—</strong></div>
+      <div class="detail-row"><span>At playhead</span><strong id="clipCurrent">—</strong></div>
+      <hr class="divider">
+      <div class="eyebrow">Clip phases</div>
+      <div id="phaseBar" class="phase-bar" style="margin-top:13px"><i></i><i class="action"></i><i class="recovery"></i></div>
+      <div class="phase-key"><span>SETUP</span><span>ACTION</span><span>RECOVERY</span></div>
+      <hr class="divider">
+      <p class="note">Expert is label 0. P(agent) above 50% means this expert window was classified as generated play. The focal expert is the blue car in the 3D view, even for an orange replay POV.</p>
+      <p class="note">For factorized checkpoints, the combined score is the sigmoid of the average car and ball logits.</p>
+      <p class="note">Each score uses the checkpoint's original causal window length. Skill clips include setup, action and recovery; ordinary driving is a small sampled comparison set.</p>
+    </aside>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
