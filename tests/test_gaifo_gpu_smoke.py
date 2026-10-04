@@ -38,10 +38,17 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 rows[:, car + 2] = 17 / POSITION_SCALE[2]
                 rows[:, car + 9] = 1
                 rows[:, car + 14] = 1
+                rows[:, car + 16] = 1
+            rows[:, 137] = 1
             np.save(replays / "replay.npy", rows)
+            np.savez_compressed(
+                replays / "replay.unsafe-starts.npz",
+                unsafe=np.zeros(len(rows), dtype=bool),
+                pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+            )
             flags = [
                 "gaifo.py", "--replay-dir", str(replays),
-                "--replay-reset-fraction", "1" if hard_positive_mining else "0",
+                "--replay-reset-fraction", "1",
                 "--n-sim", "2",
                 "--rollout", "8", "--trajectory-length", "8",
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
