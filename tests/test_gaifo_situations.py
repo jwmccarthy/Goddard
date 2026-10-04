@@ -10,7 +10,8 @@ import torch as th
 from gaifo import (
     BLUE_START, CAR_SITUATIONS, DISTANCE_BANDS, ORANGE_START, POSITION_SCALE,
     ExpertSceneDataset, GeneratedManeuverTracker, SceneGAIFOMinibatches, air_maneuvers,
-    generated_maneuver_pools, opponent_view, scene_situation_ids,
+    generated_maneuver_pools, opponent_view, recovery_surface_contact,
+    scene_situation_ids,
 )
 
 
@@ -165,6 +166,68 @@ class SituationBalanceTests(unittest.TestCase):
         self.assertEqual(air_maneuvers(np.ones(len(grounded), dtype=bool),
                                        grounded, roof, np.ones(len(grounded)),
                                        distance)[0].situation, 16)
+
+    def test_flip_resets_and_ceiling_contacts_do_not_start_recovery(self):
+        frames = []
+        for step in range(36):
+            situation = "grounded" if step < 4 else ("wall" if step >= 20 else "mid_air")
+            frame = scene(700, situation, marker=step + 1)
+            frame[BLUE_START] = 4_000 / POSITION_SCALE[0]
+            frame[0] = 3_300 / POSITION_SCALE[0]
+            if step == 7:
+                frame[BLUE_START + 18] = 1  # Flip spent before ball-wheel contact.
+            if step == 8:
+                frame[BLUE_START + 16] = 1  # The ball sets the on-ground flag.
+                frame[BLUE_START + 14] = 0
+                frame[0] = 3_900 / POSITION_SCALE[0]
+            if step == 12:
+                frame[BLUE_START + 2] = frame[2] = 2_030 / POSITION_SCALE[2]
+                frame[BLUE_START + 16] = 1  # A roof contact also sets the flag.
+                frame[BLUE_START + 14] = -1
+            if step >= 20:
+                frame[BLUE_START] = 4_070 / POSITION_SCALE[0]
+            frames.append(frame)
+
+        stacked = th.stack(frames)
+        surface = recovery_surface_contact(stacked[1:], stacked[:-1])
+        self.assertFalse(bool(surface[7]))   # Flip reset at step 8, beside the wall.
+        self.assertFalse(bool(surface[11]))  # Ceiling contact at step 12.
+        self.assertTrue(bool(surface[19]))   # Physical side-wall landing at step 20.
+        self.assertTrue(bool(surface[0]))    # Floor is still a valid recovery.
+
+        windows = th.stack([
+            th.stack((frames[max(0, step - 1)], frame))
+            for step, frame in enumerate(frames)
+        ])
+        self.assertFalse(any(generated_maneuver_pools(
+            windows[:20], th.arange(20), n_envs=1,
+        )))
+        generated = [clip for pool in generated_maneuver_pools(
+            windows, th.arange(len(windows)), n_envs=1,
+        ) for clip in pool]
+        self.assertEqual(len(generated), 1)
+        self.assertEqual((generated[0].action_start, generated[0].action_stop,
+                          generated[0].recovery_stop), (4, 20, 28))
+
+        tracker = GeneratedManeuverTracker()
+        tracker.feed(windows[:20], th.arange(20), n_envs=1)
+        self.assertFalse(any(tracker.ready))
+        self.assertIn(0, tracker.pending)
+        tracker.feed(windows[20:], th.arange(len(windows) - 20), n_envs=1)
+        archived = [clip for pool in tracker.ready for clip in pool]
+        self.assertEqual(len(archived), 1)
+        self.assertEqual((archived[0].span.action_stop,
+                          archived[0].span.recovery_stop), (20, 28))
+
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            write_timeline(folder, "complete", frames)
+            write_timeline(folder, "cut-before-wall", frames[:20])
+            expert = ExpertSceneDataset(folder, trajectory_length=2)
+            clips = [clip for pool in expert.maneuver_pools() for clip in pool]
+            self.assertEqual(len(clips), 1)
+            self.assertEqual(clips[0].action_stop - clips[0].action_start, 16)
+            self.assertEqual(clips[0].recovery_stop - clips[0].action_stop, 8)
 
     def test_stored_pov_and_heldout_boundaries_for_whole_flights(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

@@ -220,9 +220,36 @@ class GroundManeuver(SceneManeuver):
         return self.action_stop
 
 
+def recovery_surface_contact(
+    scenes: th.Tensor, previous: th.Tensor, car_start: int = BLUE_START,
+) -> th.Tensor:
+    """Only floor and side-wall contacts end a flight, not ball or roof contacts."""
+    car = scenes[..., car_start:car_start + CAR_SIZE]
+    prior = previous[..., car_start:car_start + CAR_SIZE]
+    x = car[..., 0].abs() * POSITION_SCALE[0]
+    y = car[..., 1].abs() * POSITION_SCALE[1]
+    z = car[..., 2] * POSITION_SCALE[2]
+    up_z = car[..., 14]
+    floor = (z < 2 * BALL_RADIUS) & (up_z > 0.5)
+    near_wall = (
+        (x > 3_900) | (y > 4_900) | ((x > 3_000) & (y > 4_300))
+    )
+    wall = near_wall & (z < NEAR_CEILING_HEIGHT) & (up_z.abs() < 0.5)
+
+    # Wall contact restores a spent flip too. A nearby ball doing the restoring
+    # is a flip reset, however, and must not truncate the active flight.
+    spent_flip = (prior[..., 18] > 0.5) | (prior[..., 19] > 0.5)
+    flip_available = (car[..., 18] < 0.5) & (car[..., 19] < 0.5)
+    ball_reset = (
+        spent_flip & flip_available & (z > 3 * BALL_RADIUS)
+        & (_ball_distances(scenes, car_start) < 2 * BALL_RADIUS)
+    )
+    return (car[..., CAR_BOOL_START] > 0.5) & (floor | wall) & ~ball_reset
+
+
 def air_maneuvers(
     valid: np.ndarray,
-    on_ground: np.ndarray,
+    on_surface: np.ndarray,
     height: np.ndarray,
     up_z: np.ndarray,
     ball_distance: np.ndarray,
@@ -230,9 +257,9 @@ def air_maneuvers(
     setup_steps: int = MANEUVER_SETUP_STEPS,
     recovery_steps: int = MANEUVER_RECOVERY_STEPS,
 ) -> list[AirManeuver]:
-    """Trace complete ground/surface -> air -> ground flights within valid runs."""
+    """Trace flights between floor/side-wall contacts within valid runs."""
     if (not all(len(values) == len(valid) for values in
-                (on_ground, height, up_z, ball_distance))
+                (on_surface, height, up_z, ball_distance))
             or setup_steps < 1 or recovery_steps < 1):
         raise ValueError("maneuver timelines must agree and include setup/recovery")
     active = np.flatnonzero(valid)
@@ -240,7 +267,7 @@ def air_maneuvers(
         return []
     flights: list[AirManeuver] = []
     for run in np.split(active, np.flatnonzero(np.diff(active) != 1) + 1):
-        grounded = on_ground[run]
+        grounded = on_surface[run]
         takeoffs = np.flatnonzero(grounded[:-1] & ~grounded[1:]) + 1
         landings = np.flatnonzero(grounded)
         previous_landing = int(landings[0]) if len(landings) else 0
@@ -1384,7 +1411,9 @@ class ExpertSceneDataset:
         }
         frame_pose = {
             actor: (
-                (self.frames[:, car_start + CAR_BOOL_START].cpu().numpy() > 0.5),
+                np.pad(recovery_surface_contact(
+                    self.frames[1:], self.frames[:-1], car_start,
+                ).cpu().numpy(), (1, 0)),
                 self.frames[:, car_start + 2].cpu().numpy() * POSITION_SCALE[2],
                 self.frames[:, car_start + 14].cpu().numpy(),
             )
@@ -2063,7 +2092,7 @@ def generated_maneuver_pools(
         valid &= ~episode_end.reshape(-1)
     timelines = valid.reshape(steps, n_envs).cpu().numpy()
     scored = windows[:, -1]
-    grounded = (scored[:, BLUE_START + CAR_BOOL_START] > 0.5).reshape(
+    grounded = recovery_surface_contact(scored, windows[:, -2]).reshape(
         steps, n_envs,
     ).cpu().numpy()
     height = (scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
@@ -2213,7 +2242,7 @@ class GeneratedManeuverTracker:
             valid &= ~episode_end.reshape(-1)
         valid = valid.reshape(steps, n_envs).cpu().numpy()
         scored = windows[:, -1]
-        grounded = (scored[:, BLUE_START + CAR_BOOL_START] > 0.5).reshape(
+        grounded = recovery_surface_contact(scored, windows[:, -2]).reshape(
             steps, n_envs,
         ).cpu().numpy()
         height = (scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
