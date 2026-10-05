@@ -28,7 +28,7 @@ from watch_gaifo_experts import (
 
 def write_periods(folder: Path) -> None:
     """Distinct scene markers identify which file and POV produced each score."""
-    for index, skill in enumerate(("aerial", "dribble", "flick", "driving")):
+    for index, skill in enumerate(("aerial", "dribble", "flick", "driving", "kickoff")):
         rows = np.zeros((48, 161), dtype=np.float32)
         rows[:, 2] = 92 / POSITION_SCALE[2]
         for car in (BLUE_START, ORANGE_START):
@@ -64,6 +64,12 @@ def write_periods(folder: Path) -> None:
                         rows[step, BLUE_START + 16] = 0
                     if skill == "flick" and step >= 14:
                         rows[step, BLUE_START + 18] = 1
+        elif skill == "kickoff":
+            rows[:, 0] = rows[:, 3] = 0
+            rows[:, BLUE_START + 1] = -2_560 / POSITION_SCALE[1]
+            rows[:, ORANGE_START + 1] = 2_560 / POSITION_SCALE[1]
+            rows[20:, 0] = (np.arange(20, 48) - 19) * 30 / POSITION_SCALE[0]
+            rows[20:, 3] = 900 / 6_000
         if skill == "driving":
             rows[15, -2] = 1  # A parser-invalid row breaks a driving span.
 
@@ -108,6 +114,7 @@ def checkpoint(path: Path, replay_dir: Path, *, factorize: bool = True) -> None:
             "discriminator_hidden": 8, "trajectory_length": 8,
             "replay_dir": str(replay_dir), "frameskip": 4,
             "seed": 0, "discriminator_heldout_size": 16,
+            "general_driving_fraction": .10, "kickoff_fraction": .05,
         },
         "discriminator": model.state_dict(),
     }, path)
@@ -161,7 +168,7 @@ class ExpertInspectorTests(unittest.TestCase):
                 reject_discontinuities=True, skill_sampling=True,
             )
             records = collect_sequences(expert, folder, seed=0, limit=None, max_driving=1)
-            self.assertEqual({"aerial_touch", "aerial_maneuver", "dribble", "flick", "driving"},
+            self.assertEqual({"aerial_touch", "aerial_maneuver", "dribble", "flick", "driving", "kickoff"},
                              {record.skill for record in records})
             self.assertEqual({"train", "heldout"}, {record.split for record in records})
             aerial_povs = {record.actor for record in records
@@ -214,6 +221,7 @@ class ExpertInspectorTests(unittest.TestCase):
             self.assertEqual(inspection.list_sequences(
                 skill="flick", order="most",
             )["items"][0]["miss_fraction"], 1.0)
+            self.assertGreater(inspection.list_sequences(skill="kickoff")["total"], 0)
             self.assertEqual(inspection.list_sequences(
                 skill="flick", search="does-not-exist",
             )["total"], 0)
@@ -289,6 +297,7 @@ class ExpertInspectorTests(unittest.TestCase):
                 self.assertEqual(results["items"][0]["miss_fraction"], 1.0)
                 self.assertEqual(get("/api/sequences?skill=aerial_maneuver&head=ball")
                                  ["items"][0]["miss_fraction"], 0.0)
+                self.assertGreater(get("/api/sequences?skill=kickoff")["total"], 0)
                 with urlopen(base + "/", timeout=5) as response:
                     self.assertIn(b"Expert Signal", response.read())
                 with urlopen(base + "/app.js", timeout=5) as response:

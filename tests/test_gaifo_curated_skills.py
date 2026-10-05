@@ -10,7 +10,7 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    AERIAL_MANEUVER_SKILL, AERIAL_TOUCH_SKILL, DRIVING_SKILL,
+    AERIAL_MANEUVER_SKILL, AERIAL_TOUCH_SKILL, DRIVING_SKILL, KICKOFF_SKILL,
     BLUE_START, ORANGE_START, POSITION_SCALE, ConfidentExpertResetTransform,
     CuratedReplayResetTransform, ExpertSceneDataset, GeneratedManeuverTracker,
     ReplayResetProvider, SceneGAIFOMinibatches,
@@ -62,10 +62,16 @@ def _period(folder: Path, kind: str, index: int) -> None:
                     rows[step, BLUE_START + 16] = 0
                 if kind == "flick" and step >= 14:
                     rows[step, BLUE_START + 18] = 1
+    elif kind == "kickoff":
+        rows[:, 0] = rows[:, 3] = 0
+        rows[:, BLUE_START + 1] = -2_560 / POSITION_SCALE[1]
+        rows[:, ORANGE_START + 1] = 2_560 / POSITION_SCALE[1]
+        rows[20:, 0] = (np.arange(20, 48) - 19) * 30 / POSITION_SCALE[0]
+        rows[20:, 3] = 900 / 6_000  # Kickoff challenge at step 20.
 
     unsafe = np.zeros(len(rows), dtype=bool)
     pre_goal = np.zeros(len(rows), dtype=bool)
-    if kind in ("aerial", "aerial_touch"):
+    if kind in ("aerial", "aerial_touch", "kickoff"):
         unsafe[12] = True  # Exclude the reset, not its valid touch trajectory.
         pre_goal[13] = True
     if kind == "driving":
@@ -78,8 +84,8 @@ def _period(folder: Path, kind: str, index: int) -> None:
     )
 
 
-def _expert(folder: Path, driving_fraction: float = 0.05) -> ExpertSceneDataset:
-    for index, kind in enumerate(("aerial", "aerial_touch", "dribble", "flick", "driving")):
+def _expert(folder: Path, driving_fraction: float = 0.10) -> ExpertSceneDataset:
+    for index, kind in enumerate(("aerial", "aerial_touch", "dribble", "flick", "driving", "kickoff")):
         _period(folder, kind, index)
     return ExpertSceneDataset(
         folder, trajectory_length=8, reject_discontinuities=True,
@@ -88,14 +94,15 @@ def _expert(folder: Path, driving_fraction: float = 0.05) -> ExpertSceneDataset:
 
 
 class CuratedSkillSamplingTests(unittest.TestCase):
-    def test_training_defaults_select_only_replay_skills_and_five_percent_driving(self):
+    def test_training_defaults_use_ten_percent_driving_and_five_percent_kickoff(self):
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",
         ]):
             args, _ = parse_args()
         self.assertTrue(args.curated_skill_sampling)
         self.assertEqual(args.replay_reset_fraction, 1.0)
-        self.assertEqual(args.general_driving_fraction, 0.05)
+        self.assertEqual(args.general_driving_fraction, 0.10)
+        self.assertEqual(args.kickoff_fraction, 0.05)
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",
             "--no-curated-skill-sampling",
@@ -142,20 +149,24 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                 self.assertTrue(th.isin(chosen, pool).all())
                 self.assertTrue((~expert.unsafe_reset_frames[chosen]).all())
             self.assertAlmostEqual((sample["skill_category"] == DRIVING_SKILL).float().mean().item(),
+                                   .10, delta=.02)
+            self.assertAlmostEqual((sample["skill_category"] == KICKOFF_SKILL).float().mean().item(),
                                    .05, delta=.02)
             for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL):
                 self.assertAlmostEqual((sample["skill_category"] == category).float().mean().item(),
-                                       .95 / 3, delta=.025)
-            self.assertAlmostEqual(transform.take_skill_fractions()["reset_driving_fraction"],
-                                   .05, delta=.02)
+                                       .85 / 3, delta=.025)
+            fractions = transform.take_skill_fractions()
+            self.assertAlmostEqual(fractions["reset_driving_fraction"], .10, delta=.02)
+            self.assertAlmostEqual(fractions["reset_kickoff_fraction"], .05, delta=.02)
             self.assertEqual(transform.take_skill_fractions(), {})
 
-            for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL, DRIVING_SKILL):
+            for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL,
+                             DRIVING_SKILL, KICKOFF_SKILL):
                 safe = expert._curated_reset_pools[category]
                 self.assertFalse(th.isin(expert.frames[safe, 8], th.tensor([
                     expert.frames[expert.segment_frame_indices[0][12], 8],
                     expert.frames[expert.segment_frame_indices[0][13], 8],
-                    expert.frames[expert.segment_frame_indices[-1][15], 8],
+                    expert.frames[expert.segment_frame_indices[-2][15], 8],
                 ])).any())
 
             generated = th.cat([
@@ -173,8 +184,10 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL):
                 self.assertAlmostEqual(
                     (batch["skill_category"][:n] == category).float().mean().item(),
-                    .95 / 3, delta=.05,
+                    .85 / 3, delta=.05,
                 )
+            self.assertAlmostEqual((batch["skill_category"][:n] == KICKOFF_SKILL).float().mean().item(),
+                                   .05, delta=.03)
             not_phase = ~batch["phase_aligned"][:n]
             self.assertTrue(th.equal(
                 scene_situation_ids(batch["window"][:n])[not_phase],
@@ -374,6 +387,8 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             self.assertFalse(len(expert.curated_pools()[AERIAL_TOUCH_SKILL]))
             self.assertFalse(len(expert.curated_pools()[AERIAL_MANEUVER_SKILL]))
             self.assertFalse(len(expert._curated_reset_pools[AERIAL_TOUCH_SKILL]))
+            self.assertFalse(len(expert.curated_pools()[KICKOFF_SKILL]))
+            self.assertEqual(expert.curated_weights()[DRIVING_SKILL].item(), 1.0)
             self.assertTrue(len(expert.curated_pools()[DRIVING_SKILL]))
 
     def test_heldout_curated_windows_never_become_reset_or_training_examples(self):

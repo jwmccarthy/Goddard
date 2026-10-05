@@ -9,7 +9,8 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    BLUE_START, ORANGE_START, ConfidentExpertResetTransform,
+    BLUE_START, DRIVING_SKILL, KICKOFF_SKILL, ORANGE_START, POSITION_SCALE,
+    ConfidentExpertResetTransform,
     ExpertSceneDataset, SceneWindowCapture, opponent_view,
 )
 
@@ -27,6 +28,95 @@ def save_period(folder: Path, name: str, marker: int, paired: bool = False) -> N
 
 
 class KickoffRetentionTests(unittest.TestCase):
+    def test_curated_kickoff_covers_first_challenge_and_respects_replay_safety(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            for name in ("kickoff", "nonkickoff"):
+                rows = np.zeros((110, 161), dtype=np.float32)
+                rows[:, 2] = 92.75 / POSITION_SCALE[2]
+                for car, y in ((BLUE_START, -2_560), (ORANGE_START, 2_560)):
+                    rows[:, car + 1] = y / POSITION_SCALE[1]
+                    rows[:, car + 2] = 17 / POSITION_SCALE[2]
+                    rows[:, car + 9] = rows[:, car + 14] = rows[:, car + 16] = 1
+                rows[60:, 0] = (np.arange(60, 110) - 59) * 30 / POSITION_SCALE[0]
+                rows[60:, 3] = 900 / 6_000
+                if name == "nonkickoff":
+                    rows[:, ORANGE_START + 1] = 0  # Not a kickoff formation.
+                else:
+                    rows[30, -2] = 1  # Parser discontinuity removes intersecting windows.
+                path = folder / f"100-0-{name}.npy"
+                np.save(path, rows)
+                unsafe = np.zeros(len(rows), dtype=bool)
+                unsafe[65] = True
+                np.savez_compressed(
+                    path.with_suffix(".unsafe-starts.npz"), unsafe=unsafe,
+                    pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+                )
+                if name == "kickoff":
+                    opposite = folder / "200-0-kickoff.npy"
+                    second = rows.copy()
+                    second[:, :51] = opponent_view(th.from_numpy(rows[:, :51])).numpy()
+                    np.save(opposite, second)
+                    np.savez_compressed(
+                        opposite.with_suffix(".unsafe-starts.npz"), unsafe=unsafe,
+                        pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+                    )
+
+            expert = ExpertSceneDataset(
+                folder, 8, frame_skip=4, reject_discontinuities=True,
+                skill_sampling=True,
+            )
+            start = int(expert.segment_window_starts[0][0])
+            kickoff = expert.curated_pools()[KICKOFF_SKILL]
+            self.assertEqual(set(kickoff[:, 1].tolist()), {0, 1})
+            for actor in (0, 1):
+                selected = kickoff[kickoff[:, 1] == actor, 0]
+                self.assertEqual(set(selected.tolist()),
+                                 set(range(start, start + 76)) - set(range(start + 30, start + 38)))
+                self.assertFalse(th.isin(
+                    selected, expert.curated_pools()[DRIVING_SKILL][
+                        expert.curated_pools()[DRIVING_SKILL][:, 1] == actor, 0,
+                    ],
+                ).any())
+            self.assertTrue(th.isin(kickoff[:, 0], expert.train_window_starts).all())
+            self.assertFalse(th.isin(
+                expert._curated_reset_pools[KICKOFF_SKILL],
+                th.tensor([start + 65 + expert.partition_span]),
+            ).any())
+            self.assertGreater(len(expert.curated_pools()[DRIVING_SKILL]), 0)
+
+            old_style = ExpertSceneDataset(
+                folder, 8, frame_skip=4, reject_discontinuities=True,
+                skill_sampling=True, kickoff_fraction=0,
+            )
+            self.assertFalse(len(old_style.curated_pools()[KICKOFF_SKILL]))
+            self.assertTrue(th.isin(
+                th.tensor([start]), old_style.curated_pools()[DRIVING_SKILL][:, 0],
+            ).all())
+
+            heldout = ExpertSceneDataset(
+                folder, 8, heldout_size=16, frame_skip=4,
+                reject_discontinuities=True, skill_sampling=True,
+            )
+            for split, eligible in ((False, heldout.train_window_starts),
+                                    (True, heldout.heldout_window_starts)):
+                pairs = heldout.curated_pools(heldout=split)[KICKOFF_SKILL]
+                self.assertTrue(th.isin(pairs[:, 0], eligible).all())
+                self.assertFalse((pairs[:, 1].bool()
+                                  & ~heldout.opponent_pov_available[pairs[:, 0]]).any())
+            self.assertFalse(th.isin(heldout.reset_indices,
+                                     heldout.heldout_window_starts + heldout.partition_span).any())
+
+            # A smaller frame skip must not truncate the kickoff before contact.
+            faster = ExpertSceneDataset(
+                folder, 8, frame_skip=2, reject_discontinuities=True,
+                skill_sampling=True,
+            )
+            quick_start = int(faster.segment_window_starts[0][0])
+            quick_kickoff = faster.curated_pools()[KICKOFF_SKILL]
+            self.assertGreater(int(quick_kickoff[:, 0].max()) - quick_start, 140)
+            self.assertLess(int(quick_kickoff[:, 0].max()) - quick_start, 160)
+
     def test_each_stored_pov_scores_kickoff_without_crossing_segments(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)

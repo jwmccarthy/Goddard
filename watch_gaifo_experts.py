@@ -26,7 +26,8 @@ import torch as th
 from gaifo import (
     BALL_RADIUS, BLUE_START, CAR_SIZE, GAIFO_ARCHITECTURE,
     GAIFO_ASE_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GROUND_MANEUVERS,
-    GROUND_MANEUVER_START, DRIVING_SKILL, ORANGE_START, POSITION_SCALE,
+    GROUND_MANEUVER_START, DRIVING_SKILL, KICKOFF_SKILL,
+    ORANGE_START, POSITION_SCALE,
     SKILL_CATEGORIES,
     ExpertSceneDataset, build_discriminator, opponent_view,
 )
@@ -150,16 +151,18 @@ class ExpertSequence:
         }
 
 
-def driving_spans(pairs: th.Tensor, minimum: int) -> list[tuple[int, int, int]]:
-    """Group consecutive eligible driving windows without bridging invalid rows."""
+def driving_spans(
+    pairs: th.Tensor, minimum: int, max_span: int = DRIVING_SPAN,
+) -> list[tuple[int, int, int]]:
+    """Group consecutive eligible windows without bridging invalid rows."""
     spans = []
     indices = pairs.cpu().numpy()
     for actor in (0, 1):
         starts = indices[indices[:, 1] == actor, 0]
         boundaries = np.r_[0, np.flatnonzero(np.diff(starts) != 1) + 1, len(starts)]
         for left, right in zip(boundaries[:-1], boundaries[1:]):
-            for first in range(int(left), int(right), DRIVING_SPAN):
-                last = min(first + DRIVING_SPAN, int(right))
+            for first in range(int(left), int(right), max_span):
+                last = min(first + max_span, int(right))
                 if last - first >= minimum:
                     spans.append((int(starts[first]), int(starts[last - 1]) + 1, actor))
     return spans
@@ -194,6 +197,11 @@ def collect_sequences(
                          else GROUND_MANEUVERS[label - GROUND_MANEUVER_START])
                 append(skill, split, clip.actor, clip.setup_start,
                        clip.action_start, clip.action_stop, clip.recovery_stop)
+        for start, stop, actor in driving_spans(
+            expert.curated_pools(heldout=heldout)[KICKOFF_SKILL],
+            min(expert.trajectory_length, DRIVING_SPAN), expert.kickoff_max_steps,
+        ):
+            append("kickoff", split, actor, start, start, stop, stop)
         if max_driving:
             candidates = driving_spans(
                 expert.curated_pools(heldout=heldout)[DRIVING_SKILL],
@@ -431,6 +439,7 @@ class InspectionService:
                 heldout_size=int(config.get("discriminator_heldout_size", 0)),
                 device="cpu", reject_discontinuities=True, skill_sampling=True,
                 driving_fraction=float(config.get("general_driving_fraction", 0.05)),
+                kickoff_fraction=float(config.get("kickoff_fraction", 0.0)),
             )
             records = collect_sequences(
                 expert, directory, seed, limit, self.max_driving,

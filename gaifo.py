@@ -92,10 +92,17 @@ CAR_SITUATIONS = ("grounded", "wall", "low_air", "mid_air", "high_air", "ceiling
 GROUND_MANEUVERS = ("dribble", "flick")
 GROUND_MANEUVER_START = len(DISTANCE_BANDS) * len(CAR_SITUATIONS)
 N_SITUATIONS = GROUND_MANEUVER_START + len(GROUND_MANEUVERS)
-SKILL_CATEGORIES = ("aerial_touch", "aerial_maneuver", "dribble", "flick", "driving")
-AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL, DRIBBLE_SKILL, FLICK_SKILL, DRIVING_SKILL = range(5)
+SKILL_CATEGORIES = (
+    "aerial_touch", "aerial_maneuver", "dribble", "flick", "driving", "kickoff",
+)
+(
+    AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL, DRIBBLE_SKILL,
+    FLICK_SKILL, DRIVING_SKILL, KICKOFF_SKILL,
+) = range(len(SKILL_CATEGORIES))
 SKILL_AERIAL_NEAR_STEPS = 4
 SKILL_AERIAL_TOUCH_SEPARATION = 3
+KICKOFF_MAX_STEPS = 96  # At frame skip 4, covers the challenge after the approach.
+KICKOFF_FOLLOW_THROUGH_STEPS = 16
 LOW_AIR_HEIGHT = 350.0
 MID_AIR_HEIGHT = 900.0
 NEAR_CEILING_HEIGHT = 1_700.0
@@ -943,23 +950,36 @@ class ExpertSceneDataset:
         heldout_size: int = 0,
         reject_discontinuities: bool = False,
         skill_sampling: bool = False,
-        driving_fraction: float = 0.05,
+        driving_fraction: float = 0.10,
+        kickoff_fraction: float = 0.05,
     ) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
         if limit is not None and limit < trajectory_length:
             raise ValueError("expert frame limit must fit one trajectory")
+        if frame_skip is not None and frame_skip < 1:
+            raise ValueError("expert frame skip must be positive")
         if heldout_size < 0:
             raise ValueError("heldout size must be non-negative")
         if not math.isfinite(driving_fraction) or not 0.0 <= driving_fraction < 1.0:
             raise ValueError("general-driving fraction must be in [0, 1)")
+        if not math.isfinite(kickoff_fraction) or not 0.0 <= kickoff_fraction < 1.0:
+            raise ValueError("kickoff fraction must be in [0, 1)")
+        if driving_fraction + kickoff_fraction >= 1.0:
+            raise ValueError("driving and kickoff fractions must sum to less than one")
         if skill_sampling and not reject_discontinuities:
             raise ValueError("skill-filtered expert clips require discontinuity filtering")
         self.trajectory_length = trajectory_length
         self.heldout_size = heldout_size
         self.partition_span = trajectory_length - 1
+        self.frame_skip = frame_skip if frame_skip is not None else 4
+        self.kickoff_max_steps = max(1, round(KICKOFF_MAX_STEPS * 4 / self.frame_skip))
+        self.kickoff_follow_through_steps = max(
+            1, round(KICKOFF_FOLLOW_THROUGH_STEPS * 4 / self.frame_skip),
+        )
         self.skill_sampling = skill_sampling
         self.driving_fraction = driving_fraction
+        self.kickoff_fraction = kickoff_fraction
 
         rng = np.random.default_rng(seed)
         paths = sorted(Path(replay_dir).glob("*.npy"))
@@ -1551,6 +1571,45 @@ class ExpertSceneDataset:
             self._train_maneuvers = result
         return result
 
+    def _kickoff_window_mask(self, ball_position: np.ndarray) -> th.Tensor:
+        """Take each real kickoff through first ball movement and brief follow-through."""
+        mask = np.zeros(len(self.frames), dtype=bool)
+        segments = []
+        offset = 0
+        for length in self.lengths:
+            if length - self.partition_span >= self.kickoff_follow_through_steps:
+                segments.append((offset, length))
+            offset += length
+        initial = self.frames[
+            [offset + self.partition_span for offset, _ in segments]
+        ].cpu().numpy()
+        ball_velocity = self.frames[:, 3:6].cpu().numpy()
+        for (offset, length), scene in zip(segments, initial):
+            count = min(length - self.partition_span, self.kickoff_max_steps)
+            first = offset + self.partition_span
+            at_center = np.linalg.norm(scene[:2] * POSITION_SCALE[:2]) < 2 * BALL_RADIUS
+            stationary = np.linalg.norm(scene[3:6] * BALL_MAX_SPEED) < 250
+            spawn = (scene[BLUE_START + 1] * POSITION_SCALE[1] < -2_000
+                     and scene[ORANGE_START + 1] * POSITION_SCALE[1] > 2_000
+                     and scene[BLUE_START + 2] * POSITION_SCALE[2] < 120
+                     and scene[ORANGE_START + 2] * POSITION_SCALE[2] < 120)
+            height = scene[2] * POSITION_SCALE[2]
+            if at_center and stationary and spawn and BALL_RADIUS - 20 < height < 150:
+                flight = ball_position[first:first + count]
+                velocity = ball_velocity[first:first + count]
+                moved = (
+                    (np.linalg.norm(flight[:, :2] * POSITION_SCALE[:2], axis=1)
+                     > 1.5 * BALL_RADIUS)
+                    | (np.linalg.norm(velocity * BALL_MAX_SPEED, axis=1) > 350)
+                )
+                if moved.any():
+                    stop = min(
+                        int(np.flatnonzero(moved)[0]) + self.kickoff_follow_through_steps,
+                        count,
+                    )
+                    mask[offset:offset + stop] = True
+        return th.from_numpy(mask).to(self.frames.device)
+
     def curated_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
         """The same complete skill clips and limited driving used by D and resets.
 
@@ -1603,17 +1662,28 @@ class ExpertSceneDataset:
                     indices, th.full_like(indices, actor),
                 ), dim=-1))
 
-        # A little ordinary driving prevents the critic from only recognizing
-        # successful touches. It must not duplicate any selected skill phase.
+        # Kickoff has its own quota, reaching beyond the initial approach to
+        # the first challenge. Neither kickoff nor general driving duplicates
+        # a selected aerial or ground-control skill phase.
+        kickoff_starts = (
+            self._kickoff_window_mask(ball_position) if self.kickoff_fraction
+            else th.zeros(len(self.frames), dtype=th.bool, device=self.frames.device)
+        )
         for actor, car in enumerate((BLUE_START, ORANGE_START)):
             eligible = starts
             if actor:
                 eligible = eligible[self.opponent_pov_available[eligible]]
             scored = eligible + self.partition_span
+            unused = ~th.from_numpy(used[:, actor]).to(eligible.device)[eligible]
+            kickoff = eligible[kickoff_starts[eligible] & unused]
+            if len(kickoff):
+                pools[KICKOFF_SKILL].append(th.stack((
+                    kickoff, th.full_like(kickoff, actor),
+                ), dim=-1))
             driving = (
                 (self.frames[scored, car + CAR_BOOL_START] > 0.5)
                 & (self.frames[scored, car + 14] > 0.65)
-                & ~th.from_numpy(used[:, actor]).to(eligible.device)[eligible]
+                & unused & ~kickoff_starts[eligible]
             )
             chosen = eligible[driving].cpu()
             if len(chosen):
@@ -1667,11 +1737,13 @@ class ExpertSceneDataset:
         return result
 
     def curated_weights(self, *, heldout: bool = False) -> th.Tensor:
-        """Split the aerial share evenly between touches and maneuvers."""
+        """Split the remaining share 3:3:2:1 across aerials, dribble and flick."""
         driving = self.driving_fraction
+        kickoff = self.kickoff_fraction
+        skills = 1 - driving - kickoff
         weights = th.tensor((
-            (1 - driving) / 3, (1 - driving) / 3,
-            (1 - driving) * 2 / 9, (1 - driving) / 9, driving,
+            skills / 3, skills / 3, skills * 2 / 9, skills / 9,
+            driving, kickoff,
         ), device=self.frames.device)
         available = self.curated_pools(heldout=heldout)
         present = th.tensor(
@@ -1682,7 +1754,7 @@ class ExpertSceneDataset:
             weights[:2] *= 2 / present[:2].sum()
         weights *= present
         if not bool(weights.sum()):
-            raise ValueError("no eligible curated aerial, dribble, flick, or driving windows")
+            raise ValueError("no eligible curated aerial, dribble, flick, driving, or kickoff windows")
         return weights / weights.sum()
 
     def reset_dataset(self) -> TensorDataset:
@@ -3914,11 +3986,15 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument(
         "--curated-skill-sampling", action=argparse.BooleanOptionalAction,
         default=True,
-        help="restrict replay resets and discriminator positives to matched aerial, dribble, flick, and driving clips",
+        help="restrict replay resets and discriminator positives to matched aerial, dribble, flick, driving, and kickoff clips",
     )
     parser.add_argument(
-        "--general-driving-fraction", type=float, default=0.05,
+        "--general-driving-fraction", type=float, default=0.10,
         help="general driving share of curated reset and discriminator sampling",
+    )
+    parser.add_argument(
+        "--kickoff-fraction", type=float, default=0.05,
+        help="kickoff share of curated reset and discriminator sampling, separate from general driving",
     )
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
     parser.add_argument(
@@ -4109,6 +4185,10 @@ def validate_args(args: argparse.Namespace) -> None:
         or not 0.0 <= args.general_driving_fraction < 1.0
     ):
         raise ValueError("--general-driving-fraction must be in [0, 1)")
+    if not math.isfinite(args.kickoff_fraction) or not 0.0 <= args.kickoff_fraction < 1.0:
+        raise ValueError("--kickoff-fraction must be in [0, 1)")
+    if args.general_driving_fraction + args.kickoff_fraction >= 1.0:
+        raise ValueError("driving and kickoff fractions must sum to less than one")
     if not math.isfinite(args.discriminator_noise) or args.discriminator_noise < 0.0:
         raise ValueError("--discriminator-noise must be non-negative")
     if (
@@ -4351,6 +4431,7 @@ def main() -> None:
         reject_discontinuities=args.curated_skill_sampling,
         skill_sampling=args.curated_skill_sampling,
         driving_fraction=args.general_driving_fraction,
+        kickoff_fraction=args.kickoff_fraction,
     )
     if expert.train_total < 1:
         raise ValueError("expert dataset contains no training windows")
