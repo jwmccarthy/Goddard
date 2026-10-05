@@ -9,6 +9,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium.state import RewardContext
@@ -2171,15 +2172,20 @@ class SceneDiscriminator(nn.Module):
     def score_context(self, scenes: th.Tensor, ages: th.Tensor) -> th.Tensor:
         """Skip left padding so a new episode starts from a zero recurrent state."""
         if (scenes.ndim != 3 or scenes.shape[-1] != self.scene_size
-                or ages.shape != (len(scenes),)
-                or (ages < 1).any() or (ages > scenes.shape[1]).any()):
+                or ages.shape != (len(scenes),)):
             raise ValueError("scene context and ages must match")
-        features = self._encode(scenes)
-        state = features.new_zeros((1, len(scenes), self.gru.hidden_size))
-        for step in range(scenes.shape[1]):
-            _, next_state = self.gru(features[:, step:step + 1], state)
-            active = (ages >= scenes.shape[1] - step)[None, :, None]
-            state = th.where(active, next_state, state)
+        length = scenes.shape[1]
+        lengths = ages.cpu()  # Packed sequences need CPU lengths; validate there too.
+        if (lengths < 1).any() or (lengths > length).any():
+            raise ValueError("scene context and ages must match")
+        steps = th.arange(length, device=scenes.device)
+        indices = (steps[None] + length - ages[:, None]).clamp(max=length - 1)
+        # Move real scenes to the front; the packed GRU skips the new right padding.
+        aligned = scenes.gather(1, indices[..., None].expand_as(scenes))
+        packed = pack_padded_sequence(
+            self._encode(aligned), lengths, batch_first=True, enforce_sorted=False,
+        )
+        _, state = self.gru(packed)
         return self.head(state[0]).squeeze(-1)
 
     def score_sequence(
@@ -2198,12 +2204,49 @@ class SceneDiscriminator(nn.Module):
         )
         if state.shape != (1, scenes.shape[1], self.gru.hidden_size):
             raise ValueError("initial discriminator state must match actors")
-        logits = []
-        for step in range(len(scenes)):
-            state = state.masked_fill(reset[step][None, :, None], 0)
-            output, state = self.gru(features[:, step:step + 1], state)
-            logits.append(self.head(output[:, 0]).squeeze(-1))
-        return th.stack(logits), state
+        if not reset[1:].any():
+            state = state.masked_fill(reset[0][None, :, None], 0)
+            output, state = self.gru(features, state)
+            return self.head(output).squeeze(-1).transpose(0, 1), state
+
+        # Each actor's runs between resets are independent. Process them in
+        # one packed GRU call even when different actors reset on different steps.
+        starts_by_actor = reset.transpose(0, 1).clone()
+        starts_by_actor[:, 0] = True
+        actor, start = starts_by_actor.nonzero(as_tuple=True)
+        if len(start) > max(2 * scenes.shape[1], 64):
+            # Frequent resets would otherwise create an oversized padded batch.
+            logits = []
+            for step in range(len(scenes)):
+                state = state.masked_fill(reset[step][None, :, None], 0)
+                output, state = self.gru(features[:, step:step + 1], state)
+                logits.append(self.head(output[:, 0]).squeeze(-1))
+            return th.stack(logits), state
+
+        steps = th.arange(len(scenes), device=scenes.device)
+        times = start[:, None] + steps[None, :]
+        same_actor = actor[1:] == actor[:-1]
+        lengths = th.empty_like(start)
+        lengths[:-1] = th.where(
+            same_actor, start[1:] - start[:-1], len(scenes) - start[:-1],
+        )
+        lengths[-1] = len(scenes) - start[-1]
+        packed = pack_padded_sequence(
+            features[actor[:, None], times.clamp(max=len(scenes) - 1)],
+            lengths.cpu(), batch_first=True, enforce_sorted=False,
+        )
+        initial = state[:, actor].masked_fill(
+            ((start > 0) | reset[0, actor])[None, :, None], 0,
+        )
+        output, final_states = self.gru(packed, initial)
+        unpacked, _ = pad_packed_sequence(output, batch_first=True, total_length=len(scenes))
+        valid = steps[None, :] < lengths[:, None]
+        logits = features.new_empty((len(scenes), scenes.shape[1]))
+        logits[times[valid], actor[:, None].expand_as(times)[valid]] = (
+            self.head(unpacked).squeeze(-1)[valid]
+        )
+        last_run = th.cat((~same_actor, same_actor.new_ones(1)))
+        return logits, final_states[:, last_run]
 
 
 class EgoBallSceneDiscriminator(nn.Module):

@@ -58,7 +58,84 @@ class AccumulatingFactorized(th.nn.Module):
         return windows.new_zeros((len(windows), 2))
 
 
+def stepwise_context(model, scenes, ages):
+    features = model._encode(scenes)
+    state = features.new_zeros((1, len(scenes), model.gru.hidden_size))
+    for step in range(scenes.shape[1]):
+        _, updated = model.gru(features[:, step:step + 1], state)
+        state = th.where((ages >= scenes.shape[1] - step)[None, :, None], updated, state)
+    return model.head(state[0]).squeeze(-1)
+
+
+def stepwise_sequence(model, scenes, reset, initial_state):
+    features = model._encode(scenes.transpose(0, 1))
+    state = initial_state
+    logits = []
+    for step in range(len(scenes)):
+        state = state.masked_fill(reset[step][None, :, None], 0)
+        output, state = model.gru(features[:, step:step + 1], state)
+        logits.append(model.head(output[:, 0]).squeeze(-1))
+    return th.stack(logits), state
+
+
 class RecurrentDiscriminatorTests(unittest.TestCase):
+    def test_packed_context_preserves_padded_gradients(self):
+        th.manual_seed(17)
+        model = SceneDiscriminator(8, 8, 12, recurrent_global=True)
+        scenes = th.randn(5, 6, 51, requires_grad=True)
+        ages = th.tensor([1, 2, 3, 5, 6])
+        fast = model.score_context(scenes, ages)
+        stepwise = stepwise_context(model, scenes, ages)
+        th.testing.assert_close(fast, stepwise)
+
+        inputs = (scenes, *model.parameters())
+        fast_grads = th.autograd.grad(fast.sum(), inputs, retain_graph=True)
+        stepwise_grads = th.autograd.grad(stepwise.sum(), inputs)
+        for optimized, original in zip(fast_grads, stepwise_grads):
+            th.testing.assert_close(optimized, original, rtol=1e-4, atol=1e-5)
+        for row, age in enumerate(ages.tolist()):
+            th.testing.assert_close(
+                fast_grads[0][row, :6 - age], th.zeros_like(scenes[row, :6 - age]),
+            )
+
+    def test_fused_sequence_preserves_individual_resets_and_gradients(self):
+        th.manual_seed(18)
+        model = SceneDiscriminator(8, 8, 12, recurrent_global=True)
+        scenes = th.randn(6, 4, 51, requires_grad=True)
+        initial_state = th.randn(1, 4, 8, requires_grad=True)
+        for boundaries in ((), ((2, 0), (4, 2))):
+            with self.subTest(boundaries=boundaries):
+                reset = th.zeros(6, 4, dtype=th.bool)
+                reset[0, 1] = True
+                for step, actor in boundaries:
+                    reset[step, actor] = True
+                fast, fast_state = model.score_sequence(scenes, reset, initial_state)
+                stepwise, stepwise_state = stepwise_sequence(
+                    model, scenes, reset, initial_state,
+                )
+                th.testing.assert_close(fast, stepwise)
+                th.testing.assert_close(fast_state, stepwise_state)
+                inputs = (scenes, initial_state, *model.parameters())
+                fast_grads = th.autograd.grad(
+                    fast.sum() + fast_state.sum(), inputs, retain_graph=True,
+                )
+                stepwise_grads = th.autograd.grad(
+                    stepwise.sum() + stepwise_state.sum(), inputs,
+                )
+                for optimized, original in zip(fast_grads, stepwise_grads):
+                    th.testing.assert_close(optimized, original, rtol=1e-4, atol=1e-5)
+
+    def test_frequent_resets_keep_streaming_batch_bounded(self):
+        th.manual_seed(19)
+        model = SceneDiscriminator(8, 8, 12, recurrent_global=True)
+        scenes = th.randn(20, 4, 51)
+        reset = th.ones(20, 4, dtype=th.bool)
+        initial = th.randn(1, 4, 8)
+        logits, final = model.score_sequence(scenes, reset, initial)
+        reference, expected_final = stepwise_sequence(model, scenes, reset, initial)
+        th.testing.assert_close(logits, reference)
+        th.testing.assert_close(final, expected_final)
+
     def test_context_matches_stream_and_resets_individual_actors(self):
         th.manual_seed(7)
         model = SceneDiscriminator(8, 8, 12, recurrent_global=True)
