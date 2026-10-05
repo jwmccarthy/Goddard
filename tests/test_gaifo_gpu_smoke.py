@@ -51,6 +51,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "--replay-reset-fraction", "1",
                 "--n-sim", "2",
                 "--rollout", "8", "--trajectory-length", "8",
+                "--recurrent-global",
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
                 "--discriminator-hidden", "16", "--frame-embedding", "8",

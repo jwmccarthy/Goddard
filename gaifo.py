@@ -4930,8 +4930,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="frames in the short discriminator scene window",
     )
     parser.add_argument(
-        "--recurrent-global", action=argparse.BooleanOptionalAction, default=True,
-        help="carry the always-on discriminator's GRU memory across scene windows",
+        "--recurrent-global", action=argparse.BooleanOptionalAction, default=False,
+        help="carry the always-on discriminator's GRU memory across scene windows (default: off)",
     )
     parser.add_argument(
         "--discriminator-context-length", type=int, default=16,

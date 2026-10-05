@@ -75,15 +75,17 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertEqual(parsed.sequence_length, 8)
                 self.assertEqual((parsed.policy_hidden, parsed.critic_hidden), (320, 320))
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (2, 2))
-                self.assertTrue(parsed.recurrent_global)
+                self.assertFalse(parsed.recurrent_global)
                 self.assertEqual(parsed.discriminator_context_length, 16)
                 self.assertEqual(parsed.discriminator_context_stride, 4)
 
-        with patch.object(sys, "argv", [
-            "gaifo.py", "--replay-dir", "parsed_replays", "--no-recurrent-global",
-        ]):
-            parsed, _ = parse_args()
-        self.assertFalse(parsed.recurrent_global)
+        for flag, expected in (("--recurrent-global", True),
+                               ("--no-recurrent-global", False)):
+            with self.subTest(flag=flag), patch.object(sys, "argv", [
+                "gaifo.py", "--replay-dir", "parsed_replays", flag,
+            ]):
+                parsed, _ = parse_args()
+                self.assertEqual(parsed.recurrent_global, expected)
 
     def test_policy_and_critic_depths_can_differ(self):
         for gru in (False, True):

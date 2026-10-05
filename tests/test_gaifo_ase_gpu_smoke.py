@@ -179,6 +179,7 @@ class ASEGAIFOGpuSmokeTests(unittest.TestCase):
                 key.startswith("car_gru.") for key in saved["skill_encoder"]
             ))
             self.assertTrue(saved["config"]["factorize"])
+            self.assertFalse(saved["config"]["recurrent_global"])
             self.assertIn("skill_encoder_optimizer", saved)
             self.assertTrue(saved["skill_encoder_optimizer"]["state"])
             self.assertIn("ASE diversity loss", output.getvalue())
