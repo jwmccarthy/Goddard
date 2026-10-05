@@ -42,6 +42,7 @@ class ScoreFactorizedDiscriminator(ScoreDiscriminator):
         self.grad_modes.append(th.is_grad_enabled())
         return self.scale * th.stack((
             windows[:, -1, BLUE_START + 5], windows[:, -1, 5],
+            windows[:, -1, BLUE_START + 5],
         ), dim=-1)
 
 
@@ -151,7 +152,7 @@ class HardPositiveMiningTests(unittest.TestCase):
             discriminator = ScoreFactorizedDiscriminator()
             miner = ConfidentExpertResetTransform(expert, dataset, discriminator, 128)
             scores = miner._score(th.stack((near[0], far[0])))
-            self.assertGreater(scores[0].item(), 0.7)
+            self.assertGreater(scores[0].item(), 0.6)
             self.assertAlmostEqual(scores[1].item(), 0.5)
 
             miner.ready = True

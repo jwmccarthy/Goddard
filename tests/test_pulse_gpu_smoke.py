@@ -243,7 +243,8 @@ class PulseGpuSmokeTests(unittest.TestCase):
             self.assertTrue(advanced["config"]["factorize"])
             self.assertTrue(advanced["config"]["exp_log_odds_reward"])
             self.assertEqual(advanced["gaifo_history"]["type"], "recency")
-            self.assertIn("ball_encoder.0.weight", advanced["discriminator"])
+            self.assertIn("near_discriminator.encoder.0.weight", advanced["discriminator"])
+            self.assertIn("global_discriminator.head.weight", advanced["discriminator"])
 
             frames, internal = load_demonstration_reset_frames(
                 replay_dir, "cuda:0", limit=16,

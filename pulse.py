@@ -61,7 +61,7 @@ from gaifo import (
     SceneDiscriminatorReward,
     SceneWindowCapture,
     SelectPPOFields,
-    expand_factorized_optimizer_state,
+    load_legacy_factorized_optimizer_state,
     load_discriminator_state,
 )
 from pulse_reward import PulseReward
@@ -330,7 +330,8 @@ class PulseGAIFOReward:
         )
         components = {
             name: scored[name] * self.weight
-            for name in ("car_imitation_reward", "ball_imitation_reward")
+            for name in ("far_imitation_reward", "near_imitation_reward",
+                         "global_imitation_reward")
             if name in scored
         }
         return scored.replace_fields(
@@ -653,10 +654,13 @@ def restore_pulse_training(
         group["lr"] = args.ppo_lr
     if args.gaifo_imitation:
         upgraded = load_discriminator_state(discriminator, payload["discriminator"])
-        discriminator_optimizer.load_state_dict(payload["discriminator_optimizer"])
         if upgraded:
-            expand_factorized_optimizer_state(discriminator_optimizer, discriminator)
-            print("Added initial opponent context to factorized discriminator checkpoint")
+            load_legacy_factorized_optimizer_state(
+                discriminator_optimizer, discriminator, payload["discriminator_optimizer"],
+            )
+            print("Restored far-car discriminator; initialized near-ball and global discriminators")
+        else:
+            discriminator_optimizer.load_state_dict(payload["discriminator_optimizer"])
         for group in discriminator_optimizer.param_groups:
             group["lr"] = args.discriminator_lr
         state = payload.get("gaifo_update")
@@ -1343,8 +1347,9 @@ def main() -> None:
                 logger.register_progress_metric("Discriminator", key, label, format_spec)
             if args.factorize:
                 for key, label in (
-                    ("car_heldout_accuracy", "D car accuracy"),
-                    ("ball_heldout_accuracy", "D ball accuracy"),
+                    ("far_heldout_accuracy", "D far accuracy"),
+                    ("near_heldout_accuracy", "D near accuracy"),
+                    ("global_heldout_accuracy", "D global accuracy"),
                 ):
                     logger.register_progress_metric("Discriminator", key, label, ".3f")
 

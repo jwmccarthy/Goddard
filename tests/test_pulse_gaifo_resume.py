@@ -14,8 +14,8 @@ import torch as th
 from carl.gymnasium.action import CARLActionCodec
 from distill import ACTION_FORMAT, ActionDecoder, ConditionalPrior
 from gaifo import (
-    FactorizedSceneDiscriminator, HistoricalReplayBuffer, RecencyReplayBuffer,
-    SceneDiscriminator,
+    BLUE_START, FactorizedSceneDiscriminator, HistoricalReplayBuffer, ORANGE_START,
+    RecencyReplayBuffer, SceneDiscriminator,
 )
 from jarl.collect import SnapshotPool
 from jarl.data import TensorBatch
@@ -39,23 +39,27 @@ class FactorizedDiscriminator(th.nn.Module):
     factorized = True
 
     def forward(self, windows):
-        return th.stack((windows[:, -1, 0], windows[:, -1, 3]), dim=-1)
+        return th.stack((windows[:, -1, 0], windows[:, -1, 3],
+                         windows[:, -1, ORANGE_START + 15]), dim=-1)
 
 
 class PulseGaifoResumeTests(unittest.TestCase):
-    def test_factorized_pulse_resume_expands_legacy_discriminator_inputs(self):
+    def test_factorized_pulse_resume_replaces_opponent_context_with_global_head(self):
         th.manual_seed(9)
-        previous = FactorizedSceneDiscriminator(8, 8, 16)
+        previous = FactorizedSceneDiscriminator(
+            8, 8, 16, _legacy_two_heads=True, _legacy_opponent_context=True,
+        )
         old_widths = (("car_encoder.0.weight", 27), ("ball_encoder.0.weight", 15))
+        windows = th.randn(2, 8, 51)
+        old_optimizer = th.optim.Adam(previous.parameters())
+        previous(windows).square().sum().backward()
+        old_optimizer.step()
         with th.no_grad():
             for key, width in old_widths:
                 layer = previous.car_encoder[0] if key.startswith("car") else previous.ball_encoder[0]
                 layer.weight[:, width:].zero_()
-        windows = th.randn(2, 8, 51)
         expected = previous(windows)
         old_state = {key: value.clone() for key, value in previous.state_dict().items()}
-        for key, width in old_widths:
-            old_state[key] = old_state[key][:, :width].clone()
 
         policy = th.nn.Linear(1, 1)
         critic = th.nn.Linear(1, 1)
@@ -67,18 +71,24 @@ class PulseGaifoResumeTests(unittest.TestCase):
             "policy": policy.state_dict(), "critic": critic.state_dict(),
             "optimizer": th.optim.Adam((*policy.parameters(), *critic.parameters())).state_dict(),
             "discriminator": old_state,
-            "discriminator_optimizer": th.optim.Adam(previous.parameters()).state_dict(),
+            "discriminator_optimizer": old_optimizer.state_dict(),
         }
+        restored_optimizer = th.optim.Adam(restored.parameters())
         clock = restore_pulse_training(
             payload,
             SimpleNamespace(gaifo_imitation=True, ppo_lr=1e-3,
                             discriminator_lr=1e-3, n_sim=1, rollout=2),
             resumed_policy, resumed_critic,
             th.optim.Adam((*resumed_policy.parameters(), *resumed_critic.parameters())),
-            restored, th.optim.Adam(restored.parameters()),
+            restored, restored_optimizer,
         )
         self.assertEqual(clock.env_steps, 0)
-        th.testing.assert_close(restored(windows), expected, rtol=0, atol=0)
+        self.assertEqual(restored(windows).shape, (2, 3))
+        th.testing.assert_close(restored(windows)[:, 0], expected[:, 0], rtol=0, atol=0)
+        self.assertEqual(restored_optimizer.state[restored.car_encoder[0].weight]["exp_avg"].shape,
+                         (16, old_widths[0][1]))
+        for head in (restored.near_discriminator.head, restored.global_discriminator.head):
+            self.assertFalse(restored_optimizer.state.get(head.weight))
 
     def test_imitation_keeps_pulse_rewards_and_original_learner_mask(self):
         windows = th.zeros(1, 4, 2, 51)
@@ -105,10 +115,12 @@ class PulseGaifoResumeTests(unittest.TestCase):
         th.testing.assert_close(result["learner_mask"], batch["learner_mask"])
         self.assertAlmostEqual(reward.last_mean, 0.5 / 3)
 
-    def test_factorized_imitation_scales_both_heads(self):
+    def test_factorized_imitation_scales_all_three_heads(self):
         windows = th.zeros(1, 4, 2, 51)
         windows[0, :, -1, 0] = th.tensor([-2.0, -2.0, 2.0, 2.0])
-        windows[0, :, -1, 3] = th.tensor([-2.0, 2.0, -2.0, 2.0])
+        windows[0, :, -1, 3] = th.tensor([-2.0, 2.0, 2.0, 2.0])
+        windows[0, :, -1, ORANGE_START + 15] = th.tensor([-2.0, -2.0, 2.0, 2.0])
+        windows[0, [1, 3], :, BLUE_START] = 3_000 / 4_108
         batch = TensorBatch({
             "observation": th.zeros(1, 4, 51),
             "scene_window": windows,
@@ -121,13 +133,19 @@ class PulseGaifoResumeTests(unittest.TestCase):
             microbatch_size=4, max_magnitude=10, weight=0.5,
         )(batch, PrepareContext())
         th.testing.assert_close(
-            result["imitation_reward"], th.tensor([[0.5, 0.0, 0.0, -0.5]])
+            result["imitation_reward"], th.tensor([[0.5, 0.5, -0.5, -0.5]])
         )
         th.testing.assert_close(
-            result["car_imitation_reward"], th.tensor([[0.25, 0.25, -0.25, -0.25]])
+            result["far_imitation_reward"], th.tensor([[0., 0.25, 0., -0.25]])
         )
         th.testing.assert_close(
-            result["training_reward"], th.tensor([[1.5, 1.0, 1.0, 0.5]])
+            result["near_imitation_reward"], th.tensor([[0.25, 0., -0.25, 0.]])
+        )
+        th.testing.assert_close(
+            result["global_imitation_reward"], th.tensor([[0.25, 0.25, -0.25, -0.25]])
+        )
+        th.testing.assert_close(
+            result["training_reward"], th.tensor([[1.5, 1.5, 0.5, 0.5]])
         )
 
     def test_gaifo_history_round_trip_preserves_samples(self):

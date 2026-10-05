@@ -15,8 +15,8 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    BLUE_START, CAR_SIZE, GAIFO_ARCHITECTURE, ORANGE_START, POSITION_SCALE,
-    ExpertSceneDataset, build_discriminator,
+    BLUE_START, GAIFO_ARCHITECTURE, ORANGE_START, POSITION_SCALE,
+    ExpertSceneDataset, FactorizedSceneDiscriminator, build_discriminator,
 )
 from watch_checkpoints import CheckpointRegistry
 from watch_gaifo_experts import (
@@ -93,17 +93,27 @@ def write_periods(folder: Path) -> None:
             )
 
 
-def checkpoint(path: Path, replay_dir: Path, *, factorize: bool = True) -> None:
+def checkpoint(path: Path, replay_dir: Path, *, factorize: bool = True,
+               legacy: bool = False, opponent_context: bool = False) -> None:
     model_args = argparse.Namespace(
         factorize=factorize, frame_embedding=8, temporal_hidden=8,
         discriminator_hidden=8,
     )
-    model = build_discriminator(model_args)
+    model = (
+        FactorizedSceneDiscriminator(
+            8, 8, 8, _legacy_two_heads=True,
+            _legacy_opponent_context=opponent_context,
+        ) if legacy else build_discriminator(model_args)
+    )
     for parameter in model.parameters():
         parameter.data.zero_()
     if factorize:
         model.car_head.bias.data.fill_(2)
-        model.ball_head.bias.data.fill_(-2)
+        if legacy:
+            model.ball_head.bias.data.fill_(-2)
+        else:
+            model.near_discriminator.head.bias.data.fill_(-2)
+            model.global_discriminator.head.bias.data.fill_(1)
     else:
         model.head.bias.data.fill_(-2)
     th.save({
@@ -132,17 +142,24 @@ class ExpertInspectorTests(unittest.TestCase):
     def test_inspector_can_load_legacy_factorized_weights(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
             folder = Path(temporary)
-            path = folder / "gaifo_000000000042.pt"
-            checkpoint(path, folder)
-            saved = th.load(path, map_location="cpu", weights_only=True)
-            for key, old_width in (("car_encoder.0.weight", CAR_SIZE + 6),
-                                   ("ball_encoder.0.weight", 9 + 6)):
-                saved["discriminator"][key] = (
-                    saved["discriminator"][key][:, :old_width].clone()
-                )
-            th.save(saved, path)
-            model, _, _ = load_discriminator(path, th.device("cpu"))
-            th.testing.assert_close(model(th.zeros(1, 8, 51)), th.tensor([[2., -2.]]))
+            for context in (False, True):
+                with self.subTest(context=context):
+                    path = folder / f"gaifo_00000000004{int(context)}.pt"
+                    checkpoint(path, folder, legacy=True, opponent_context=context)
+                    saved = th.load(path, map_location="cpu", weights_only=True)
+                    reference = FactorizedSceneDiscriminator(
+                        8, 8, 8, _legacy_two_heads=True,
+                        _legacy_opponent_context=context,
+                    )
+                    if context:
+                        saved["discriminator"] = reference.state_dict()
+                        th.save(saved, path)
+                    else:
+                        reference.load_state_dict(saved["discriminator"])
+                    model, _, _ = load_discriminator(path, th.device("cpu"))
+                    windows = th.randn(2, 8, 51)
+                    th.testing.assert_close(model(windows), reference(windows), rtol=1e-6, atol=1e-6)
+                    self.assertIsNone(model.global_discriminator)
 
     def test_checkpoint_registry_and_both_discriminator_shapes(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
@@ -157,9 +174,9 @@ class ExpertInspectorTests(unittest.TestCase):
                 checkpoint(path, replays, factorize=factorize)
                 model, config, step = load_discriminator(path, th.device("cpu"))
                 logits = model(th.zeros((2, 8, 51)))
-                self.assertEqual(logits.shape, (2, 2) if factorize else (2,))
+                self.assertEqual(logits.shape, (2, 3) if factorize else (2,))
                 th.testing.assert_close(
-                    logits[0], th.tensor([2., -2.] if factorize else -2.),
+                    logits[0], th.tensor([2., -2., 1.] if factorize else -2.),
                 )
                 self.assertEqual(config["factorize"], factorize)
                 self.assertEqual(step, 42 if factorize else 1)
@@ -288,7 +305,7 @@ class ExpertInspectorTests(unittest.TestCase):
             service._worker.join(timeout=20)
             self.assertFalse(service._worker.is_alive())
             self.assertEqual(service.status()["phase"], "ready", service.status())
-            self.assertEqual(service.status()["heads"], ("combined", "car", "ball"))
+            self.assertEqual(service.status()["heads"], ("combined", "far", "near", "global"))
             self.assertEqual(service.status()["goals"], 0)
 
             arena = Path(carl.__file__).resolve().parent / "assets" / "arena.obj"
@@ -307,14 +324,21 @@ class ExpertInspectorTests(unittest.TestCase):
                 self.assertEqual(len(get("/api/checkpoints")), 1)
                 self.assertEqual(get("/api/sequences?outcome=goal")["total"], 0)
                 self.assertGreater(get("/api/sequences?outcome=other")["total"], 0)
-                results = get("/api/sequences?skill=aerial_maneuver&head=car&order=most")
+                results = get("/api/sequences?skill=aerial_maneuver&head=far&order=most")
                 self.assertGreater(results["total"], 0)
                 selected = get(f"/api/sequence/{results['items'][0]['id']}")
-                self.assertEqual(len(selected["frames"]), len(selected["scores"]["car"]))
-                self.assertTrue(all(score == .5 for score in selected["scores"]["combined"]))
+                self.assertEqual(len(selected["frames"]), len(selected["scores"]["far"]))
+                expected = [th.sigmoid(th.tensor(value)).item() for value in (1.5, -0.5)]
+                self.assertTrue(all(any(abs(score - candidate) < 1e-6 for candidate in expected)
+                                    for score in selected["scores"]["combined"]))
+                global_score = th.sigmoid(th.tensor(1.)).item()
+                self.assertTrue(all(abs(score - global_score) < 1e-6
+                                    for score in selected["scores"]["global"]))
                 self.assertEqual(results["items"][0]["miss_fraction"], 1.0)
-                self.assertEqual(get("/api/sequences?skill=aerial_maneuver&head=ball")
+                self.assertEqual(get("/api/sequences?skill=aerial_maneuver&head=near")
                                  ["items"][0]["miss_fraction"], 0.0)
+                self.assertGreater(get("/api/sequences?skill=aerial_maneuver&head=global")
+                                   ["total"], 0)
                 self.assertGreater(get("/api/sequences?skill=kickoff")["total"], 0)
                 with urlopen(base + "/", timeout=5) as response:
                     self.assertIn(b"Expert Signal", response.read())

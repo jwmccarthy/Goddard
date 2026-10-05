@@ -104,10 +104,13 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         self.assertTrue(saved["config"]["factorize"])
         self.assertTrue(any(key.startswith("car_encoder.")
                             for key in saved["discriminator"]))
-        self.assertTrue(any(key.startswith("ball_encoder.")
+        self.assertTrue(any(key.startswith("near_discriminator.")
                             for key in saved["discriminator"]))
-        self.assertIn("D car accuracy", output)
-        self.assertIn("D ball accuracy", output)
+        self.assertIn("global_discriminator.head.weight", saved["discriminator"])
+        self.assertNotIn("ball_head.weight", saved["discriminator"])
+        self.assertIn("D far accuracy", output)
+        self.assertIn("D near accuracy", output)
+        self.assertIn("D global accuracy", output)
 
     def test_hard_positive_mining_in_unified_and_factorized_modes(self):
         for factorize in (False, True):

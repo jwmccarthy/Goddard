@@ -124,9 +124,8 @@ DRIBBLE_MIN_STEPS = 5
 DRIBBLE_MAX_HORIZONTAL_DISTANCE = 180.0
 DRIBBLE_MAX_RELATIVE_SPEED = 1_200.0
 FLICK_MIN_VELOCITY_CHANGE = 500.0
-BALL_GATE_RADIUS = 200.0
-BALL_GATE_SCALE = 1_000.0
-BALL_GATE_FLOOR = 0.1
+GLOBAL_DISCRIMINATOR_WEIGHT = 0.5
+SPECIALIST_DISCRIMINATOR_WEIGHT = 0.5
 RESET_MINING_CANDIDATES = 8
 RESET_MINING_FRACTION = 0.5
 RESET_MINING_MIN_CONFIDENCE = 0.6
@@ -535,14 +534,6 @@ def ground_maneuvers(
                 goal_terminal=goal_at_end and recovery_stop == len(run),
             ))
     return maneuvers
-
-
-def ball_responsibility(windows: th.Tensor) -> th.Tensor:
-    """Keep a small off-ball signal and credit recent proximity after contact."""
-    separation = (nearest_ball_distance(windows) - BALL_GATE_RADIUS).clamp_min(0)
-    return BALL_GATE_FLOOR + (1 - BALL_GATE_FLOOR) * th.exp(
-        -0.5 * (separation / BALL_GATE_SCALE).square()
-    )
 
 
 def actor_view(scenes: th.Tensor, actor_index: int) -> th.Tensor:
@@ -2042,17 +2033,22 @@ class RecencyReplayBuffer:
 
 
 class SceneDiscriminator(nn.Module):
-    """Structured scene-level discriminator for short 1v1 trajectory windows."""
+    """Structured discriminator for whole-scene trajectory windows."""
 
     def __init__(
         self,
         frame_embedding: int,
         temporal_hidden: int,
         hidden_size: int = 128,
+        *, n_cars: int = N_CARS,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
             raise ValueError("discriminator dimensions must be positive")
+        if n_cars not in (N_CARS, DOUBLES_N_CARS):
+            raise ValueError("scene discriminator needs two or four cars")
+        self.n_cars = n_cars
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.ball_encoder = nn.Sequential(
             nn.Linear(BALL_SIZE, hidden_size),
             nn.ReLU(),
@@ -2066,65 +2062,103 @@ class SceneDiscriminator(nn.Module):
             nn.ReLU(),
         )
         self.gru = nn.GRU(
-            frame_embedding * 3, temporal_hidden, batch_first=True
+            frame_embedding * (n_cars + 1), temporal_hidden, batch_first=True
         )
         self.head = nn.Linear(temporal_hidden, 1)
 
     def forward(self, windows: th.Tensor) -> th.Tensor:
-        if windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE:
-            raise ValueError("unified discriminator requires two-car scene windows")
+        if windows.ndim != 3 or windows.shape[-1] != self.scene_size:
+            raise ValueError("scene discriminator requires two- or four-car scene windows")
         B, T, _ = windows.shape
         ball = windows[..., :BALL_SIZE]
-        cars = windows[..., BALL_SIZE:SCENE_SIZE].view(B, T, N_CARS, CAR_SIZE)
-        blue, orange = cars[:, :, 0], cars[:, :, 1]
-
-        sign = th.tensor([1.0, -1.0], device=windows.device, dtype=windows.dtype)
-        blue_in = th.cat([blue, sign[0].expand_as(blue[..., :1])], dim=-1)
-        orange_in = th.cat([orange, sign[1].expand_as(orange[..., :1])], dim=-1)
-
+        cars = windows[..., BALL_SIZE:].reshape(B, T, self.n_cars, CAR_SIZE)
+        sign = windows.new_tensor(
+            [1.0] * (self.n_cars // 2) + [-1.0] * (self.n_cars // 2)
+        ).view(1, 1, self.n_cars, 1)
+        car_in = th.cat((cars, sign.expand(B, T, -1, -1)), dim=-1)
         ball_emb = self.ball_encoder(ball)
-        blue_emb = self.car_encoder(blue_in)
-        orange_emb = self.car_encoder(orange_in)
-
-        frame_embedding = th.cat([ball_emb, blue_emb, orange_emb], dim=-1)
+        car_emb = self.car_encoder(car_in).flatten(-2)
+        frame_embedding = th.cat((ball_emb, car_emb), dim=-1)
         gru_out, _ = self.gru(frame_embedding)
         return self.head(gru_out[:, -1]).squeeze(-1)
 
 
-class FactorizedSceneDiscriminator(nn.Module):
-    """Score ego motion and ball control with fixed initial other-car context.
+class EgoBallSceneDiscriminator(nn.Module):
+    """Judge the joint ego-car and ball trajectory without opponent shortcuts."""
 
-    Only the first frame of teammates and opponents is visible to either head;
-    their subsequent actions cannot become a shortcut for imitation reward.
-    Use ``actor_view`` to score each player's own window in four-car scenes.
+    def __init__(self, frame_embedding: int, temporal_hidden: int, hidden_size: int):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(BALL_SIZE + CAR_SIZE + 6, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
+        )
+        self.gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
+        self.head = nn.Linear(temporal_hidden, 1)
+
+    def forward(self, windows: th.Tensor) -> th.Tensor:
+        if windows.ndim != 3:
+            raise ValueError("near-ball discriminator needs [batch, frames, scene] windows")
+        scene_car_count(windows)
+        ball = windows[..., :BALL_SIZE]
+        ego = windows[..., BLUE_START:BLUE_START + CAR_SIZE]
+        relative_position = ball[..., :3] - ego[..., :3]
+        relative_velocity = ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
+        inputs = th.cat((ball, ego, relative_position, relative_velocity), dim=-1)
+        features, _ = self.gru(self.encoder(inputs))
+        return self.head(features[:, -1]).squeeze(-1)
+
+
+class FactorizedSceneDiscriminator(nn.Module):
+    """Score the whole scene plus a proximity-selected ego-motion/interaction head.
+
+    Only the global discriminator sees other cars. Legacy car/ball
+    checkpoints can be inspected in their original form using the private flags.
     """
 
     factorized = True
 
     def __init__(
         self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
-        *, n_cars: int = N_CARS,
+        *, n_cars: int = N_CARS, _legacy_two_heads: bool = False,
+        _legacy_opponent_context: bool = False,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
             raise ValueError("discriminator dimensions must be positive")
         if n_cars not in (N_CARS, DOUBLES_N_CARS):
             raise ValueError("factorized discriminator needs two or four cars")
+        if _legacy_opponent_context and not _legacy_two_heads:
+            raise ValueError("opponent context is only supported for legacy checkpoints")
         self.n_cars = n_cars
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
-        self.other_context_size = (n_cars - 1) * (CAR_SIZE + 6)
+        self.other_context_size = (
+            (n_cars - 1) * (CAR_SIZE + 6) if _legacy_opponent_context else 0
+        )
         self.car_encoder = nn.Sequential(
             nn.Linear(CAR_SIZE + 6 + self.other_context_size, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
-        self.ball_encoder = nn.Sequential(
-            nn.Linear(BALL_SIZE + 6 + self.other_context_size, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
-        )
+        if _legacy_two_heads:
+            self.ball_encoder = nn.Sequential(
+                nn.Linear(BALL_SIZE + 6 + self.other_context_size, hidden_size), nn.ReLU(),
+                nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
+            )
         self.car_gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
-        self.ball_gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
+        if _legacy_two_heads:
+            self.ball_gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
         self.car_head = nn.Linear(temporal_hidden, 1)
-        self.ball_head = nn.Linear(temporal_hidden, 1)
+        if _legacy_two_heads:
+            self.ball_head = nn.Linear(temporal_hidden, 1)
+        self.near_discriminator = (
+            None if _legacy_two_heads else EgoBallSceneDiscriminator(
+                frame_embedding, temporal_hidden, hidden_size,
+            )
+        )
+        self.global_discriminator = (
+            None if _legacy_two_heads else SceneDiscriminator(
+                frame_embedding, temporal_hidden, hidden_size, n_cars=n_cars,
+            )
+        )
 
     def forward(self, windows: th.Tensor) -> th.Tensor:
         if windows.ndim != 3 or windows.shape[-1] != self.scene_size:
@@ -2135,59 +2169,106 @@ class FactorizedSceneDiscriminator(nn.Module):
         relative_velocity = (
             ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
         )
-        others = windows[:, 0, BLUE_START + CAR_SIZE:].reshape(
-            -1, self.n_cars - 1, CAR_SIZE,
-        )
-        relative_others = others[..., :6] - ego[:, 0, None, :6]
-        initial_others = th.cat((others, relative_others), dim=-1).flatten(1)
-        context = initial_others[:, None].expand(-1, windows.shape[1], -1)
         # Hold context fixed so the car head cannot classify subsequent ball motion.
         initial_context = th.cat((relative_position[:, 0], relative_velocity[:, 0]), dim=-1)
         car_input = th.cat((
-            ego, initial_context[:, None].expand(-1, windows.shape[1], -1), context,
+            ego, initial_context[:, None].expand(-1, windows.shape[1], -1),
         ), dim=-1)
-        ball_input = th.cat((ball, relative_position, relative_velocity, context), dim=-1)
+        if self.near_discriminator is None and self.other_context_size:
+            others = windows[:, 0, BLUE_START + CAR_SIZE:].reshape(
+                -1, self.n_cars - 1, CAR_SIZE,
+            )
+            relative_others = others[..., :6] - ego[:, 0, None, :6]
+            initial_others = th.cat((others, relative_others), dim=-1).flatten(1)
+            context = initial_others[:, None].expand(-1, windows.shape[1], -1)
+            car_input = th.cat((car_input, context), dim=-1)
         car_features, _ = self.car_gru(self.car_encoder(car_input))
-        ball_features, _ = self.ball_gru(self.ball_encoder(ball_input))
-        return th.cat((
-            self.car_head(car_features[:, -1]), self.ball_head(ball_features[:, -1]),
-        ), dim=-1)
+        far_score = self.car_head(car_features[:, -1])
+        if self.near_discriminator is not None:
+            near_score = self.near_discriminator(windows).unsqueeze(-1)
+        else:
+            ball_input = th.cat((ball, relative_position, relative_velocity), dim=-1)
+            if self.other_context_size:
+                ball_input = th.cat((ball_input, context), dim=-1)
+            ball_features, _ = self.ball_gru(self.ball_encoder(ball_input))
+            near_score = self.ball_head(ball_features[:, -1])
+        if self.global_discriminator is None:
+            return th.cat((far_score, near_score), dim=-1)
+        global_score = self.global_discriminator(windows).unsqueeze(-1)
+        return th.cat((far_score, near_score, global_score), dim=-1)
 
 
 def load_discriminator_state(discriminator: nn.Module, state: dict[str, th.Tensor]) -> bool:
-    """Expand legacy factorized inputs without changing their initial predictions."""
-    upgraded = False
-    if isinstance(discriminator, FactorizedSceneDiscriminator):
-        layers = (
-            ("car_encoder.0.weight", discriminator.car_encoder[0].weight, CAR_SIZE + 6),
-            ("ball_encoder.0.weight", discriminator.ball_encoder[0].weight, BALL_SIZE + 6),
-        )
-        if all(key in state and state[key].shape == (weight.shape[0], old_width)
-               for key, weight, old_width in layers):
-            state = state.copy()
-            for key, weight, old_width in layers:
-                state[key] = F.pad(state[key], (0, weight.shape[1] - old_width))
-            upgraded = True
-    discriminator.load_state_dict(state)
-    return upgraded
+    """Keep the old car head as far; initialize near interaction and global heads."""
+    if (not isinstance(discriminator, FactorizedSceneDiscriminator)
+            or discriminator.near_discriminator is None
+            or any(key.startswith(("near_discriminator.", "global_discriminator."))
+                   for key in state)):
+        discriminator.load_state_dict(state)
+        return False
 
-
-def expand_factorized_optimizer_state(
-    optimizer: th.optim.Optimizer, discriminator: FactorizedSceneDiscriminator,
-) -> None:
-    """Preserve old Adam moments and initialize new opponent columns to zero."""
-    for layer, old_width in (
-        (discriminator.car_encoder[0], CAR_SIZE + 6),
-        (discriminator.ball_encoder[0], BALL_SIZE + 6),
+    weight = state["car_encoder.0.weight"]
+    expected = discriminator.car_encoder[0].weight
+    width = CAR_SIZE + 6
+    if weight.shape[0] != expected.shape[0] or weight.shape[1] not in (
+        width, width + (discriminator.n_cars - 1) * (CAR_SIZE + 6),
     ):
-        for name, value in optimizer.state[layer.weight].items():
-            if isinstance(value, th.Tensor) and value.ndim == 2:
-                if value.shape == (layer.weight.shape[0], old_width):
-                    optimizer.state[layer.weight][name] = F.pad(
-                        value, (0, layer.weight.shape[1] - old_width),
-                    )
-                elif value.shape != layer.weight.shape:
-                    raise ValueError(f"incompatible factorized discriminator optimizer {name}")
+        raise ValueError("incompatible legacy discriminator car inputs")
+    old_car = {key: value for key, value in state.items()
+               if key.startswith(("car_encoder.", "car_gru.", "car_head."))}
+    old_car["car_encoder.0.weight"] = weight[:, :width].clone()
+    missing = discriminator.load_state_dict(old_car, strict=False)
+    new_keys = {key for key in discriminator.state_dict()
+                if key.startswith(("near_discriminator.", "global_discriminator."))}
+    if set(missing.missing_keys) != new_keys or missing.unexpected_keys:
+        raise ValueError("legacy discriminator has incompatible parameters")
+    return True
+
+
+def load_legacy_factorized_optimizer_state(
+    optimizer: th.optim.Optimizer, discriminator: FactorizedSceneDiscriminator,
+    saved: dict,
+) -> None:
+    """Keep far-head moments; discard old ball-head moments and initialize near/global."""
+    current = optimizer.state_dict()
+    if len(saved["param_groups"]) != 1 or len(current["param_groups"]) != 1:
+        raise ValueError("legacy factorized discriminator needs a single optimizer group")
+    previous = saved["param_groups"][0]
+    active = current["param_groups"][0]
+    car_encoder = [f"car_encoder.{name}" for name, _ in discriminator.car_encoder.named_parameters()]
+    car_gru = [f"car_gru.{name}" for name, _ in discriminator.car_gru.named_parameters()]
+    car_head = [f"car_head.{name}" for name, _ in discriminator.car_head.named_parameters()]
+    legacy_names = (
+        car_encoder + [name.replace("car_encoder.", "ball_encoder.") for name in car_encoder]
+        + car_gru + [name.replace("car_gru.", "ball_gru.") for name in car_gru]
+        + car_head + [name.replace("car_head.", "ball_head.") for name in car_head]
+    )
+    named = list(discriminator.named_parameters())
+    if (len(previous["params"]) != len(legacy_names)
+            or any(old is not new for old, (_, new) in zip(
+                optimizer.param_groups[0]["params"], named,
+            ))):
+        raise ValueError("legacy factorized discriminator optimizer does not match model")
+    old_ids = dict(zip(legacy_names, previous["params"]))
+    new_ids = active["params"]
+    state = {
+        param_id: saved["state"][old_ids[name]]
+        for (name, _), param_id in zip(named, new_ids)
+        if name in old_ids and old_ids[name] in saved["state"]
+    }
+    optimizer.load_state_dict({
+        "state": state,
+        "param_groups": [{**previous, "params": new_ids}],
+    })
+    layer = discriminator.car_encoder[0]
+    for name, value in optimizer.state[layer.weight].items():
+        if isinstance(value, th.Tensor) and value.ndim == 2:
+            width = layer.weight.shape[1]
+            legacy_width = width + (discriminator.n_cars - 1) * (CAR_SIZE + 6)
+            if value.shape not in ((layer.weight.shape[0], width),
+                                   (layer.weight.shape[0], legacy_width)):
+                raise ValueError(f"incompatible factorized discriminator optimizer {name}")
+            optimizer.state[layer.weight][name] = value[:, :width].clone()
 
 
 class CuratedReplayResetTransform:
@@ -2273,11 +2354,12 @@ class ConfidentExpertResetTransform:
     def _confidence(self, windows: th.Tensor) -> th.Tensor:
         logits = self.discriminator(windows)
         if getattr(self.discriminator, "factorized", False):
-            expert_probability = th.sigmoid(-logits)
+            if logits.shape != (len(windows), 3):
+                raise ValueError("factorized discriminator must return far, near, and global logits")
             near = nearest_ball_distance(windows) <= BALL_NEAR_DISTANCE
-            return th.where(
-                near, expert_probability.mean(dim=-1), expert_probability[:, 0],
-            )
+            specialist = th.where(near, logits[:, 1], logits[:, 0])
+            logits = (GLOBAL_DISCRIMINATOR_WEIGHT * logits[:, 2]
+                      + SPECIALIST_DISCRIMINATOR_WEIGHT * specialist)
         return th.sigmoid(-logits)
 
     def _score(self, starts: th.Tensor) -> th.Tensor:
@@ -2352,6 +2434,21 @@ class ConfidentExpertResetTransform:
         return fraction
 
 
+def balanced_proximity_weights(near: th.Tensor, target: th.Tensor) -> th.Tensor:
+    """Balance agent/expert labels within each populated near/far band."""
+    if near.ndim != 1 or target.shape != near.shape:
+        raise ValueError("proximity labels must match the discriminator batch")
+    agent = target.bool()
+    masks = [((~near) & agent, (~near) & ~agent), (near & agent, near & ~agent)]
+    populated = [index for index, (generated, expert) in enumerate(masks)
+                 if generated.any() and expert.any()]
+    weights = target.new_zeros((len(target), 2))
+    for index in populated:
+        for mask in masks[index]:
+            weights[mask, index] = len(target) / (2 * len(populated) * mask.sum())
+    return weights
+
+
 class SceneDiscriminatorLoss:
     """BCE-with-logits loss for generated-vs-expert scene windows."""
 
@@ -2366,29 +2463,30 @@ class SceneDiscriminatorLoss:
         agent = target.bool()
         metrics = {}
         if getattr(self.discriminator, "factorized", False):
-            if logit.shape != (len(target), 2):
-                raise ValueError("factorized discriminator must return car and ball logits")
-            car_loss = F.binary_cross_entropy_with_logits(logit[:, 0], target)
-            ball_errors = F.binary_cross_entropy_with_logits(
-                logit[:, 1], target, reduction="none",
-            )
-            weights = batch.get("ball_weight")
+            if logit.shape != (len(target), 3):
+                raise ValueError("factorized discriminator must return far, near, and global logits")
+            near = batch.get("ball_near")
+            if near is None:
+                near = nearest_ball_distance(batch["window"]) <= BALL_NEAR_DISTANCE
+            weights = batch.get("band_weight")
             if weights is None:
-                weights = ball_responsibility(batch["window"]).square()
-                class_losses = [
-                    (ball_errors[chosen] * weights[chosen]).sum()
-                    / weights[chosen].sum().clamp_min(1e-6)
-                    for chosen in (agent, ~agent) if chosen.any()
-                ]
-                ball_loss = th.stack(class_losses).mean()
-            else:
-                ball_loss = (ball_errors * weights).mean()
-            loss = (car_loss + ball_loss) * 0.5
+                weights = balanced_proximity_weights(near, target)
+            errors = F.binary_cross_entropy_with_logits(
+                logit[:, :2], target[:, None].expand(-1, 2), reduction="none",
+            )
+            head_losses = (errors * weights).mean(dim=0)
+            global_loss = F.binary_cross_entropy_with_logits(logit[:, 2], target)
+            loss = (SPECIALIST_DISCRIMINATOR_WEIGHT * head_losses.sum()
+                    + GLOBAL_DISCRIMINATOR_WEIGHT * global_loss)
             metrics = {
-                "car_loss": car_loss.detach(), "ball_loss": ball_loss.detach(),
-                "near_ball_fraction": (nearest_ball_distance(batch["window"])
-                                       <= BALL_NEAR_DISTANCE).float().mean(),
+                "far_loss": head_losses[0].detach(),
+                "near_loss": head_losses[1].detach(),
+                "global_loss": global_loss.detach(),
+                "near_ball_fraction": near.float().mean(),
             }
+            specialist = th.where(near, logit[:, 1], logit[:, 0])
+            logit = (GLOBAL_DISCRIMINATOR_WEIGHT * logit[:, 2]
+                     + SPECIALIST_DISCRIMINATOR_WEIGHT * specialist)
         else:
             loss = F.binary_cross_entropy_with_logits(logit, target)
 
@@ -3008,11 +3106,15 @@ class SceneGAIFOMinibatches:
                         phase_aligned[chosen] = True
                         consumed += len(agent_ids)
 
+                expert_windows = self.expert._windows_for_povs(sampled_experts)
+                if self.factorize:
+                    ball_near = th.cat((
+                        nearest_ball_distance(sampled_agents) <= BALL_NEAR_DISTANCE,
+                        nearest_ball_distance(expert_windows) <= BALL_NEAR_DISTANCE,
+                    ))
                 agent_windows = add_scene_noise(sampled_agents, self.noise_std)
-                expert_windows = add_scene_noise(
-                    self.expert._windows_for_povs(sampled_experts), self.noise_std,
-                )
-                yield TensorBatch({
+                expert_windows = add_scene_noise(expert_windows, self.noise_std)
+                sample = TensorBatch({
                     "window": th.cat((agent_windows, expert_windows)),
                     "is_agent": th.cat((
                         th.ones(count, device=agents.device),
@@ -3024,6 +3126,7 @@ class SceneGAIFOMinibatches:
                     "grounded_random": th.cat((categories == DRIVING_SKILL,
                                                 categories == DRIVING_SKILL)),
                 })
+                yield sample.with_fields(ball_near=ball_near) if self.factorize else sample
             if self._epoch_callback is not None:
                 self._epoch_callback()
 
@@ -3207,10 +3310,15 @@ class SceneGAIFOMinibatches:
                     )
                     agent_windows = th.cat([agent_windows, historical], dim=0)
 
-                agent_windows = add_scene_noise(agent_windows, self.noise_std)
                 expert_windows = self.expert.sample(sample_count, agent_windows.device)
                 if selected_count:
                     expert_windows[:selected_count] = self.expert._windows_for_povs(expert_pairs)
+                if self.factorize:
+                    ball_near = th.cat((
+                        nearest_ball_distance(agent_windows) <= BALL_NEAR_DISTANCE,
+                        nearest_ball_distance(expert_windows) <= BALL_NEAR_DISTANCE,
+                    ))
+                agent_windows = add_scene_noise(agent_windows, self.noise_std)
                 expert_windows = add_scene_noise(expert_windows, self.noise_std)
                 is_agent = th.cat(
                     [
@@ -3223,7 +3331,7 @@ class SceneGAIFOMinibatches:
                                  & (th.arange(sample_count, device=agent_windows.device)
                                     < selected_count))
 
-                yield TensorBatch(
+                sample = TensorBatch(
                     {
                         "window": th.cat([agent_windows, expert_windows]),
                         "is_agent": is_agent,
@@ -3231,6 +3339,7 @@ class SceneGAIFOMinibatches:
                         "grounded_random": th.cat([grounded_mask, grounded_mask]),
                     }
                 )
+                yield sample.with_fields(ball_near=ball_near) if self.factorize else sample
 
             if self._epoch_callback is not None:
                 self._epoch_callback()
@@ -3272,22 +3381,26 @@ def train_discriminator_minibatch(
             metrics[f"{name}_fraction"] = (
                 (sample["skill_category"][:n_agent] == category).float().mean()
             )
-    ball_weights = None
+    band_weights = near = None
     if getattr(discriminator, "factorized", False):
-        ball_weights = ball_responsibility(windows).square()
-    if ball_weights is not None:
-        for chosen in (slice(None, n_agent), slice(n_agent, None)):
-            ball_weights[chosen] /= ball_weights[chosen].mean().clamp_min(1e-6)
+        near = sample.get("ball_near")
+        if near is None:
+            near = nearest_ball_distance(windows) <= BALL_NEAR_DISTANCE
+        band_weights = balanced_proximity_weights(near, labels)
+        metrics["near_agent_fraction"] = near[:n_agent].float().mean()
+        metrics["near_expert_fraction"] = near[n_agent:].float().mean()
     for start in range(0, n_agent, microbatch_size):
         stop = min(start + microbatch_size, n_agent)
         chunk = TensorBatch({
             "window": th.cat((windows[start:stop], windows[n_agent + start:n_agent + stop])),
             "is_agent": th.cat((labels[start:stop], labels[n_agent + start:n_agent + stop])),
         })
-        if ball_weights is not None:
-            chunk = chunk.with_fields(ball_weight=th.cat((
-                ball_weights[start:stop], ball_weights[n_agent + start:n_agent + stop],
-            )))
+        if band_weights is not None:
+            chunk = chunk.with_fields(
+                ball_near=th.cat((near[start:stop], near[n_agent + start:n_agent + stop])),
+                band_weight=th.cat((band_weights[start:stop],
+                                    band_weights[n_agent + start:n_agent + stop])),
+            )
         output = loss(chunk)
         fraction = (stop - start) / n_agent
         (output.loss * fraction).backward()
@@ -3361,17 +3474,19 @@ class SceneDiscriminatorReward:
         valid: th.Tensor,
     ) -> th.Tensor:
         scores = th.zeros(
-            (*valid.shape, 2) if self.factorize else valid.shape,
+            (*valid.shape, 3) if self.factorize else valid.shape,
             dtype=windows.dtype, device=windows.device,
         )
         if not valid.any():
             return scores
 
         flat_windows = windows.reshape(-1, self.trajectory_length, SCENE_SIZE)
-        flat_scores = scores.reshape(-1, 2) if self.factorize else scores.flatten()
+        flat_scores = scores.reshape(-1, 3) if self.factorize else scores.flatten()
         indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
+        near = (nearest_ball_distance(flat_windows[indices]) <= BALL_NEAR_DISTANCE
+                if self.factorize else None)
         selected_scores = th.empty(
-            (len(indices), 2) if self.factorize else (len(indices),),
+            (len(indices), 3) if self.factorize else (len(indices),),
             dtype=scores.dtype, device=scores.device,
         )
         for start in range(0, len(indices), self.batch_size):
@@ -3380,6 +3495,9 @@ class SceneDiscriminatorReward:
                 flat_windows[indices[start:stop]], self.noise_std
             )
             logits = self.discriminator(noisy)
+            expected = (stop - start, 3) if self.factorize else (stop - start,)
+            if logits.shape != expected:
+                raise ValueError(f"discriminator returned {tuple(logits.shape)}, expected {expected}")
             if self.exp_log_odds_reward:
                 # D = sigmoid(-logits) is the expert probability, so
                 # exp(log D - log(1-D)) = exp(-logits).
@@ -3391,26 +3509,29 @@ class SceneDiscriminatorReward:
                     -self.max_magnitude, self.max_magnitude
                 )
 
-        if self.exp_log_odds_reward:
-            flat_scores[indices] = selected_scores
-            return scores
-
         if self.factorize:
-            std = selected_scores.std(dim=0, unbiased=False)
-            normalized = th.where(
-                std > 1e-8,
-                (selected_scores - selected_scores.mean(dim=0)) / std.clamp_min(1e-8),
-                th.zeros_like(selected_scores),
-            )
+            # Normalize the specialist scores within their own proximity bands.
+            # The global score is normalized across every valid window.
+            gated = th.zeros_like(selected_scores)
+            for head, active in enumerate((~near, near, th.ones_like(near))):
+                values = selected_scores[active, head]
+                if self.exp_log_odds_reward:
+                    gated[active, head] = values
+                elif len(values):
+                    std = values.std(unbiased=False)
+                    if std > 1e-8:
+                        gated[active, head] = ((values - values.mean()) / std).clamp(
+                            -self.max_magnitude, self.max_magnitude,
+                        )
+            flat_scores[indices] = gated
+        elif self.exp_log_odds_reward:
+            flat_scores[indices] = selected_scores
         else:
             std = selected_scores.std(unbiased=False)
             if std > 1e-8:
-                normalized = (selected_scores - selected_scores.mean()) / std
-            else:
-                normalized = th.zeros_like(selected_scores)
-        flat_scores[indices] = normalized.clamp(
-            -self.max_magnitude, self.max_magnitude
-        )
+                flat_scores[indices] = ((selected_scores - selected_scores.mean()) / std).clamp(
+                    -self.max_magnitude, self.max_magnitude,
+                )
         return scores
 
     @th.no_grad()
@@ -3428,14 +3549,15 @@ class SceneDiscriminatorReward:
         scores = self._score_windows(windows, valid).to(dtype)
         components = {}
         if self.factorize:
-            proximity = ball_responsibility(windows).to(dtype)
-            car_reward = 0.5 * scores[..., 0]
-            ball_reward = 0.5 * proximity * scores[..., 1]
-            imitation_reward = car_reward + ball_reward
+            far_reward = SPECIALIST_DISCRIMINATOR_WEIGHT * scores[..., 0]
+            near_reward = SPECIALIST_DISCRIMINATOR_WEIGHT * scores[..., 1]
+            global_reward = GLOBAL_DISCRIMINATOR_WEIGHT * scores[..., 2]
+            imitation_reward = far_reward + near_reward + global_reward
             components = {
-                "car_imitation_reward": car_reward,
-                "ball_imitation_reward": ball_reward,
-                "ball_proximity": proximity,
+                "far_imitation_reward": far_reward,
+                "near_imitation_reward": near_reward,
+                "global_imitation_reward": global_reward,
+                "ball_near": (nearest_ball_distance(windows) <= BALL_NEAR_DISTANCE) & valid,
             }
         else:
             imitation_reward = scores
@@ -3779,7 +3901,7 @@ class AdaptiveDiscriminatorUpdate:
         if validation is None:
             validation = self._heldout_pairs(heldout_generated, heldout_near)
         factorize = getattr(self.discriminator, "factorized", False)
-        head_names = ("car", "ball") if factorize else ("unified",)
+        head_names = ("far", "near", "global") if factorize else ("unified",)
         if validation is None:
             metrics = {
                 "loss": 0.0,
@@ -3795,7 +3917,9 @@ class AdaptiveDiscriminatorUpdate:
 
         generated, expert, near_generated, near_expert = validation
         n = len(generated)
-        totals = th.zeros(5, len(head_names), device=generated.device)
+        totals = th.zeros(5, device=generated.device)
+        head_counts = th.zeros(2, len(head_names), device=generated.device)
+        head_correct = th.zeros_like(head_counts)
 
         was_training = self.discriminator.training
         with th.inference_mode():
@@ -3803,20 +3927,48 @@ class AdaptiveDiscriminatorUpdate:
             try:
                 for start in range(0, n, self.microbatch_size):
                     stop = min(start + self.microbatch_size, n)
-                    logits = self.discriminator(add_scene_noise(
-                        th.cat((generated[start:stop], expert[start:stop])),
-                        self.noise_std,
-                    ))
+                    raw = th.cat((generated[start:stop], expert[start:stop]))
+                    logits = self.discriminator(add_scene_noise(raw, self.noise_std))
                     generated_logits, expert_logits = logits.split(stop - start)
-                    if not factorize:
+                    if factorize:
+                        near = nearest_ball_distance(raw) <= BALL_NEAR_DISTANCE
+                        generated_near, expert_near = near.split(stop - start)
+                        generated_masks = th.stack((
+                            ~generated_near, generated_near,
+                            th.ones_like(generated_near),
+                        ), dim=-1)
+                        expert_masks = th.stack((
+                            ~expert_near, expert_near, th.ones_like(expert_near),
+                        ), dim=-1)
+                        generated_selected = (
+                            GLOBAL_DISCRIMINATOR_WEIGHT * generated_logits[:, 2]
+                            + SPECIALIST_DISCRIMINATOR_WEIGHT * th.where(
+                                generated_near, generated_logits[:, 1], generated_logits[:, 0],
+                            )
+                        )
+                        expert_selected = (
+                            GLOBAL_DISCRIMINATOR_WEIGHT * expert_logits[:, 2]
+                            + SPECIALIST_DISCRIMINATOR_WEIGHT * th.where(
+                                expert_near, expert_logits[:, 1], expert_logits[:, 0],
+                            )
+                        )
+                    else:
+                        generated_masks = th.ones(stop - start, 1, device=generated.device)
+                        expert_masks = th.ones_like(generated_masks)
                         generated_logits = generated_logits[:, None]
                         expert_logits = expert_logits[:, None]
-                    totals[0] += F.softplus(-generated_logits).sum(dim=0)
-                    totals[0] += F.softplus(expert_logits).sum(dim=0)
-                    totals[1] += th.sigmoid(generated_logits).sum(dim=0)
-                    totals[2] += th.sigmoid(expert_logits).sum(dim=0)
-                    totals[3] += (generated_logits > 0.0).sum(dim=0)
-                    totals[4] += (expert_logits <= 0.0).sum(dim=0)
+                        generated_selected = generated_logits[:, 0]
+                        expert_selected = expert_logits[:, 0]
+                    head_counts[0] += generated_masks.sum(dim=0)
+                    head_counts[1] += expert_masks.sum(dim=0)
+                    head_correct[0] += ((generated_logits > 0) * generated_masks).sum(dim=0)
+                    head_correct[1] += ((expert_logits <= 0) * expert_masks).sum(dim=0)
+                    totals[0] += F.softplus(-generated_selected).sum()
+                    totals[0] += F.softplus(expert_selected).sum()
+                    totals[1] += th.sigmoid(generated_selected).sum()
+                    totals[2] += th.sigmoid(expert_selected).sum()
+                    totals[3] += (generated_selected > 0).sum()
+                    totals[4] += (expert_selected <= 0).sum()
                 near_accuracy = None
                 if factorize and near_generated is not None:
                     n_near = len(near_generated)
@@ -3834,25 +3986,30 @@ class AdaptiveDiscriminatorUpdate:
             finally:
                 self.discriminator.train(was_training)
         loss, agent_score, expert_score, agent_correct, expert_correct = totals.tolist()
-        head_accuracies = [
-            (agent_correct[index] + expert_correct[index]) / (2 * n)
-            for index in range(len(head_names))
-        ]
+        head_accuracies = {}
+        measured = []
+        for index, name in enumerate(head_names):
+            if bool((head_counts[:, index] > 0).all()):
+                accuracy = (head_correct[:, index] / head_counts[:, index]).mean().item()
+                measured.append(accuracy)
+            else:
+                accuracy = 0.0
+            head_accuracies[name] = accuracy
         metrics = {
-            "loss": sum(loss) / (2 * n * len(head_names)),
-            "agent_score": sum(agent_score) / (n * len(head_names)),
-            "expert_score": sum(expert_score) / (n * len(head_names)),
-            "agent_accuracy": sum(agent_correct) / (n * len(head_names)),
-            "expert_accuracy": sum(expert_correct) / (n * len(head_names)),
-            "heldout_accuracy": min(head_accuracies),
+            "loss": loss / (2 * n),
+            "agent_score": agent_score / n,
+            "expert_score": expert_score / n,
+            "agent_accuracy": agent_correct / n,
+            "expert_accuracy": expert_correct / n,
+            "heldout_accuracy": min(measured),
         }
         if factorize:
             metrics.update({
-                f"{name}_heldout_accuracy": head_accuracies[index]
-                for index, name in enumerate(head_names)
+                f"{name}_heldout_accuracy": head_accuracies[name]
+                for name in head_names
             })
             if near_accuracy is not None:
-                metrics["ball_near_heldout_accuracy"] = near_accuracy
+                metrics["near_heldout_accuracy"] = near_accuracy
                 metrics["heldout_accuracy"] = min(metrics["heldout_accuracy"], near_accuracy)
         return metrics
 
@@ -4118,9 +4275,12 @@ def restore_training_checkpoint(
             module.load_state_dict(payload[name])
     for name, optimizer in optimizers.items():
         if name != "skill_encoder" or not upgrade_encoder:
-            optimizer.load_state_dict(payload[f"{name}_optimizer"])
             if name == "discriminator" and upgrade_discriminator:
-                expand_factorized_optimizer_state(optimizer, modules[name])
+                load_legacy_factorized_optimizer_state(
+                    optimizer, modules[name], payload[f"{name}_optimizer"],
+                )
+            else:
+                optimizer.load_state_dict(payload[f"{name}_optimizer"])
         learning_rate = (
             args.ase_encoder_lr if name == "skill_encoder" else (
                 args.discriminator_lr if "discriminator" in name else args.ppo_lr
@@ -4131,7 +4291,7 @@ def restore_training_checkpoint(
     if upgrade_encoder:
         print("Initialized ASE skill encoder from checkpoint; reset encoder optimizer")
     if upgrade_discriminator:
-        print("Added initial opponent context to factorized discriminator checkpoint")
+        print("Restored far-car discriminator; initialized near-ball and global discriminators")
 
     if "torch_rng_state" in payload:
         th.set_rng_state(payload["torch_rng_state"].cpu())
@@ -4182,7 +4342,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--factorize", action=argparse.BooleanOptionalAction, default=False,
-        help="train separate car-motion and near-ball-control discriminators with proximity-gated ball reward",
+        help="train an always-on global scene discriminator and proximity-gated far-car and near-car/ball specialists",
     )
     parser.add_argument(
         "--hard-positive-mining", action=argparse.BooleanOptionalAction, default=False,
@@ -4839,9 +4999,9 @@ def main() -> None:
         logger.register_progress_metric(section, key, label, fmt)
     if args.factorize:
         for key, label in (
-            ("car_heldout_accuracy", "D car accuracy"),
-            ("ball_heldout_accuracy", "D ball accuracy"),
-            ("ball_near_heldout_accuracy", "D ball near accuracy"),
+            ("far_heldout_accuracy", "D far accuracy"),
+            ("near_heldout_accuracy", "D near accuracy"),
+            ("global_heldout_accuracy", "D global accuracy"),
             ("train_near_ball_fraction", "D near-ball fraction"),
         ):
             logger.register_progress_metric("Discriminator", key, label, ".3f")

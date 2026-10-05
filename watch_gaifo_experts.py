@@ -24,12 +24,14 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    BALL_RADIUS, BLUE_START, CAR_SIZE, GAIFO_ARCHITECTURE,
+    BALL_NEAR_DISTANCE, BALL_RADIUS, BLUE_START, CAR_SIZE,
+    GLOBAL_DISCRIMINATOR_WEIGHT, SPECIALIST_DISCRIMINATOR_WEIGHT, GAIFO_ARCHITECTURE,
     GAIFO_ASE_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GROUND_MANEUVERS,
     GROUND_MANEUVER_START, DRIVING_SKILL, KICKOFF_SKILL,
     ORANGE_START, POSITION_SCALE,
     SKILL_CATEGORIES,
-    ExpertSceneDataset, build_discriminator, load_discriminator_state, opponent_view,
+    ExpertSceneDataset, FactorizedSceneDiscriminator, build_discriminator,
+    load_discriminator_state, nearest_ball_distance, opponent_view,
 )
 from watch_checkpoints import CheckpointRegistry
 
@@ -38,7 +40,8 @@ ROOT = Path(__file__).resolve().parent
 FRONTEND = ROOT / "web" / "gaifo_experts"
 CAR_OFFSET = (13.8757, 0.0, 20.755)
 SKILLS = SKILL_CATEGORIES
-HEADS = ("combined", "car", "ball")
+HEADS = ("combined", "far", "near", "global")
+LEGACY_HEADS = ("combined", "car", "ball")
 DRIVING_SPAN = 64  # A short stretch of uninterrupted, eligible driving windows.
 
 
@@ -73,13 +76,24 @@ def load_discriminator(path: Path, device: th.device):
         GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
     ) or "discriminator" not in payload:
         raise ValueError(f"checkpoint has no supported 1v1 discriminator: {path}")
-    model = build_discriminator(argparse.Namespace(
+    args = argparse.Namespace(
         factorize=bool(config.get("factorize", False)),
         discriminator_hidden=int(config["discriminator_hidden"]),
         frame_embedding=int(config["frame_embedding"]),
         temporal_hidden=int(config["temporal_hidden"]),
-    ))
-    load_discriminator_state(model, payload["discriminator"])
+    )
+    state = payload["discriminator"]
+    if args.factorize and not any(key.startswith("global_discriminator.") for key in state):
+        width = state["car_encoder.0.weight"].shape[1]
+        if width not in (CAR_SIZE + 6, 2 * (CAR_SIZE + 6)):
+            raise ValueError("legacy factorized discriminator has incompatible car inputs")
+        model = FactorizedSceneDiscriminator(
+            args.frame_embedding, args.temporal_hidden, args.discriminator_hidden,
+            _legacy_two_heads=True, _legacy_opponent_context=width > CAR_SIZE + 6,
+        )
+    else:
+        model = build_discriminator(args)
+    load_discriminator_state(model, state)
     return model.to(device).eval().requires_grad_(False), config, int(payload["step"])
 
 
@@ -238,7 +252,9 @@ def score_sequences(
     device: th.device, batch_size: int, progress=None,
 ) -> tuple[str, ...]:
     """Use every valid causal expert window from each clip, without added noise."""
-    heads = HEADS if getattr(model, "factorized", False) else ("combined",)
+    heads = ("combined",)
+    if getattr(model, "factorized", False):
+        heads = HEADS if getattr(model, "global_discriminator", None) is not None else LEGACY_HEADS
     for record in records:
         record.probabilities = np.empty((record.length, len(heads)), dtype=np.float32)
     total = sum(record.length for record in records)
@@ -256,11 +272,18 @@ def score_sequences(
             logits = model(windows)
             if not bool(th.isfinite(logits).all()):
                 raise ValueError("discriminator produced non-finite logits")
-            if len(heads) == 3:
-                if logits.shape != (len(pairs), 2):
-                    raise ValueError("factorized discriminator must return car and ball logits")
+            if getattr(model, "factorized", False):
+                if logits.shape != (len(pairs), len(heads) - 1):
+                    raise ValueError("factorized discriminator returned the wrong number of logits")
+                if len(heads) == 4:
+                    near = nearest_ball_distance(windows) <= BALL_NEAR_DISTANCE
+                    specialist = th.where(near, logits[:, 1], logits[:, 0])
+                    combined = (SPECIALIST_DISCRIMINATOR_WEIGHT * specialist
+                                + GLOBAL_DISCRIMINATOR_WEIGHT * logits[:, 2])
+                else:
+                    combined = logits.mean(dim=-1)
                 probabilities = th.cat((
-                    th.sigmoid(logits.mean(dim=-1, keepdim=True)), th.sigmoid(logits),
+                    th.sigmoid(combined[:, None]), th.sigmoid(logits),
                 ), dim=-1)
             else:
                 if logits.shape != (len(pairs),):

@@ -277,7 +277,7 @@
       <div class="phase-key"><span>SETUP</span><span>ACTION</span><span>RECOVERY</span></div>
       <hr class="divider">
       <p class="note">Expert is label 0. P(agent) above 50% means this expert window was classified as generated play. The focal expert is the blue car in the 3D view, even for an orange replay POV.</p>
-      <p class="note">For factorized checkpoints, the combined score is the sigmoid of the average car and ball logits.</p>
+      <p class="note">For new factorized checkpoints, the combined score averages the always-on global logit with either the near-ball car/ball or far-ball car-motion logit, selected by the ego car’s closest approach during the window. Legacy two-head checkpoints average the car and ball logits.</p>
       <p class="note">Each score uses the checkpoint's original causal window length. Skill clips include setup and action through recovery or a scored goal; ordinary driving is a small sampled comparison set.</p>
     </aside>
   </div>
