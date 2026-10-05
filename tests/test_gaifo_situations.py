@@ -202,9 +202,10 @@ class SituationBalanceTests(unittest.TestCase):
         self.assertEqual((int((sampled < 20).sum()), int((sampled >= 30).sum())), (8, 8))
         self.assertTrue({4, 19, 20, 29, 30, 45}.issubset(sampled.tolist()))
 
-    def test_controlled_aerial_needs_separate_elevated_touches_and_ball_movement(self):
+    def test_three_aerial_contacts_are_distinct_events_not_frames_or_carry_distance(self):
         touches = np.zeros(12, dtype=bool)
         touches[3:5] = touches[8:10] = True
+        touches[11] = True
         car_height = np.full(12, 650.)
         ball = np.zeros((12, 3))
         ball[:, 1] = np.arange(12) * 30 / POSITION_SCALE[1]
@@ -213,20 +214,20 @@ class SituationBalanceTests(unittest.TestCase):
 
         classify = lambda: aerial_skill_category(touches, car_height, ball, distance)
         self.assertEqual(classify(), AERIAL_MANEUVER_SKILL)
-        touches[8:10] = False
+        touches[11] = False
         self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
-        touches[5:10] = True  # One sustained contact, not six separate touches.
+        touches[5:10] = True  # One sustained contact, not seven separate touches.
         self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
+        touches[:] = False
+        touches[[3, 5, 7]] = True  # One jittering contact, not three.
+        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
+        touches[3:5] = touches[8:10] = True
         touches[5:8] = False
-        ball[:, 1] = 0  # Two hits on a stationary ball are not a controlled carry.
-        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
-        ball[:, 1] = np.arange(12) * 30 / POSITION_SCALE[1]
-        distance[6] = 1_600  # Lost the ball entirely between hits.
-        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
-        distance[6] = 150
-        ball[6, 2] = 92 / POSITION_SCALE[2]  # Ball landed between hits.
-        self.assertEqual(classify(), AERIAL_TOUCH_SKILL)
-        ball[6, 2] = 750 / POSITION_SCALE[2]
+        touches[11] = True
+        ball[:, 1] = 0  # Control need not be uninterrupted between real touches.
+        distance[6] = 1_600
+        ball[6, 2] = 92 / POSITION_SCALE[2]
+        self.assertEqual(classify(), AERIAL_MANEUVER_SKILL)
         touches[:] = False
         self.assertIsNone(classify())
         touches[3] = True

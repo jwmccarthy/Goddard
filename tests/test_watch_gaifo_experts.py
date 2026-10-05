@@ -47,7 +47,7 @@ def write_periods(folder: Path) -> None:
             rows[8:25, 0] = 100 / POSITION_SCALE[0]
             rows[8:25, 2] = 750 / POSITION_SCALE[2]
             rows[8:25, 1] = (np.arange(8, 25) - 8) * 20 / POSITION_SCALE[1]
-            rows[10, 156] = rows[16, 156] = 1
+            rows[[10, 16, 22], 156] = 1
         elif skill in ("dribble", "flick"):
             for step in range(len(rows)):
                 if 5 <= step < 12:
@@ -274,6 +274,7 @@ class ExpertInspectorTests(unittest.TestCase):
             self.assertFalse(service._worker.is_alive())
             self.assertEqual(service.status()["phase"], "ready", service.status())
             self.assertEqual(service.status()["heads"], ("combined", "car", "ball"))
+            self.assertEqual(service.status()["goals"], 0)
 
             arena = Path(carl.__file__).resolve().parent / "assets" / "arena.obj"
             server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service, arena))
@@ -289,6 +290,8 @@ class ExpertInspectorTests(unittest.TestCase):
             try:
                 self.assertEqual(get("/api/status")["phase"], "ready")
                 self.assertEqual(len(get("/api/checkpoints")), 1)
+                self.assertEqual(get("/api/sequences?outcome=goal")["total"], 0)
+                self.assertGreater(get("/api/sequences?outcome=other")["total"], 0)
                 results = get("/api/sequences?skill=aerial_maneuver&head=car&order=most")
                 self.assertGreater(results["total"], 0)
                 selected = get(f"/api/sequence/{results['items'][0]['id']}")
@@ -303,7 +306,8 @@ class ExpertInspectorTests(unittest.TestCase):
                 with urlopen(base + "/app.js", timeout=5) as response:
                     self.assertIn(b"OrbitControls", response.read())
                 for route, status in (("/api/sequence/99999", 404),
-                                      ("/api/sequences?head=unknown", 400)):
+                                       ("/api/sequences?head=unknown", 400),
+                                       ("/api/sequences?outcome=unknown", 400)):
                     with self.subTest(route=route), self.assertRaises(HTTPError) as raised:
                         get(route)
                     self.assertEqual(raised.exception.code, status)

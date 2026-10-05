@@ -11,7 +11,8 @@ import torch as th
 
 from gaifo import (
     AERIAL_MANEUVER_SKILL, AERIAL_TOUCH_SKILL, DRIVING_SKILL, KICKOFF_SKILL,
-    BLUE_START, ORANGE_START, POSITION_SCALE, ConfidentExpertResetTransform,
+    BLUE_START, ORANGE_START, POSITION_SCALE, SKILL_CATEGORIES,
+    ConfidentExpertResetTransform,
     CuratedReplayResetTransform, ExpertSceneDataset, GeneratedManeuverTracker,
     ReplayResetProvider, SceneGAIFOMinibatches,
     generated_maneuver_pools, parse_args, scene_situation_ids,
@@ -19,6 +20,7 @@ from gaifo import (
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.data import TensorBatch
 from jarl.envs import DatasetResetSampler
+from watch_checkpoints import load_curated_reset_provider
 
 
 def _period(folder: Path, kind: str, index: int) -> None:
@@ -43,7 +45,7 @@ def _period(folder: Path, kind: str, index: int) -> None:
         rows[8:25, 0] = 100 / POSITION_SCALE[0]
         if kind == "aerial":
             rows[8:25, 1] = (np.arange(8, 25) - 8) * 20 / POSITION_SCALE[1]
-            rows[10, 156] = rows[16, 156] = 1  # Two controlled airborne touches.
+            rows[[10, 16, 22], 156] = 1  # Three distinct airborne touches.
         else:
             rows[10, 156] = 1
     elif kind in ("dribble", "flick"):
@@ -94,6 +96,40 @@ def _expert(folder: Path, driving_fraction: float = 0.10) -> ExpertSceneDataset:
 
 
 class CuratedSkillSamplingTests(unittest.TestCase):
+    def test_checkpoint_viewer_resets_select_safe_curated_skills_and_training_mix(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = _expert(Path(directory))
+            provider = load_curated_reset_provider(
+                Path(directory), "cpu", frame_skip=4, state_limit=24,
+                corpus_limit=None, seed=0,
+            )
+            self.assertEqual(set(provider.providers), set(SKILL_CATEGORIES))
+            self.assertLessEqual(len(next(iter(provider.providers.values())).frames), 24)
+            mask = th.ones(1, dtype=th.bool)
+            markers = [
+                expert.frames[pool, 8] for pool in expert._curated_reset_pools
+            ]
+
+            for category, eligible in zip(SKILL_CATEGORIES, markers):
+                provider.select(category)
+                for _ in range(8):
+                    request = provider(mask)
+                    self.assertTrue(bool(th.isin(request.ball[0, 8], eligible)))
+                    self.assertEqual(request.simulation_indices.tolist(), [0])
+                    self.assertTrue(request.normalized)
+            with self.assertRaisesRegex(ValueError, "unavailable reset type"):
+                provider.select("unmatched")
+            self.assertIsNone(provider(th.zeros(1, dtype=th.bool)))
+
+            provider.select("mixed")
+            counts = np.zeros(len(SKILL_CATEGORIES), dtype=np.int64)
+            for _ in range(1_000):
+                marker = float(provider(mask).ball[0, 8])
+                counts[int(marker * 10) - 1] += 1
+            observed = counts / counts.sum()
+            expected = CuratedReplayResetTransform(expert).weights.numpy()
+            np.testing.assert_allclose(observed, expected, atol=.05)
+
     def test_training_defaults_use_ten_percent_driving_and_five_percent_kickoff(self):
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",

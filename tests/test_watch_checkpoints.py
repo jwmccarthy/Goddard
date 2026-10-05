@@ -1,6 +1,9 @@
 import argparse
+import http.client
+import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,9 +11,13 @@ from unittest.mock import patch
 import numpy as np
 import torch as th
 from gymnasium.spaces import Box, MultiDiscrete
+from http.server import ThreadingHTTPServer
 
 from gaifo import GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, build_policy
-from watch_checkpoints import CheckpointRegistry, load_policy_checkpoint, parse_args
+from watch_checkpoints import (
+    CheckpointRegistry, SpectatorState, load_policy_checkpoint, make_handler,
+    parse_args,
+)
 
 
 class FakeEnv:
@@ -21,6 +28,54 @@ class FakeEnv:
 
 
 class WatchGAIFOCheckpointsTests(unittest.TestCase):
+    def test_reset_type_api_offers_loaded_pools_and_rejects_unavailable_choices(self):
+        state = SpectatorState()
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                make_handler(state, folder, folder / "arena.obj", CheckpointRegistry(folder)),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            client = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            try:
+                client.request("GET", "/api/reset-types")
+                response = client.getresponse()
+                self.assertEqual(json.load(response), {"types": [], "selected": "mixed"})
+
+                state.configure_reset_types(("aerial_maneuver", "driving"))
+                client.request("GET", "/api/reset-types")
+                response = client.getresponse()
+                self.assertEqual([item["id"] for item in json.load(response)["types"]], [
+                    "mixed", "aerial_maneuver", "driving",
+                ])
+
+                client.request("POST", "/api/reset", json.dumps({
+                    "reset_type": "aerial_maneuver",
+                }), {"Content-Type": "application/json"})
+                self.assertEqual(client.getresponse().status, 204)
+                self.assertEqual(state.take_reset_request(), (False, "aerial_maneuver"))
+
+                client.request("POST", "/api/reset", json.dumps({
+                    "reset_type": "flick",
+                }), {"Content-Type": "application/json"})
+                self.assertEqual(client.getresponse().status, 400)
+                self.assertIsNone(state.take_reset_request())
+
+                client.request("POST", "/api/reset")
+                self.assertEqual(client.getresponse().status, 204)
+                self.assertEqual(state.take_reset_request(), (False, "aerial_maneuver"))
+
+                client.request("POST", "/api/kickoff")
+                self.assertEqual(client.getresponse().status, 204)
+                self.assertEqual(state.take_reset_request(), (True, "aerial_maneuver"))
+            finally:
+                client.close()
+                server.shutdown()
+                thread.join(timeout=2)
+                server.server_close()
+
     def test_policy_width_flag_keeps_legacy_spelling(self):
         with patch.object(sys, "argv", [
             "watch_checkpoints.py", "--policy-hidden", "16",

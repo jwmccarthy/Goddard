@@ -240,7 +240,7 @@ async function pollStatus() {
     const status = await getJSON('/api/status');
     if (status.phase === 'ready') {
       $('scanScreen').classList.add('hidden');
-      statusMessage(`${Number(status.step).toLocaleString()} steps · ${status.clips.toLocaleString()} clips`, 'ready');
+      statusMessage(`${Number(status.step).toLocaleString()} steps · ${status.clips.toLocaleString()} clips · ${status.goals.toLocaleString()} goals`, 'ready');
       $('scannedCount').textContent = `${status.windows.toLocaleString()} windows`;
       const version = `${status.checkpoint}:${status.step}:${status.replay_dir}`;
       if (version !== readyVersion) {
@@ -314,9 +314,16 @@ function listCard(item) {
   const split = document.createElement('span');
   split.className = `chip ${item.split}`;
   split.textContent = item.split;
+  bottom.append(split);
+  if (item.goal_terminal) {
+    const goal = document.createElement('span');
+    goal.className = 'chip';
+    goal.textContent = 'GOAL';
+    bottom.append(goal);
+  }
   const context = document.createElement('span');
   context.textContent = `${percent(item.miss_fraction)} failed · ${item.length} frames`;
-  bottom.append(split, context);
+  bottom.append(context);
   card.append(top, source, bottom);
   card.addEventListener('click', () => selectSequence(item.id));
   return card;
@@ -334,6 +341,7 @@ async function loadCatalog(reset = true) {
   const query = new URLSearchParams({
     skill: currentSkill, split: $('splitSelect').value,
     head: $('headSelect').value, order: $('orderSelect').value,
+    outcome: $('outcomeSelect').value,
     search: $('searchInput').value, offset: pageOffset, limit: 40,
   });
   try {
@@ -378,7 +386,7 @@ async function selectSequence(id) {
     ball.visible = true;
     $('frameSlider').max = Math.max(0, clip.frames.length - 1);
     $('stageTitle').textContent = `${clip.skill[0].toUpperCase()}${clip.skill.slice(1).replaceAll('_', ' ')} · expert #${clip.id}`;
-    $('stageSubtitle').textContent = `${clip.split} · ${clip.source} · ${clip.frames.length} frames`;
+    $('stageSubtitle').textContent = `${clip.split} · ${clip.source} · ${clip.frames.length} frames${clip.goal_terminal ? ' · GOAL' : ''}`;
     for (const card of document.querySelectorAll('.sequence-item')) {
       card.classList.toggle('selected', Number(card.dataset.id) === id);
     }
@@ -430,7 +438,7 @@ function showFrame(index) {
   state.cars.forEach((car, idx) => setCar(idx, car));
   $('frameSlider').value = frameIndex;
   $('frameTime').textContent = `${(frameIndex * clip.frame_skip / 120).toFixed(2)} s`;
-  $('frameLabel').textContent = `row ${clip.source_start + frameIndex} / ${clip.source_stop}${state.touch ? ' · EGO TOUCH' : ''}`;
+  $('frameLabel').textContent = `row ${clip.source_start + frameIndex} / ${clip.source_stop}${state.touch ? ' · EGO TOUCH' : ''}${clip.goal_terminal && frameIndex === clip.frames.length - 1 ? ' · GOAL' : ''}`;
   $('clipCurrent').textContent = `${percent(activeScores()[frameIndex])} P(agent)`;
   $('playButton').textContent = playing ? 'Ⅱ' : '▶';
   drawChart();
@@ -543,7 +551,7 @@ for (const button of document.querySelectorAll('.skill-button')) {
     loadCatalog(true);
   });
 }
-for (const id of ['splitSelect', 'headSelect', 'orderSelect']) {
+for (const id of ['splitSelect', 'headSelect', 'outcomeSelect', 'orderSelect']) {
   $(id).addEventListener('change', () => {
     if (id === 'headSelect') updateMetrics();
     loadCatalog(true);

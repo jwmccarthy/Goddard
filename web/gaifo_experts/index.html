@@ -235,6 +235,7 @@
       <div class="filters">
         <label>DATA SPLIT<select id="splitSelect"><option value="all">All splits</option><option value="heldout">Held-out</option><option value="train">Training</option></select></label>
         <label>SCORE HEAD<select id="headSelect"><option value="combined">Combined</option></select></label>
+        <label class="wide">PLAY ENDS<select id="outcomeSelect"><option value="all">Any outcome</option><option value="goal">Goal</option><option value="other">No goal</option></select></label>
         <label class="wide">RANK BY<select id="orderSelect"><option value="most">Most misclassified · average</option><option value="least">Least misclassified · average</option><option value="misses">Most windows misclassified</option><option value="peak">Highest single-window error</option></select></label>
       </div>
       <input id="searchInput" class="filter-search" type="search" placeholder="Search replay name or ID…" aria-label="Search replay name or sequence ID">
@@ -277,7 +278,7 @@
       <hr class="divider">
       <p class="note">Expert is label 0. P(agent) above 50% means this expert window was classified as generated play. The focal expert is the blue car in the 3D view, even for an orange replay POV.</p>
       <p class="note">For factorized checkpoints, the combined score is the sigmoid of the average car and ball logits.</p>
-      <p class="note">Each score uses the checkpoint's original causal window length. Skill clips include setup, action and recovery; ordinary driving is a small sampled comparison set.</p>
+      <p class="note">Each score uses the checkpoint's original causal window length. Skill clips include setup and action through recovery or a scored goal; ordinary driving is a small sampled comparison set.</p>
     </aside>
   </div>
   <script type="module" src="/app.js"></script>

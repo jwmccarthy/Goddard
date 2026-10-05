@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import carl
+import numpy as np
 import torch as th
 
 from carl.gymnasium import CARLTorchVectorEnv
@@ -24,6 +25,9 @@ from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_ASE_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
+    SKILL_CATEGORIES,
+    CuratedReplayResetTransform,
+    ExpertSceneDataset,
     build_policy as build_gaifo_policy,
 )
 from gaifo_ase import SkillObservationSpace, SkillViewerPolicy
@@ -32,7 +36,7 @@ from pulse import (
     build_policy as build_pulse_policy, file_sha256,
 )
 from replay_resets import (
-    ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
+    ReplayResetProvider, reset_index_dataset,
 )
 
 
@@ -146,6 +150,8 @@ class SpectatorState:
         self.sequence = 0
         self.frame = None
         self.pending_match: tuple[Path, Path] | None = None
+        self.reset_types: tuple[str, ...] = ()
+        self.reset_type = "mixed"
 
     def publish(self, frame: dict) -> None:
         with self.condition:
@@ -162,6 +168,140 @@ class SpectatorState:
             match = self.pending_match
             self.pending_match = None
             return match
+
+
+    def configure_reset_types(self, types: tuple[str, ...]) -> None:
+        with self.condition:
+            self.reset_types = ("mixed", *types)
+            if self.reset_type not in self.reset_types:
+                self.reset_type = "mixed"
+
+    def reset_options(self) -> dict:
+        with self.condition:
+            return {
+                "types": [
+                    {"id": name, "label": (
+                        "Training mix" if name == "mixed"
+                        else name.replace("_", " ").title()
+                    )}
+                    for name in self.reset_types
+                ],
+                "selected": self.reset_type,
+            }
+
+    def request_reset(self, reset_type: str | None = None) -> None:
+        with self.condition:
+            if not self.reset_types:
+                raise ValueError("replay reset states are still loading")
+            if reset_type is not None:
+                if reset_type not in self.reset_types:
+                    raise ValueError(f"unavailable reset type: {reset_type}")
+                self.reset_type = reset_type
+            self.reset.set()
+
+    def request_kickoff(self) -> None:
+        with self.condition:
+            self.kickoff.set()
+
+    def take_reset_request(self) -> tuple[bool, str] | None:
+        with self.condition:
+            if not (self.reset.is_set() or self.kickoff.is_set()):
+                return None
+            kickoff = self.kickoff.is_set()
+            self.reset.clear()
+            self.kickoff.clear()
+            return kickoff, self.reset_type
+
+
+class CuratedViewerResetProvider:
+    """One-match replay resets with GAIFO's weighted or selected skill pools."""
+
+    def __init__(
+        self,
+        frames: th.Tensor,
+        internal_states: th.Tensor,
+        pools: dict[str, th.Tensor],
+        weights: th.Tensor,
+        seed: int,
+    ) -> None:
+        self.providers = {
+            name: ReplayResetProvider(
+                DatasetResetSampler(
+                    reset_index_dataset(indices), probability=1.0, seed=seed,
+                ),
+                frames, internal_states,
+            )
+            for name, indices in pools.items()
+        }
+        self.weights = weights.cpu()
+        self.generator = th.Generator(device="cpu").manual_seed(seed)
+        self.reset_type = "mixed"
+
+    def select(self, reset_type: str) -> None:
+        if reset_type != "mixed" and reset_type not in self.providers:
+            raise ValueError(f"unavailable reset type: {reset_type}")
+        self.reset_type = reset_type
+
+    def __call__(self, reset_mask: th.Tensor):
+        if not bool(reset_mask.any()):
+            return None
+        category = self.reset_type
+        if category == "mixed":
+            index = th.multinomial(
+                self.weights, 1, replacement=True, generator=self.generator,
+            ).item()
+            category = SKILL_CATEGORIES[index]
+        return self.providers[category](reset_mask)
+
+
+def load_curated_reset_provider(
+    replay_dir: Path,
+    device: str | th.device,
+    frame_skip: int,
+    state_limit: int,
+    corpus_limit: int | None,
+    seed: int,
+) -> CuratedViewerResetProvider:
+    """Classify complete replay periods, then retain a bounded GPU reset cache."""
+    expert = ExpertSceneDataset(
+        replay_dir, trajectory_length=8, limit=corpus_limit, seed=seed,
+        frame_skip=frame_skip, device="cpu", reject_discontinuities=True,
+        skill_sampling=True,
+    )
+    transform = CuratedReplayResetTransform(expert)
+    weights = transform.weights.cpu().numpy()
+    random = np.random.default_rng(seed)
+    available = np.flatnonzero(weights)
+    reserved = np.zeros(len(SKILL_CATEGORIES), dtype=np.int64)
+    if state_limit >= len(available):
+        reserved[available] = 1
+    counts = random.multinomial(state_limit - int(reserved.sum()), weights) + reserved
+
+    frames = []
+    internals = []
+    pools = {}
+    offset = 0
+    for category, pool, count in zip(SKILL_CATEGORIES, transform.pools, counts):
+        if not count:
+            continue
+        choice = random.choice(len(pool), size=min(int(count), len(pool)), replace=False)
+        indices = pool[th.from_numpy(choice)]
+        frames.append(expert.frames[indices])
+        internals.append(expert.internal_states[indices])
+        pools[category] = th.arange(offset, offset + len(indices), device=device)
+        offset += len(indices)
+
+    if not frames:
+        raise ValueError("no safe curated replay reset frames")
+    active_weights = th.tensor([
+        float(weights[index]) if category in pools else 0.0
+        for index, category in enumerate(SKILL_CATEGORIES)
+    ])
+    active_weights /= active_weights.sum()
+    return CuratedViewerResetProvider(
+        th.cat(frames).to(device), th.cat(internals).to(device),
+        pools, active_weights, seed,
+    )
 
 
 def load_policy_checkpoint(
@@ -392,20 +532,11 @@ def simulate(
 ) -> None:
     base = None
     try:
-        replay_frames, replay_internal = load_demonstration_reset_frames(
-            args.replay_dir,
-            "cuda:0",
-            args.frameskip,
-            args.reset_state_limit,
-            args.seed,
-            require_frame_skip_match=False,
+        reset_provider = load_curated_reset_provider(
+            args.replay_dir, "cuda:0", args.frameskip, args.reset_state_limit,
+            args.reset_corpus_limit or None, args.seed,
         )
-        reset_sampler = DatasetResetSampler(
-            reset_index_dataset(th.arange(
-                len(replay_frames), device=replay_frames.device,
-            )),
-            probability=1.0, seed=args.seed,
-        )
+        state.configure_reset_types(tuple(reset_provider.providers))
         base = CARLTorchVectorEnv(
             n_sim=1,
             n_blue=1,
@@ -415,9 +546,7 @@ def simulate(
             max_ticks=args.max_ticks,
             normalize=True,
             synchronize=True,
-            reset_state_provider=ReplayResetProvider(
-                reset_sampler, replay_frames, replay_internal,
-            ),
+            reset_state_provider=reset_provider,
             discrete_actions=True,
         )
         env, blue, orange = load_match(
@@ -449,12 +578,12 @@ def simulate(
                     blue, orange = next_blue, next_orange
                     blue_state = blue.initial_state(1)
                     orange_state = orange.initial_state(1)
-                    state.reset.set()
+                    state.request_reset()
 
-            if state.reset.is_set() or state.kickoff.is_set():
-                kickoff = state.kickoff.is_set()
-                state.reset.clear()
-                state.kickoff.clear()
+            request = state.take_reset_request()
+            if request is not None:
+                kickoff, reset_type = request
+                reset_provider.select(reset_type)
                 observation = reset_observation(env, kickoff)
                 blue_state = blue.initial_state(1)
                 orange_state = orange.initial_state(1)
@@ -516,12 +645,22 @@ def make_handler(
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             if self.path == "/api/reset":
-                state.reset.set()
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length < 0 or length > 1_024:
+                        raise ValueError("reset request is too large")
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    if not isinstance(payload, dict):
+                        raise ValueError("reset request must be an object")
+                    state.request_reset(payload.get("reset_type"))
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(error))
+                    return
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.end_headers()
                 return
             if self.path == "/api/kickoff":
-                state.kickoff.set()
+                state.request_kickoff()
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.end_headers()
                 return
@@ -544,6 +683,9 @@ def make_handler(
         def do_GET(self) -> None:
             if self.path == "/api/checkpoints":
                 self._json([item.as_dict() for item in registry.list()])
+                return
+            if self.path == "/api/reset-types":
+                self._json(state.reset_options())
                 return
             if self.path == "/api/stream":
                 self._stream()
@@ -621,6 +763,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-ticks", type=int, default=4096)
     parser.add_argument("--reset-state-limit", type=int, default=4096)
+    parser.add_argument(
+        "--reset-corpus-limit", type=int, default=200_000,
+        help="replay frames to classify for curated resets (0 scans the full corpus)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--blue-skill-seed", type=int, default=0)
     parser.add_argument("--orange-skill-seed", type=int, default=1)
@@ -633,6 +779,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--blue and --orange must be provided together")
     if args.frameskip < 1 or args.max_ticks < 1 or args.reset_state_limit < 1:
         parser.error("frame, episode, and replay limits must be positive")
+    if args.reset_corpus_limit < 0 or 0 < args.reset_corpus_limit < 8:
+        parser.error("reset corpus limit must be zero or at least eight frames")
     if args.hidden_size is not None and args.hidden_size < 1:
         parser.error("hidden size must be positive")
     return args

@@ -57,7 +57,10 @@ from gaifo_ase import (
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
 )
-from replay_safety import infer_unsafe_start_mask, pre_goal_start_mask
+from replay_safety import (
+    GOAL_EXCLUSION_SECONDS, TICKS_PER_SECOND,
+    infer_unsafe_start_mask, pre_goal_start_mask,
+)
 from reward_spec import CEILING_Z
 
 
@@ -100,6 +103,7 @@ SKILL_CATEGORIES = (
     FLICK_SKILL, DRIVING_SKILL, KICKOFF_SKILL,
 ) = range(len(SKILL_CATEGORIES))
 SKILL_AERIAL_NEAR_STEPS = 4
+SKILL_AERIAL_MANEUVER_CONTACTS = 3
 SKILL_AERIAL_TOUCH_SEPARATION = 3
 KICKOFF_MAX_STEPS = 96  # At frame skip 4, covers the challenge after the approach.
 KICKOFF_FOLLOW_THROUGH_STEPS = 16
@@ -112,7 +116,7 @@ AERIAL_RECOVERY_STEPS = 16
 AERIAL_MIN_CONTEXT_STEPS = 8
 MANEUVER_SETUP_STEPS = 8
 MANEUVER_RECOVERY_STEPS = 8
-MANEUVER_MAX_TRACKED_STEPS = 128
+MANEUVER_MAX_TRACKED_STEPS = 256
 GROUND_MAX_TRACKED_STEPS = 256
 MANEUVER_MAX_PENDING = 2_048
 MANEUVER_ARCHIVE_PER_SITUATION = 32
@@ -219,6 +223,7 @@ class SceneManeuver:
     recovery_stop: int
     actor: int = 0
     stride: int = 1
+    goal_terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -283,6 +288,30 @@ def recovery_surface_contact(
     return on_surface & ~ball_reset
 
 
+def _maneuver_runs(
+    valid: np.ndarray, goal_ends: np.ndarray | None,
+) -> list[np.ndarray]:
+    if goal_ends is not None and goal_ends.shape != valid.shape:
+        raise ValueError("goal endings must align with maneuver frames")
+    active = np.flatnonzero(valid)
+    if not len(active):
+        return []
+    boundaries = np.diff(active) != 1
+    if goal_ends is not None:
+        # A new episode can start immediately after a scored goal.
+        boundaries |= goal_ends[active[:-1]]
+    return np.split(active, np.flatnonzero(boundaries) + 1)
+
+
+def _aerial_contact_count(touches: np.ndarray) -> int:
+    """Debounce nearby sampled flags from the same physical contact."""
+    starts = np.flatnonzero(
+        np.diff(np.pad(touches.astype(np.int8), (1, 0))) == 1
+    )
+    return (1 + int((np.diff(starts) >= SKILL_AERIAL_TOUCH_SEPARATION).sum())
+            if len(starts) else 0)
+
+
 def air_maneuvers(
     valid: np.ndarray,
     on_surface: np.ndarray,
@@ -292,36 +321,55 @@ def air_maneuvers(
     *,
     setup_steps: int = AERIAL_SETUP_STEPS,
     recovery_steps: int = AERIAL_RECOVERY_STEPS,
+    goal_ends: np.ndarray | None = None,
+    touches: np.ndarray | None = None,
+    allow_partial: bool = False,
 ) -> list[AirManeuver]:
-    """Trace genuinely elevated flights with ground/wall setup and recovery."""
+    """Trace flights; three contacts also qualify without setup or recovery."""
     if (not all(len(values) == len(valid) for values in
-                (on_surface, height, up_z, ball_distance))
+        (on_surface, height, up_z, ball_distance))
             or setup_steps < 1 or recovery_steps < 1):
         raise ValueError("maneuver timelines must agree and include setup/recovery")
-    active = np.flatnonzero(valid)
-    if not len(active):
-        return []
+    if (touches is not None and touches.shape != valid.shape
+            or allow_partial and touches is None):
+        raise ValueError("partial aerials require aligned touch events")
     flights: list[AirManeuver] = []
-    for run in np.split(active, np.flatnonzero(np.diff(active) != 1) + 1):
+    for run in _maneuver_runs(valid, goal_ends):
+        goal_at_end = goal_ends is not None and bool(goal_ends[run[-1]])
         grounded = on_surface[run]
         takeoffs = np.flatnonzero(grounded[:-1] & ~grounded[1:]) + 1
         landings = np.flatnonzero(grounded)
         previous_landing = int(landings[0]) if len(landings) else 0
+        spans = []
+        if allow_partial and not grounded[0]:
+            landing = int(landings[0]) if len(landings) else len(run)
+            if _aerial_contact_count(touches[run[:landing]]) >= SKILL_AERIAL_MANEUVER_CONTACTS:
+                next_takeoff = int(takeoffs[0]) if len(takeoffs) else len(run)
+                spans.append((0, 0, landing, min(len(run), landing + recovery_steps,
+                                                 next_takeoff)))
         for index, takeoff in enumerate(takeoffs):
             next_landing = np.searchsorted(landings, takeoff)
             if next_landing == len(landings):
-                break  # An incomplete airborne span cannot provide recovery.
-            landing = int(landings[next_landing])
+                if (not goal_at_end and not (
+                    allow_partial and _aerial_contact_count(touches[run[takeoff:]])
+                    >= SKILL_AERIAL_MANEUVER_CONTACTS
+                )):
+                    break  # An incomplete airborne span cannot provide recovery.
+                landing = len(run)
+            else:
+                landing = int(landings[next_landing])
             if landing - takeoff < 2:
                 previous_landing = landing
                 continue
             next_takeoff = int(takeoffs[index + 1]) if index + 1 < len(takeoffs) else len(run)
             setup_start = max(previous_landing, takeoff - setup_steps)
             recovery_stop = min(len(run), landing + recovery_steps, next_takeoff)
+            spans.append((setup_start, takeoff, landing, recovery_stop))
+            previous_landing = landing
+        for setup_start, takeoff, landing, recovery_stop in spans:
             air = run[takeoff:landing]
             peak = float(height[air].max())
             if peak <= 2 * BALL_RADIUS:
-                previous_landing = landing
                 continue  # A ground-level flick is not an aerial maneuver.
             roof = ((height[air] >= NEAR_CEILING_HEIGHT)
                     & ((up_z[air] <= -0.5) | (height[air] >= CEILING_AIR_HEIGHT)))
@@ -341,10 +389,10 @@ def air_maneuvers(
                 situation=situation * len(DISTANCE_BANDS) + band,
                 setup_start=int(run[setup_start]),
                 action_start=int(run[takeoff]),
-                action_stop=int(run[landing]),
+                action_stop=int(run[landing]) if landing < len(run) else int(run[-1]) + 1,
                 recovery_stop=int(run[recovery_stop - 1]) + 1,
+                goal_terminal=goal_at_end and recovery_stop == len(run),
             ))
-            previous_landing = landing
     return flights
 
 
@@ -352,12 +400,9 @@ def aerial_skill_category(
     touches: np.ndarray, car_height: np.ndarray,
     ball_position: np.ndarray, ball_distance: np.ndarray,
 ) -> int | None:
-    """An aerial touch is one contact; a carry needs separate, controlled contacts.
-
-    Consecutive sampled touch flags are one contact, even if the near-ball mask
-    fluctuates. Between separate touches the ball must remain aloft and in reach,
-    stay close at least half the time, and travel farther than its radius.
-    """
+    """Three distinct airborne contacts define a maneuver, with no carry gate."""
+    if _aerial_contact_count(touches) >= SKILL_AERIAL_MANEUVER_CONTACTS:
+        return AERIAL_MANEUVER_SKILL
     ball_height = ball_position[:, 2] * POSITION_SCALE[2]
     close = ((car_height > 2 * BALL_RADIUS) & (ball_height > 250)
              & (ball_distance < BALL_CLOSE_DISTANCE))
@@ -366,25 +411,10 @@ def aerial_skill_category(
         return None
 
     touch_edges = np.flatnonzero(np.diff(np.pad(touches.astype(np.int8), (1, 1))))
-    events = []
-    for begin, end in zip(touch_edges[::2], touch_edges[1::2]):
-        contact = np.flatnonzero(close[begin:end])
-        if len(contact):
-            events.append(int(begin + contact[0]))
-    if not events:
-        return None
-
-    for first, second in zip(events, events[1:]):
-        between = slice(first, second + 1)
-        if (second - first >= SKILL_AERIAL_TOUCH_SEPARATION
-                and (ball_height[between] > 250).all()
-                and (ball_distance[between] < BALL_NEAR_DISTANCE).all()
-                and (ball_distance[between] < BALL_CLOSE_DISTANCE).mean() >= 0.5
-                and np.linalg.norm(
-                    (ball_position[second] - ball_position[first]) * POSITION_SCALE
-                ) > BALL_RADIUS):
-            return AERIAL_MANEUVER_SKILL
-    return AERIAL_TOUCH_SKILL
+    return (AERIAL_TOUCH_SKILL if any(
+        close[begin:end].any()
+        for begin, end in zip(touch_edges[::2], touch_edges[1::2])
+    ) else None)
 
 
 def generated_air_skill(
@@ -437,18 +467,17 @@ def ground_maneuvers(
     *,
     setup_steps: int = MANEUVER_SETUP_STEPS,
     recovery_steps: int = MANEUVER_RECOVERY_STEPS,
+    goal_ends: np.ndarray | None = None,
 ) -> list[GroundManeuver]:
-    """Trace sustained dribbles and flip-driven flick releases in one timeline."""
+    """Trace sustained dribbles and flicks through recovery or a scored goal."""
     if features.shape != (len(valid), 14) or setup_steps < 1 or recovery_steps < 1:
         raise ValueError("ground control needs aligned scenes and setup/recovery")
     raw = dribble_control_mask(features) & valid
     carrying = raw.copy()
     carrying[1:-1] |= raw[:-2] & raw[2:] & valid[1:-1]
-    active = np.flatnonzero(valid)
-    if not len(active):
-        return []
     maneuvers: list[GroundManeuver] = []
-    for run in np.split(active, np.flatnonzero(np.diff(active) != 1) + 1):
+    for run in _maneuver_runs(valid, goal_ends):
+        goal_at_end = goal_ends is not None and bool(goal_ends[run[-1]])
         in_control = carrying[run]
         changes = np.flatnonzero(np.diff(np.pad(in_control.astype(np.int8), (1, 1))))
         starts, stops = changes[::2], changes[1::2]
@@ -457,7 +486,18 @@ def ground_maneuvers(
             next_start = int(starts[index + 1]) if index + 1 < len(starts) else len(run)
             setup_start = max(previous_stop, int(start) - setup_steps)
             previous_stop = int(stop)
-            if stop - start < DRIBBLE_MIN_STEPS or setup_start == start or stop == len(run):
+            if stop - start < DRIBBLE_MIN_STEPS or setup_start == start:
+                continue
+            if stop == len(run):
+                if goal_at_end:
+                    maneuvers.append(GroundManeuver(
+                        situation=GROUND_MANEUVER_START,
+                        setup_start=int(run[setup_start]),
+                        action_start=int(run[start]),
+                        action_stop=int(run[-1]) + 1,
+                        recovery_stop=int(run[-1]) + 1,
+                        goal_terminal=True,
+                    ))
                 continue
             release_end = min(len(run), int(stop) + recovery_steps, next_start)
             flip_begin = max(0, int(stop) - 3)
@@ -482,7 +522,8 @@ def ground_maneuvers(
             ), None) if jumped else None
             action_stop = release_action if release_action is not None else int(stop)
             recovery_stop = min(len(run), action_stop + recovery_steps, next_start)
-            if recovery_stop <= action_stop:
+            if (recovery_stop < action_stop
+                    or (recovery_stop == action_stop and not goal_at_end)):
                 continue
             maneuvers.append(GroundManeuver(
                 situation=GROUND_MANEUVER_START + int(release_action is not None),
@@ -491,6 +532,7 @@ def ground_maneuvers(
                 action_stop=int(run[action_stop]) if action_stop < len(run)
                 else int(run[-1]) + 1,
                 recovery_stop=int(run[recovery_stop - 1]) + 1,
+                goal_terminal=goal_at_end and recovery_stop == len(run),
             ))
     return maneuvers
 
@@ -656,6 +698,31 @@ def _unsafe_replay_reset_frames(
     # The first touch column is the ego's contact. An opponent's contact is
     # immediately available from the paired POV; neither is a safe reset tick.
     return unsafe | pre_goal | np.asarray(stored[:, -5:], dtype=bool).any(axis=-1)
+
+
+def _replay_goal_scorer(path: Path, stored: np.ndarray) -> int | None:
+    """Identify the scorer at a period boundary, including legacy replay files.
+
+    Older safety sidecars omit goal annotations. Their last physical ball state
+    can still establish a goal when it has crossed the goal line inside the
+    mouth. An explicit non-goal annotation takes precedence over that fallback.
+    """
+    sidecar = path.with_suffix(".unsafe-starts.npz")
+    if sidecar.is_file():
+        with np.load(sidecar) as metadata:
+            if "pre_goal" in metadata:
+                pre_goal = metadata["pre_goal"]
+                if pre_goal.shape != (len(stored),):
+                    raise ValueError(f"invalid goal mask for {path.name}")
+                if not bool(pre_goal[-1]):
+                    return None
+                return 0 if stored[-1, 1] > 0 else 1
+
+    ball = stored[-1, :3] * np.asarray(POSITION_SCALE)
+    if (abs(ball[1]) >= GOAL_Y and abs(ball[0]) < 900
+            and 0 < ball[2] < GOAL_HEIGHT):
+        return 0 if ball[1] > 0 else 1
+    return None
 
 
 def advanced_touch_events(
@@ -1006,6 +1073,7 @@ class ExpertSceneDataset:
         ego_touches: list[th.Tensor] = []
         unsafe_reset_frames: list[th.Tensor] = []
         lengths: list[int] = []
+        goal_actors: list[int | None] = []
         total = 0
         for group in selected:
             path = group[0]
@@ -1017,6 +1085,7 @@ class ExpertSceneDataset:
                 else:
                     stored_frame_skip = _sampled_frame_skip(path, frame_skip)
             stored = np.load(path, mmap_mode="r")
+            goal_actor = _replay_goal_scorer(path, stored)
             if skill_sampling:
                 source_skip = stored_frame_skip if frame_skip is not None else 4
                 unsafe_reset = _unsafe_replay_reset_frames(path, stored, source_skip)
@@ -1105,6 +1174,7 @@ class ExpertSceneDataset:
                     opponent_internal, stored_frame_skip, frame_skip
                 )
             internal = np.stack((ego_internal, opponent_internal), axis=1)
+            full_length = len(source)
             if limit is not None and total + len(source) > limit:
                 keep = max(0, limit - total)
                 if keep == 0:
@@ -1144,6 +1214,7 @@ class ExpertSceneDataset:
                 unsafe_reset_frames.append(th.from_numpy(unsafe_reset.copy()))
                 ego_touches.append(th.from_numpy(touches.copy()))
             lengths.append(len(source))
+            goal_actors.append(goal_actor if real_length == full_length else None)
             total += real_length
             if limit is not None and total >= limit:
                 break
@@ -1162,6 +1233,7 @@ class ExpertSceneDataset:
             th.cat(unsafe_reset_frames).to(device) if skill_sampling else None
         )
         self.lengths = lengths
+        self.segment_goal_actors = goal_actors
         window_starts = []
         segment_window_starts = []
         segment_frame_indices = []
@@ -1536,25 +1608,59 @@ class ExpertSceneDataset:
             actor: self.frames[:, list(ground_feature_indices(car_start))].cpu().numpy()
             for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
         }
+        touches = self.ego_touches.cpu().numpy() if self.ego_touches is not None else None
+        contacts = (self.contact_frames.cpu().numpy()
+                    if self.contact_frames is not None else None)
+        goal_tail_steps = round(GOAL_EXCLUSION_SECONDS * TICKS_PER_SECOND / self.frame_skip)
         groups: list[list[SceneManeuver]] = [[] for _ in range(N_SITUATIONS)]
         offset = 0
-        for length in self.lengths:
+        for length, goal_actor in zip(self.lengths, self.segment_goal_actors):
             count = max(0, length - self.trajectory_length + 1)
             if count and allowed[offset:offset + count].any():
                 actors = (0, 1) if stored_opponent[offset] else (0,)
                 for actor in actors:
+                    goal_ends = np.zeros(count, dtype=bool)
+                    goal_ends[-1] = actor == goal_actor
                     surface, height, up_z = frame_pose[actor]
                     scored = slice(offset + self.trajectory_length - 1, offset + length)
                     frame_dist = frame_distance[actor][offset:offset + length]
                     distance = frame_dist[:count].copy()
                     for step in range(1, self.trajectory_length):
                         np.minimum(distance, frame_dist[step:step + count], out=distance)
-                    for maneuver in (*air_maneuvers(
+                    maneuvers = [*air_maneuvers(
                         allowed[offset:offset + count], surface[scored],
                         height[scored], up_z[scored], distance,
+                        goal_ends=goal_ends,
+                        touches=touches[scored, actor] if touches is not None else None,
+                        allow_partial=touches is not None,
                     ), *ground_maneuvers(
                         allowed[offset:offset + count], control_features[actor][scored],
-                    )):
+                        goal_ends=goal_ends,
+                    )]
+                    if (contacts is not None and goal_ends[-1]
+                            and allowed[offset + count - 1]
+                            and not any(maneuver.goal_terminal for maneuver in maneuvers)):
+                        # A shot may land or release before the ball crosses the
+                        # line. Keep its safe, untouched follow-through to goal.
+                        candidates = [
+                            maneuver for maneuver in maneuvers
+                            if (0 < count - maneuver.recovery_stop <= goal_tail_steps
+                                and count - maneuver.action_stop <= goal_tail_steps
+                                and allowed[offset + maneuver.recovery_stop:
+                                            offset + count].all()
+                                and not contacts[
+                                    offset + maneuver.action_stop + self.partition_span:
+                                    offset + count + self.partition_span
+                                ].any())
+                        ]
+                        if candidates:
+                            latest = max(candidates, key=lambda clip: clip.action_stop)
+                            maneuvers = [
+                                replace(maneuver, recovery_stop=count, goal_terminal=True)
+                                if maneuver is latest else maneuver
+                                for maneuver in maneuvers
+                            ]
+                    for maneuver in maneuvers:
                         groups[maneuver.situation].append(replace(
                             maneuver,
                             setup_start=offset + maneuver.setup_start,
@@ -1640,17 +1746,22 @@ class ExpertSceneDataset:
             for clip in clips:
                 actor = clip.actor
                 if isinstance(clip, AirManeuver):
-                    # Exclude flights cut short by a replay, split, or next
-                    # takeoff: a demonstration needs both its approach and landing.
-                    if (clip.action_start - clip.setup_start < AERIAL_MIN_CONTEXT_STEPS
-                            or clip.recovery_stop - clip.action_stop < AERIAL_MIN_CONTEXT_STEPS):
-                        continue
                     scored = np.arange(clip.action_start, clip.action_stop) + self.partition_span
                     category = aerial_skill_category(
                         touches[scored, actor], heights[actor][scored],
                         ball_position[scored], distances[actor][scored],
                     )
                     if category is None:
+                        continue
+                    # A three-touch aerial can begin or end at a replay, goal,
+                    # or valid-window boundary. Single touches still need both
+                    # grounded setup and recovery (unless a goal ends the play).
+                    if (category != AERIAL_MANEUVER_SKILL
+                            and (clip.action_start - clip.setup_start
+                                 < AERIAL_MIN_CONTEXT_STEPS
+                                 or (not clip.goal_terminal
+                                     and clip.recovery_stop - clip.action_stop
+                                     < AERIAL_MIN_CONTEXT_STEPS))):
                         continue
                     clip = replace(clip, skill_category=category)
                 else:
@@ -2266,12 +2377,14 @@ class GeneratedSceneTimeline:
     up_z: np.ndarray
     distance: np.ndarray
     control: np.ndarray
+    goal_ends: np.ndarray
 
 
 def generated_scene_timeline(
     windows: th.Tensor, indices: th.Tensor, n_envs: int,
     episode_end: th.Tensor | None = None,
     ego_ball_touch: th.Tensor | None = None,
+    goal_scored: th.Tensor | None = None,
 ) -> GeneratedSceneTimeline:
     if n_envs < 1 or len(windows) % n_envs:
         raise ValueError("generated windows must be time-major by actor")
@@ -2280,26 +2393,37 @@ def generated_scene_timeline(
         raise ValueError("episode ends must match the generated actor timeline")
     if ego_ball_touch is not None and ego_ball_touch.shape != (steps, n_envs):
         raise ValueError("ball touches must match the generated actor timeline")
+    if goal_scored is not None and goal_scored.shape != (steps, n_envs):
+        raise ValueError("scored goals must match the generated actor timeline")
+    if goal_scored is not None and episode_end is None:
+        raise ValueError("scored goals require episode endings")
     valid = th.zeros(len(windows), dtype=th.bool, device=windows.device)
     valid[indices] = True
+    scored = (goal_scored.bool().clone() if goal_scored is not None
+              else th.zeros((steps, n_envs), dtype=th.bool, device=windows.device))
     if episode_end is not None:
-        valid &= ~episode_end.reshape(-1)
-    scored = windows[:, -1]
+        valid &= ~(episode_end.bool() & ~scored).reshape(-1)
+        scored &= episode_end.bool()
+    else:
+        scored.zero_()
+    goal_ends = (scored & valid.reshape(steps, n_envs)).cpu().numpy()
+    scenes = windows[:, -1]
     return GeneratedSceneTimeline(
         valid=valid.reshape(steps, n_envs).cpu().numpy(),
         touches=(ego_ball_touch.bool().cpu().numpy() if ego_ball_touch is not None
                  else np.zeros((steps, n_envs), dtype=bool)),
-        grounded=recovery_surface_contact(scored, windows[:, -2]).reshape(
+        grounded=recovery_surface_contact(scenes, windows[:, -2]).reshape(
             steps, n_envs,
         ).cpu().numpy(),
-        height=(scored[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
+        height=(scenes[:, BLUE_START + 2] * POSITION_SCALE[2]).reshape(
             steps, n_envs,
         ).cpu().numpy(),
-        up_z=scored[:, BLUE_START + 14].reshape(steps, n_envs).cpu().numpy(),
+        up_z=scenes[:, BLUE_START + 14].reshape(steps, n_envs).cpu().numpy(),
         distance=nearest_ball_distance(windows).reshape(steps, n_envs).cpu().numpy(),
-        control=scored[:, list(ground_feature_indices(BLUE_START))].reshape(
+        control=scenes[:, list(ground_feature_indices(BLUE_START))].reshape(
             steps, n_envs, 14,
         ).cpu().numpy(),
+        goal_ends=goal_ends,
     )
 
 
@@ -2310,12 +2434,13 @@ def generated_maneuver_pools(
     episode_end: th.Tensor | None = None,
     *,
     ego_ball_touch: th.Tensor | None = None,
+    goal_scored: th.Tensor | None = None,
     timeline: GeneratedSceneTimeline | None = None,
 ) -> tuple[list[SceneManeuver], ...]:
     """Find complete aerial and ground-control maneuvers per valid actor timeline."""
     if timeline is None:
         timeline = generated_scene_timeline(
-            windows, indices, n_envs, episode_end, ego_ball_touch,
+            windows, indices, n_envs, episode_end, ego_ball_touch, goal_scored,
         )
     steps = len(windows) // n_envs
     timelines = timeline.valid
@@ -2327,14 +2452,20 @@ def generated_maneuver_pools(
         for maneuver in (*air_maneuvers(
             timelines[:, actor], timeline.grounded[:, actor], timeline.height[:, actor],
             timeline.up_z[:, actor], timeline.distance[:, actor],
-        ), *ground_maneuvers(timelines[:, actor], timeline.control[:, actor])):
+            goal_ends=timeline.goal_ends[:, actor],
+        ), *ground_maneuvers(
+            timelines[:, actor], timeline.control[:, actor],
+            goal_ends=timeline.goal_ends[:, actor],
+        )):
             if (isinstance(maneuver, AirManeuver)
+                    and not maneuver.goal_terminal
                     and maneuver.recovery_stop - maneuver.action_stop < AERIAL_MIN_CONTEXT_STEPS):
                 continue
             # Short recovery at the rollout edge belongs to the cross-rollout tracker.
             recovery_steps = (AERIAL_RECOVERY_STEPS if isinstance(maneuver, AirManeuver)
                               else MANEUVER_RECOVERY_STEPS)
-            if (timelines[-1, actor] and maneuver.recovery_stop == steps
+            if (not maneuver.goal_terminal and timelines[-1, actor]
+                    and maneuver.recovery_stop == steps
                     and maneuver.recovery_stop - maneuver.action_stop < recovery_steps):
                 continue
             if isinstance(maneuver, AirManeuver):
@@ -2375,7 +2506,13 @@ def aligned_maneuver_windows(
             phases[:-1], phases[1:], (AERIAL_SETUP_STEPS, 64, AERIAL_RECOVERY_STEPS)
         )
     ]
-    counts = [1, 2, 1]
+    if (agent.action_start == agent.setup_start
+            or expert.action_start == expert.setup_start):
+        desired[0] = 0
+    if (agent.recovery_stop == agent.action_stop
+            or expert.recovery_stop == expert.action_stop):
+        desired[2] = 0
+    counts = [int(desired[0] > 0), 2, int(desired[2] > 0)]
     if budget < sum(counts):
         empty = th.empty(0, dtype=th.long, device=device)
         return empty, empty.reshape(0, 1).expand(0, 2)
@@ -2393,6 +2530,8 @@ def aligned_maneuver_windows(
     def indices(flight: SceneManeuver) -> th.Tensor:
         segments = []
         for start, end, count in zip(phases[:-1], phases[1:], counts):
+            if not count:
+                continue
             length = (getattr(flight, end) - getattr(flight, start)) // flight.stride
             offsets = th.linspace(0, length - 1, count, device=device).round().long()
             segments.append(getattr(flight, start) + offsets * flight.stride)
@@ -2461,12 +2600,13 @@ class GeneratedManeuverTracker:
         self, windows: th.Tensor, indices: th.Tensor, n_envs: int,
         episode_end: th.Tensor | None = None,
         *, ego_ball_touch: th.Tensor | None = None,
+        goal_scored: th.Tensor | None = None,
         timeline: GeneratedSceneTimeline | None = None,
     ) -> None:
         """Accumulate train-split maneuvers; a reset or invalid window breaks one."""
         if timeline is None:
             timeline = generated_scene_timeline(
-                windows, indices, n_envs, episode_end, ego_ball_touch,
+                windows, indices, n_envs, episode_end, ego_ball_touch, goal_scored,
             )
         steps = len(windows) // n_envs
         touches = timeline.touches
@@ -2476,6 +2616,7 @@ class GeneratedManeuverTracker:
             self.pending_ground.clear()
             self.clear_ready()
         valid = timeline.valid
+        goal_ends = timeline.goal_ends
         grounded = timeline.grounded
         height = timeline.height
         up_z = timeline.up_z
@@ -2488,6 +2629,8 @@ class GeneratedManeuverTracker:
         for actor, partial in previous.items():
             invalid = np.flatnonzero(~valid[:, actor])
             count = int(invalid[0]) if len(invalid) else steps
+            goals = np.flatnonzero(goal_ends[:count, actor])
+            count = min(count, int(goals[0]) + 1) if len(goals) else count
             if not count:
                 continue
             joined = th.cat((partial.windows, scenes[:count, actor]), dim=0)
@@ -2496,19 +2639,26 @@ class GeneratedManeuverTracker:
             up = np.concatenate((partial.up_z, up_z[:count, actor]))
             near = np.concatenate((partial.distance, distance[:count, actor]))
             touch_events = np.concatenate((partial.touches, touches[:count, actor]))
+            goal_at_end = bool(goal_ends[count - 1, actor])
+            ending = np.zeros(len(joined), dtype=bool)
+            ending[-1] = goal_at_end
             completed = next((flight for flight in air_maneuvers(
                 np.ones(len(joined), dtype=bool), on_ground, z, up, near,
+                goal_ends=ending,
             ) if flight.action_start == partial.action_start), None)
             if (completed is not None and
-                    completed.recovery_stop - completed.action_stop >= AERIAL_MIN_CONTEXT_STEPS
+                    (completed.goal_terminal or
+                     completed.recovery_stop - completed.action_stop >= AERIAL_MIN_CONTEXT_STEPS)
                     and (completed.recovery_stop - completed.action_stop >= AERIAL_RECOVERY_STEPS
-                         or completed.recovery_stop < len(joined) or count < steps)):
+                         or completed.goal_terminal or completed.recovery_stop < len(joined)
+                         or count < steps)):
                 self._archive(joined, replace(
                     completed, skill_category=generated_air_skill(
                         joined, completed, touch_events,
                     ),
                 ))
-            elif count == steps and len(joined) < MANEUVER_MAX_TRACKED_STEPS:
+            elif (count == steps and not goal_at_end
+                  and len(joined) < MANEUVER_MAX_TRACKED_STEPS):
                 self.pending[actor] = PendingAirManeuver(
                     joined, partial.action_start, on_ground, z, up, near,
                     touch_events,
@@ -2519,18 +2669,26 @@ class GeneratedManeuverTracker:
         for actor, partial in previous_ground.items():
             invalid = np.flatnonzero(~valid[:, actor])
             count = int(invalid[0]) if len(invalid) else steps
+            goals = np.flatnonzero(goal_ends[:count, actor])
+            count = min(count, int(goals[0]) + 1) if len(goals) else count
             if not count:
                 continue
             joined = th.cat((partial.windows, scenes[:count, actor]), dim=0)
             features = np.concatenate((partial.features, control[:count, actor]))
+            goal_at_end = bool(goal_ends[count - 1, actor])
+            ending = np.zeros(len(joined), dtype=bool)
+            ending[-1] = goal_at_end
             completed = next((maneuver for maneuver in ground_maneuvers(
                 np.ones(len(joined), dtype=bool), features,
+                goal_ends=ending,
             ) if maneuver.action_start == partial.action_start), None)
             if (completed is not None and
                     (completed.recovery_stop - completed.action_stop >= MANEUVER_RECOVERY_STEPS
-                     or completed.recovery_stop < len(joined) or count < steps)):
+                     or completed.goal_terminal or completed.recovery_stop < len(joined)
+                     or count < steps)):
                 self._archive(joined, completed)
-            elif (count == steps and len(joined) < GROUND_MAX_TRACKED_STEPS
+            elif (count == steps and not goal_at_end
+                  and len(joined) < GROUND_MAX_TRACKED_STEPS
                   and dribble_control_mask(features)[-MANEUVER_RECOVERY_STEPS:].any()):
                 self.pending_ground[actor] = PendingGroundManeuver(
                     joined, partial.action_start, features,
@@ -2539,13 +2697,13 @@ class GeneratedManeuverTracker:
         if steps < 2:
             return
         takeoffs = grounded[:-1] & ~grounded[1:] & valid[:-1] & valid[1:]
-        candidates = np.flatnonzero(valid[-1] & takeoffs.any(axis=0))
+        candidates = np.flatnonzero(valid[-1] & ~goal_ends[-1] & takeoffs.any(axis=0))
         unfinished = []
         for actor in candidates:
             if actor in self.pending:
                 continue
-            invalid = np.flatnonzero(~valid[:, actor])
-            run_start = int(invalid[-1] + 1) if len(invalid) else 0
+            boundaries = np.flatnonzero(~valid[:, actor] | goal_ends[:, actor])
+            run_start = int(boundaries[-1] + 1) if len(boundaries) else 0
             possible = np.flatnonzero(takeoffs[run_start:, actor])
             if not len(possible):
                 continue
@@ -2576,14 +2734,17 @@ class GeneratedManeuverTracker:
         raw = carrying.copy()
         carrying[1:-1] |= raw[:-2] & raw[2:] & valid[1:-1]
         possible = np.flatnonzero(
-            valid[-1] & carrying[-MANEUVER_RECOVERY_STEPS:].any(axis=0)
+            valid[-1] & ~goal_ends[-1]
+            & carrying[-MANEUVER_RECOVERY_STEPS:].any(axis=0)
         )
         unfinished_ground = []
         for actor in possible:
             if actor in self.pending_ground:
                 continue
-            invalid = np.flatnonzero(~valid[:, actor])
-            run_start = int(invalid[-1] + 1) if len(invalid) else 0
+            boundaries = np.flatnonzero(~valid[:, actor] | goal_ends[:, actor])
+            run_start = int(boundaries[-1] + 1) if len(boundaries) else 0
+            if not carrying[run_start:, actor].any():
+                continue
             local = carrying[run_start:, actor].astype(np.int8)
             edges = np.flatnonzero(np.diff(np.pad(local, (1, 1))))
             if not len(edges):
@@ -2646,6 +2807,7 @@ class SceneGAIFOMinibatches:
         episode_end: th.Tensor | None,
         archived_flights: tuple[list[CompletedSceneManeuver], ...] | None,
         ego_ball_touch: th.Tensor | None,
+        goal_scored: th.Tensor | None,
         timeline: GeneratedSceneTimeline | None,
     ):
         """Pair curated experts by exact scene bin or complete-maneuver phase."""
@@ -2656,7 +2818,8 @@ class SceneGAIFOMinibatches:
         agent_flights = (
             generated_maneuver_pools(
                 windows, indices, n_envs, episode_end,
-                ego_ball_touch=ego_ball_touch, timeline=timeline,
+                ego_ball_touch=ego_ball_touch, goal_scored=goal_scored,
+                timeline=timeline,
             )
             if self.factorize else tuple([] for _ in range(N_SITUATIONS))
         )
@@ -2828,12 +2991,13 @@ class SceneGAIFOMinibatches:
         episode_end: th.Tensor | None = None,
         archived_flights: tuple[list[CompletedSceneManeuver], ...] | None = None,
         ego_ball_touch: th.Tensor | None = None,
+        goal_scored: th.Tensor | None = None,
         timeline: GeneratedSceneTimeline | None = None,
     ):
         if self.expert.skill_sampling:
             yield from self._sample_curated_windows(
                 windows, indices, n_envs, episode_end, archived_flights,
-                ego_ball_touch, timeline,
+                ego_ball_touch, goal_scored, timeline,
             )
             return
         agent_groups: list[th.Tensor] = [indices[:0] for _ in range(N_SITUATIONS)]
@@ -2861,7 +3025,8 @@ class SceneGAIFOMinibatches:
             ]
             grounded_expert_available = len(self.expert._grounded_choices()[0]) > 0
             agent_flights = generated_maneuver_pools(
-                windows, indices, n_envs, episode_end, timeline=timeline,
+                windows, indices, n_envs, episode_end,
+                goal_scored=goal_scored, timeline=timeline,
             )
             if archived_flights is not None:
                 if len(archived_flights) != N_SITUATIONS:
@@ -3373,11 +3538,16 @@ class AdaptiveDiscriminatorUpdate:
         truncated = batch.get("truncated")
         if truncated is not None:
             terminal = truncated.bool() if terminal is None else terminal.bool() | truncated.bool()
+        goal_scored = (
+            batch["reward"].gt(0) & terminal.bool()
+            if terminal is not None and "reward" in batch else None
+        )
         touch_events = batch.get("ego_ball_touch")
         timeline = None
         if self.maneuver_tracker is not None:
             timeline = generated_scene_timeline(
-                flat_windows, train_indices, valid.shape[1], terminal, touch_events,
+                flat_windows, train_indices, valid.shape[1], terminal,
+                touch_events, goal_scored,
             )
             self.maneuver_tracker.feed(
                 flat_windows, train_indices, valid.shape[1], terminal,
@@ -3429,7 +3599,8 @@ class AdaptiveDiscriminatorUpdate:
                     flat_windows, train_indices, n_envs=valid.shape[1], episode_end=terminal,
                     archived_flights=(self.maneuver_tracker.ready
                                       if self.maneuver_tracker is not None else None),
-                    ego_ball_touch=touch_events, timeline=timeline,
+                    ego_ball_touch=touch_events, goal_scored=goal_scored,
+                    timeline=timeline,
                 ):
                     minibatch_metrics = train_discriminator_minibatch(
                         sample, self.discriminator, self.optimizer, self.loss,

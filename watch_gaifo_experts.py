@@ -131,6 +131,7 @@ class ExpertSequence:
     stop: int
     source_start: int
     probabilities: np.ndarray = field(repr=False)
+    goal_terminal: bool = False
     metrics: dict[str, dict[str, float]] = field(default_factory=dict, repr=False)
 
     @property
@@ -147,6 +148,7 @@ class ExpertSequence:
             "source_start": self.source_start,
             "source_stop": self.source_start + self.length - 1,
             "length": self.length,
+            "goal_terminal": self.goal_terminal,
             **self.metrics[head],
         }
 
@@ -185,6 +187,8 @@ def collect_sequences(
             action_stop=action_stop, stop=stop,
             source_start=start - offsets[segment],
             probabilities=np.empty((stop - start, 0), dtype=np.float32),
+            goal_terminal=(expert.segment_goal_actors[segment] == actor
+                           and stop == offsets[segment + 1] - expert.partition_span),
         ))
 
     for heldout in (False, True):
@@ -208,9 +212,21 @@ def collect_sequences(
                 min(expert.trajectory_length, DRIVING_SPAN),
             )
             if len(candidates) > max_driving:
-                selected = np.random.default_rng(seed + int(heldout)).choice(
-                    len(candidates), size=max_driving, replace=False,
-                )
+                goal_candidates = []
+                other_candidates = []
+                for index, (start, stop, actor) in enumerate(candidates):
+                    segment = bisect_right(offsets, start) - 1
+                    is_goal = (expert.segment_goal_actors[segment] == actor
+                               and stop == offsets[segment + 1] - expert.partition_span)
+                    (goal_candidates if is_goal else other_candidates).append(index)
+                random = np.random.default_rng(seed + int(heldout))
+                n_goal = min(len(goal_candidates), max(1, max_driving // 4))
+                n_other = min(len(other_candidates), max_driving - n_goal)
+                n_goal = min(len(goal_candidates), max_driving - n_other)
+                selected = list(random.choice(goal_candidates, size=n_goal, replace=False))
+                selected.extend(random.choice(
+                    other_candidates, size=n_other, replace=False,
+                ))
                 candidates = [candidates[int(index)] for index in sorted(selected)]
             for start, stop, actor in candidates:
                 append("driving", split, actor, start, start, stop, stop)
@@ -332,17 +348,20 @@ class Inspection:
             "step": self.step, "replay_dir": str(self.replay_dir),
             "frame_skip": self.frame_skip, "device": self.device,
             "heads": self.heads, "clips": len(self.records),
+            "goals": sum(record.goal_terminal for record in self.records),
             "windows": sum(record.length for record in self.records),
             "counts": counts, "ball_radius": BALL_RADIUS,
         }
 
     def list_sequences(
         self, *, skill: str = "all", split: str = "all", head: str = "combined",
-        order: str = "most", search: str = "", offset: int = 0, limit: int = 40,
+        order: str = "most", outcome: str = "all", search: str = "",
+        offset: int = 0, limit: int = 40,
     ) -> dict:
         if skill not in (*SKILLS, "all") or split not in ("train", "heldout", "all"):
             raise ValueError("unknown skill or split")
-        if head not in self.heads or order not in ("most", "least", "misses", "peak"):
+        if (head not in self.heads or order not in ("most", "least", "misses", "peak")
+                or outcome not in ("all", "goal", "other")):
             raise ValueError("unknown discriminator head or ranking")
         if offset < 0 or not 1 <= limit <= 100:
             raise ValueError("invalid sequence page")
@@ -351,6 +370,7 @@ class Inspection:
             record for record in self.records
             if (skill == "all" or record.skill == skill)
             and (split == "all" or record.split == split)
+            and (outcome == "all" or record.goal_terminal == (outcome == "goal"))
             and (not search or search in record.source.casefold()
                  or search in str(record.id))
         ]
