@@ -61,6 +61,8 @@ from gaifo import (
     SceneDiscriminatorReward,
     SceneWindowCapture,
     SelectPPOFields,
+    expand_factorized_optimizer_state,
+    load_discriminator_state,
 )
 from pulse_reward import PulseReward
 from replay_resets import (
@@ -650,8 +652,11 @@ def restore_pulse_training(
     for group in optimizer.param_groups:
         group["lr"] = args.ppo_lr
     if args.gaifo_imitation:
-        discriminator.load_state_dict(payload["discriminator"])
+        upgraded = load_discriminator_state(discriminator, payload["discriminator"])
         discriminator_optimizer.load_state_dict(payload["discriminator_optimizer"])
+        if upgraded:
+            expand_factorized_optimizer_state(discriminator_optimizer, discriminator)
+            print("Added initial opponent context to factorized discriminator checkpoint")
         for group in discriminator_optimizer.param_groups:
             group["lr"] = args.discriminator_lr
         state = payload.get("gaifo_update")

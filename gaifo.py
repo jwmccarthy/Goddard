@@ -2092,9 +2092,10 @@ class SceneDiscriminator(nn.Module):
 
 
 class FactorizedSceneDiscriminator(nn.Module):
-    """Score each acting car's motion and attributable ball control separately.
+    """Score ego motion and ball control with fixed initial other-car context.
 
-    Other cars, whether teammates or opponents, are excluded from the ego heads.
+    Only the first frame of teammates and opponents is visible to either head;
+    their subsequent actions cannot become a shortcut for imitation reward.
     Use ``actor_view`` to score each player's own window in four-car scenes.
     """
 
@@ -2109,13 +2110,15 @@ class FactorizedSceneDiscriminator(nn.Module):
             raise ValueError("discriminator dimensions must be positive")
         if n_cars not in (N_CARS, DOUBLES_N_CARS):
             raise ValueError("factorized discriminator needs two or four cars")
+        self.n_cars = n_cars
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.other_context_size = (n_cars - 1) * (CAR_SIZE + 6)
         self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + 6, hidden_size), nn.ReLU(),
+            nn.Linear(CAR_SIZE + 6 + self.other_context_size, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.ball_encoder = nn.Sequential(
-            nn.Linear(BALL_SIZE + 6, hidden_size), nn.ReLU(),
+            nn.Linear(BALL_SIZE + 6 + self.other_context_size, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.car_gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
@@ -2132,17 +2135,59 @@ class FactorizedSceneDiscriminator(nn.Module):
         relative_velocity = (
             ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
         )
+        others = windows[:, 0, BLUE_START + CAR_SIZE:].reshape(
+            -1, self.n_cars - 1, CAR_SIZE,
+        )
+        relative_others = others[..., :6] - ego[:, 0, None, :6]
+        initial_others = th.cat((others, relative_others), dim=-1).flatten(1)
+        context = initial_others[:, None].expand(-1, windows.shape[1], -1)
         # Hold context fixed so the car head cannot classify subsequent ball motion.
         initial_context = th.cat((relative_position[:, 0], relative_velocity[:, 0]), dim=-1)
         car_input = th.cat((
-            ego, initial_context[:, None].expand(-1, windows.shape[1], -1),
+            ego, initial_context[:, None].expand(-1, windows.shape[1], -1), context,
         ), dim=-1)
-        ball_input = th.cat((ball, relative_position, relative_velocity), dim=-1)
+        ball_input = th.cat((ball, relative_position, relative_velocity, context), dim=-1)
         car_features, _ = self.car_gru(self.car_encoder(car_input))
         ball_features, _ = self.ball_gru(self.ball_encoder(ball_input))
         return th.cat((
             self.car_head(car_features[:, -1]), self.ball_head(ball_features[:, -1]),
         ), dim=-1)
+
+
+def load_discriminator_state(discriminator: nn.Module, state: dict[str, th.Tensor]) -> bool:
+    """Expand legacy factorized inputs without changing their initial predictions."""
+    upgraded = False
+    if isinstance(discriminator, FactorizedSceneDiscriminator):
+        layers = (
+            ("car_encoder.0.weight", discriminator.car_encoder[0].weight, CAR_SIZE + 6),
+            ("ball_encoder.0.weight", discriminator.ball_encoder[0].weight, BALL_SIZE + 6),
+        )
+        if all(key in state and state[key].shape == (weight.shape[0], old_width)
+               for key, weight, old_width in layers):
+            state = state.copy()
+            for key, weight, old_width in layers:
+                state[key] = F.pad(state[key], (0, weight.shape[1] - old_width))
+            upgraded = True
+    discriminator.load_state_dict(state)
+    return upgraded
+
+
+def expand_factorized_optimizer_state(
+    optimizer: th.optim.Optimizer, discriminator: FactorizedSceneDiscriminator,
+) -> None:
+    """Preserve old Adam moments and initialize new opponent columns to zero."""
+    for layer, old_width in (
+        (discriminator.car_encoder[0], CAR_SIZE + 6),
+        (discriminator.ball_encoder[0], BALL_SIZE + 6),
+    ):
+        for name, value in optimizer.state[layer.weight].items():
+            if isinstance(value, th.Tensor) and value.ndim == 2:
+                if value.shape == (layer.weight.shape[0], old_width):
+                    optimizer.state[layer.weight][name] = F.pad(
+                        value, (0, layer.weight.shape[1] - old_width),
+                    )
+                elif value.shape != layer.weight.shape:
+                    raise ValueError(f"incompatible factorized discriminator optimizer {name}")
 
 
 class CuratedReplayResetTransform:
@@ -4031,8 +4076,11 @@ def restore_training_checkpoint(
     optimizers: dict[str, th.optim.Optimizer],
 ) -> Clock:
     upgrade_encoder = False
+    upgrade_discriminator = False
     for name, module in modules.items():
-        if name == "skill_encoder" and isinstance(module, SkillGRUEncoder) and (
+        if name == "discriminator":
+            upgrade_discriminator = load_discriminator_state(module, payload[name])
+        elif name == "skill_encoder" and isinstance(module, SkillGRUEncoder) and (
             "ase_encoder_type" not in payload["config"]
         ):
             base = {
@@ -4071,6 +4119,8 @@ def restore_training_checkpoint(
     for name, optimizer in optimizers.items():
         if name != "skill_encoder" or not upgrade_encoder:
             optimizer.load_state_dict(payload[f"{name}_optimizer"])
+            if name == "discriminator" and upgrade_discriminator:
+                expand_factorized_optimizer_state(optimizer, modules[name])
         learning_rate = (
             args.ase_encoder_lr if name == "skill_encoder" else (
                 args.discriminator_lr if "discriminator" in name else args.ppo_lr
@@ -4080,6 +4130,8 @@ def restore_training_checkpoint(
             group["lr"] = learning_rate
     if upgrade_encoder:
         print("Initialized ASE skill encoder from checkpoint; reset encoder optimizer")
+    if upgrade_discriminator:
+        print("Added initial opponent context to factorized discriminator checkpoint")
 
     if "torch_rng_state" in payload:
         th.set_rng_state(payload["torch_rng_state"].cpu())

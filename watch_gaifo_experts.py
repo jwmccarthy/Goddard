@@ -29,7 +29,7 @@ from gaifo import (
     GROUND_MANEUVER_START, DRIVING_SKILL, KICKOFF_SKILL,
     ORANGE_START, POSITION_SCALE,
     SKILL_CATEGORIES,
-    ExpertSceneDataset, build_discriminator, opponent_view,
+    ExpertSceneDataset, build_discriminator, load_discriminator_state, opponent_view,
 )
 from watch_checkpoints import CheckpointRegistry
 
@@ -79,7 +79,7 @@ def load_discriminator(path: Path, device: th.device):
         frame_embedding=int(config["frame_embedding"]),
         temporal_hidden=int(config["temporal_hidden"]),
     ))
-    model.load_state_dict(payload["discriminator"])
+    load_discriminator_state(model, payload["discriminator"])
     return model.to(device).eval().requires_grad_(False), config, int(payload["step"])
 
 

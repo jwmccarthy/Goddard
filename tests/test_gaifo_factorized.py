@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -12,7 +13,9 @@ import torch as th
 from gaifo import (
     AdaptiveDiscriminatorUpdate,
     BALL_NEAR_DISTANCE,
+    BALL_SIZE,
     BLUE_START,
+    CAR_SIZE,
     GAIFOCheckpoints,
     ExpertSceneDataset,
     FactorizedSceneDiscriminator,
@@ -23,6 +26,7 @@ from gaifo import (
     ball_responsibility,
     build_discriminator,
     generated_scene_timeline,
+    load_discriminator_state,
     load_resume_checkpoint,
     nearest_ball_distance,
     opponent_view,
@@ -72,6 +76,94 @@ class NearMistakeHeads(th.nn.Module):
 
 
 class FactorizedGAIFOTests(unittest.TestCase):
+    def test_initial_other_cars_condition_both_heads_without_future_motion(self):
+        th.manual_seed(4)
+        for n_cars, others in ((2, (30,)), (4, (30, 51, 72))):
+            with self.subTest(n_cars=n_cars):
+                model = FactorizedSceneDiscriminator(8, 8, 16, n_cars=n_cars)
+                windows = th.randn(3, 8, model.scene_size) * 0.1
+                original = model(windows)
+                later = windows.clone()
+                for other in others:
+                    later[:, 1:, other:other + CAR_SIZE] += 1.0
+                th.testing.assert_close(original, model(later), rtol=0, atol=0)
+                for other in others:
+                    changed_start = windows.clone()
+                    changed_start[:, 0, other:other + 6] += 1.0
+                    changed = model(changed_start)
+                    self.assertTrue(((original - changed).abs().max(dim=0).values > 1e-5).all())
+
+    def test_old_factorized_weights_and_adam_moments_upgrade_without_output_change(self):
+        th.manual_seed(3)
+        reference = FactorizedSceneDiscriminator(8, 8, 16)
+        old_optimizer = th.optim.Adam(reference.parameters())
+        windows = th.randn(4, 8, 51)
+        reference(windows).square().sum().backward()
+        old_optimizer.step()
+        old_widths = {
+            "car_encoder.0.weight": CAR_SIZE + 6,
+            "ball_encoder.0.weight": BALL_SIZE + 6,
+        }
+        with th.no_grad():
+            for key, width in old_widths.items():
+                encoder = reference.car_encoder if key.startswith("car") else reference.ball_encoder
+                encoder[0].weight[:, width:].zero_()
+        expected = reference(windows).detach()
+        legacy = {key: value.clone() for key, value in reference.state_dict().items()}
+        for key, width in old_widths.items():
+            legacy[key] = legacy[key][:, :width].clone()
+        saved_optimizer = old_optimizer.state_dict()
+        parameter_ids = saved_optimizer["param_groups"][0]["params"]
+        for (name, parameter), param_id in zip(reference.named_parameters(), parameter_ids):
+            if name in old_widths:
+                for moment in ("exp_avg", "exp_avg_sq"):
+                    values = saved_optimizer["state"][param_id][moment]
+                    saved_optimizer["state"][param_id][moment] = (
+                        values[:, :old_widths[name]].clone()
+                    )
+
+        policy = th.nn.Linear(1, 1)
+        critic = th.nn.Linear(1, 1)
+        restored = FactorizedSceneDiscriminator(8, 8, 16)
+        modules = {"policy": policy, "critic": critic, "discriminator": restored}
+        optimizers = {name: th.optim.Adam(module.parameters())
+                      for name, module in modules.items()}
+        payload = {
+            "step": 0, "config": {"n_sim": 1, "rollout": 8},
+            **{name: module.state_dict() for name, module in modules.items()
+               if name != "discriminator"},
+            "discriminator": legacy,
+            **{f"{name}_optimizer": (
+                saved_optimizer if name == "discriminator" else optimizer.state_dict()
+            ) for name, optimizer in optimizers.items()},
+        }
+        restore_training_checkpoint(
+            payload, SimpleNamespace(ppo_lr=1e-3, discriminator_lr=1e-3),
+            modules, optimizers,
+        )
+        th.testing.assert_close(expected, restored(windows), rtol=0, atol=0)
+        for name, old_width in old_widths.items():
+            encoder = restored.car_encoder if name.startswith("car") else restored.ball_encoder
+            state = optimizers["discriminator"].state[encoder[0].weight]
+            param_id = dict(zip((key for key, _ in reference.named_parameters()),
+                                parameter_ids))[name]
+            for moment in ("exp_avg", "exp_avg_sq"):
+                th.testing.assert_close(
+                    state[moment][:, :old_width],
+                    saved_optimizer["state"][param_id][moment],
+                )
+                self.assertTrue((state[moment][:, old_width:] == 0).all())
+
+        restored(windows).sum().backward()
+        for name, old_width in old_widths.items():
+            encoder = restored.car_encoder if name.startswith("car") else restored.ball_encoder
+            self.assertGreater(encoder[0].weight.grad[:, old_width:].abs().sum().item(), 0)
+        optimizers["discriminator"].step()
+        self.assertTrue(th.isfinite(restored.car_encoder[0].weight).all())
+        self.assertFalse(load_discriminator_state(
+            FactorizedSceneDiscriminator(8, 8, 16), reference.state_dict(),
+        ))
+
     def test_car_head_uses_start_context_but_not_future_ball_motion(self):
         th.manual_seed(2)
         model = FactorizedSceneDiscriminator(8, 8, 16)

@@ -15,7 +15,7 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    BLUE_START, GAIFO_ARCHITECTURE, ORANGE_START, POSITION_SCALE,
+    BLUE_START, CAR_SIZE, GAIFO_ARCHITECTURE, ORANGE_START, POSITION_SCALE,
     ExpertSceneDataset, build_discriminator,
 )
 from watch_checkpoints import CheckpointRegistry
@@ -129,6 +129,21 @@ class MarkerDiscriminator(th.nn.Module):
 
 
 class ExpertInspectorTests(unittest.TestCase):
+    def test_inspector_can_load_legacy_factorized_weights(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
+            folder = Path(temporary)
+            path = folder / "gaifo_000000000042.pt"
+            checkpoint(path, folder)
+            saved = th.load(path, map_location="cpu", weights_only=True)
+            for key, old_width in (("car_encoder.0.weight", CAR_SIZE + 6),
+                                   ("ball_encoder.0.weight", 9 + 6)):
+                saved["discriminator"][key] = (
+                    saved["discriminator"][key][:, :old_width].clone()
+                )
+            th.save(saved, path)
+            model, _, _ = load_discriminator(path, th.device("cpu"))
+            th.testing.assert_close(model(th.zeros(1, 8, 51)), th.tensor([[2., -2.]]))
+
     def test_checkpoint_registry_and_both_discriminator_shapes(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
             folder = Path(temporary)

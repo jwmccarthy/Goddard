@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -12,7 +13,10 @@ import torch as th
 
 from carl.gymnasium.action import CARLActionCodec
 from distill import ACTION_FORMAT, ActionDecoder, ConditionalPrior
-from gaifo import HistoricalReplayBuffer, RecencyReplayBuffer, SceneDiscriminator
+from gaifo import (
+    FactorizedSceneDiscriminator, HistoricalReplayBuffer, RecencyReplayBuffer,
+    SceneDiscriminator,
+)
 from jarl.collect import SnapshotPool
 from jarl.data import TensorBatch
 from jarl.runtime import Clock
@@ -39,6 +43,43 @@ class FactorizedDiscriminator(th.nn.Module):
 
 
 class PulseGaifoResumeTests(unittest.TestCase):
+    def test_factorized_pulse_resume_expands_legacy_discriminator_inputs(self):
+        th.manual_seed(9)
+        previous = FactorizedSceneDiscriminator(8, 8, 16)
+        old_widths = (("car_encoder.0.weight", 27), ("ball_encoder.0.weight", 15))
+        with th.no_grad():
+            for key, width in old_widths:
+                layer = previous.car_encoder[0] if key.startswith("car") else previous.ball_encoder[0]
+                layer.weight[:, width:].zero_()
+        windows = th.randn(2, 8, 51)
+        expected = previous(windows)
+        old_state = {key: value.clone() for key, value in previous.state_dict().items()}
+        for key, width in old_widths:
+            old_state[key] = old_state[key][:, :width].clone()
+
+        policy = th.nn.Linear(1, 1)
+        critic = th.nn.Linear(1, 1)
+        resumed_policy = th.nn.Linear(1, 1)
+        resumed_critic = th.nn.Linear(1, 1)
+        restored = FactorizedSceneDiscriminator(8, 8, 16)
+        payload = {
+            "step": 0, "config": {"n_sim": 1, "rollout": 2},
+            "policy": policy.state_dict(), "critic": critic.state_dict(),
+            "optimizer": th.optim.Adam((*policy.parameters(), *critic.parameters())).state_dict(),
+            "discriminator": old_state,
+            "discriminator_optimizer": th.optim.Adam(previous.parameters()).state_dict(),
+        }
+        clock = restore_pulse_training(
+            payload,
+            SimpleNamespace(gaifo_imitation=True, ppo_lr=1e-3,
+                            discriminator_lr=1e-3, n_sim=1, rollout=2),
+            resumed_policy, resumed_critic,
+            th.optim.Adam((*resumed_policy.parameters(), *resumed_critic.parameters())),
+            restored, th.optim.Adam(restored.parameters()),
+        )
+        self.assertEqual(clock.env_steps, 0)
+        th.testing.assert_close(restored(windows), expected, rtol=0, atol=0)
+
     def test_imitation_keeps_pulse_rewards_and_original_learner_mask(self):
         windows = th.zeros(1, 4, 2, 51)
         windows[0, :2, -1, 0] = th.tensor([-2.0, 2.0])
