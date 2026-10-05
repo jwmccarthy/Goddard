@@ -18,6 +18,13 @@ class BallXDiscriminator(th.nn.Module):
         return 50.0 * windows[:, -1, 0]
 
 
+class RecurrentBallXDiscriminator(th.nn.Module):
+    recurrent_global = True
+
+    def score_context(self, scenes: th.Tensor, ages: th.Tensor) -> th.Tensor:
+        return 50.0 * scenes[:, -1, 0]
+
+
 def write_pov(folder: Path, name: str, ball_x: float, paired: bool) -> None:
     rows = np.zeros((32, 161), dtype=np.float32)
     rows[:, 0] = ball_x
@@ -77,6 +84,12 @@ class ExpertPOVTests(unittest.TestCase):
             scores = miner._score(starts)
             self.assertTrue((scores[expert.opponent_pov_available[starts]] > 0.99).all())
             self.assertTrue((scores[~expert.opponent_pov_available[starts]] < 0.01).all())
+
+            recurrent = ConfidentExpertResetTransform(
+                expert, expert.reset_dataset(), RecurrentBallXDiscriminator(),
+                microbatch_size=1, context_length=5,
+            )
+            th.testing.assert_close(recurrent._score(starts), scores)
 
             with tempfile.TemporaryDirectory(dir="/tmp/opencode") as single_directory:
                 single = Path(single_directory)

@@ -86,12 +86,21 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
 
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)
-            return load_resume_checkpoint(max(checkpoints)), output.getvalue(), ready_resets
+            saved = load_resume_checkpoint(max(checkpoints))
+            self.assertTrue(saved["config"]["recurrent_global"])
+            self.assertEqual(saved["config"]["discriminator_context_length"], 16)
+            optimizer = saved["discriminator_optimizer"]
+            self.assertEqual(len(optimizer["state"]), len(optimizer["param_groups"][0]["params"]))
+            return saved, output.getvalue(), ready_resets
 
     def test_short_window_training_and_terminal_metrics(self):
         saved, output, _ = self._short_window_training(False)
         self.assertEqual(saved["step"], 64)
         self.assertFalse(saved["config"]["factorize"])
+        self.assertEqual(saved["config"]["policy_layers"], 2)
+        self.assertEqual(saved["config"]["critic_layers"], 2)
+        self.assertIn("body.model.2.weight", saved["policy"])
+        self.assertIn("body.model.2.weight", saved["critic"])
         self.assertNotIn("long_discriminator", saved)
         self.assertNotIn("long_discriminator_optimizer", saved)
         self.assertIn("D heldout accuracy", output)

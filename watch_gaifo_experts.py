@@ -78,6 +78,7 @@ def load_discriminator(path: Path, device: th.device):
         raise ValueError(f"checkpoint has no supported 1v1 discriminator: {path}")
     args = argparse.Namespace(
         factorize=bool(config.get("factorize", False)),
+        recurrent_global=bool(config.get("recurrent_global", False)),
         discriminator_hidden=int(config["discriminator_hidden"]),
         frame_embedding=int(config["frame_embedding"]),
         temporal_hidden=int(config["temporal_hidden"]),
@@ -93,6 +94,7 @@ def load_discriminator(path: Path, device: th.device):
         )
     else:
         model = build_discriminator(args)
+    model.context_length = int(config.get("discriminator_context_length", 16))
     load_discriminator_state(model, state)
     return model.to(device).eval().requires_grad_(False), config, int(payload["step"])
 
@@ -269,7 +271,29 @@ def score_sequences(
         chosen = th.tensor(pairs, dtype=th.long, device=expert.frames.device)
         windows = expert._windows_for_povs(chosen).to(device)
         with th.inference_mode():
-            logits = model(windows)
+            if getattr(model, "recurrent_global", False):
+                context = windows.new_empty((len(pairs), model.context_length, windows.shape[-1]))
+                ages = chosen.new_empty((len(pairs),))
+                heldout = th.tensor(
+                    [records[record_id].split == "heldout" for record_id, _ in destinations],
+                    dtype=th.bool, device=chosen.device,
+                )
+                for split in (False, True):
+                    selected = heldout == split
+                    if selected.any():
+                        context[selected], ages[selected] = expert.context_frames(
+                            chosen[selected], model.context_length,
+                            heldout=split, return_age=True,
+                        )
+                if getattr(model, "factorized", False):
+                    logits = th.cat((
+                        model.specialist_logits(windows),
+                        model.global_discriminator.score_context(context, ages)[:, None],
+                    ), dim=-1)
+                else:
+                    logits = model.score_context(context, ages)
+            else:
+                logits = model(windows)
             if not bool(th.isfinite(logits).all()):
                 raise ValueError("discriminator produced non-finite logits")
             if getattr(model, "factorized", False):

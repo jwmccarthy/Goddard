@@ -191,6 +191,42 @@ class ExpertInspectorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_checkpoint(registry, "basic_999999999999.pt")
 
+    def test_recurrent_global_inspector_uses_causal_expert_context(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
+            folder = Path(temporary)
+            write_periods(folder)
+            expert = ExpertSceneDataset(
+                folder, trajectory_length=8, frame_skip=4, heldout_size=16,
+                reject_discontinuities=True, skill_sampling=True,
+            )
+            path = folder / "gaifo_000000000042.pt"
+            checkpoint(path, folder)
+            saved = th.load(path, map_location="cpu", weights_only=True)
+            th.manual_seed(4)
+            reference = FactorizedSceneDiscriminator(8, 8, 8, recurrent_global=True)
+            saved["discriminator"] = reference.state_dict()
+            saved["config"]["recurrent_global"] = True
+            saved["config"]["discriminator_context_length"] = 4
+            th.save(saved, path)
+
+            model, config, _ = load_discriminator(path, th.device("cpu"))
+            self.assertTrue(model.recurrent_global)
+            self.assertEqual(config["discriminator_context_length"], 4)
+            records = collect_sequences(expert, folder, seed=0, limit=None, max_driving=1)
+            heads = score_sequences(expert, records, model, th.device("cpu"), batch_size=13)
+            self.assertEqual(heads, ("combined", "far", "near", "global"))
+            self.assertEqual({record.split for record in records}, {"train", "heldout"})
+            for record in records:
+                pair = th.tensor([[record.stop - 1, record.actor]])
+                context, age = expert.context_frames(
+                    pair, 4, heldout=record.split == "heldout", return_age=True,
+                )
+                with th.inference_mode():
+                    expected = th.sigmoid(
+                        model.global_discriminator.score_context(context, age)
+                    ).item()
+                self.assertAlmostEqual(record.probabilities[-1, 3], expected, places=6)
+
     def test_ranked_curated_clips_use_unnoised_causal_windows_and_stored_povs(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
             folder = Path(temporary)

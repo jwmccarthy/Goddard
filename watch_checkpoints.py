@@ -346,6 +346,7 @@ def load_policy_checkpoint(
         if config.get("ase_diversity", False) != (architecture == GAIFO_ASE_ARCHITECTURE):
             raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
         hidden = int(config["policy_hidden"])
+        layers = int(config.get("policy_layers", 1))
         skill_size = (
             int(config["ase_skill_dim"])
             if architecture == GAIFO_ASE_ARCHITECTURE else 0
@@ -354,13 +355,14 @@ def load_policy_checkpoint(
             raise ValueError(f"checkpoint ASE skill dimension is invalid: {path}")
         policy = build_gaifo_policy(
             SkillObservationSpace(env, skill_size) if skill_size else env,
-            argparse.Namespace(policy_hidden=hidden, gru=gru),
+            argparse.Namespace(policy_hidden=hidden, policy_layers=layers, gru=gru),
         )
         policy_state = payload["policy"]
     else:
         checkpoint = policy_checkpoint(payload, path)
         policy_state = checkpoint.state
         hidden = checkpoint.hidden_size
+        layers = checkpoint.policy_layers
         architecture = (
             None if checkpoint.architecture == BASIC_POLICY_ARCHITECTURE
             else checkpoint.architecture
@@ -374,6 +376,7 @@ def load_policy_checkpoint(
                 env,
                 argparse.Namespace(
                     policy_hidden=hidden,
+                    policy_layers=layers,
                     gru=architecture == GAIFO_GRU_ARCHITECTURE,
                 ),
             )
@@ -386,9 +389,13 @@ def load_policy_checkpoint(
             policy.eval().requires_grad_(False), skill_size, skill_seed,
         )
         return wrapped.eval().requires_grad_(False), (
-            "gaifo", hidden, architecture, skill_size,
+            "gaifo", hidden, layers, architecture, skill_size,
         )
-    return policy.eval().requires_grad_(False), (kind, hidden, architecture)
+    signature = (
+        (kind, hidden, architecture, layers) if architecture is not None
+        else (kind, hidden, architecture)
+    )
+    return policy.eval().requires_grad_(False), signature
 
 
 def resolve_pulse_artifact(

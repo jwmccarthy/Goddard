@@ -73,11 +73,56 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertIsNone(resumed)
                 self.assertEqual(parsed.gru, expected)
                 self.assertEqual(parsed.sequence_length, 8)
+                self.assertEqual((parsed.policy_hidden, parsed.critic_hidden), (320, 320))
+                self.assertEqual((parsed.policy_layers, parsed.critic_layers), (2, 2))
+                self.assertTrue(parsed.recurrent_global)
+                self.assertEqual(parsed.discriminator_context_length, 16)
+                self.assertEqual(parsed.discriminator_context_stride, 4)
 
-    def test_rollout_reset_and_ppo_update(self):
+        with patch.object(sys, "argv", [
+            "gaifo.py", "--replay-dir", "parsed_replays", "--no-recurrent-global",
+        ]):
+            parsed, _ = parse_args()
+        self.assertFalse(parsed.recurrent_global)
+
+    def test_policy_and_critic_depths_can_differ(self):
         for gru in (False, True):
             with self.subTest(gru=gru):
                 args = self.args(gru)
+                args.policy_hidden = 24
+                args.critic_hidden = 32
+                args.policy_layers = 2
+                args.critic_layers = 3
+                policy = build_policy(self.env, args)
+                critic = build_critic(self.env, args)
+                self.assertEqual(policy.foot.model[0].out_features, 24)
+                self.assertEqual(critic.foot.model[0].out_features, 32)
+                if gru:
+                    self.assertEqual(policy.head.dims, [24])
+                    self.assertEqual(critic.head.dims, [32, 32])
+                else:
+                    self.assertEqual(policy.body.dims, [24, 24])
+                    self.assertEqual(critic.body.dims, [32, 32, 32])
+                with th.no_grad():
+                    observations = th.zeros(2, 51)
+                    self.assertEqual(
+                        policy.act(observations, policy.initial_state(2)).action.shape,
+                        (2, 2),
+                    )
+                    self.assertEqual(
+                        critic.evaluate_values(
+                            observations, critic.initial_state(2)
+                        ).shape,
+                        (2,),
+                    )
+
+    def test_rollout_reset_and_ppo_update(self):
+        for gru, layers in ((False, 1), (True, 1), (False, 2), (True, 2)):
+            with self.subTest(gru=gru, layers=layers):
+                args = self.args(gru)
+                if layers == 2:
+                    args.policy_layers = layers
+                    args.critic_layers = layers
                 policy = build_policy(self.env, args)
                 critic = build_critic(self.env, args)
                 self.assertIsInstance(policy.body, GRU if gru else MLP)
@@ -155,13 +200,24 @@ class GAIFOGruTests(unittest.TestCase):
                 body_grad = next(policy.body.parameters()).grad
                 self.assertIsNotNone(body_grad)
                 self.assertGreater(body_grad.abs().sum().item(), 0)
+                if layers == 2:
+                    policy_extra = policy.head.model[0] if gru else policy.body.model[2]
+                    critic_extra = critic.head.model[0] if gru else critic.body.model[2]
+                    self.assertGreater(policy_extra.weight.grad.abs().sum().item(), 0)
+                    self.assertGreater(critic_extra.weight.grad.abs().sum().item(), 0)
 
     def test_checkpoint_architecture_and_resume(self):
-        for gru in (False, True):
-            with self.subTest(gru=gru), tempfile.TemporaryDirectory(
+        for gru, layers in ((False, 1), (True, 1), (False, 2), (True, 2)):
+            with self.subTest(gru=gru, layers=layers), tempfile.TemporaryDirectory(
                 dir="/tmp/opencode"
             ) as directory:
                 args = self.args(gru)
+                if layers == 2:
+                    args.policy_layers = layers
+                    args.critic_layers = layers
+                    args.recurrent_global = True
+                    args.discriminator_context_length = 4
+                    args.discriminator_context_stride = 2
                 args.frameskip = 4
                 args.discriminator_hidden = 16
                 args.frame_embedding = 8
@@ -199,7 +255,7 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertNotIn("long_discriminator", single)
                 self.assertNotIn("long_discriminator_optimizer", single)
 
-                if not gru:
+                if not gru and layers == 1:
                     # Older dual-discriminator MLP checkpoints keep their short weights.
                     legacy = single
                     legacy["long_discriminator"] = th.nn.Linear(3, 1).state_dict()
@@ -218,6 +274,8 @@ class GAIFOGruTests(unittest.TestCase):
                     GAIFO_GRU_ARCHITECTURE if gru else GAIFO_ARCHITECTURE,
                 )
                 self.assertEqual(payload["config"]["sequence_length"], 4)
+                self.assertEqual(payload["config"].get("policy_layers", 1), layers)
+                self.assertEqual(payload["config"].get("critic_layers", 1), layers)
                 with patch.object(sys, "argv", [
                     "gaifo.py", "--resume-checkpoint", str(path), "--timesteps", "16",
                 ]):
@@ -225,12 +283,32 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertIsNotNone(resumed)
                 self.assertEqual(parsed.gru, gru)
                 self.assertEqual(parsed.entropy_end, args.entropy_end)
+                self.assertEqual((parsed.policy_layers, parsed.critic_layers), (layers, layers))
+                self.assertEqual(parsed.recurrent_global, layers == 2)
                 validate_resume_args(parsed, resumed)
+
+                parsed.recurrent_global = layers != 2
+                with self.assertRaisesRegex(ValueError, "--recurrent-global must match"):
+                    validate_resume_args(parsed, resumed)
+                parsed.recurrent_global = layers == 2
+                if parsed.recurrent_global:
+                    parsed.discriminator_context_length += 1
+                    with self.assertRaisesRegex(ValueError, "--discriminator-context-length must match"):
+                        validate_resume_args(parsed, resumed)
+                    parsed.discriminator_context_length -= 1
 
                 parsed.gru = not gru
                 with self.assertRaisesRegex(ValueError, "checkpoint architecture"):
                     validate_resume_args(parsed, resumed)
                 parsed.gru = gru
+                parsed.policy_layers += 1
+                with self.assertRaisesRegex(ValueError, "--policy-layers must match"):
+                    validate_resume_args(parsed, resumed)
+                parsed.policy_layers = layers
+                parsed.critic_layers += 1
+                with self.assertRaisesRegex(ValueError, "--critic-layers must match"):
+                    validate_resume_args(parsed, resumed)
+                parsed.critic_layers = layers
 
                 restored_modules = {
                     "policy": build_policy(self.env, parsed),

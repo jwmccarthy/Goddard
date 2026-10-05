@@ -166,6 +166,55 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "GRU setting"):
                 load_policy_checkpoint(path, env, 4, None)
 
+    def test_deeper_gaifo_and_basic_checkpoints_remain_watchable(self):
+        env = FakeEnv()
+        observations = th.randn(1, 51)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            for gru, layers in ((False, 2), (True, 3)):
+                with self.subTest(gru=gru, layers=layers):
+                    architecture = (
+                        GAIFO_GRU_ARCHITECTURE if gru else GAIFO_ARCHITECTURE
+                    )
+                    reference = build_policy(
+                        env, argparse.Namespace(
+                            policy_hidden=16, policy_layers=layers, gru=gru,
+                        ),
+                    ).eval()
+                    gaifo_path = Path(directory) / "gaifo_000000000002.pt"
+                    th.save({
+                        "config": {
+                            "architecture": architecture,
+                            "policy_hidden": 16,
+                            "policy_layers": layers,
+                            "gru": gru,
+                        },
+                        "policy": reference.state_dict(),
+                    }, gaifo_path)
+                    basic_path = Path(directory) / "training_latest.pt"
+                    th.save({
+                        "modules": {"policy": reference.state_dict()},
+                        "config": {
+                            "policy_architecture": architecture,
+                            "hidden_size": 16,
+                            "policy_layers": layers,
+                        },
+                    }, basic_path)
+                    for kind, path in (("gaifo", gaifo_path), ("basic", basic_path)):
+                        loaded, signature = load_policy_checkpoint(path, env, 4, None)
+                        self.assertEqual(signature, (kind, 16, architecture, layers))
+                        with th.no_grad():
+                            expected = reference.act(
+                                observations, reference.initial_state(1),
+                                deterministic=True,
+                            )
+                            actual = loaded.act(
+                                observations, loaded.initial_state(1),
+                                deterministic=True,
+                            )
+                        th.testing.assert_close(actual.action, expected.action)
+                        if gru:
+                            th.testing.assert_close(actual.next_state, expected.next_state)
+
     def test_registry_ignores_removed_skill_checkpoints(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
@@ -199,7 +248,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                         },
                     }, path)
                     loaded, signature = load_policy_checkpoint(path, env, 4, None)
-                    self.assertEqual(signature, ("basic", 16, architecture))
+                    self.assertEqual(signature, ("basic", 16, architecture, 1))
                     state = reference.initial_state(1)
                     with th.no_grad():
                         expected = reference.act(

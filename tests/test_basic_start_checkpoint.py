@@ -141,6 +141,44 @@ class BasicStartingCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "--policy-hidden"):
                 configure_starting_checkpoint(args)
 
+    def test_deeper_gaifo_policy_loads_as_start_and_raw_snapshot(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            path = Path(directory) / "source.pt"
+            for architecture, layers in (
+                (GAIFO_ARCHITECTURE, 2),
+                (GAIFO_GRU_ARCHITECTURE, 2),
+                (GAIFO_GRU_ARCHITECTURE, 3),
+            ):
+                with self.subTest(architecture=architecture, layers=layers):
+                    args = argparse.Namespace(hidden_size=16, policy_layers=layers)
+                    original, _ = build_policy_and_critic(self.env, args, architecture)
+                    payload = {
+                        "policy": original.state_dict(),
+                        "config": {
+                            "architecture": architecture,
+                            "policy_hidden": 16,
+                            "policy_layers": layers,
+                            "gru": architecture == GAIFO_GRU_ARCHITECTURE,
+                        },
+                    }
+                    torch.save(payload, path)
+                    arguments = checkpoint_args(start=path)
+                    starting, _ = configure_starting_checkpoint(arguments)
+                    self.assertEqual(starting.policy_layers, layers)
+                    self.assertEqual(arguments.policy_layers, layers)
+                    restored, _ = build_policy_and_critic(self.env, arguments, architecture)
+                    restored.load_state_dict(starting.state)
+
+                    payload["config"]["policy_layers"] += 1
+                    torch.save(payload, path)
+                    with self.assertRaisesRegex(ValueError, "policy layers do not match"):
+                        load_policy_checkpoint(path)
+
+                    torch.save(original.state_dict(), path)
+                    snapshot, _ = load_policy_checkpoint(path)
+                    self.assertEqual(snapshot.architecture, architecture)
+                    self.assertEqual(snapshot.policy_layers, layers)
+
     def test_gaifo_style_flags_accept_legacy_basic_spellings(self):
         aliases = (
             ("--n-sim", "--num-simulations", "12"),
@@ -324,9 +362,15 @@ class BasicStartingCheckpointTests(unittest.TestCase):
 
     def test_ppo_and_resume_keep_reference_for_both_gaifo_architectures(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            for architecture in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
-                with self.subTest(architecture=architecture):
+            for architecture, layers in (
+                (GAIFO_ARCHITECTURE, 1),
+                (GAIFO_GRU_ARCHITECTURE, 1),
+                (GAIFO_ARCHITECTURE, 2),
+                (GAIFO_GRU_ARCHITECTURE, 2),
+            ):
+                with self.subTest(architecture=architecture, layers=layers):
                     args = ppo_args(architecture)
+                    args.policy_layers = layers
                     args.sparse = architecture == GAIFO_GRU_ARCHITECTURE
                     policy, critic = build_policy_and_critic(self.env, args, architecture)
                     reference = copy.deepcopy(policy).eval().requires_grad_(False)
@@ -334,7 +378,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                     self.env.reward = reward
                     runner, rollout, learner, _, objects = build_ppo(
                         self.env, policy, critic, reward, args,
-                        Path(directory) / architecture, reference,
+                        Path(directory) / f"{architecture}-layers-{layers}", reference,
                     )
                     runner.reset()
                     for _ in range(args.rollout_steps):
@@ -350,10 +394,13 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                     checkpointer(SimpleNamespace(clock=Clock(
                         vector_steps=4, env_steps=16, learner_updates=1
                     )))
+                    saved = torch.load(path, map_location="cpu", weights_only=True)
+                    self.assertEqual(saved["config"]["policy_layers"], layers)
                     restored_args = checkpoint_args(resume=path)
                     _, has_reference = configure_starting_checkpoint(restored_args)
                     self.assertTrue(has_reference)
                     self.assertEqual(restored_args.policy_architecture, architecture)
+                    self.assertEqual(restored_args.policy_layers, layers)
                     self.assertEqual(restored_args.start_kl_coef, args.start_kl_coef)
                     self.assertEqual(restored_args.sparse, args.sparse)
                     new_policy, new_critic = build_policy_and_critic(

@@ -74,6 +74,7 @@ class PolicyCheckpoint:
     architecture: str
     hidden_size: int
     state: dict[str, torch.Tensor]
+    policy_layers: int = 1
 
 
 def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
@@ -94,8 +95,11 @@ def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
     if not isinstance(foot, torch.Tensor) or foot.ndim != 2:
         raise ValueError(f"checkpoint has no supported policy encoder: {path}")
     if "body.rnn.weight_ih_l0" in state:
+        intermediate = state.get("head.model.2.weight")
         architecture = (
             BASIC_POLICY_ARCHITECTURE if "head.model.4.weight" in state
+            and isinstance(intermediate, torch.Tensor)
+            and intermediate.shape[0] == foot.shape[0] // 2
             else GAIFO_GRU_ARCHITECTURE
         )
     elif "body.model.0.weight" in state:
@@ -118,7 +122,18 @@ def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
     saved_hidden = config.get("policy_hidden", config.get("hidden_size"))
     if saved_hidden is not None and saved_hidden != hidden_size:
         raise ValueError(f"checkpoint hidden size does not match weights: {path}")
-    return PolicyCheckpoint(architecture, hidden_size, state)
+    if architecture == BASIC_POLICY_ARCHITECTURE:
+        policy_layers = 1
+    else:
+        prefix = "body.model." if architecture == GAIFO_ARCHITECTURE else "head.model."
+        policy_layers = sum(
+            name.startswith(prefix) and name.endswith(".weight") for name in state
+        )
+        if policy_layers < 1:
+            raise ValueError(f"checkpoint has no supported policy layers: {path}")
+        if config.get("policy_layers", policy_layers) != policy_layers:
+            raise ValueError(f"checkpoint policy layers do not match weights: {path}")
+    return PolicyCheckpoint(architecture, hidden_size, state, policy_layers)
 
 
 def load_policy_checkpoint(path: Path) -> tuple[PolicyCheckpoint, dict]:
@@ -157,6 +172,7 @@ def configure_starting_checkpoint(
                 f"--policy-hidden must match checkpoint ({checkpoint.hidden_size})"
             )
         arguments.policy_architecture = checkpoint.architecture
+        arguments.policy_layers = checkpoint.policy_layers
 
         if arguments.start_kl_coef is None and resumed_reference:
             arguments.start_kl_coef = payload.get("config", {}).get(
@@ -583,6 +599,8 @@ def build_policy_and_critic(
         gaifo_args = argparse.Namespace(
             policy_hidden=arguments.hidden_size,
             critic_hidden=arguments.hidden_size,
+            policy_layers=getattr(arguments, "policy_layers", 1),
+            critic_layers=getattr(arguments, "policy_layers", 1),
             gru=architecture == GAIFO_GRU_ARCHITECTURE,
         )
         actor = build_gaifo_policy(environment, gaifo_args)
@@ -985,6 +1003,12 @@ def build_ppo(
         "config": {
             "policy_architecture": arguments.policy_architecture,
             "hidden_size": arguments.hidden_size,
+            **(
+                {"policy_layers": getattr(arguments, "policy_layers", 1)}
+                if arguments.policy_architecture in (
+                    GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+                ) else {}
+            ),
             "start_kl_coef": arguments.start_kl_coef,
             "sparse": arguments.sparse,
         },

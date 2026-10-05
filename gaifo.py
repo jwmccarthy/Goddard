@@ -2,6 +2,7 @@ import argparse
 import math
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from itertools import zip_longest
 from pathlib import Path
 
 import numpy as np
@@ -1279,7 +1280,9 @@ class ExpertSceneDataset:
         self._curated_pools: dict[bool, tuple[th.Tensor, ...]] = {}
         self._curated_maneuvers: dict[bool, tuple[list[SceneManeuver], ...]] = {}
         self._curated_labeled_pools: dict[bool, tuple[tuple[th.Tensor, ...], ...]] = {}
+        self._context_situation_pools: dict[bool, tuple[th.Tensor, ...]] = {}
         self._curated_reset_pools: tuple[th.Tensor, ...] | None = None
+        self._context_run_starts: dict[bool, th.Tensor] = {}
         if skill_sampling:
             self.curated_pools()
 
@@ -1500,6 +1503,69 @@ class ExpertSceneDataset:
             windows[opponent] = opponent_view(windows[opponent])
         return windows
 
+    def sample_povs(self, n: int, *, heldout: bool = False) -> th.Tensor:
+        """Choose expert window starts and their stored focal viewpoint."""
+        if n < 1:
+            raise ValueError("expert sample count must be positive")
+        generator = self._heldout_generator if heldout else self._train_generator
+        if self.skill_sampling:
+            categories = th.multinomial(
+                self.curated_weights(heldout=heldout), n, replacement=True,
+                generator=generator,
+            )
+            pairs = th.empty((n, 2), dtype=th.long, device=self.frames.device)
+            for category, pool in enumerate(self.curated_pools(heldout=heldout)):
+                selected = (categories == category).nonzero(as_tuple=True)[0]
+                if len(selected):
+                    pairs[selected] = pool[th.randint(
+                        len(pool), (len(selected),), device=self.frames.device,
+                        generator=generator,
+                    )]
+            return pairs
+        starts = self.heldout_window_starts if heldout else self.train_window_starts
+        if not len(starts):
+            raise ValueError("no expert windows in the requested split")
+        chosen = starts[th.randint(
+            len(starts), (n,), device=self.frames.device, generator=generator,
+        )]
+        opponent = (self.opponent_pov_available[chosen]
+                    & (th.rand(n, device=self.frames.device, generator=generator) < 0.5))
+        return th.stack((chosen, opponent.long()), dim=-1)
+
+    def context_frames(
+        self, pairs: th.Tensor, length: int, *, heldout: bool = False,
+        max_age: th.Tensor | None = None,
+        return_age: bool = False,
+    ) -> th.Tensor | tuple[th.Tensor, th.Tensor]:
+        """Causal expert scenes, stopped at split, replay, or unsafe-window gaps."""
+        if pairs.ndim != 2 or pairs.shape[1] != 2 or length < 1:
+            raise ValueError("expert context needs window/actor pairs and a positive length")
+        if not len(pairs):
+            empty = self.frames.new_empty((0, length, self.frames.shape[-1]))
+            return (empty, pairs.new_empty(0)) if return_age else empty
+        starts = self.heldout_window_starts if heldout else self.train_window_starts
+        if heldout not in self._context_run_starts:
+            beginning = th.ones(len(starts), dtype=th.bool, device=starts.device)
+            beginning[1:] = starts[1:] != starts[:-1] + 1
+            run_starts = th.where(beginning, starts, 0).cummax(0).values
+            self._context_run_starts[heldout] = run_starts
+        position = th.searchsorted(starts, pairs[:, 0].contiguous())
+        if (position >= len(starts)).any() or not th.equal(starts[position], pairs[:, 0]):
+            raise ValueError("expert context includes an unavailable window")
+        run_start = self._context_run_starts[heldout][position]
+        if max_age is not None:
+            if max_age.shape != (len(pairs),) or (max_age < 1).any():
+                raise ValueError("expert context age must match selected windows")
+            run_start = th.maximum(run_start, pairs[:, 0] - max_age + 1)
+        ages = (pairs[:, 0] - run_start + 1).clamp(max=length)
+        offsets = th.arange(length - 1, -1, -1, device=pairs.device)
+        indices = th.maximum(pairs[:, :1] - offsets, run_start[:, None])
+        scenes = self.frames[indices + self.partition_span]
+        opponent = pairs[:, 1].bool()
+        if opponent.any():
+            scenes[opponent] = opponent_view(scenes[opponent])
+        return (scenes, ages) if return_age else scenes
+
     def situation_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
         """Eligible (window start, focal actor) pairs for each situation band."""
         cached = self._heldout_situation_pools if heldout else self._train_situation_pools
@@ -1539,6 +1605,23 @@ class ExpertSceneDataset:
         else:
             self._train_situation_pools = pools
         return pools
+
+    def context_situation_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
+        """Match recurrent positives to the same curated scene situations."""
+        if not self.skill_sampling:
+            return self.situation_pools(heldout=heldout)
+        if heldout not in self._context_situation_pools:
+            groups: list[list[th.Tensor]] = [[] for _ in range(N_SITUATIONS)]
+            for pool in self.curated_pools(heldout=heldout):
+                for chunk in pool.split(8_192):
+                    labels = scene_situation_ids(self._windows_for_povs(chunk))
+                    for label in labels.unique().tolist():
+                        groups[label].append(chunk[labels == label])
+            empty = self.train_window_starts.new_empty((0, 2))
+            self._context_situation_pools[heldout] = tuple(
+                th.cat(group) if group else empty for group in groups
+            )
+        return self._context_situation_pools[heldout]
 
     def _grounded_choices(self) -> tuple[th.Tensor, th.Tensor]:
         """Cache physical training frames and eligible flat-ground POV flags."""
@@ -2040,7 +2123,7 @@ class SceneDiscriminator(nn.Module):
         frame_embedding: int,
         temporal_hidden: int,
         hidden_size: int = 128,
-        *, n_cars: int = N_CARS,
+        *, n_cars: int = N_CARS, recurrent_global: bool = False,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
@@ -2049,6 +2132,7 @@ class SceneDiscriminator(nn.Module):
             raise ValueError("scene discriminator needs two or four cars")
         self.n_cars = n_cars
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.recurrent_global = recurrent_global
         self.ball_encoder = nn.Sequential(
             nn.Linear(BALL_SIZE, hidden_size),
             nn.ReLU(),
@@ -2066,21 +2150,60 @@ class SceneDiscriminator(nn.Module):
         )
         self.head = nn.Linear(temporal_hidden, 1)
 
-    def forward(self, windows: th.Tensor) -> th.Tensor:
-        if windows.ndim != 3 or windows.shape[-1] != self.scene_size:
-            raise ValueError("scene discriminator requires two- or four-car scene windows")
-        B, T, _ = windows.shape
-        ball = windows[..., :BALL_SIZE]
-        cars = windows[..., BALL_SIZE:].reshape(B, T, self.n_cars, CAR_SIZE)
-        sign = windows.new_tensor(
+    def _encode(self, scenes: th.Tensor) -> th.Tensor:
+        B, T, _ = scenes.shape
+        ball = scenes[..., :BALL_SIZE]
+        cars = scenes[..., BALL_SIZE:].reshape(B, T, self.n_cars, CAR_SIZE)
+        sign = scenes.new_tensor(
             [1.0] * (self.n_cars // 2) + [-1.0] * (self.n_cars // 2)
         ).view(1, 1, self.n_cars, 1)
         car_in = th.cat((cars, sign.expand(B, T, -1, -1)), dim=-1)
         ball_emb = self.ball_encoder(ball)
         car_emb = self.car_encoder(car_in).flatten(-2)
-        frame_embedding = th.cat((ball_emb, car_emb), dim=-1)
-        gru_out, _ = self.gru(frame_embedding)
+        return th.cat((ball_emb, car_emb), dim=-1)
+
+    def forward(self, windows: th.Tensor) -> th.Tensor:
+        if windows.ndim != 3 or windows.shape[-1] != self.scene_size:
+            raise ValueError("scene discriminator requires two- or four-car scene windows")
+        gru_out, _ = self.gru(self._encode(windows))
         return self.head(gru_out[:, -1]).squeeze(-1)
+
+    def score_context(self, scenes: th.Tensor, ages: th.Tensor) -> th.Tensor:
+        """Skip left padding so a new episode starts from a zero recurrent state."""
+        if (scenes.ndim != 3 or scenes.shape[-1] != self.scene_size
+                or ages.shape != (len(scenes),)
+                or (ages < 1).any() or (ages > scenes.shape[1]).any()):
+            raise ValueError("scene context and ages must match")
+        features = self._encode(scenes)
+        state = features.new_zeros((1, len(scenes), self.gru.hidden_size))
+        for step in range(scenes.shape[1]):
+            _, next_state = self.gru(features[:, step:step + 1], state)
+            active = (ages >= scenes.shape[1] - step)[None, :, None]
+            state = th.where(active, next_state, state)
+        return self.head(state[0]).squeeze(-1)
+
+    def score_sequence(
+        self, scenes: th.Tensor, reset: th.Tensor,
+        initial_state: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Score chronological scene frames, resetting memory at episode starts."""
+        if (not self.recurrent_global or scenes.ndim != 3
+                or scenes.shape[-1] != self.scene_size
+                or reset.shape != scenes.shape[:2]):
+            raise ValueError("recurrent scene scoring needs [time, actors, scene] and reset")
+        features = self._encode(scenes.transpose(0, 1))
+        state = (
+            features.new_zeros((1, scenes.shape[1], self.gru.hidden_size))
+            if initial_state is None else initial_state
+        )
+        if state.shape != (1, scenes.shape[1], self.gru.hidden_size):
+            raise ValueError("initial discriminator state must match actors")
+        logits = []
+        for step in range(len(scenes)):
+            state = state.masked_fill(reset[step][None, :, None], 0)
+            output, state = self.gru(features[:, step:step + 1], state)
+            logits.append(self.head(output[:, 0]).squeeze(-1))
+        return th.stack(logits), state
 
 
 class EgoBallSceneDiscriminator(nn.Module):
@@ -2120,7 +2243,7 @@ class FactorizedSceneDiscriminator(nn.Module):
     def __init__(
         self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
         *, n_cars: int = N_CARS, _legacy_two_heads: bool = False,
-        _legacy_opponent_context: bool = False,
+        _legacy_opponent_context: bool = False, recurrent_global: bool = False,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
@@ -2131,6 +2254,7 @@ class FactorizedSceneDiscriminator(nn.Module):
             raise ValueError("opponent context is only supported for legacy checkpoints")
         self.n_cars = n_cars
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.recurrent_global = recurrent_global
         self.other_context_size = (
             (n_cars - 1) * (CAR_SIZE + 6) if _legacy_opponent_context else 0
         )
@@ -2157,10 +2281,11 @@ class FactorizedSceneDiscriminator(nn.Module):
         self.global_discriminator = (
             None if _legacy_two_heads else SceneDiscriminator(
                 frame_embedding, temporal_hidden, hidden_size, n_cars=n_cars,
+                recurrent_global=recurrent_global,
             )
         )
 
-    def forward(self, windows: th.Tensor) -> th.Tensor:
+    def specialist_logits(self, windows: th.Tensor) -> th.Tensor:
         if windows.ndim != 3 or windows.shape[-1] != self.scene_size:
             raise ValueError("factorized discriminator needs [batch, frames, scene] windows")
         ball = windows[..., :BALL_SIZE]
@@ -2192,10 +2317,18 @@ class FactorizedSceneDiscriminator(nn.Module):
                 ball_input = th.cat((ball_input, context), dim=-1)
             ball_features, _ = self.ball_gru(self.ball_encoder(ball_input))
             near_score = self.ball_head(ball_features[:, -1])
+        return th.cat((far_score, near_score), dim=-1)
+
+    def forward(self, windows: th.Tensor, context: th.Tensor | None = None) -> th.Tensor:
+        specialist = self.specialist_logits(windows)
         if self.global_discriminator is None:
-            return th.cat((far_score, near_score), dim=-1)
-        global_score = self.global_discriminator(windows).unsqueeze(-1)
-        return th.cat((far_score, near_score, global_score), dim=-1)
+            return specialist
+        if context is not None and not self.recurrent_global:
+            raise ValueError("global context requires a recurrent discriminator")
+        global_score = self.global_discriminator(
+            windows if context is None else context
+        ).unsqueeze(-1)
+        return th.cat((specialist, global_score), dim=-1)
 
 
 def load_discriminator_state(discriminator: nn.Module, state: dict[str, th.Tensor]) -> bool:
@@ -2326,15 +2459,17 @@ class ConfidentExpertResetTransform:
         dataset: TensorDataset,
         discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
         microbatch_size: int,
+        context_length: int = 16,
     ) -> None:
-        if microbatch_size < 1:
-            raise ValueError("reset scoring microbatch size must be positive")
+        if microbatch_size < 1 or context_length < 1:
+            raise ValueError("reset scoring batch and context length must be positive")
         if len(dataset) != len(expert.reset_indices) or dataset.device != expert.frames.device:
             raise ValueError("reset dataset must match the expert training frames")
         self.expert = expert
         self.dataset = dataset
         self.discriminator = discriminator
         self.microbatch_size = microbatch_size
+        self.context_length = context_length
         resettable = th.zeros(len(expert.frames), dtype=th.bool, device=expert.frames.device)
         resettable[expert.reset_indices] = True
         if expert.skill_sampling:
@@ -2351,8 +2486,26 @@ class ConfidentExpertResetTransform:
         self._total = 0
         self._mined = 0
 
-    def _confidence(self, windows: th.Tensor) -> th.Tensor:
-        logits = self.discriminator(windows)
+    def _confidence(
+        self, windows: th.Tensor, context: th.Tensor | None = None,
+        ages: th.Tensor | None = None,
+    ) -> th.Tensor:
+        if getattr(self.discriminator, "recurrent_global", False):
+            if context is None or ages is None:
+                raise ValueError("recurrent reset scoring needs causal expert context")
+            factorized = getattr(self.discriminator, "factorized", False)
+            global_model = (
+                self.discriminator.global_discriminator if factorized
+                else self.discriminator
+            )
+            global_logits = global_model.score_context(context, ages)
+            logits = (
+                th.cat((self.discriminator.specialist_logits(windows),
+                        global_logits[:, None]), dim=-1)
+                if factorized else global_logits
+            )
+        else:
+            logits = self.discriminator(windows)
         if getattr(self.discriminator, "factorized", False):
             if logits.shape != (len(windows), 3):
                 raise ValueError("factorized discriminator must return far, near, and global logits")
@@ -2370,12 +2523,30 @@ class ConfidentExpertResetTransform:
             try:
                 for chunk in starts.split(self.microbatch_size):
                     windows = self.expert.frames[chunk[:, None] + self.expert.window_offsets]
-                    confidence = self._confidence(windows)
+                    recurrent = getattr(self.discriminator, "recurrent_global", False)
+                    if recurrent:
+                        context, ages = self.expert.context_frames(
+                            th.stack((chunk, th.zeros_like(chunk)), dim=-1),
+                            self.context_length, return_age=True,
+                        )
+                    else:
+                        context = ages = None
+                    confidence = self._confidence(windows, context, ages)
                     paired = self.expert.opponent_pov_available[chunk]
                     if paired.any():
+                        if recurrent:
+                            opponent_context, opponent_ages = self.expert.context_frames(
+                                th.stack((chunk[paired], th.ones_like(chunk[paired])), dim=-1),
+                                self.context_length, return_age=True,
+                            )
+                        else:
+                            opponent_context = opponent_ages = None
                         confidence[paired] = th.maximum(
                             confidence[paired],
-                            self._confidence(opponent_view(windows[paired])),
+                            self._confidence(
+                                opponent_view(windows[paired]),
+                                opponent_context, opponent_ages,
+                            ),
                         )
                     scores.append(confidence)
             finally:
@@ -2454,17 +2625,25 @@ class SceneDiscriminatorLoss:
 
     def __init__(
         self, discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+        *, specialists_only: bool = False,
     ) -> None:
+        if specialists_only and not getattr(discriminator, "factorized", False):
+            raise ValueError("specialist loss requires a factorized discriminator")
         self.discriminator = discriminator
+        self.specialists_only = specialists_only
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
-        logit = self.discriminator(batch["window"])
+        logit = (
+            self.discriminator.specialist_logits(batch["window"])
+            if self.specialists_only else self.discriminator(batch["window"])
+        )
         target = batch["is_agent"]
         agent = target.bool()
         metrics = {}
         if getattr(self.discriminator, "factorized", False):
-            if logit.shape != (len(target), 3):
-                raise ValueError("factorized discriminator must return far, near, and global logits")
+            expected = 2 if self.specialists_only else 3
+            if logit.shape != (len(target), expected):
+                raise ValueError("factorized discriminator returned the wrong number of logits")
             near = batch.get("ball_near")
             if near is None:
                 near = nearest_ball_distance(batch["window"]) <= BALL_NEAR_DISTANCE
@@ -2475,18 +2654,21 @@ class SceneDiscriminatorLoss:
                 logit[:, :2], target[:, None].expand(-1, 2), reduction="none",
             )
             head_losses = (errors * weights).mean(dim=0)
-            global_loss = F.binary_cross_entropy_with_logits(logit[:, 2], target)
-            loss = (SPECIALIST_DISCRIMINATOR_WEIGHT * head_losses.sum()
-                    + GLOBAL_DISCRIMINATOR_WEIGHT * global_loss)
+            loss = SPECIALIST_DISCRIMINATOR_WEIGHT * head_losses.sum()
             metrics = {
                 "far_loss": head_losses[0].detach(),
                 "near_loss": head_losses[1].detach(),
-                "global_loss": global_loss.detach(),
                 "near_ball_fraction": near.float().mean(),
             }
             specialist = th.where(near, logit[:, 1], logit[:, 0])
-            logit = (GLOBAL_DISCRIMINATOR_WEIGHT * logit[:, 2]
-                     + SPECIALIST_DISCRIMINATOR_WEIGHT * specialist)
+            if self.specialists_only:
+                logit = specialist
+            else:
+                global_loss = F.binary_cross_entropy_with_logits(logit[:, 2], target)
+                loss += GLOBAL_DISCRIMINATOR_WEIGHT * global_loss
+                metrics["global_loss"] = global_loss.detach()
+                logit = (GLOBAL_DISCRIMINATOR_WEIGHT * logit[:, 2]
+                         + SPECIALIST_DISCRIMINATOR_WEIGHT * specialist)
         else:
             loss = F.binary_cross_entropy_with_logits(logit, target)
 
@@ -2507,6 +2689,43 @@ class SceneDiscriminatorLoss:
                 **metrics,
             },
         )
+
+
+class GlobalContextLoss:
+    """Teach the global branch to retain expert-like behavior across scene frames."""
+
+    global_only = True
+
+    def __init__(
+        self, discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+    ) -> None:
+        if not discriminator.recurrent_global:
+            raise ValueError("global context loss requires a recurrent discriminator")
+        self.global_discriminator = (
+            discriminator.global_discriminator
+            if getattr(discriminator, "factorized", False) else discriminator
+        )
+
+    def __call__(self, batch: TensorBatch) -> LossOutput:
+        logit = self.global_discriminator.score_context(
+            batch["window"], batch["age"],
+        )
+        target = batch["is_agent"]
+        loss = F.binary_cross_entropy_with_logits(logit, target)
+        agent = target.bool()
+        with th.no_grad():
+            agent_score = th.sigmoid(logit[agent]).mean()
+            expert_score = th.sigmoid(logit[~agent]).mean()
+            agent_accuracy = (logit[agent] > 0).float().mean()
+            expert_accuracy = (logit[~agent] <= 0).float().mean()
+        return LossOutput(loss, {
+            "loss": loss,
+            "global_loss": loss.detach(),
+            "agent_score": agent_score,
+            "expert_score": expert_score,
+            "agent_accuracy": agent_accuracy,
+            "expert_accuracy": expert_accuracy,
+        })
 
 
 @dataclass(frozen=True)
@@ -2914,6 +3133,125 @@ class GeneratedManeuverTracker:
                 scenes[setup:, actor].detach().clone(), begin - setup,
                 control[setup:, actor].copy(),
             )
+
+
+def simulation_episode_ends(episode_end: th.Tensor) -> th.Tensor:
+    """A 1v1 simulation resets both focal viewpoints when either actor is done."""
+    if episode_end.ndim != 2 or episode_end.shape[1] % N_CARS:
+        raise ValueError("1v1 episode ends need two actors per simulation")
+    return episode_end.bool().reshape(
+        len(episode_end), -1, N_CARS,
+    ).any(dim=-1).repeat_interleave(N_CARS, dim=-1)
+
+
+def generated_context_frames(
+    windows: th.Tensor, indices: th.Tensor, n_envs: int,
+    episode_end: th.Tensor | None, length: int,
+) -> tuple[th.Tensor, th.Tensor]:
+    """Gather consecutive scenes without crossing actor or episode boundaries."""
+    if (windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE or n_envs < 1
+            or n_envs % N_CARS
+            or len(windows) % n_envs or length < 1):
+        raise ValueError("generated context needs time-major 1v1 scene windows")
+    steps = len(windows) // n_envs
+    if episode_end is not None and episode_end.shape != (steps, n_envs):
+        raise ValueError("generated context episode ends must match actors")
+    if not len(indices):
+        return windows.new_empty((0, length, SCENE_SIZE)), indices.new_empty(0)
+    if (indices < 0).any() or (indices >= len(windows)).any():
+        raise ValueError("generated context indices must be in the rollout")
+    endings = (simulation_episode_ends(episode_end) if episode_end is not None else
+               th.zeros((steps, n_envs), dtype=th.bool, device=windows.device))
+    beginnings = th.zeros((steps, n_envs), dtype=th.long, device=windows.device)
+    beginnings[1:] = th.where(
+        endings[:-1], th.arange(1, steps, device=windows.device)[:, None], 0,
+    )
+    beginnings = beginnings.cummax(dim=0).values
+    time, actor = indices // n_envs, indices % n_envs
+    beginning = beginnings[time, actor]
+    offsets = th.arange(length - 1, -1, -1, device=windows.device)
+    selected = th.maximum(time[:, None] - offsets, beginning[:, None])
+    frames = windows.reshape(steps, n_envs, windows.shape[1], SCENE_SIZE)[:, :, -1]
+    return frames[selected, actor[:, None]], (time - beginning + 1).clamp(max=length)
+
+
+class GlobalContextMinibatches:
+    """Train the global GRU on adjacent frames from the same actor and expert POV."""
+
+    def __init__(
+        self, expert: ExpertSceneDataset, batch_size: int, epochs: int,
+        noise_std: float, context_length: int, stride: int,
+        history: HistoricalReplayBuffer | RecencyReplayBuffer | None = None,
+        mix_fraction: float = 0.0,
+    ) -> None:
+        if min(batch_size, epochs, context_length, stride) < 1:
+            raise ValueError("global context batch, epoch, length and stride must be positive")
+        if not 0.0 <= mix_fraction < 1.0:
+            raise ValueError("global context history mix must be in [0, 1)")
+        self.expert = expert
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.noise_std = noise_std
+        self.context_length = context_length
+        self.stride = stride
+        self.history = history
+        self.mix_fraction = mix_fraction if history is not None else 0.0
+        self._epoch_callback = None
+
+    def set_epoch_callback(self, callback) -> None:
+        self._epoch_callback = callback
+
+    def sample_contexts(
+        self, windows: th.Tensor, indices: th.Tensor, n_envs: int,
+        episode_end: th.Tensor | None = None,
+    ):
+        pools = self.expert.context_situation_pools()
+        available = th.tensor([bool(len(pool)) for pool in pools], device=windows.device)
+        for _ in range(self.epochs):
+            shuffled = indices[th.randperm(len(indices), device=indices.device)]
+            selected = shuffled[:max(1, math.ceil(len(shuffled) / self.stride))]
+            for batch_indices in selected.split(self.batch_size):
+                count = len(batch_indices)
+                n_history = 0
+                if self.history is not None and self.history.size:
+                    n_history = min(int(count * self.mix_fraction), self.history.size)
+                current = batch_indices[:count - n_history]
+                context, ages = generated_context_frames(
+                    windows, current, n_envs, episode_end, self.context_length,
+                )
+                labels = scene_situation_ids(windows[current])
+                if n_history:
+                    past = self.history.sample(n_history, windows.device)
+                    context = th.cat((context, past))
+                    ages = th.cat((ages, ages.new_full((n_history,), self.context_length)))
+                    labels = th.cat((labels, scene_situation_ids(
+                        past[:, -min(self.expert.trajectory_length, self.context_length):],
+                    )))
+                matched = available[labels]
+                if not matched.any():
+                    continue
+                context, ages, labels = context[matched], ages[matched], labels[matched]
+                pairs = th.empty((len(context), 2), dtype=th.long, device=windows.device)
+                for label in labels.unique().tolist():
+                    positions = (labels == label).nonzero(as_tuple=True)[0]
+                    pool = pools[label]
+                    pairs[positions] = pool[th.randint(
+                        len(pool), (len(positions),), device=windows.device,
+                    )]
+                expert, matched_ages = self.expert.context_frames(
+                    pairs, self.context_length, max_age=ages, return_age=True,
+                )
+                n = len(context)
+                yield TensorBatch({
+                    "window": th.cat((add_scene_noise(context, self.noise_std),
+                                      add_scene_noise(expert, self.noise_std))),
+                    "is_agent": th.cat((context.new_ones(n), context.new_zeros(n))),
+                    # Match both lengths: an expert split or unsafe gap must not
+                    # become a shortcut for identifying the label.
+                    "age": th.cat((matched_ages, matched_ages)),
+                })
+            if self._epoch_callback is not None:
+                self._epoch_callback()
 
 
 class SceneGAIFOMinibatches:
@@ -3349,7 +3687,7 @@ def train_discriminator_minibatch(
     sample: TensorBatch,
     discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
     optimizer: th.optim.Optimizer,
-    loss: SceneDiscriminatorLoss,
+    loss: SceneDiscriminatorLoss | GlobalContextLoss,
     microbatch_size: int,
     max_grad_norm: float,
 ) -> dict[str, th.Tensor]:
@@ -3382,7 +3720,7 @@ def train_discriminator_minibatch(
                 (sample["skill_category"][:n_agent] == category).float().mean()
             )
     band_weights = near = None
-    if getattr(discriminator, "factorized", False):
+    if getattr(discriminator, "factorized", False) and not getattr(loss, "global_only", False):
         near = sample.get("ball_near")
         if near is None:
             near = nearest_ball_distance(windows) <= BALL_NEAR_DISTANCE
@@ -3395,6 +3733,10 @@ def train_discriminator_minibatch(
             "window": th.cat((windows[start:stop], windows[n_agent + start:n_agent + stop])),
             "is_agent": th.cat((labels[start:stop], labels[n_agent + start:n_agent + stop])),
         })
+        if "age" in sample:
+            chunk = chunk.with_fields(age=th.cat((
+                sample["age"][start:stop], sample["age"][n_agent + start:n_agent + stop],
+            )))
         if band_weights is not None:
             chunk = chunk.with_fields(
                 ball_near=th.cat((near[start:stop], near[n_agent + start:n_agent + stop])),
@@ -3410,6 +3752,8 @@ def train_discriminator_minibatch(
 
     th.nn.utils.clip_grad_norm_(discriminator.parameters(), max_grad_norm)
     optimizer.step()
+    if getattr(loss, "global_only", False):
+        discriminator.context_version = getattr(discriminator, "context_version", 0) + 1
     return metrics
 
 
@@ -3433,6 +3777,7 @@ class SceneDiscriminatorReward:
         batch_size: int = 16_384,
         max_magnitude: float = 10.0,
         exp_log_odds_reward: bool = False,
+        context_length: int = 16,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -3444,8 +3789,11 @@ class SceneDiscriminatorReward:
             raise ValueError("aerial touch reward weight must be non-negative")
         if not math.isfinite(flip_reset_reward_weight) or flip_reset_reward_weight < 0.0:
             raise ValueError("flip reset reward weight must be non-negative")
+        if context_length < 1:
+            raise ValueError("recurrent context length must be positive")
         self.discriminator = discriminator
         self.factorize = getattr(discriminator, "factorized", False)
+        self.recurrent_global = getattr(discriminator, "recurrent_global", False)
         self.noise_std = noise_std
         self.trajectory_length = trajectory_length
         self.goal_reward_weight = goal_reward_weight
@@ -3454,6 +3802,11 @@ class SceneDiscriminatorReward:
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
         self.exp_log_odds_reward = exp_log_odds_reward
+        self.context_length = context_length
+        self._recent_frames: th.Tensor | None = None
+        self._recent_ends: th.Tensor | None = None
+        self._last_state: th.Tensor | None = None
+        self._context_version: int | None = None
 
     @staticmethod
     def _event_reward(
@@ -3468,14 +3821,69 @@ class SceneDiscriminatorReward:
             raise ValueError(f"{name} must match the actor rollout shape")
         return score.to(reference.dtype) * weight
 
+    def _score_global_sequence(
+        self, windows: th.Tensor, valid: th.Tensor,
+        episode_end: th.Tensor | None,
+    ) -> th.Tensor:
+        if episode_end is None or episode_end.shape != valid.shape:
+            raise ValueError("recurrent discriminator needs episode ends for each actor")
+        current_frames = windows[:, :, -1]
+        # A window can be unscored while its scene still belongs to this episode.
+        # Only a real termination clears recurrent memory.
+        current_ends = simulation_episode_ends(episode_end)
+        have_history = (self._recent_frames is not None
+                        and self._recent_frames.shape[1:] == current_frames.shape[1:])
+        version = getattr(self.discriminator, "context_version", 0)
+        carry = (have_history and self._last_state is not None
+                 and self._context_version == version)
+        need_prefix = have_history and (not carry or len(current_frames) < self.context_length)
+        history_frames = (
+            th.cat((self._recent_frames, current_frames)) if need_prefix
+            else current_frames
+        )
+        history_ends = (
+            th.cat((self._recent_ends, current_ends)) if need_prefix
+            else current_ends
+        )
+        frames = current_frames if carry else history_frames
+        endings = current_ends if carry else history_ends
+        resets = th.zeros_like(endings)
+        resets[0] = self._recent_ends[-1] if carry else True
+        resets[1:] = endings[:-1]
+        self._recent_frames = history_frames[-self.context_length:].detach().clone()
+        self._recent_ends = history_ends[-self.context_length:].detach().clone()
+        global_model = (
+            self.discriminator.global_discriminator if self.factorize
+            else self.discriminator
+        )
+        scores = []
+        states = []
+        for start in range(0, windows.shape[1], self.batch_size):
+            stop = min(start + self.batch_size, windows.shape[1])
+            logits, state = global_model.score_sequence(
+                add_scene_noise(frames[:, start:stop], self.noise_std),
+                resets[:, start:stop],
+                self._last_state[:, start:stop] if carry else None,
+            )
+            scores.append(logits[-len(windows):])
+            states.append(state)
+        self._last_state = th.cat(states, dim=1).detach()
+        self._context_version = version
+        return th.cat(scores, dim=1)
+
     def _score_windows(
         self,
         windows: th.Tensor,
         valid: th.Tensor,
+        episode_end: th.Tensor | None = None,
     ) -> th.Tensor:
         scores = th.zeros(
             (*valid.shape, 3) if self.factorize else valid.shape,
             dtype=windows.dtype, device=windows.device,
+        )
+        global_scores = (
+            self._score_global_sequence(windows, valid, episode_end).flatten()
+            if self.recurrent_global else None
         )
         if not valid.any():
             return scores
@@ -3491,10 +3899,20 @@ class SceneDiscriminatorReward:
         )
         for start in range(0, len(indices), self.batch_size):
             stop = min(start + self.batch_size, len(indices))
-            noisy = add_scene_noise(
-                flat_windows[indices[start:stop]], self.noise_std
-            )
-            logits = self.discriminator(noisy)
+            if self.recurrent_global and not self.factorize:
+                logits = global_scores[indices[start:stop]]
+            else:
+                noisy = add_scene_noise(
+                    flat_windows[indices[start:stop]], self.noise_std
+                )
+                logits = (
+                    self.discriminator.specialist_logits(noisy)
+                    if self.recurrent_global else self.discriminator(noisy)
+                )
+                if self.recurrent_global:
+                    logits = th.cat((
+                        logits, global_scores[indices[start:stop], None],
+                    ), dim=-1)
             expected = (stop - start, 3) if self.factorize else (stop - start,)
             if logits.shape != expected:
                 raise ValueError(f"discriminator returned {tuple(logits.shape)}, expected {expected}")
@@ -3546,7 +3964,11 @@ class SceneDiscriminatorReward:
             raise ValueError("scene windows have the wrong shape")
 
         dtype = batch["observation"].dtype
-        scores = self._score_windows(windows, valid).to(dtype)
+        terminal = batch.get("terminated")
+        truncated = batch.get("truncated")
+        if truncated is not None:
+            terminal = truncated.bool() if terminal is None else terminal.bool() | truncated.bool()
+        scores = self._score_windows(windows, valid, terminal).to(dtype)
         components = {}
         if self.factorize:
             far_reward = SPECIALIST_DISCRIMINATOR_WEIGHT * scores[..., 0]
@@ -3644,6 +4066,9 @@ class AdaptiveDiscriminatorUpdate:
         update_interval: int = 1,
         microbatch_size: int = 1_024,
         reset_miner: ConfidentExpertResetTransform | None = None,
+        context_length: int = 16,
+        context_stride: int = 4,
+        context_history: HistoricalReplayBuffer | RecencyReplayBuffer | None = None,
     ) -> None:
         if heldout_size < 0:
             raise ValueError("heldout size must be non-negative")
@@ -3657,6 +4082,8 @@ class AdaptiveDiscriminatorUpdate:
             raise ValueError("update interval must be positive")
         if microbatch_size < 1:
             raise ValueError("microbatch size must be positive")
+        if min(context_length, context_stride) < 1:
+            raise ValueError("discriminator context length and stride must be positive")
         self.expert = expert
         self.history = history
         self.batch_size = batch_size
@@ -3674,6 +4101,10 @@ class AdaptiveDiscriminatorUpdate:
         self.update_interval = update_interval
         self.microbatch_size = microbatch_size
         self.reset_miner = reset_miner
+        self.recurrent_global = getattr(discriminator, "recurrent_global", False)
+        self.context_length = context_length
+        self.context_stride = context_stride
+        self.context_history = context_history
         self._progress_callback = None
         self._heldout_sim: th.Tensor | None = None
         self._has_updated = False
@@ -3705,6 +4136,8 @@ class AdaptiveDiscriminatorUpdate:
         truncated = batch.get("truncated")
         if truncated is not None:
             terminal = truncated.bool() if terminal is None else terminal.bool() | truncated.bool()
+        if terminal is not None and self.recurrent_global:
+            terminal = simulation_episode_ends(terminal)
         goal_scored = (
             batch["reward"].gt(0) & terminal.bool()
             if terminal is not None and "reward" in batch else None
@@ -3731,7 +4164,12 @@ class AdaptiveDiscriminatorUpdate:
         # Use the same held-out examples to check every minibatch in this update.
         # Resampling and gathering the full validation set on every check was
         # nearly as costly as training the discriminator itself.
-        validation = self._heldout_pairs(heldout_generated, heldout_near)
+        validation = self._heldout_pairs(
+            heldout_generated, heldout_near,
+            flat_windows=flat_windows if self.recurrent_global else None,
+            heldout_indices=heldout_indices if self.recurrent_global else None,
+            n_envs=valid.shape[1], episode_end=terminal,
+        )
         evaluation = self._evaluate(heldout_generated, heldout_near, validation=validation)
         if self._has_updated:
             self._rollouts_since_update += 1
@@ -3756,37 +4194,78 @@ class AdaptiveDiscriminatorUpdate:
                 factorize=getattr(self.discriminator, "factorized", False),
             )
             sampler.set_epoch_callback(self._epoch_finished)
-            metric_totals: dict[str, float | th.Tensor] = {}
-            minibatch_count = 0
-            callback = self._progress_callback
-            if callback is not None:
-                callback.start(self.epochs, self.section)
-            try:
-                for sample in sampler.sample_windows(
-                    flat_windows, train_indices, n_envs=valid.shape[1], episode_end=terminal,
+            sampled_windows = (
+                sampler.sample_windows(
+                    flat_windows, train_indices, n_envs=valid.shape[1],
+                    episode_end=terminal,
                     archived_flights=(self.maneuver_tracker.ready
                                       if self.maneuver_tracker is not None else None),
                     ego_ball_touch=touch_events, goal_scored=goal_scored,
                     timeline=timeline,
-                ):
-                    minibatch_metrics = train_discriminator_minibatch(
-                        sample, self.discriminator, self.optimizer, self.loss,
-                        self.microbatch_size, self.max_grad_norm,
+                ) if not self.recurrent_global or getattr(self.discriminator, "factorized", False)
+                else ()
+            )
+            if self.recurrent_global:
+                context_sampler = GlobalContextMinibatches(
+                    self.expert, self.batch_size, self.epochs, self.noise_std,
+                    self.context_length, self.context_stride,
+                    history=self.context_history, mix_fraction=self.history_mix_fraction,
+                )
+                if not getattr(self.discriminator, "factorized", False):
+                    context_sampler.set_epoch_callback(self._epoch_finished)
+                specialist_loss = (
+                    SceneDiscriminatorLoss(self.discriminator, specialists_only=True)
+                    if getattr(self.discriminator, "factorized", False) else None
+                )
+                context_loss = GlobalContextLoss(self.discriminator)
+                batches = (
+                    tuple((sample, selected_loss) for sample, selected_loss in (
+                        (specialist, specialist_loss), (contextual, context_loss),
+                    ) if sample is not None)
+                    for specialist, contextual in zip_longest(
+                        sampled_windows,
+                        context_sampler.sample_contexts(
+                            flat_windows, train_indices, valid.shape[1], terminal,
+                        ),
                     )
-
-                    for key, value in minibatch_metrics.items():
-                        metric_totals[key] = metric_totals.get(key, 0.0) + value
-                    minibatch_count += 1
-
+                )
+            else:
+                batches = (((sample, self.loss),) for sample in sampled_windows)
+            metric_totals: dict[str, float | th.Tensor] = {}
+            metric_counts: dict[str, int] = {}
+            minibatch_count = 0
+            evaluated_last_batch = False
+            callback = self._progress_callback
+            if callback is not None:
+                callback.start(self.epochs, self.section)
+            try:
+                for group_index, group in enumerate(batches, 1):
+                    for sample, selected_loss in group:
+                        minibatch_metrics = train_discriminator_minibatch(
+                            sample, self.discriminator, self.optimizer, selected_loss,
+                            self.microbatch_size, self.max_grad_norm,
+                        )
+                        for key, value in minibatch_metrics.items():
+                            metric_totals[key] = metric_totals.get(key, 0.0) + value
+                            metric_counts[key] = metric_counts.get(key, 0) + 1
+                        minibatch_count += 1
+                    if self.recurrent_global and group_index != 1 and group_index % 4:
+                        evaluated_last_batch = False
+                        continue
                     evaluation = self._evaluate(
                         heldout_generated, heldout_near, validation=validation,
                     )
+                    evaluated_last_batch = True
                     if evaluation["heldout_accuracy"] >= self.accuracy_target:
                         metrics["updated"] = 1.0
                         break
                 else:
                     if minibatch_count > 0:
                         metrics["updated"] = 1.0
+                if self.recurrent_global and minibatch_count and not evaluated_last_batch:
+                    evaluation = self._evaluate(
+                        heldout_generated, heldout_near, validation=validation,
+                    )
             finally:
                 if callback is not None:
                     callback.finish()
@@ -3800,7 +4279,7 @@ class AdaptiveDiscriminatorUpdate:
                 self._rollouts_since_update = 0
                 metrics["minibatches"] = float(minibatch_count)
                 for key, total in metric_totals.items():
-                    averaged = total / minibatch_count
+                    averaged = total / metric_counts[key]
                     metrics[f"train_{key}"] = (
                         float(averaged.item())
                         if isinstance(averaged, th.Tensor)
@@ -3818,6 +4297,20 @@ class AdaptiveDiscriminatorUpdate:
                     th.randperm(len(train_indices), device=train_indices.device)[:add_count]
                 ]
                 self.history.add(flat_windows[selected], add_count)
+        if self.context_history is not None:
+            add_count = (
+                min(max(1, self.history_add_size // self.context_stride), len(train_indices))
+                if self.history_add_size else 0
+            )
+            if add_count:
+                selected = train_indices[
+                    th.randperm(len(train_indices), device=train_indices.device)[:add_count]
+                ]
+                context, ages = generated_context_frames(
+                    flat_windows, selected, valid.shape[1], terminal, self.context_length,
+                )
+                complete = ages == self.context_length
+                self.context_history.add(context[complete], add_count)
 
         return experience, {self.section: metrics}
 
@@ -3876,13 +4369,31 @@ class AdaptiveDiscriminatorUpdate:
 
     def _heldout_pairs(
         self, heldout_generated: th.Tensor, heldout_near: th.Tensor | None,
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor | None, th.Tensor | None] | None:
+        *, flat_windows: th.Tensor | None = None,
+        heldout_indices: th.Tensor | None = None, n_envs: int = 1,
+        episode_end: th.Tensor | None = None,
+    ) -> tuple | None:
         n = min(len(heldout_generated), self.expert.heldout_total, self.heldout_size)
         if not n:
             return None
         device = heldout_generated.device
-        generated = heldout_generated[th.randperm(len(heldout_generated), device=device)[:n]]
-        expert = self.expert.sample_heldout(n, device)
+        selected = th.randperm(len(heldout_generated), device=device)[:n]
+        generated = heldout_generated[selected]
+        if self.recurrent_global:
+            if flat_windows is None or heldout_indices is None:
+                raise ValueError("recurrent heldout evaluation needs chronological windows")
+            generated_context, generated_ages = generated_context_frames(
+                flat_windows, heldout_indices[selected], n_envs,
+                episode_end, self.context_length,
+            )
+            expert_pairs = self.expert.sample_povs(n, heldout=True)
+            expert = self.expert._windows_for_povs(expert_pairs)
+            expert_context, ages = self.expert.context_frames(
+                expert_pairs, self.context_length, heldout=True,
+                max_age=generated_ages, return_age=True,
+            )
+        else:
+            expert = self.expert.sample_heldout(n, device)
         near_generated = near_expert = None
         if (getattr(self.discriminator, "factorized", False)
                 and heldout_near is not None and len(heldout_near)):
@@ -3891,12 +4402,16 @@ class AdaptiveDiscriminatorUpdate:
                 th.randperm(len(heldout_near), device=device)[:n_near]
             ]
             near_expert = self.expert.sample_near(n_near, device, heldout=True)
+        if self.recurrent_global:
+            return (
+                generated, expert, near_generated, near_expert,
+                generated_context, expert_context, ages,
+            )
         return generated, expert, near_generated, near_expert
 
     def _evaluate(
         self, heldout_generated: th.Tensor, heldout_near: th.Tensor | None = None,
-        *, validation: tuple[th.Tensor, th.Tensor, th.Tensor | None, th.Tensor | None]
-        | None = None,
+        *, validation: tuple | None = None,
     ) -> dict[str, float]:
         if validation is None:
             validation = self._heldout_pairs(heldout_generated, heldout_near)
@@ -3915,7 +4430,9 @@ class AdaptiveDiscriminatorUpdate:
                 metrics.update({f"{name}_heldout_accuracy": 0.0 for name in head_names})
             return metrics
 
-        generated, expert, near_generated, near_expert = validation
+        generated, expert, near_generated, near_expert = validation[:4]
+        if self.recurrent_global:
+            generated_context, expert_context, ages = validation[4:]
         n = len(generated)
         totals = th.zeros(5, device=generated.device)
         head_counts = th.zeros(2, len(head_names), device=generated.device)
@@ -3928,7 +4445,24 @@ class AdaptiveDiscriminatorUpdate:
                 for start in range(0, n, self.microbatch_size):
                     stop = min(start + self.microbatch_size, n)
                     raw = th.cat((generated[start:stop], expert[start:stop]))
-                    logits = self.discriminator(add_scene_noise(raw, self.noise_std))
+                    if self.recurrent_global:
+                        context = add_scene_noise(th.cat((
+                            generated_context[start:stop], expert_context[start:stop],
+                        )), self.noise_std)
+                        current_ages = th.cat((ages[start:stop], ages[start:stop]))
+                        global_model = (
+                            self.discriminator.global_discriminator if factorize
+                            else self.discriminator
+                        )
+                        global_logits = global_model.score_context(context, current_ages)
+                        logits = (
+                            th.cat((self.discriminator.specialist_logits(
+                                add_scene_noise(raw, self.noise_std)
+                            ), global_logits[:, None]), dim=-1)
+                            if factorize else global_logits
+                        )
+                    else:
+                        logits = self.discriminator(add_scene_noise(raw, self.noise_std))
                     generated_logits, expert_logits = logits.split(stop - start)
                     if factorize:
                         near = nearest_ball_distance(raw) <= BALL_NEAR_DISTANCE
@@ -3975,10 +4509,14 @@ class AdaptiveDiscriminatorUpdate:
                     near_correct = th.zeros(2, device=generated.device)
                     for start in range(0, n_near, self.microbatch_size):
                         stop = min(start + self.microbatch_size, n_near)
-                        logits = self.discriminator(add_scene_noise(
+                        noisy = add_scene_noise(
                             th.cat((near_generated[start:stop], near_expert[start:stop])),
                             self.noise_std,
-                        ))[:, 1]
+                        )
+                        logits = (
+                            self.discriminator.specialist_logits(noisy)[:, 1]
+                            if self.recurrent_global else self.discriminator(noisy)[:, 1]
+                        )
                         generated_logit, expert_logit = logits.split(stop - start)
                         near_correct[0] += (generated_logit > 0).sum()
                         near_correct[1] += (expert_logit <= 0).sum()
@@ -4206,6 +4744,8 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         )
     if args.factorize != config.get("factorize", False):
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
+    if args.recurrent_global != config.get("recurrent_global", False):
+        raise ValueError("--recurrent-global must match the checkpoint discriminator when resuming")
     if args.ase_diversity != config.get("ase_diversity", False):
         raise ValueError("--ase-diversity must match the checkpoint architecture when resuming")
     ase_settings = (
@@ -4214,15 +4754,21 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
     ) if args.ase_diversity else ()
     for name in (
         "frameskip", "trajectory_length", "policy_hidden", "critic_hidden",
+        "policy_layers", "critic_layers",
         "discriminator_hidden", "frame_embedding", "temporal_hidden",
-    ) + ase_settings:
+    ) + (("discriminator_context_length", "discriminator_context_stride")
+         if args.recurrent_global else ()) + ase_settings:
         if name in ("ase_sequence_length", "ase_encoder_type") and name not in config:
             # Older ASE checkpoints can upgrade their skill predictor in place.
             continue
-        if getattr(args, name) != config.get(name):
+        saved = (
+            config.get(name, 1) if name in ("policy_layers", "critic_layers")
+            else config.get(name)
+        )
+        if getattr(args, name) != saved:
             raise ValueError(
                 f"--{name.replace('_', '-')} must match the checkpoint "
-                f"({config.get(name)}) when resuming"
+                f"({saved}) when resuming"
             )
 
 
@@ -4341,6 +4887,18 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="frames in the short discriminator scene window",
     )
     parser.add_argument(
+        "--recurrent-global", action=argparse.BooleanOptionalAction, default=True,
+        help="carry the always-on discriminator's GRU memory across scene windows",
+    )
+    parser.add_argument(
+        "--discriminator-context-length", type=int, default=16,
+        help="consecutive scene frames per global discriminator training example",
+    )
+    parser.add_argument(
+        "--discriminator-context-stride", type=int, default=4,
+        help="sample roughly one global context endpoint per this many generated steps",
+    )
+    parser.add_argument(
         "--factorize", action=argparse.BooleanOptionalAction, default=False,
         help="train an always-on global scene discriminator and proximity-gated far-car and near-car/ball specialists",
     )
@@ -4456,8 +5014,16 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="linearly anneal --entropy to this value over --timesteps (default: constant)",
     )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--policy-hidden", type=int, default=256)
-    parser.add_argument("--critic-hidden", type=int, default=256)
+    parser.add_argument("--policy-hidden", type=int, default=320)
+    parser.add_argument("--critic-hidden", type=int, default=320)
+    parser.add_argument(
+        "--policy-layers", type=int, default=2,
+        help="policy hidden layers after the encoder (extra layers follow the GRU)",
+    )
+    parser.add_argument(
+        "--critic-layers", type=int, default=2,
+        help="critic hidden layers after the encoder (extra layers follow the GRU)",
+    )
     parser.add_argument(
         "--timesteps", type=int, default=2_000_000_000,
         help="total target environment steps, including checkpoint steps",
@@ -4477,6 +5043,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
                 "resume_checkpoint", "replay_reset_fraction",
             )
         }
+        # Checkpoints predating configurable depth used one hidden layer.
+        inherited.setdefault("policy_layers", 1)
+        inherited.setdefault("critic_layers", 1)
+        inherited.setdefault("recurrent_global", False)
         parser.set_defaults(**inherited)
     args = parser.parse_args()
     if args.replay_reset_fraction is None:
@@ -4524,6 +5094,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "max_ticks",
         "rollout",
         "trajectory_length",
+        "discriminator_context_length",
+        "discriminator_context_stride",
         "discriminator_batch",
         "discriminator_microbatch",
         "discriminator_epochs",
@@ -4537,6 +5109,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "sequence_length",
         "policy_hidden",
         "critic_hidden",
+        "policy_layers",
+        "critic_layers",
         "timesteps",
         "checkpoint_interval",
         "checkpoint_keep",
@@ -4691,25 +5265,33 @@ def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
 
 
 def build_policy(env, args: argparse.Namespace) -> MultiCategoricalPolicy:
+    layers = getattr(args, "policy_layers", 1)
     return MultiCategoricalPolicy(
         foot=LinearEncoder(args.policy_hidden, func=nn.ReLU),
         body=(
             GRU(hidden_size=args.policy_hidden) if args.gru
-            else MLP(dims=[args.policy_hidden], func=nn.ReLU)
+            else MLP(dims=[args.policy_hidden] * layers, func=nn.ReLU)
         ),
-        head=MLP(dims=[], out_init_func=orthogonal_init(std=0.01)),
+        head=MLP(
+            dims=[args.policy_hidden] * (layers - 1) if args.gru else [],
+            out_init_func=orthogonal_init(std=0.01),
+        ),
         action_codec=env.action_codec,
     ).build(env).to(env.device)
 
 
 def build_critic(env, args: argparse.Namespace) -> Critic:
+    layers = getattr(args, "critic_layers", 1)
     return Critic(
         foot=LinearEncoder(args.critic_hidden, func=nn.ReLU),
         body=(
             GRU(hidden_size=args.critic_hidden) if args.gru
-            else MLP(dims=[args.critic_hidden], func=nn.ReLU)
+            else MLP(dims=[args.critic_hidden] * layers, func=nn.ReLU)
         ),
-        head=MLP(dims=[], out_init_func=orthogonal_init(std=1.0)),
+        head=MLP(
+            dims=[args.critic_hidden] * (layers - 1) if args.gru else [],
+            out_init_func=orthogonal_init(std=1.0),
+        ),
     ).build(env).to(env.device)
 
 
@@ -4721,6 +5303,7 @@ def build_discriminator(
         frame_embedding=args.frame_embedding,
         temporal_hidden=args.temporal_hidden,
         hidden_size=args.discriminator_hidden,
+        recurrent_global=getattr(args, "recurrent_global", False),
     )
 
 
@@ -4829,6 +5412,7 @@ def main() -> None:
     reset_miner = (
         ConfidentExpertResetTransform(
             expert, reset_dataset, discriminator, args.discriminator_microbatch,
+            context_length=args.discriminator_context_length,
         ) if args.hard_positive_mining else None
     )
     base_env.reset_state_provider = ReplayResetProvider(
@@ -4854,7 +5438,23 @@ def main() -> None:
             **history_options, reservoir_fraction=args.history_reservoir_fraction,
         )
         if args.recency_replay else HistoricalReplayBuffer(**history_options)
-    )
+    ) if not args.recurrent_global or args.factorize else None
+    context_history = None
+    if args.recurrent_global:
+        context_options = dict(
+            capacity=max(
+                2 if args.recency_replay else 1,
+                round(args.history_capacity * args.trajectory_length
+                      / args.discriminator_context_length),
+            ),
+            trajectory_length=args.discriminator_context_length,
+            device=env.device, seed=args.seed,
+        )
+        context_history = (
+            RecencyReplayBuffer(
+                **context_options, reservoir_fraction=args.history_reservoir_fraction,
+            ) if args.recency_replay else HistoricalReplayBuffer(**context_options)
+        )
 
     policy_optimizer = th.optim.Adam(policy.parameters(), lr=args.ppo_lr)
     critic_optimizer = th.optim.Adam(critic.parameters(), lr=args.ppo_lr)
@@ -4915,6 +5515,9 @@ def main() -> None:
         update_interval=args.discriminator_update_interval,
         microbatch_size=args.discriminator_microbatch,
         reset_miner=reset_miner,
+        context_length=args.discriminator_context_length,
+        context_stride=args.discriminator_context_stride,
+        context_history=context_history,
     )
 
     ppo_config = PPOConfig(
@@ -4953,6 +5556,7 @@ def main() -> None:
                 batch_size=args.discriminator_microbatch,
                 max_magnitude=args.reward_max_magnitude,
                 exp_log_odds_reward=args.exp_log_odds_reward,
+                context_length=args.discriminator_context_length,
             ),
             *((skill_reward,) if skill_reward is not None else ()),
             GAE(
