@@ -76,8 +76,9 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertEqual((parsed.policy_hidden, parsed.critic_hidden), (320, 320))
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (2, 2))
                 self.assertFalse(parsed.recurrent_global)
-                self.assertEqual(parsed.discriminator_context_length, 16)
-                self.assertEqual(parsed.discriminator_context_stride, 4)
+                self.assertEqual(parsed.discriminator_context_length, 128)
+                self.assertEqual(parsed.discriminator_context_stride, 16)
+                self.assertEqual(parsed.discriminator_bptt_length, 64)
 
         for flag, expected in (("--recurrent-global", True),
                                ("--no-recurrent-global", False)):
@@ -220,6 +221,7 @@ class GAIFOGruTests(unittest.TestCase):
                     args.recurrent_global = True
                     args.discriminator_context_length = 4
                     args.discriminator_context_stride = 2
+                    args.discriminator_bptt_length = 2
                 args.frameskip = 4
                 args.discriminator_hidden = 16
                 args.frame_embedding = 8
@@ -298,6 +300,22 @@ class GAIFOGruTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "--discriminator-context-length must match"):
                         validate_resume_args(parsed, resumed)
                     parsed.discriminator_context_length -= 1
+                    parsed.discriminator_bptt_length += 1
+                    with self.assertRaisesRegex(ValueError, "--discriminator-bptt-length must match"):
+                        validate_resume_args(parsed, resumed)
+                    parsed.discriminator_bptt_length -= 1
+
+                    legacy_path = Path(directory) / "pre-bptt.pt"
+                    legacy = {**payload, "config": dict(payload["config"])}
+                    del legacy["config"]["discriminator_bptt_length"]
+                    th.save(legacy, legacy_path)
+                    with patch.object(sys, "argv", [
+                        "gaifo.py", "--resume-checkpoint", str(legacy_path),
+                        "--timesteps", "16",
+                    ]):
+                        previous, old_payload = parse_args()
+                    self.assertEqual(previous.discriminator_bptt_length, 4)
+                    validate_resume_args(previous, old_payload)
 
                 parsed.gru = not gru
                 with self.assertRaisesRegex(ValueError, "checkpoint architecture"):

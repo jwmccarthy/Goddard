@@ -60,6 +60,57 @@ ranked-doubles uploads involving the 14 verified IDs in the sampled pages.
 Several accounts exceeded the 200-results-per-page limit in individual
 half-year intervals, so the actual number is higher. Every verified player
 has ranked-doubles uploads dated in 2026; Firstkiller and Frosty have hundreds
-of matches each. The current parser and GAIFO trainer are built for 1v1 scenes
-with two cars; ranked-doubles replays require a separate 2v2 data path before
-they can be used as demonstrations.
+of matches each. Search and parse the 2v2 playlist with the **same verified
+platform IDs** (never an ambiguous display name):
+
+```bash
+# Inspect a bounded selection before downloading.
+.venv/bin/python -m ballchasing_replays.download_mechanical_duels \
+  --playlist ranked-doubles --max-per-player 200 --max-downloads 50 --metadata-only
+
+# Download and parse one balanced, verified POV per selected four-car match.
+.venv/bin/python -m ballchasing_replays.download_mechanical_duels \
+  --playlist ranked-doubles --max-per-player 200 --max-downloads 50 \
+  --parse --workers 2
+```
+
+This playlist defaults to `ballchasing_replays/mechanical_doubles/replays` for
+raw files and `parsed_replays/pro_2v2_fs4` for parsed POVs. The downloader
+avoids UUIDs already in that parsed folder and keeps the doubles manifest
+separate from the duels manifest. The parser accepts only complete 2v2 matches;
+its 215-column output contains the 93-feature ball/four-car scene, the focal
+car's internal state, and contact/correction flags. Safety sidecars include
+`unsafe`, `frame_skip`, and `pre_goal` for newly parsed matches. Existing
+`pro_2v2_fs4` files may lack `pre_goal`; the loader excludes the segment's
+conservative five-second goal tail when it is absent.
+
+Start a bounded 2v2 GAIFO pilot using that existing four-car corpus:
+
+```bash
+.venv/bin/python gaifo.py --team-size 2 \
+  --replay-dir parsed_replays/pro_2v2_fs4 \
+  --expert-frame-limit 120000 --n-sim 64 --rollout 32 \
+  --discriminator-batch 2048 --discriminator-microbatch 64 \
+  --ppo-batch 4096 --discriminator-context-length 128 \
+  --max-ticks 3600 --timesteps 5000000
+```
+
+In another terminal, watch the newest GAIFO run play 2v2; open
+`http://127.0.0.1:8788` in a browser:
+
+```bash
+.venv/bin/python watch_checkpoints.py --team-size 2 \
+  --checkpoint-dir checkpoints/gaifo
+```
+
+If other runs are newer, set `--checkpoint-dir` to the 2v2 run's own
+`checkpoints/gaifo/gaifo-*` directory. Both teams can use the same checkpoint,
+or you can choose different 2v2 checkpoints from that run in the viewer.
+
+2v2 automatically enables the factorized far/near specialists and a causal
+global Transformer. Its capped context trains on matched-length, contiguous
+agent/expert clips; global reward is the expert-log-odds change between a
+window and that **same window without its newest frame**, so an expiring old
+frame earns nothing. Every recorded expert POV is eligible, with held-out
+validation grouped by replay ID. `--max-ticks 3600` is 30 seconds of game time
+at 120 physics ticks per second; use more ticks for longer episodes.

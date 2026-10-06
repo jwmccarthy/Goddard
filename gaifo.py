@@ -67,9 +67,14 @@ from reward_spec import CEILING_Z
 
 
 SCENE_SIZE = 51
+GLOBAL_CONTEXT_LENGTH = 128  # 4.3 seconds at 120 Hz with frame skip 4.
+GLOBAL_CONTEXT_BPTT_LENGTH = 64
+GLOBAL_CONTEXT_STRIDE = 16
+GLOBAL_CONTEXT_FRAME_BUDGET = 16  # Old 16-frame batches set the memory budget.
 GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v3"
 GAIFO_GRU_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-gru"
 GAIFO_ASE_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-ase"
+GAIFO_DOUBLES_ARCHITECTURE = "scene-marl-gaifo-2v2-v1-transformer"
 BALL_SIZE = 9
 CAR_SIZE = 21
 N_CARS = 2
@@ -178,16 +183,17 @@ def _ball_distances(windows: th.Tensor, car_start: int) -> th.Tensor:
 
 
 def scene_situation_ids(windows: th.Tensor, car_start: int = BLUE_START) -> th.Tensor:
-    """Distance and ego-car situation at the closest approach in each 1v1 window.
+    """Distance and focal-car situation at the closest approach in each window.
 
     Six car situations are crossed with close (<350), approach (<1500), and
     far (>=1500) ball-distance bands. Near-roof airborne play counts as ceiling;
     a car with its wheels on a vertical surface counts as wall instead.
     """
-    if windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE:
-        raise ValueError("situation labels need [batch, frames, 1v1 scene] windows")
-    if car_start not in (BLUE_START, ORANGE_START):
-        raise ValueError("situation car must be one of the stored 1v1 actors")
+    if windows.ndim != 3:
+        raise ValueError("situation labels need [batch, frames, scene] windows")
+    n_cars = scene_car_count(windows)
+    if car_start not in range(BALL_SIZE, BALL_SIZE + n_cars * CAR_SIZE, CAR_SIZE):
+        raise ValueError("situation car must be in the physical scene")
     distance = _ball_distances(windows, car_start)
     closest = distance.argmin(dim=1)
     rows = th.arange(len(windows), device=windows.device)
@@ -625,7 +631,7 @@ def resample_scene(
     ).astype(np.float32)
 
     nearest = np.where(alpha < 0.5, left, right)
-    for car_start in (BLUE_START, ORANGE_START):
+    for car_start in range(BALL_SIZE, scene.shape[1], CAR_SIZE):
         bool_slice = slice(
             car_start + CAR_BOOL_START,
             car_start + CAR_BOOL_END,
@@ -655,17 +661,21 @@ def resample_internal_state(
         + state[right] * alpha[:, None]
     ).astype(np.float32)
     nearest = np.where(alpha < 0.5, left, right)
-    output[:, INTERNAL_BOOL_INDICES] = state[nearest[:, None], INTERNAL_BOOL_INDICES]
+    output[..., INTERNAL_BOOL_INDICES] = state[nearest][..., INTERNAL_BOOL_INDICES]
     return output
 
 
 def extract_scene_observations(
     observation: th.Tensor,
+    n_cars: int = N_CARS,
 ) -> th.Tensor:
-    """Return every actor's own canonical 51-feature physical scene prefix."""
-    if observation.shape[-1] < SCENE_SIZE:
-        raise ValueError(f"actor observations require at least {SCENE_SIZE} features")
-    return observation[..., :SCENE_SIZE].contiguous()
+    """Return every actor's canonical two- or four-car physical scene prefix."""
+    if n_cars not in (N_CARS, DOUBLES_N_CARS):
+        raise ValueError("scene capture needs two or four cars")
+    size = BALL_SIZE + n_cars * CAR_SIZE
+    if observation.shape[-1] < size:
+        raise ValueError(f"actor observations require at least {size} features")
+    return observation[..., :size].contiguous()
 
 
 def _unsafe_replay_reset_frames(
@@ -754,13 +764,20 @@ def advanced_touch_events(
 class GameplayDiagnostics:
     """Record physical events and goal-only episode rewards before CARL auto-resets."""
 
-    def __init__(self, n_sim: int, device: th.device, no_touch_timeout_steps: int) -> None:
+    def __init__(
+        self, n_sim: int, device: th.device, no_touch_timeout_steps: int,
+        n_cars: int = N_CARS,
+    ) -> None:
+        if n_cars not in (N_CARS, DOUBLES_N_CARS):
+            raise ValueError("gameplay diagnostics need two or four actors")
+        self.n_cars = n_cars
+        self.team_size = n_cars // 2
         self.no_touch_timeout_steps = no_touch_timeout_steps
         self.touch_steps = th.zeros(n_sim, dtype=th.long, device=device)
-        self.last_aerial_touch_score = th.zeros(n_sim * N_CARS, device=device)
-        self.last_flip_reset = th.zeros(n_sim * N_CARS, device=device)
-        self.last_ego_ball_touch = th.zeros(n_sim * N_CARS, dtype=th.bool, device=device)
-        self.last_opponent_ball_touch = th.zeros(n_sim * N_CARS, dtype=th.bool, device=device)
+        self.last_aerial_touch_score = th.zeros(n_sim * n_cars, device=device)
+        self.last_flip_reset = th.zeros(n_sim * n_cars, device=device)
+        self.last_ego_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
+        self.last_opponent_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
         self.counts = {
             name: th.zeros((), dtype=th.float32, device=device)
             for name in (
@@ -779,16 +796,19 @@ class GameplayDiagnostics:
     def __call__(self, context: RewardContext) -> th.Tensor:
         touches = context.current.car_ball_touches
         self.last_ego_ball_touch = touches.reshape(-1)
-        self.last_opponent_ball_touch = touches.flip(dims=(-1,)).reshape(-1)
+        opposing = touches.reshape(-1, 2, self.team_size).any(dim=-1).flip(-1)
+        self.last_opponent_ball_touch = opposing.repeat_interleave(
+            self.team_size, dim=-1,
+        ).reshape(-1)
         score_for_actor = context.events.score_delta[:, None] * context.current.team_sign
         aerial_score, aerial, flip_reset = advanced_touch_events(context)
-        self.last_aerial_touch_score = (
-            aerial_score - aerial_score.flip(dims=(-1,))
-        ).reshape(-1)
+        def differential(scores: th.Tensor) -> th.Tensor:
+            other = scores.reshape(-1, 2, self.team_size).mean(dim=-1).flip(-1)
+            return scores - other.repeat_interleave(self.team_size, dim=-1)
+
+        self.last_aerial_touch_score = differential(aerial_score).reshape(-1)
         flip_reset_score = flip_reset.to(aerial_score.dtype)
-        self.last_flip_reset = (
-            flip_reset_score - flip_reset_score.flip(dims=(-1,))
-        ).reshape(-1)
+        self.last_flip_reset = differential(flip_reset_score).reshape(-1)
 
         self.touch_steps += 1
         self.touch_steps[touches.any(dim=-1)] = 0
@@ -803,8 +823,8 @@ class GameplayDiagnostics:
         self.counts["flip_resets"] += flip_reset.sum()
         self.counts["goals_for"] += (score_for_actor > 0).sum()
         self.counts["goals_against"] += (score_for_actor < 0).sum()
-        self.counts["episodes"] += context.events.done.sum() * N_CARS
-        self.counts["timeouts"] += timeout.sum() * N_CARS
+        self.counts["episodes"] += context.events.done.sum() * self.n_cars
+        self.counts["timeouts"] += timeout.sum() * self.n_cars
 
         # GAIFO's imitation reward is computed separately; preserve CARL's
         # default goal-only reward for episode statistics and rollout records.
@@ -865,9 +885,13 @@ class ASEBallTouchCapture(CaptureBase):
 class SceneWindowCapture(CaptureBase):
     """Capture short scene windows across rollout boundaries, resetting on done."""
 
-    def __init__(self, trajectory_length: int) -> None:
+    def __init__(self, trajectory_length: int, n_cars: int = N_CARS) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
+        if n_cars not in (N_CARS, DOUBLES_N_CARS):
+            raise ValueError("scene capture needs two or four cars")
+        self.n_cars = n_cars
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.trajectory_length = trajectory_length
         self.distances = np.arange(trajectory_length - 1, -1, -1)
 
@@ -877,8 +901,8 @@ class SceneWindowCapture(CaptureBase):
         self.history_pos: th.Tensor | None = None
 
     def reset(self, batch_size: int) -> None:
-        if batch_size % N_CARS:
-            raise ValueError("1v1 collection requires two actors per simulation")
+        if batch_size % self.n_cars:
+            raise ValueError("scene collection needs complete simulations")
         self.n_envs = batch_size
         self.history = None
         self.history_age = None
@@ -894,8 +918,8 @@ class SceneWindowCapture(CaptureBase):
         if len(observation) != self.n_envs:
             raise ValueError("scene capture batch changed after reset")
 
-        current_scene = extract_scene_observations(observation)
-        next_scene = extract_scene_observations(next_obs)
+        current_scene = extract_scene_observations(observation, self.n_cars)
+        next_scene = extract_scene_observations(next_obs, self.n_cars)
         n_envs = len(current_scene)
         capacity = self.trajectory_length - 1
 
@@ -903,7 +927,7 @@ class SceneWindowCapture(CaptureBase):
             self.history = th.zeros(
                 n_envs,
                 capacity,
-                SCENE_SIZE,
+                self.scene_size,
                 dtype=observation.dtype,
                 device=observation.device,
             )
@@ -944,9 +968,9 @@ class SceneWindowCapture(CaptureBase):
             dtype=th.bool,
             device=observation.device,
         )
-        n_sim = n_envs // N_CARS
-        simulation_done = done.view(n_sim, N_CARS).any(dim=1)
-        env_done = simulation_done.repeat_interleave(N_CARS)
+        n_sim = n_envs // self.n_cars
+        simulation_done = done.view(n_sim, self.n_cars).any(dim=1)
+        env_done = simulation_done.repeat_interleave(self.n_cars)
         self.history[env_done] = 0
         self.history_age[env_done] = 0
         self.history_pos[env_done] = 0
@@ -958,7 +982,7 @@ class SceneWindowCapture(CaptureBase):
         current_scene: th.Tensor,
         next_scene: th.Tensor,
     ) -> th.Tensor:
-        """Build [n_envs, trajectory_length, SCENE_SIZE] windows from circular history.
+        """Build [n_envs, trajectory_length, scene_size] windows from circular history.
 
         Distances are chronological offsets from ``next_scene`` (0 = newest),
         ordered oldest-to-newest so the window ends with the scored transition's
@@ -972,7 +996,7 @@ class SceneWindowCapture(CaptureBase):
         window = th.empty(
             n_envs,
             samples,
-            SCENE_SIZE,
+            self.scene_size,
             dtype=current_scene.dtype,
             device=current_scene.device,
         )
@@ -997,7 +1021,7 @@ class SceneWindowCapture(CaptureBase):
 
 
 class ExpertSceneDataset:
-    """Expert windows from stored 1v1 POVs, never from an unstored opponent."""
+    """Expert windows from stored POVs, never from an unstored actor."""
 
     def __init__(
         self,
@@ -1012,7 +1036,10 @@ class ExpertSceneDataset:
         skill_sampling: bool = False,
         driving_fraction: float = 0.10,
         kickoff_fraction: float = 0.05,
+        n_cars: int = N_CARS,
     ) -> None:
+        if n_cars not in (N_CARS, DOUBLES_N_CARS):
+            raise ValueError("expert scenes need two or four cars")
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
         if limit is not None and limit < trajectory_length:
@@ -1029,6 +1056,10 @@ class ExpertSceneDataset:
             raise ValueError("driving and kickoff fractions must sum to less than one")
         if skill_sampling and not reject_discontinuities:
             raise ValueError("skill-filtered expert clips require discontinuity filtering")
+        self.n_cars = n_cars
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.internal_state_start = 83 + 27 * n_cars
+        self.safety_sampling = skill_sampling or n_cars == DOUBLES_N_CARS
         self.trajectory_length = trajectory_length
         self.heldout_size = heldout_size
         self.partition_span = trajectory_length - 1
@@ -1046,14 +1077,21 @@ class ExpertSceneDataset:
         groups: dict[tuple[str, ...], list[Path]] = {}
         for path in paths:
             source = np.load(path, mmap_mode="r")
-            if source.ndim != 2 or source.shape[1] != 161:
+            if source.ndim != 2 or source.shape[1] != 161 + 27 * (n_cars - N_CARS):
                 continue
             key = self._dedup_key(path)
             groups.setdefault(key, []).append(path)
 
         selected = [sorted(groups[key]) for key in sorted(groups)]
+        if n_cars == DOUBLES_N_CARS:
+            # Every recorded POV is a real expert example; keep related POVs
+            # together when splitting train and held-out games.
+            selected = [
+                [path, *(other for other in group if other != path)]
+                for group in selected for path in group
+            ]
         if not selected:
-            raise ValueError(f"no 1v1 replay files found in {replay_dir}")
+            raise ValueError(f"no {n_cars // 2}v{n_cars // 2} replay files found in {replay_dir}")
 
         if limit is not None:
             rng.shuffle(selected)
@@ -1067,6 +1105,7 @@ class ExpertSceneDataset:
         unsafe_reset_frames: list[th.Tensor] = []
         lengths: list[int] = []
         goal_actors: list[int | None] = []
+        replay_keys: list[str] = []
         total = 0
         for group in selected:
             path = group[0]
@@ -1079,11 +1118,12 @@ class ExpertSceneDataset:
                     stored_frame_skip = _sampled_frame_skip(path, frame_skip)
             stored = np.load(path, mmap_mode="r")
             goal_actor = _replay_goal_scorer(path, stored)
-            if skill_sampling:
+            if self.safety_sampling:
                 source_skip = stored_frame_skip if frame_skip is not None else 4
                 unsafe_reset = _unsafe_replay_reset_frames(path, stored, source_skip)
+            if skill_sampling:
                 touches = np.zeros((len(stored), N_CARS), dtype=bool)
-                touches[:, 0] = stored[:, 156] > 0.5
+                touches[:, 0] = stored[:, self.internal_state_start + INTERNAL_STATE_SIZE] > 0.5
             if reject_discontinuities:
                 # The final two columns flag parser corrections and implausible
                 # physics jumps. The preceding columns are real touch/bump
@@ -1091,17 +1131,72 @@ class ExpertSceneDataset:
                 invalid = np.asarray(stored[:, -2:], dtype=bool).any(axis=-1)
                 contact = np.asarray(stored[:, -5:-2], dtype=bool).any(axis=-1)
             source = np.array(
-                stored[:, :SCENE_SIZE], dtype=np.float32, copy=True
+                stored[:, :self.scene_size], dtype=np.float32, copy=True
             )
             ego_internal = np.array(
                 stored[
-                    :, INTERNAL_STATE_START:INTERNAL_STATE_START + INTERNAL_STATE_SIZE
+                    :, self.internal_state_start:self.internal_state_start + INTERNAL_STATE_SIZE
                 ],
                 dtype=np.float32,
                 copy=True,
             )
             opponent_internal = np.zeros_like(ego_internal)
-            if len(group) > 1:
+            if n_cars == DOUBLES_N_CARS:
+                internal = np.zeros((len(source), n_cars, INTERNAL_STATE_SIZE), dtype=np.float32)
+                internal[:, 0] = ego_internal
+                for actor in range(1, n_cars):
+                    car = source[:, BALL_SIZE + CAR_SIZE * actor:
+                                 BALL_SIZE + CAR_SIZE * (actor + 1)]
+                    for scene_field, internal_field in (
+                        (16, 0), (19, 7), (18, 8), (20, 17),
+                    ):
+                        internal[:, actor, internal_field] = car[:, scene_field]
+                if len(group) > 1:
+                    views = {
+                        actor: actor_view(th.from_numpy(source), actor).numpy()
+                        for actor in range(1, n_cars)
+                    }
+                    # Rotating from a teammate POV can reverse the two
+                    # opponents' stored order. Check both legitimate orders.
+                    swapped_views = {}
+                    for actor, view in views.items():
+                        swapped = view.copy()
+                        swapped[:, 51:72] = view[:, 72:93]
+                        swapped[:, 72:93] = view[:, 51:72]
+                        swapped_views[actor] = swapped
+                    for counterpart_path in group[1:]:
+                        counterpart = np.load(counterpart_path, mmap_mode="r")
+                        if len(counterpart) != len(stored):
+                            continue
+                        if frame_skip is not None:
+                            counterpart_meta = counterpart_path.with_suffix(".unsafe-starts.npz")
+                            if counterpart_meta.is_file():
+                                with np.load(counterpart_meta) as metadata:
+                                    counterpart_skip = int(metadata.get("frame_skip", -1))
+                            else:
+                                counterpart_skip = _sampled_frame_skip(counterpart_path, frame_skip)
+                            if counterpart_skip != stored_frame_skip:
+                                continue
+                        actor = next((
+                            index for index, view in views.items()
+                            if any(np.allclose(
+                                candidate, counterpart[:, :self.scene_size],
+                                rtol=1e-5, atol=1e-5,
+                            ) for candidate in (view, swapped_views[index]))
+                        ), None)
+                        if actor is None:
+                            continue
+                        internal[:, actor] = counterpart[
+                            :, self.internal_state_start:
+                            self.internal_state_start + INTERNAL_STATE_SIZE
+                        ]
+                        unsafe_reset |= _unsafe_replay_reset_frames(
+                            counterpart_path, counterpart, source_skip,
+                        )
+                        if reject_discontinuities:
+                            invalid |= np.asarray(counterpart[:, -2:], dtype=bool).any(axis=-1)
+                            contact |= np.asarray(counterpart[:, -5:-2], dtype=bool).any(axis=-1)
+            elif len(group) > 1:
                 opponent_path = group[1]
                 opponent = np.load(opponent_path, mmap_mode="r")
                 if len(opponent) != len(stored):
@@ -1152,21 +1247,28 @@ class ExpertSceneDataset:
                 event_prefix = np.pad(contact.astype(np.int64).cumsum(0), (1, 0))
                 previous_right = np.concatenate(([-1], right[:-1]))
                 contact = (event_prefix[right + 1] - event_prefix[previous_right + 1]) > 0
-            if skill_sampling and frame_skip is not None and stored_frame_skip != frame_skip:
+            if self.safety_sampling and frame_skip is not None and stored_frame_skip != frame_skip:
                 left, right, _ = _resample_coordinates(
                     len(stored), stored_frame_skip, frame_skip,
                 )
                 unsafe_reset = unsafe_reset[left] | unsafe_reset[right]
-                touches = touches[left] | touches[right]
+                if skill_sampling:
+                    touches = touches[left] | touches[right]
             if frame_skip is not None:
                 source = resample_scene(source, stored_frame_skip, frame_skip)
                 ego_internal = resample_internal_state(
                     ego_internal, stored_frame_skip, frame_skip
                 )
-                opponent_internal = resample_internal_state(
-                    opponent_internal, stored_frame_skip, frame_skip
-                )
-            internal = np.stack((ego_internal, opponent_internal), axis=1)
+                if n_cars == DOUBLES_N_CARS:
+                    internal = resample_internal_state(
+                        internal, stored_frame_skip, frame_skip,
+                    )
+                else:
+                    opponent_internal = resample_internal_state(
+                        opponent_internal, stored_frame_skip, frame_skip,
+                    )
+            if n_cars == N_CARS:
+                internal = np.stack((ego_internal, opponent_internal), axis=1)
             full_length = len(source)
             if limit is not None and total + len(source) > limit:
                 keep = max(0, limit - total)
@@ -1177,8 +1279,9 @@ class ExpertSceneDataset:
                 if reject_discontinuities:
                     invalid = invalid[:keep]
                     contact = contact[:keep]
-                if skill_sampling:
+                if self.safety_sampling:
                     unsafe_reset = unsafe_reset[:keep]
+                if skill_sampling:
                     touches = touches[:keep]
             real_length = len(source)
             # Every kickoff belongs to a causal window, including the first
@@ -1190,24 +1293,29 @@ class ExpertSceneDataset:
             if reject_discontinuities:
                 invalid = np.concatenate((np.repeat(invalid[:1], pad), invalid))
                 contact = np.concatenate((np.repeat(contact[:1], pad), contact))
-            if skill_sampling:
+            if self.safety_sampling:
                 unsafe_reset = np.concatenate((
                     np.ones(pad, dtype=bool), unsafe_reset,
                 ))
+            if skill_sampling:
                 touches = np.concatenate((
                     np.zeros((pad, N_CARS), dtype=bool), touches,
                 ))
             frames.append(th.from_numpy(source))
             internal_states.append(th.from_numpy(internal))
-            opponent_povs.append(th.full((len(source),), len(group) > 1, dtype=th.bool))
+            opponent_povs.append(th.full(
+                (len(source),), len(group) > 1 and n_cars == N_CARS, dtype=th.bool,
+            ))
             if reject_discontinuities:
                 invalid_frames.append(th.from_numpy(invalid.copy()))
                 contact_frames.append(th.from_numpy(contact.copy()))
-            if skill_sampling:
+            if self.safety_sampling:
                 unsafe_reset_frames.append(th.from_numpy(unsafe_reset.copy()))
+            if skill_sampling:
                 ego_touches.append(th.from_numpy(touches.copy()))
             lengths.append(len(source))
             goal_actors.append(goal_actor if real_length == full_length else None)
+            replay_keys.append(self._dedup_key(path)[-1])
             total += real_length
             if limit is not None and total >= limit:
                 break
@@ -1223,10 +1331,11 @@ class ExpertSceneDataset:
         )
         self.ego_touches = th.cat(ego_touches).to(device) if skill_sampling else None
         self.unsafe_reset_frames = (
-            th.cat(unsafe_reset_frames).to(device) if skill_sampling else None
+            th.cat(unsafe_reset_frames).to(device) if self.safety_sampling else None
         )
         self.lengths = lengths
         self.segment_goal_actors = goal_actors
+        self.segment_replay_keys = replay_keys
         window_starts = []
         segment_window_starts = []
         segment_frame_indices = []
@@ -1266,7 +1375,7 @@ class ExpertSceneDataset:
             self.train_window_starts = safe_starts(self.train_window_starts)
             self.heldout_window_starts = safe_starts(self.heldout_window_starts)
             self.reset_indices = self.reset_indices[~invalid[self.reset_indices]]
-        if skill_sampling:
+        if self.safety_sampling:
             self.reset_indices = self.reset_indices[
                 ~self.unsafe_reset_frames[self.reset_indices]
             ]
@@ -1293,6 +1402,39 @@ class ExpertSceneDataset:
             index for index, indices in enumerate(self.segment_frame_indices)
             if len(indices) > self.partition_span
         ]
+        if self.n_cars == DOUBLES_N_CARS and self.heldout_size > 0:
+            replay_ids = sorted({self.segment_replay_keys[index] for index in eligible})
+            if len(replay_ids) < 2:
+                raise ValueError("held-out 2v2 scenes need at least two distinct replay IDs")
+            order = th.randperm(len(replay_ids), device=device, generator=split_rng).tolist()
+            shuffled = [replay_ids[index] for index in order]
+            totals = th.tensor([
+                sum(len(starts) for starts, key in zip(
+                    self.segment_window_starts, self.segment_replay_keys,
+                ) if key == replay_id)
+                for replay_id in shuffled
+            ], device=device).cumsum(0)
+            count = int(th.searchsorted(totals, th.tensor(self.heldout_size,
+                                                         device=device)).item()) + 1
+            heldout_games = set(shuffled[:min(count, len(shuffled) - 1)])
+            self.heldout_window_starts = th.cat([
+                starts for starts, key in zip(
+                    self.segment_window_starts, self.segment_replay_keys,
+                ) if key in heldout_games
+            ])
+            self.train_window_starts = th.cat([
+                starts for starts, key in zip(
+                    self.segment_window_starts, self.segment_replay_keys,
+                ) if key not in heldout_games
+            ])
+            self.reset_indices = th.cat([
+                indices for indices, key in zip(
+                    self.segment_frame_indices, self.segment_replay_keys,
+                ) if key not in heldout_games
+            ])
+            self._train_generator = th.Generator(device=device).manual_seed(seed)
+            self._heldout_generator = th.Generator(device=device).manual_seed(seed + 1)
+            return
         if self.heldout_size > 0 and len(eligible) > 1:
             order = th.tensor(eligible, device=device)[th.randperm(
                 len(eligible), device=device, generator=split_rng
@@ -1665,9 +1807,12 @@ class ExpertSceneDataset:
         starts = self.heldout_window_starts if heldout else self.train_window_starts
         allowed[starts.cpu().numpy()] = True
         stored_opponent = self.opponent_pov_available.cpu().numpy()
+        actors = ((0, BLUE_START), (1, ORANGE_START)) if self.n_cars == N_CARS else (
+            (0, BLUE_START),
+        )
         frame_distance = {
             actor: _ball_distances(self.frames, car_start).cpu().numpy()
-            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+            for actor, car_start in actors
         }
         frame_pose = {
             actor: (
@@ -1677,11 +1822,11 @@ class ExpertSceneDataset:
                 self.frames[:, car_start + 2].cpu().numpy() * POSITION_SCALE[2],
                 self.frames[:, car_start + 14].cpu().numpy(),
             )
-            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+            for actor, car_start in actors
         }
         control_features = {
             actor: self.frames[:, list(ground_feature_indices(car_start))].cpu().numpy()
-            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+            for actor, car_start in actors
         }
         touches = self.ego_touches.cpu().numpy() if self.ego_touches is not None else None
         contacts = (self.contact_frames.cpu().numpy()
@@ -1770,10 +1915,11 @@ class ExpertSceneDataset:
             first = offset + self.partition_span
             at_center = np.linalg.norm(scene[:2] * POSITION_SCALE[:2]) < 2 * BALL_RADIUS
             stationary = np.linalg.norm(scene[3:6] * BALL_MAX_SPEED) < 250
+            opponent_start = BALL_SIZE + self.n_cars // 2 * CAR_SIZE
             spawn = (scene[BLUE_START + 1] * POSITION_SCALE[1] < -2_000
-                     and scene[ORANGE_START + 1] * POSITION_SCALE[1] > 2_000
+                     and scene[opponent_start + 1] * POSITION_SCALE[1] > 2_000
                      and scene[BLUE_START + 2] * POSITION_SCALE[2] < 120
-                     and scene[ORANGE_START + 2] * POSITION_SCALE[2] < 120)
+                     and scene[opponent_start + 2] * POSITION_SCALE[2] < 120)
             height = scene[2] * POSITION_SCALE[2]
             if at_center and stationary and spawn and BALL_RADIUS - 20 < height < 150:
                 flight = ball_position[first:first + count]
@@ -1957,13 +2103,17 @@ class HistoricalReplayBuffer:
         trajectory_length: int,
         device: str | th.device,
         seed: int = 0,
+        scene_size: int = SCENE_SIZE,
     ) -> None:
         if capacity < 0:
             raise ValueError("history capacity must be non-negative")
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
+        if scene_size not in (SCENE_SIZE, DOUBLES_SCENE_SIZE):
+            raise ValueError("historical scenes need two or four cars")
         self.capacity = capacity
         self.trajectory_length = trajectory_length
+        self.scene_size = scene_size
         self.device = th.device(device)
         self.buffer: th.Tensor | None = None
         self.size = 0
@@ -1974,7 +2124,7 @@ class HistoricalReplayBuffer:
         """Store a bounded random subset of ``windows`` (detached)."""
         if add_size <= 0 or len(windows) == 0 or self.capacity == 0:
             return
-        if windows.shape[1:] != (self.trajectory_length, SCENE_SIZE):
+        if windows.shape[1:] != (self.trajectory_length, self.scene_size):
             raise ValueError("historical windows have the wrong shape")
         windows = windows.detach().to(self.device, non_blocking=False)
         if len(windows) > add_size:
@@ -1987,7 +2137,7 @@ class HistoricalReplayBuffer:
             self.buffer = th.empty(
                 self.capacity,
                 self.trajectory_length,
-                SCENE_SIZE,
+                self.scene_size,
                 dtype=windows.dtype,
                 device=self.device,
             )
@@ -2013,7 +2163,7 @@ class HistoricalReplayBuffer:
             return th.empty(
                 0,
                 self.trajectory_length,
-                SCENE_SIZE,
+                self.scene_size,
                 device=device,
             )
         n = min(n, self.size)
@@ -2032,6 +2182,7 @@ class RecencyReplayBuffer:
         device: str | th.device,
         seed: int = 0,
         reservoir_fraction: float = 0.25,
+        scene_size: int = SCENE_SIZE,
     ) -> None:
         if capacity < 2:
             raise ValueError("recency replay capacity must be at least two")
@@ -2041,8 +2192,10 @@ class RecencyReplayBuffer:
         self.reservoir_capacity = max(1, round(capacity * reservoir_fraction))
         self.recent = HistoricalReplayBuffer(
             capacity - self.reservoir_capacity, trajectory_length, device, seed,
+            scene_size=scene_size,
         )
         self.trajectory_length = trajectory_length
+        self.scene_size = scene_size
         self.device = th.device(device)
         self.reservoir: th.Tensor | None = None
         self.reservoir_size = 0
@@ -2056,7 +2209,7 @@ class RecencyReplayBuffer:
     def add(self, windows: th.Tensor, add_size: int) -> None:
         if add_size <= 0 or len(windows) == 0:
             return
-        if windows.shape[1:] != (self.trajectory_length, SCENE_SIZE):
+        if windows.shape[1:] != (self.trajectory_length, self.scene_size):
             raise ValueError("historical windows have the wrong shape")
         windows = windows.detach().to(self.device, non_blocking=False)
         if len(windows) > add_size:
@@ -2066,7 +2219,7 @@ class RecencyReplayBuffer:
         self.recent.add(windows, len(windows))
         if self.reservoir is None:
             self.reservoir = windows.new_empty(
-                (self.reservoir_capacity, self.trajectory_length, SCENE_SIZE)
+                (self.reservoir_capacity, self.trajectory_length, self.scene_size)
             )
         filling = min(self.reservoir_capacity - self.reservoir_size, len(windows))
         if filling:
@@ -2098,7 +2251,7 @@ class RecencyReplayBuffer:
 
     def sample(self, n: int, device: str | th.device) -> th.Tensor:
         if self.size == 0:
-            return th.empty(0, self.trajectory_length, SCENE_SIZE, device=device)
+            return th.empty(0, self.trajectory_length, self.scene_size, device=device)
         n = min(n, self.size)
         n_old = min(int(n * self.reservoir_fraction), self.reservoir_size)
         if n > 1 and self.reservoir_size:
@@ -2149,6 +2302,11 @@ class SceneDiscriminator(nn.Module):
         self.gru = nn.GRU(
             frame_embedding * (n_cars + 1), temporal_hidden, batch_first=True
         )
+        if recurrent_global:
+            # The GRU's update gate retains old state. Its default ~0.5 gate
+            # forgets scene cues before a multi-second training horizon ends.
+            with th.no_grad():
+                self.gru.bias_ih_l0[temporal_hidden:2 * temporal_hidden].fill_(3.0)
         self.head = nn.Linear(temporal_hidden, 1)
 
     def _encode(self, scenes: th.Tensor) -> th.Tensor:
@@ -2169,12 +2327,23 @@ class SceneDiscriminator(nn.Module):
         gru_out, _ = self.gru(self._encode(windows))
         return self.head(gru_out[:, -1]).squeeze(-1)
 
-    def score_context(self, scenes: th.Tensor, ages: th.Tensor) -> th.Tensor:
-        """Skip left padding so a new episode starts from a zero recurrent state."""
+    def score_context(
+        self, scenes: th.Tensor, ages: th.Tensor, *, bptt_length: int | None = None,
+    ) -> th.Tensor:
+        """Carry state from a detached burn-in into a differentiable final chunk.
+
+        Skip left padding so a new episode starts from zero state. Inference
+        scores the entire context; training can bound its backward graph while
+        still conditioning on older, consecutive frames.
+        """
         if (scenes.ndim != 3 or scenes.shape[-1] != self.scene_size
                 or ages.shape != (len(scenes),)):
             raise ValueError("scene context and ages must match")
         length = scenes.shape[1]
+        if bptt_length is None:
+            bptt_length = length
+        if not 1 <= bptt_length <= length:
+            raise ValueError("discriminator BPTT length must fit the context")
         lengths = ages.cpu()  # Packed sequences need CPU lengths; validate there too.
         if (lengths < 1).any() or (lengths > length).any():
             raise ValueError("scene context and ages must match")
@@ -2182,10 +2351,29 @@ class SceneDiscriminator(nn.Module):
         indices = (steps[None] + length - ages[:, None]).clamp(max=length - 1)
         # Move real scenes to the front; the packed GRU skips the new right padding.
         aligned = scenes.gather(1, indices[..., None].expand_as(scenes))
-        packed = pack_padded_sequence(
-            self._encode(aligned), lengths, batch_first=True, enforce_sorted=False,
+        prefix_lengths = (lengths - bptt_length).clamp(min=0)
+        state = None
+        if (prefix_lengths > 0).any():
+            with th.no_grad():
+                prefix = prefix_lengths > 0
+                selected = prefix.to(scenes.device)
+                packed_prefix = pack_padded_sequence(
+                    self._encode(aligned[selected, :int(prefix_lengths.max())]),
+                    prefix_lengths[prefix], batch_first=True, enforce_sorted=False,
+                )
+                _, carried = self.gru(packed_prefix)
+                state = carried.new_zeros((1, len(scenes), self.gru.hidden_size))
+                state[:, selected] = carried
+        tail_steps = (prefix_lengths.to(scenes.device)[:, None]
+                      + th.arange(bptt_length, device=scenes.device))
+        tail = aligned.gather(
+            1, tail_steps.clamp(max=length - 1)[..., None].expand(-1, -1, self.scene_size),
         )
-        _, state = self.gru(packed)
+        packed = pack_padded_sequence(
+            self._encode(tail), lengths.clamp(max=bptt_length),
+            batch_first=True, enforce_sorted=False,
+        )
+        _, state = self.gru(packed, state)
         return self.head(state[0]).squeeze(-1)
 
     def score_sequence(
@@ -2249,6 +2437,91 @@ class SceneDiscriminator(nn.Module):
         return logits, final_states[:, last_run]
 
 
+class CausalSceneTransformer(nn.Module):
+    """Bounded causal global judge of ball, ego, teammate, and both opponents.
+
+    The two opposing cars share an encoder and are pooled: their file order
+    cannot become a shortcut for recognizing the selected expert's POV.
+    """
+
+    transformer_global = True
+
+    def __init__(
+        self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
+        *, max_context: int = GLOBAL_CONTEXT_LENGTH, layers: int = 2,
+    ) -> None:
+        super().__init__()
+        if (min(frame_embedding, temporal_hidden, hidden_size, max_context, layers) < 1
+                or temporal_hidden % 4):
+            raise ValueError("Transformer dimensions must be positive and divisible by four")
+        self.n_cars = DOUBLES_N_CARS
+        self.scene_size = DOUBLES_SCENE_SIZE
+        self.max_context = max_context
+        self.ball_encoder = nn.Sequential(
+            nn.Linear(BALL_SIZE, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
+        )
+        self.car_encoder = nn.Sequential(
+            nn.Linear(CAR_SIZE + 3, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
+        )
+        self.frame_projection = nn.Linear(frame_embedding * 4, temporal_hidden)
+        self.position = nn.Embedding(max_context, temporal_hidden)
+        self.temporal = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=temporal_hidden, nhead=4,
+                dim_feedforward=max(temporal_hidden * 4, hidden_size * 2),
+                dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
+            ), num_layers=layers, enable_nested_tensor=False,
+        )
+        self.head = nn.Linear(temporal_hidden, 1)
+
+    def _encode(self, scenes: th.Tensor) -> th.Tensor:
+        count, steps = scenes.shape[:2]
+        cars = scenes[..., BALL_SIZE:].reshape(count, steps, 4, CAR_SIZE)
+        roles = F.one_hot(th.tensor([0, 1, 2, 2], device=scenes.device), 3)
+        roles = roles.to(scenes.dtype).view(1, 1, 4, 3).expand(count, steps, -1, -1)
+        encoded = self.car_encoder(th.cat((cars, roles), dim=-1))
+        combined = th.cat((
+            self.ball_encoder(scenes[..., :BALL_SIZE]),
+            encoded[:, :, 0], encoded[:, :, 1], encoded[:, :, 2:].mean(dim=2),
+        ), dim=-1)
+        return self.frame_projection(combined)
+
+    def score_context(
+        self, scenes: th.Tensor, ages: th.Tensor, *, return_previous: bool = False,
+    ) -> th.Tensor | tuple[th.Tensor, th.Tensor]:
+        """Score the real prefix and optionally that *same prefix* minus its end.
+
+        Context arrays are left-padded with their first real scene. Align real
+        frames to the left before masking, so no padding influences attention.
+        At age one the empty preceding prefix has neutral expert log-odds zero.
+        """
+        if (scenes.ndim != 3 or scenes.shape[-1] != self.scene_size
+                or ages.shape != (len(scenes),) or not 1 <= scenes.shape[1] <= self.max_context
+                or (ages < 1).any() or (ages > scenes.shape[1]).any()):
+            raise ValueError("Transformer context needs valid four-car scenes and lengths")
+        length = scenes.shape[1]
+        steps = th.arange(length, device=scenes.device)
+        indices = (steps[None] + length - ages[:, None]).clamp(max=length - 1)
+        aligned = scenes.gather(1, indices[..., None].expand_as(scenes))
+        embedded = self._encode(aligned) + self.position(steps)[None]
+        causal = th.ones(length, length, dtype=th.bool, device=scenes.device).triu(1)
+        padding = steps[None] >= ages[:, None]
+        output = self.temporal(embedded, mask=causal, src_key_padding_mask=padding)
+        logits = self.head(output).squeeze(-1)
+        current = logits.gather(1, (ages - 1)[:, None]).squeeze(1)
+        if not return_previous:
+            return current
+        previous = logits.gather(1, (ages - 2).clamp(min=0)[:, None]).squeeze(1)
+        return current, th.where(ages > 1, previous, th.zeros_like(previous))
+
+    def forward(self, windows: th.Tensor) -> th.Tensor:
+        ages = th.full((len(windows),), windows.shape[1], dtype=th.long,
+                       device=windows.device)
+        return self.score_context(windows, ages)
+
+
 class EgoBallSceneDiscriminator(nn.Module):
     """Judge the joint ego-car and ball trajectory without opponent shortcuts."""
 
@@ -2287,6 +2560,7 @@ class FactorizedSceneDiscriminator(nn.Module):
         self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
         *, n_cars: int = N_CARS, _legacy_two_heads: bool = False,
         _legacy_opponent_context: bool = False, recurrent_global: bool = False,
+        transformer_global: bool = False, context_length: int = GLOBAL_CONTEXT_LENGTH,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
@@ -2295,9 +2569,13 @@ class FactorizedSceneDiscriminator(nn.Module):
             raise ValueError("factorized discriminator needs two or four cars")
         if _legacy_opponent_context and not _legacy_two_heads:
             raise ValueError("opponent context is only supported for legacy checkpoints")
+        if transformer_global and (n_cars != DOUBLES_N_CARS or recurrent_global
+                                   or _legacy_two_heads):
+            raise ValueError("Transformer global needs factorized four-car scenes")
         self.n_cars = n_cars
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.recurrent_global = recurrent_global
+        self.transformer_global = transformer_global
         self.other_context_size = (
             (n_cars - 1) * (CAR_SIZE + 6) if _legacy_opponent_context else 0
         )
@@ -2322,7 +2600,9 @@ class FactorizedSceneDiscriminator(nn.Module):
             )
         )
         self.global_discriminator = (
-            None if _legacy_two_heads else SceneDiscriminator(
+            None if _legacy_two_heads else CausalSceneTransformer(
+                frame_embedding, temporal_hidden, hidden_size, max_context=context_length,
+            ) if transformer_global else SceneDiscriminator(
                 frame_embedding, temporal_hidden, hidden_size, n_cars=n_cars,
                 recurrent_global=recurrent_global,
             )
@@ -2366,8 +2646,8 @@ class FactorizedSceneDiscriminator(nn.Module):
         specialist = self.specialist_logits(windows)
         if self.global_discriminator is None:
             return specialist
-        if context is not None and not self.recurrent_global:
-            raise ValueError("global context requires a recurrent discriminator")
+        if context is not None and not (self.recurrent_global or self.transformer_global):
+            raise ValueError("global context requires a causal discriminator")
         global_score = self.global_discriminator(
             windows if context is None else context
         ).unsqueeze(-1)
@@ -2533,7 +2813,8 @@ class ConfidentExpertResetTransform:
         self, windows: th.Tensor, context: th.Tensor | None = None,
         ages: th.Tensor | None = None,
     ) -> th.Tensor:
-        if getattr(self.discriminator, "recurrent_global", False):
+        if (getattr(self.discriminator, "recurrent_global", False)
+                or getattr(self.discriminator, "transformer_global", False)):
             if context is None or ages is None:
                 raise ValueError("recurrent reset scoring needs causal expert context")
             factorized = getattr(self.discriminator, "factorized", False)
@@ -2566,8 +2847,9 @@ class ConfidentExpertResetTransform:
             try:
                 for chunk in starts.split(self.microbatch_size):
                     windows = self.expert.frames[chunk[:, None] + self.expert.window_offsets]
-                    recurrent = getattr(self.discriminator, "recurrent_global", False)
-                    if recurrent:
+                    contextual = (getattr(self.discriminator, "recurrent_global", False)
+                                  or getattr(self.discriminator, "transformer_global", False))
+                    if contextual:
                         context, ages = self.expert.context_frames(
                             th.stack((chunk, th.zeros_like(chunk)), dim=-1),
                             self.context_length, return_age=True,
@@ -2577,7 +2859,7 @@ class ConfidentExpertResetTransform:
                     confidence = self._confidence(windows, context, ages)
                     paired = self.expert.opponent_pov_available[chunk]
                     if paired.any():
-                        if recurrent:
+                        if contextual:
                             opponent_context, opponent_ages = self.expert.context_frames(
                                 th.stack((chunk[paired], th.ones_like(chunk[paired])), dim=-1),
                                 self.context_length, return_age=True,
@@ -2735,27 +3017,38 @@ class SceneDiscriminatorLoss:
 
 
 class GlobalContextLoss:
-    """Teach the global branch to retain expert-like behavior across scene frames."""
+    """Teach the global branch with causal histories and matched label lengths."""
 
     global_only = True
 
     def __init__(
         self, discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+        bptt_length: int | None = None,
     ) -> None:
-        if not discriminator.recurrent_global:
-            raise ValueError("global context loss requires a recurrent discriminator")
+        if not (discriminator.recurrent_global
+                or getattr(discriminator, "transformer_global", False)):
+            raise ValueError("global context loss requires a causal discriminator")
         self.global_discriminator = (
             discriminator.global_discriminator
             if getattr(discriminator, "factorized", False) else discriminator
         )
+        self.bptt_length = bptt_length
+        self.transformer_global = getattr(discriminator, "transformer_global", False)
 
     def __call__(self, batch: TensorBatch) -> LossOutput:
-        logit = self.global_discriminator.score_context(
-            batch["window"], batch["age"],
+        ages = batch["age"]
+        logit = (
+            self.global_discriminator.score_context(batch["window"], ages)
+            if self.transformer_global else
+            self.global_discriminator.score_context(
+                batch["window"], ages, bptt_length=self.bptt_length,
+            )
         )
         target = batch["is_agent"]
         loss = F.binary_cross_entropy_with_logits(logit, target)
         agent = target.bool()
+        burnin = (th.zeros_like(ages) if self.transformer_global else
+                  (ages - (self.bptt_length or batch["window"].shape[1])).clamp(min=0))
         with th.no_grad():
             agent_score = th.sigmoid(logit[agent]).mean()
             expert_score = th.sigmoid(logit[~agent]).mean()
@@ -2768,6 +3061,8 @@ class GlobalContextLoss:
             "expert_score": expert_score,
             "agent_accuracy": agent_accuracy,
             "expert_accuracy": expert_accuracy,
+            "context_steps": ages.float().mean(),
+            "burnin_steps": burnin.float().mean(),
         })
 
 
@@ -3178,67 +3473,112 @@ class GeneratedManeuverTracker:
             )
 
 
-def simulation_episode_ends(episode_end: th.Tensor) -> th.Tensor:
-    """A 1v1 simulation resets both focal viewpoints when either actor is done."""
-    if episode_end.ndim != 2 or episode_end.shape[1] % N_CARS:
-        raise ValueError("1v1 episode ends need two actors per simulation")
+def simulation_episode_ends(
+    episode_end: th.Tensor, n_cars: int = N_CARS,
+) -> th.Tensor:
+    """Reset all focal viewpoints together whenever their simulation ends."""
+    if (n_cars not in (N_CARS, DOUBLES_N_CARS) or episode_end.ndim != 2
+            or episode_end.shape[1] % n_cars):
+        raise ValueError("episode ends need complete simulations")
     return episode_end.bool().reshape(
-        len(episode_end), -1, N_CARS,
-    ).any(dim=-1).repeat_interleave(N_CARS, dim=-1)
+        len(episode_end), -1, n_cars,
+    ).any(dim=-1).repeat_interleave(n_cars, dim=-1)
+
+
+class GeneratedContextTimeline:
+    """Causal actor histories across rollouts, with shared simulation boundaries."""
+
+    def __init__(
+        self, windows: th.Tensor, n_envs: int, episode_end: th.Tensor | None,
+        prefix_frames: th.Tensor | None = None, prefix_ends: th.Tensor | None = None,
+        n_cars: int = N_CARS,
+    ) -> None:
+        size = BALL_SIZE + n_cars * CAR_SIZE
+        if (n_cars not in (N_CARS, DOUBLES_N_CARS) or windows.ndim != 3
+                or windows.shape[-1] != size or n_envs < 1
+                or n_envs % n_cars or len(windows) % n_envs):
+            raise ValueError("generated context needs time-major complete scene windows")
+        self.scene_size = size
+        self.n_envs = n_envs
+        self.steps = len(windows) // n_envs
+        if episode_end is not None and episode_end.shape != (self.steps, n_envs):
+            raise ValueError("generated context episode ends must match actors")
+        if (prefix_frames is None) != (prefix_ends is None):
+            raise ValueError("generated context needs both previous frames and episode ends")
+        current = windows.reshape(self.steps, n_envs, windows.shape[1], size)[:, :, -1]
+        endings = (simulation_episode_ends(episode_end, n_cars) if episode_end is not None else
+                   th.zeros((self.steps, n_envs), dtype=th.bool, device=windows.device))
+        self.offset = 0
+        if prefix_frames is not None:
+            if (prefix_frames.ndim != 3 or prefix_frames.shape[1:] != (n_envs, size)
+                    or prefix_ends.shape != prefix_frames.shape[:2]
+                    or prefix_frames.device != windows.device
+                    or prefix_ends.device != windows.device):
+                raise ValueError("previous generated contexts must match the current actors")
+            self.offset = len(prefix_frames)
+            current = th.cat((prefix_frames, current))
+            endings = th.cat((prefix_ends.bool(), endings))
+        self.frames = current
+        self.ends = endings
+        beginnings = th.zeros(endings.shape, dtype=th.long, device=windows.device)
+        beginnings[1:] = th.where(
+            endings[:-1], th.arange(1, len(endings), device=windows.device)[:, None], 0,
+        )
+        self.beginnings = beginnings.cummax(dim=0).values
+
+    def contexts(self, indices: th.Tensor, length: int) -> tuple[th.Tensor, th.Tensor]:
+        if length < 1:
+            raise ValueError("generated context length must be positive")
+        if not len(indices):
+            return self.frames.new_empty((0, length, self.scene_size)), indices.new_empty(0)
+        if (indices < 0).any() or (indices >= self.steps * self.n_envs).any():
+            raise ValueError("generated context indices must be in the rollout")
+        time, actor = indices // self.n_envs + self.offset, indices % self.n_envs
+        beginning = self.beginnings[time, actor]
+        offsets = th.arange(length - 1, -1, -1, device=self.frames.device)
+        selected = th.maximum(time[:, None] - offsets, beginning[:, None])
+        return (self.frames[selected, actor[:, None]],
+                (time - beginning + 1).clamp(max=length))
 
 
 def generated_context_frames(
     windows: th.Tensor, indices: th.Tensor, n_envs: int,
-    episode_end: th.Tensor | None, length: int,
+    episode_end: th.Tensor | None, length: int, n_cars: int = N_CARS,
 ) -> tuple[th.Tensor, th.Tensor]:
     """Gather consecutive scenes without crossing actor or episode boundaries."""
-    if (windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE or n_envs < 1
-            or n_envs % N_CARS
-            or len(windows) % n_envs or length < 1):
-        raise ValueError("generated context needs time-major 1v1 scene windows")
-    steps = len(windows) // n_envs
-    if episode_end is not None and episode_end.shape != (steps, n_envs):
-        raise ValueError("generated context episode ends must match actors")
-    if not len(indices):
-        return windows.new_empty((0, length, SCENE_SIZE)), indices.new_empty(0)
-    if (indices < 0).any() or (indices >= len(windows)).any():
-        raise ValueError("generated context indices must be in the rollout")
-    endings = (simulation_episode_ends(episode_end) if episode_end is not None else
-               th.zeros((steps, n_envs), dtype=th.bool, device=windows.device))
-    beginnings = th.zeros((steps, n_envs), dtype=th.long, device=windows.device)
-    beginnings[1:] = th.where(
-        endings[:-1], th.arange(1, steps, device=windows.device)[:, None], 0,
-    )
-    beginnings = beginnings.cummax(dim=0).values
-    time, actor = indices // n_envs, indices % n_envs
-    beginning = beginnings[time, actor]
-    offsets = th.arange(length - 1, -1, -1, device=windows.device)
-    selected = th.maximum(time[:, None] - offsets, beginning[:, None])
-    frames = windows.reshape(steps, n_envs, windows.shape[1], SCENE_SIZE)[:, :, -1]
-    return frames[selected, actor[:, None]], (time - beginning + 1).clamp(max=length)
+    return GeneratedContextTimeline(
+        windows, n_envs, episode_end, n_cars=n_cars,
+    ).contexts(indices, length)
+
+
+def bounded_context_batch_size(size: int, length: int, minimum: int) -> int:
+    """Limit long-context batches to roughly the former number of scene frames."""
+    return min(size, max(minimum, size * GLOBAL_CONTEXT_FRAME_BUDGET // length))
 
 
 class GlobalContextMinibatches:
-    """Train the global GRU on adjacent frames from the same actor and expert POV."""
+    """Train a causal global judge on contiguous actor and expert histories."""
 
     def __init__(
         self, expert: ExpertSceneDataset, batch_size: int, epochs: int,
         noise_std: float, context_length: int, stride: int,
         history: HistoricalReplayBuffer | RecencyReplayBuffer | None = None,
         mix_fraction: float = 0.0,
+        variable_length: bool = False,
     ) -> None:
         if min(batch_size, epochs, context_length, stride) < 1:
             raise ValueError("global context batch, epoch, length and stride must be positive")
         if not 0.0 <= mix_fraction < 1.0:
             raise ValueError("global context history mix must be in [0, 1)")
         self.expert = expert
-        self.batch_size = batch_size
+        self.batch_size = bounded_context_batch_size(batch_size, context_length, 128)
         self.epochs = epochs
         self.noise_std = noise_std
         self.context_length = context_length
         self.stride = stride
         self.history = history
         self.mix_fraction = mix_fraction if history is not None else 0.0
+        self.variable_length = variable_length
         self._epoch_callback = None
 
     def set_epoch_callback(self, callback) -> None:
@@ -3247,22 +3587,46 @@ class GlobalContextMinibatches:
     def sample_contexts(
         self, windows: th.Tensor, indices: th.Tensor, n_envs: int,
         episode_end: th.Tensor | None = None,
+        *, timeline: GeneratedContextTimeline | None = None,
     ):
+        if timeline is None:
+            timeline = GeneratedContextTimeline(
+                windows, n_envs, episode_end, n_cars=self.expert.n_cars,
+            )
         pools = self.expert.context_situation_pools()
         available = th.tensor([bool(len(pool)) for pool in pools], device=windows.device)
         for _ in range(self.epochs):
             shuffled = indices[th.randperm(len(indices), device=indices.device)]
-            selected = shuffled[:max(1, math.ceil(len(shuffled) / self.stride))]
-            for batch_indices in selected.split(self.batch_size):
+            remaining = max(1, math.ceil(len(shuffled) / self.stride))
+            selected, selected_labels = [], []
+            # Sample *eligible* endpoints before applying the stride. Otherwise
+            # a short rollout may pick only unmatched situations and never
+            # train the global branch at all.
+            for chunk in shuffled.split(self.batch_size):
+                labels = scene_situation_ids(windows[chunk])
+                matched = available[labels]
+                if matched.any():
+                    selected.append(chunk[matched][:remaining])
+                    selected_labels.append(labels[matched][:remaining])
+                    remaining -= len(selected[-1])
+                    if remaining == 0:
+                        break
+            if selected:
+                chosen = th.cat(selected)
+                chosen_labels = th.cat(selected_labels)
+            else:
+                chosen = indices[:0]
+                chosen_labels = indices[:0]
+            for batch_indices, batch_labels in zip(
+                chosen.split(self.batch_size), chosen_labels.split(self.batch_size),
+            ):
                 count = len(batch_indices)
                 n_history = 0
                 if self.history is not None and self.history.size:
                     n_history = min(int(count * self.mix_fraction), self.history.size)
                 current = batch_indices[:count - n_history]
-                context, ages = generated_context_frames(
-                    windows, current, n_envs, episode_end, self.context_length,
-                )
-                labels = scene_situation_ids(windows[current])
+                context, ages = timeline.contexts(current, self.context_length)
+                labels = batch_labels[:count - n_history]
                 if n_history:
                     past = self.history.sample(n_history, windows.device)
                     context = th.cat((context, past))
@@ -3274,6 +3638,12 @@ class GlobalContextMinibatches:
                 if not matched.any():
                     continue
                 context, ages, labels = context[matched], ages[matched], labels[matched]
+                if self.variable_length:
+                    # The same random cap is applied to each matched agent and
+                    # expert pair. Ages still obey real episode/safety limits.
+                    ages = th.minimum(ages, th.randint(
+                        1, self.context_length + 1, (len(ages),), device=windows.device,
+                    ))
                 pairs = th.empty((len(context), 2), dtype=th.long, device=windows.device)
                 for label in labels.unique().tolist():
                     positions = (labels == label).nonzero(as_tuple=True)[0]
@@ -3837,6 +4207,11 @@ class SceneDiscriminatorReward:
         self.discriminator = discriminator
         self.factorize = getattr(discriminator, "factorized", False)
         self.recurrent_global = getattr(discriminator, "recurrent_global", False)
+        self.transformer_global = getattr(discriminator, "transformer_global", False)
+        if self.transformer_global and exp_log_odds_reward:
+            raise ValueError("Transformer differential reward requires log-odds rewards")
+        self.n_cars = getattr(discriminator, "n_cars", N_CARS)
+        self.scene_size = getattr(discriminator, "scene_size", SCENE_SIZE)
         self.noise_std = noise_std
         self.trajectory_length = trajectory_length
         self.goal_reward_weight = goal_reward_weight
@@ -3873,7 +4248,7 @@ class SceneDiscriminatorReward:
         current_frames = windows[:, :, -1]
         # A window can be unscored while its scene still belongs to this episode.
         # Only a real termination clears recurrent memory.
-        current_ends = simulation_episode_ends(episode_end)
+        current_ends = simulation_episode_ends(episode_end, self.n_cars)
         have_history = (self._recent_frames is not None
                         and self._recent_frames.shape[1:] == current_frames.shape[1:])
         version = getattr(self.discriminator, "context_version", 0)
@@ -3914,6 +4289,43 @@ class SceneDiscriminatorReward:
         self._context_version = version
         return th.cat(scores, dim=1)
 
+    def _score_transformer_global(
+        self, windows: th.Tensor, valid: th.Tensor,
+        episode_end: th.Tensor | None,
+    ) -> th.Tensor:
+        if episode_end is None or episode_end.shape != valid.shape:
+            raise ValueError("Transformer reward needs episode ends for each actor")
+        n_envs = valid.shape[1]
+        flat = windows.reshape(-1, self.trajectory_length, self.scene_size)
+        previous = self._recent_frames
+        previous_ends = self._recent_ends
+        if previous is not None and previous.shape[1:] != (n_envs, self.scene_size):
+            previous = previous_ends = None
+        timeline = GeneratedContextTimeline(
+            flat, n_envs, episode_end, previous, previous_ends,
+            n_cars=self.n_cars,
+        )
+        if self.context_length > 1:
+            self._recent_frames = timeline.frames[-(self.context_length - 1):].detach().clone()
+            self._recent_ends = timeline.ends[-(self.context_length - 1):].detach().clone()
+        result = flat.new_zeros(len(flat))
+        indices = valid.flatten().nonzero(as_tuple=True)[0]
+        global_model = self.discriminator.global_discriminator
+        chunk_size = bounded_context_batch_size(self.batch_size, self.context_length, 8)
+        for chunk in indices.split(chunk_size):
+            context, ages = timeline.contexts(chunk, self.context_length)
+            current, previous = global_model.score_context(
+                add_scene_noise(context, self.noise_std), ages,
+                return_previous=True,
+            )
+            # Label 1 means agent; -logit is expert log-odds. Both scores use
+            # the identical capped window start. When a frame expires, it
+            # cannot generate reward merely by disappearing from the history.
+            result[chunk] = (previous - current).clamp(
+                -self.max_magnitude, self.max_magnitude,
+            )
+        return result.reshape_as(valid)
+
     def _score_windows(
         self,
         windows: th.Tensor,
@@ -3926,12 +4338,14 @@ class SceneDiscriminatorReward:
         )
         global_scores = (
             self._score_global_sequence(windows, valid, episode_end).flatten()
-            if self.recurrent_global else None
+            if self.recurrent_global else
+            self._score_transformer_global(windows, valid, episode_end).flatten()
+            if self.transformer_global else None
         )
         if not valid.any():
             return scores
 
-        flat_windows = windows.reshape(-1, self.trajectory_length, SCENE_SIZE)
+        flat_windows = windows.reshape(-1, self.trajectory_length, self.scene_size)
         flat_scores = scores.reshape(-1, 3) if self.factorize else scores.flatten()
         indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
         near = (nearest_ball_distance(flat_windows[indices]) <= BALL_NEAR_DISTANCE
@@ -3950,12 +4364,15 @@ class SceneDiscriminatorReward:
                 )
                 logits = (
                     self.discriminator.specialist_logits(noisy)
-                    if self.recurrent_global else self.discriminator(noisy)
+                    if self.recurrent_global or self.transformer_global
+                    else self.discriminator(noisy)
                 )
                 if self.recurrent_global:
                     logits = th.cat((
                         logits, global_scores[indices[start:stop], None],
                     ), dim=-1)
+                elif self.transformer_global:
+                    logits = th.cat((logits, th.zeros_like(logits[:, :1])), dim=-1)
             expected = (stop - start, 3) if self.factorize else (stop - start,)
             if logits.shape != expected:
                 raise ValueError(f"discriminator returned {tuple(logits.shape)}, expected {expected}")
@@ -3969,6 +4386,8 @@ class SceneDiscriminatorReward:
                 selected_scores[start:stop] = (-logits).clamp(
                     -self.max_magnitude, self.max_magnitude
                 )
+            if self.transformer_global:
+                selected_scores[start:stop, 2] = global_scores[indices[start:stop]]
 
         if self.factorize:
             # Normalize the specialist scores within their own proximity bands.
@@ -3976,7 +4395,9 @@ class SceneDiscriminatorReward:
             gated = th.zeros_like(selected_scores)
             for head, active in enumerate((~near, near, th.ones_like(near))):
                 values = selected_scores[active, head]
-                if self.exp_log_odds_reward:
+                if head == 2 and self.transformer_global:
+                    gated[active, head] = values
+                elif self.exp_log_odds_reward:
                     gated[active, head] = values
                 elif len(values):
                     std = values.std(unbiased=False)
@@ -4002,7 +4423,7 @@ class SceneDiscriminatorReward:
         windows = batch["scene_window"]
         valid = batch["scene_window_valid"].bool()
         if windows.shape[:2] != valid.shape or windows.shape[-2:] != (
-            self.trajectory_length, SCENE_SIZE
+            self.trajectory_length, self.scene_size
         ):
             raise ValueError("scene windows have the wrong shape")
 
@@ -4111,6 +4532,7 @@ class AdaptiveDiscriminatorUpdate:
         reset_miner: ConfidentExpertResetTransform | None = None,
         context_length: int = 16,
         context_stride: int = 4,
+        context_bptt_length: int | None = None,
         context_history: HistoricalReplayBuffer | RecencyReplayBuffer | None = None,
     ) -> None:
         if heldout_size < 0:
@@ -4127,6 +4549,10 @@ class AdaptiveDiscriminatorUpdate:
             raise ValueError("microbatch size must be positive")
         if min(context_length, context_stride) < 1:
             raise ValueError("discriminator context length and stride must be positive")
+        if context_bptt_length is None:
+            context_bptt_length = min(GLOBAL_CONTEXT_BPTT_LENGTH, context_length)
+        if not 1 <= context_bptt_length <= context_length:
+            raise ValueError("discriminator BPTT length must fit the context")
         self.expert = expert
         self.history = history
         self.batch_size = batch_size
@@ -4145,9 +4571,22 @@ class AdaptiveDiscriminatorUpdate:
         self.microbatch_size = microbatch_size
         self.reset_miner = reset_miner
         self.recurrent_global = getattr(discriminator, "recurrent_global", False)
+        self.transformer_global = getattr(discriminator, "transformer_global", False)
+        self.contextual_global = self.recurrent_global or self.transformer_global
+        self.n_cars = expert.n_cars
+        self.scene_size = expert.scene_size
         self.context_length = context_length
         self.context_stride = context_stride
+        self.context_bptt_length = context_bptt_length
+        self.context_microbatch_size = bounded_context_batch_size(
+            microbatch_size, context_length, 8 if self.transformer_global else 64,
+        )
+        self.context_heldout_size = bounded_context_batch_size(
+            heldout_size, context_length, 32 if self.transformer_global else 128,
+        )
         self.context_history = context_history
+        self._recent_context_frames: th.Tensor | None = None
+        self._recent_context_ends: th.Tensor | None = None
         self._progress_callback = None
         self._heldout_sim: th.Tensor | None = None
         self._has_updated = False
@@ -4172,15 +4611,27 @@ class AdaptiveDiscriminatorUpdate:
             raise RuntimeError("no valid generated scene windows in rollout")
 
         flat_windows = windows.reshape(
-            -1, self.expert.trajectory_length, SCENE_SIZE
+            -1, self.expert.trajectory_length, self.scene_size
         )
         train_indices, heldout_indices = self._split_generated(valid)
         terminal = batch.get("terminated")
         truncated = batch.get("truncated")
         if truncated is not None:
             terminal = truncated.bool() if terminal is None else terminal.bool() | truncated.bool()
-        if terminal is not None and self.recurrent_global:
-            terminal = simulation_episode_ends(terminal)
+        if self.contextual_global and terminal is None:
+            raise ValueError("causal discriminator training needs episode ends")
+        if self.contextual_global:
+            terminal = simulation_episode_ends(terminal, self.n_cars)
+        context_timeline = None
+        if self.contextual_global:
+            if (self._recent_context_frames is not None
+                    and self._recent_context_frames.shape[1:] != (valid.shape[1], self.scene_size)):
+                self._recent_context_frames = self._recent_context_ends = None
+            context_timeline = GeneratedContextTimeline(
+                flat_windows, valid.shape[1], terminal,
+                self._recent_context_frames, self._recent_context_ends,
+                n_cars=self.n_cars,
+            )
         goal_scored = (
             batch["reward"].gt(0) & terminal.bool()
             if terminal is not None and "reward" in batch else None
@@ -4209,9 +4660,8 @@ class AdaptiveDiscriminatorUpdate:
         # nearly as costly as training the discriminator itself.
         validation = self._heldout_pairs(
             heldout_generated, heldout_near,
-            flat_windows=flat_windows if self.recurrent_global else None,
-            heldout_indices=heldout_indices if self.recurrent_global else None,
-            n_envs=valid.shape[1], episode_end=terminal,
+            context_timeline=context_timeline,
+            heldout_indices=heldout_indices if self.contextual_global else None,
         )
         evaluation = self._evaluate(heldout_generated, heldout_near, validation=validation)
         if self._has_updated:
@@ -4245,14 +4695,15 @@ class AdaptiveDiscriminatorUpdate:
                                       if self.maneuver_tracker is not None else None),
                     ego_ball_touch=touch_events, goal_scored=goal_scored,
                     timeline=timeline,
-                ) if not self.recurrent_global or getattr(self.discriminator, "factorized", False)
+                ) if not self.contextual_global or getattr(self.discriminator, "factorized", False)
                 else ()
             )
-            if self.recurrent_global:
+            if self.contextual_global:
                 context_sampler = GlobalContextMinibatches(
                     self.expert, self.batch_size, self.epochs, self.noise_std,
                     self.context_length, self.context_stride,
                     history=self.context_history, mix_fraction=self.history_mix_fraction,
+                    variable_length=self.transformer_global,
                 )
                 if not getattr(self.discriminator, "factorized", False):
                     context_sampler.set_epoch_callback(self._epoch_finished)
@@ -4260,7 +4711,9 @@ class AdaptiveDiscriminatorUpdate:
                     SceneDiscriminatorLoss(self.discriminator, specialists_only=True)
                     if getattr(self.discriminator, "factorized", False) else None
                 )
-                context_loss = GlobalContextLoss(self.discriminator)
+                context_loss = GlobalContextLoss(
+                    self.discriminator, self.context_bptt_length,
+                )
                 batches = (
                     tuple((sample, selected_loss) for sample, selected_loss in (
                         (specialist, specialist_loss), (contextual, context_loss),
@@ -4269,6 +4722,7 @@ class AdaptiveDiscriminatorUpdate:
                         sampled_windows,
                         context_sampler.sample_contexts(
                             flat_windows, train_indices, valid.shape[1], terminal,
+                            timeline=context_timeline,
                         ),
                     )
                 )
@@ -4284,15 +4738,20 @@ class AdaptiveDiscriminatorUpdate:
             try:
                 for group_index, group in enumerate(batches, 1):
                     for sample, selected_loss in group:
+                        microbatch_size = (
+                            self.context_microbatch_size
+                            if getattr(selected_loss, "global_only", False)
+                            else self.microbatch_size
+                        )
                         minibatch_metrics = train_discriminator_minibatch(
                             sample, self.discriminator, self.optimizer, selected_loss,
-                            self.microbatch_size, self.max_grad_norm,
+                            microbatch_size, self.max_grad_norm,
                         )
                         for key, value in minibatch_metrics.items():
                             metric_totals[key] = metric_totals.get(key, 0.0) + value
                             metric_counts[key] = metric_counts.get(key, 0) + 1
                         minibatch_count += 1
-                    if self.recurrent_global and group_index != 1 and group_index % 4:
+                    if self.contextual_global and group_index != 1 and group_index % 4:
                         evaluated_last_batch = False
                         continue
                     evaluation = self._evaluate(
@@ -4305,7 +4764,7 @@ class AdaptiveDiscriminatorUpdate:
                 else:
                     if minibatch_count > 0:
                         metrics["updated"] = 1.0
-                if self.recurrent_global and minibatch_count and not evaluated_last_batch:
+                if self.contextual_global and minibatch_count and not evaluated_last_batch:
                     evaluation = self._evaluate(
                         heldout_generated, heldout_near, validation=validation,
                     )
@@ -4349,21 +4808,26 @@ class AdaptiveDiscriminatorUpdate:
                 selected = train_indices[
                     th.randperm(len(train_indices), device=train_indices.device)[:add_count]
                 ]
-                context, ages = generated_context_frames(
-                    flat_windows, selected, valid.shape[1], terminal, self.context_length,
-                )
+                context, ages = context_timeline.contexts(selected, self.context_length)
                 complete = ages == self.context_length
                 self.context_history.add(context[complete], add_count)
+
+        if context_timeline is not None and self.context_length > 1:
+            # The discriminator may skip updates for several rollouts. Keep the
+            # actual scenes and endings so its next batch can cross those edges.
+            recent = slice(-(self.context_length - 1), None)
+            self._recent_context_frames = context_timeline.frames[recent].detach().clone()
+            self._recent_context_ends = context_timeline.ends[recent].detach().clone()
 
         return experience, {self.section: metrics}
 
     def _split_generated(
         self, valid: th.Tensor
     ) -> tuple[th.Tensor, th.Tensor]:
-        if valid.ndim != 2 or valid.shape[1] % N_CARS:
-            raise ValueError("generated validity must be [time, 1v1 actors]")
+        if valid.ndim != 2 or valid.shape[1] % self.n_cars:
+            raise ValueError("generated validity must be [time, complete simulations]")
         T, n_envs = valid.shape
-        n_sim = n_envs // N_CARS
+        n_sim = n_envs // self.n_cars
         flat_valid = valid.flatten()
         valid_indices = th.nonzero(flat_valid, as_tuple=False).squeeze(-1)
         if self.heldout_size == 0 or n_sim < 2:
@@ -4372,7 +4836,7 @@ class AdaptiveDiscriminatorUpdate:
         if self._heldout_sim is not None:
             heldout_mask = (
                 self._heldout_sim.view(1, n_sim, 1)
-                .expand(T, n_sim, N_CARS)
+                .expand(T, n_sim, self.n_cars)
                 .reshape(T, n_envs)
                 & valid
             ).flatten()
@@ -4381,7 +4845,7 @@ class AdaptiveDiscriminatorUpdate:
                 th.nonzero(heldout_mask, as_tuple=False).squeeze(-1),
             )
 
-        per_sim = valid.view(T, n_sim, N_CARS).sum(dim=(0, 2))
+        per_sim = valid.view(T, n_sim, self.n_cars).sum(dim=(0, 2))
         candidates = th.nonzero(per_sim > 0, as_tuple=False).squeeze(-1)
         if len(candidates) < 2:
             return valid_indices, valid_indices[:0]
@@ -4401,7 +4865,7 @@ class AdaptiveDiscriminatorUpdate:
         self._heldout_sim = heldout_sim
         heldout_mask = (
             heldout_sim.view(1, n_sim, 1)
-            .expand(T, n_sim, N_CARS)
+            .expand(T, n_sim, self.n_cars)
             .reshape(T, n_envs)
             & valid
         ).flatten()
@@ -4412,22 +4876,21 @@ class AdaptiveDiscriminatorUpdate:
 
     def _heldout_pairs(
         self, heldout_generated: th.Tensor, heldout_near: th.Tensor | None,
-        *, flat_windows: th.Tensor | None = None,
-        heldout_indices: th.Tensor | None = None, n_envs: int = 1,
-        episode_end: th.Tensor | None = None,
+        *, context_timeline: GeneratedContextTimeline | None = None,
+        heldout_indices: th.Tensor | None = None,
     ) -> tuple | None:
-        n = min(len(heldout_generated), self.expert.heldout_total, self.heldout_size)
+        n = min(len(heldout_generated), self.expert.heldout_total,
+                self.context_heldout_size if self.contextual_global else self.heldout_size)
         if not n:
             return None
         device = heldout_generated.device
         selected = th.randperm(len(heldout_generated), device=device)[:n]
         generated = heldout_generated[selected]
-        if self.recurrent_global:
-            if flat_windows is None or heldout_indices is None:
-                raise ValueError("recurrent heldout evaluation needs chronological windows")
-            generated_context, generated_ages = generated_context_frames(
-                flat_windows, heldout_indices[selected], n_envs,
-                episode_end, self.context_length,
+        if self.contextual_global:
+            if context_timeline is None or heldout_indices is None:
+                raise ValueError("causal heldout evaluation needs chronological windows")
+            generated_context, generated_ages = context_timeline.contexts(
+                heldout_indices[selected], self.context_length,
             )
             expert_pairs = self.expert.sample_povs(n, heldout=True)
             expert = self.expert._windows_for_povs(expert_pairs)
@@ -4445,7 +4908,7 @@ class AdaptiveDiscriminatorUpdate:
                 th.randperm(len(heldout_near), device=device)[:n_near]
             ]
             near_expert = self.expert.sample_near(n_near, device, heldout=True)
-        if self.recurrent_global:
+        if self.contextual_global:
             return (
                 generated, expert, near_generated, near_expert,
                 generated_context, expert_context, ages,
@@ -4474,7 +4937,7 @@ class AdaptiveDiscriminatorUpdate:
             return metrics
 
         generated, expert, near_generated, near_expert = validation[:4]
-        if self.recurrent_global:
+        if self.contextual_global:
             generated_context, expert_context, ages = validation[4:]
         n = len(generated)
         totals = th.zeros(5, device=generated.device)
@@ -4482,13 +4945,15 @@ class AdaptiveDiscriminatorUpdate:
         head_correct = th.zeros_like(head_counts)
 
         was_training = self.discriminator.training
+        batch_size = (self.context_microbatch_size if self.contextual_global
+                      else self.microbatch_size)
         with th.inference_mode():
             self.discriminator.eval()
             try:
-                for start in range(0, n, self.microbatch_size):
-                    stop = min(start + self.microbatch_size, n)
+                for start in range(0, n, batch_size):
+                    stop = min(start + batch_size, n)
                     raw = th.cat((generated[start:stop], expert[start:stop]))
-                    if self.recurrent_global:
+                    if self.contextual_global:
                         context = add_scene_noise(th.cat((
                             generated_context[start:stop], expert_context[start:stop],
                         )), self.noise_std)
@@ -4558,7 +5023,7 @@ class AdaptiveDiscriminatorUpdate:
                         )
                         logits = (
                             self.discriminator.specialist_logits(noisy)[:, 1]
-                            if self.recurrent_global else self.discriminator(noisy)[:, 1]
+                            if self.contextual_global else self.discriminator(noisy)[:, 1]
                         )
                         generated_logit, expert_logit = logits.split(stop - start)
                         near_correct[0] += (generated_logit > 0).sum()
@@ -4669,7 +5134,8 @@ class GAIFOCheckpoints:
             "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
             "config": {
                 "architecture": (
-                    GAIFO_ASE_ARCHITECTURE if getattr(self.args, "ase_diversity", False) else (
+                    GAIFO_DOUBLES_ARCHITECTURE if getattr(self.args, "team_size", 1) == 2
+                    else GAIFO_ASE_ARCHITECTURE if getattr(self.args, "ase_diversity", False) else (
                         GAIFO_GRU_ARCHITECTURE if self.args.gru else GAIFO_ARCHITECTURE
                     )
                 ),
@@ -4722,19 +5188,26 @@ def load_resume_checkpoint(path: Path) -> dict:
     architecture = config.get("architecture")
     if architecture not in (
         GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
+        GAIFO_DOUBLES_ARCHITECTURE,
     ):
         raise ValueError(f"incompatible GAIFO architecture in {path}")
-    if config.get("gru", False) != (architecture == GAIFO_GRU_ARCHITECTURE):
+    if (architecture != GAIFO_DOUBLES_ARCHITECTURE
+            and config.get("gru", False) != (architecture == GAIFO_GRU_ARCHITECTURE)):
         raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
     if config.get("ase_diversity", False) != (architecture == GAIFO_ASE_ARCHITECTURE):
         raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
+    if (config.get("team_size", 1) == 2) != (architecture == GAIFO_DOUBLES_ARCHITECTURE):
+        raise ValueError(f"checkpoint team size does not match architecture in {path}")
+    if (architecture == GAIFO_DOUBLES_ARCHITECTURE
+            and not config.get("transformer_global", False)):
+        raise ValueError(f"checkpoint Transformer setting does not match architecture in {path}")
     step = payload.get("step")
     if type(step) is not int or step < 0:
         raise ValueError(f"checkpoint has an invalid training step: {path}")
     for name in ("n_sim", "rollout"):
         if type(config.get(name)) is not int or config[name] < 1:
             raise ValueError(f"checkpoint has an invalid {name}: {path}")
-    if step % (config["n_sim"] * N_CARS):
+    if step % (config["n_sim"] * config.get("team_size", 1) * N_CARS):
         raise ValueError(f"checkpoint step is not a complete vector step: {path}")
     required = (
         "policy", "critic", "discriminator", "policy_optimizer",
@@ -4787,6 +5260,10 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         )
     if args.factorize != config.get("factorize", False):
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
+    if args.team_size != config.get("team_size", 1):
+        raise ValueError("--team-size must match the checkpoint environment when resuming")
+    if args.transformer_global != config.get("transformer_global", False):
+        raise ValueError("--transformer-global must match the checkpoint discriminator when resuming")
     if args.recurrent_global != config.get("recurrent_global", False):
         raise ValueError("--recurrent-global must match the checkpoint discriminator when resuming")
     if args.ase_diversity != config.get("ase_diversity", False):
@@ -4799,8 +5276,14 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         "frameskip", "trajectory_length", "policy_hidden", "critic_hidden",
         "policy_layers", "critic_layers",
         "discriminator_hidden", "frame_embedding", "temporal_hidden",
-    ) + (("discriminator_context_length", "discriminator_context_stride")
-         if args.recurrent_global else ()) + ase_settings:
+    ) + (("discriminator_context_length", "discriminator_context_stride",
+          "discriminator_bptt_length")
+          if args.recurrent_global else
+          ("discriminator_context_length", "discriminator_context_stride")
+          if args.transformer_global else ()) + ase_settings:
+        if name == "discriminator_bptt_length" and name not in config:
+            # Before long-context training, the full context was differentiable.
+            continue
         if name in ("ase_sequence_length", "ase_encoder_type") and name not in config:
             # Older ASE checkpoints can upgrade their skill predictor in place.
             continue
@@ -4890,7 +5373,7 @@ def restore_training_checkpoint(
     if "clock" in payload:
         return Clock(**payload["clock"])
     config = payload["config"]
-    vector_steps = payload["step"] // (config["n_sim"] * N_CARS)
+    vector_steps = payload["step"] // (config["n_sim"] * config.get("team_size", 1) * N_CARS)
     return Clock(
         vector_steps=vector_steps,
         env_steps=payload["step"],
@@ -4908,7 +5391,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
 
     parser = argparse.ArgumentParser(
-        description="GAIfO imitation learning for 1v1 Rocket League via CARL and JARL."
+        description="GAIfO imitation learning for 1v1 or 2v2 Rocket League via CARL and JARL."
     )
     parser.add_argument(
         "--resume-checkpoint", type=Path,
@@ -4918,9 +5401,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--replay-dir",
         type=Path,
         required=resume is None,
-        help="1v1 replay folder or its parent containing pro_1v1_fs4",
+        help="parsed 1v1/2v2 POV folder or its parent containing pro_1v1_fs4/pro_2v2_fs4",
     )
-    parser.add_argument("--n-sim", type=int, default=16_384)
+    parser.add_argument("--team-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--n-sim", type=int, default=None)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
@@ -4934,15 +5418,23 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="carry the always-on discriminator's GRU memory across scene windows (default: off)",
     )
     parser.add_argument(
-        "--discriminator-context-length", type=int, default=16,
-        help="consecutive scene frames per global discriminator training example",
+        "--transformer-global", action=argparse.BooleanOptionalAction, default=None,
+        help="use capped causal Transformer context and step-difference global reward (default: on for 2v2)",
     )
     parser.add_argument(
-        "--discriminator-context-stride", type=int, default=4,
+        "--discriminator-context-length", type=int, default=GLOBAL_CONTEXT_LENGTH,
+        help="consecutive scene frames of recurrent memory (default: 128, about 4.3 s at frame skip 4)",
+    )
+    parser.add_argument(
+        "--discriminator-context-stride", type=int, default=GLOBAL_CONTEXT_STRIDE,
         help="sample roughly one global context endpoint per this many generated steps",
     )
     parser.add_argument(
-        "--factorize", action=argparse.BooleanOptionalAction, default=False,
+        "--discriminator-bptt-length", type=int, default=None,
+        help="differentiable final frames of each global context; earlier frames burn in detached memory (default: up to 64)",
+    )
+    parser.add_argument(
+        "--factorize", action=argparse.BooleanOptionalAction, default=None,
         help="train an always-on global scene discriminator and proximity-gated far-car and near-car/ball specialists",
     )
     parser.add_argument(
@@ -4993,7 +5485,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument("--discriminator-update-interval", type=int, default=4)
     parser.add_argument("--discriminator-lr", type=float, default=3e-4)
     parser.add_argument("--discriminator-hidden", type=int, default=128)
-    parser.add_argument("--discriminator-heldout-size", type=int, default=16_384)
+    parser.add_argument("--discriminator-heldout-size", type=int, default=None)
     parser.add_argument("--discriminator-accuracy-target", type=float, default=0.80)
     parser.add_argument("--frame-embedding", type=int, default=128)
     parser.add_argument("--temporal-hidden", type=int, default=128)
@@ -5090,8 +5582,22 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("policy_layers", 1)
         inherited.setdefault("critic_layers", 1)
         inherited.setdefault("recurrent_global", False)
+        inherited.setdefault("team_size", 1)
+        inherited.setdefault("transformer_global", False)
         parser.set_defaults(**inherited)
     args = parser.parse_args()
+    if args.n_sim is None:
+        args.n_sim = 256 if args.team_size == 2 else 16_384
+    if args.discriminator_heldout_size is None:
+        args.discriminator_heldout_size = 512 if args.team_size == 2 else 16_384
+    if args.factorize is None:
+        args.factorize = args.team_size == 2
+    if args.transformer_global is None:
+        args.transformer_global = args.team_size == 2
+    if args.discriminator_bptt_length is None:
+        args.discriminator_bptt_length = min(
+            GLOBAL_CONTEXT_BPTT_LENGTH, args.discriminator_context_length,
+        )
     if args.replay_reset_fraction is None:
         default = 1.0 if args.curated_skill_sampling else 0.70
         if (resume is not None and args.curated_skill_sampling ==
@@ -5113,23 +5619,35 @@ def validate_args(args: argparse.Namespace) -> None:
 
     replay_dir = args.replay_dir
     if not next(replay_dir.glob("*.npy"), None):
-        for name in (f"pro_1v1_fs{args.frameskip}", "pro_1v1_fs4"):
+        team = f"pro_{args.team_size}v{args.team_size}_fs"
+        for name in (f"{team}{args.frameskip}", f"{team}4"):
             candidate = replay_dir / name
             if candidate.is_dir():
                 replay_dir = candidate
                 break
 
-    found_1v1 = False
+    found_replay = False
+    width = 161 + 54 * (args.team_size - 1)
     for path in replay_dir.glob("*.npy"):
         source = np.load(path, mmap_mode="r")
-        if source.ndim == 2 and source.shape[1] == 161:
-            found_1v1 = True
+        if source.ndim == 2 and source.shape[1] == width:
+            found_replay = True
             break
-    if not found_1v1:
-        raise FileNotFoundError(f"no 1v1 replay files in {args.replay_dir}")
+    if not found_replay:
+        raise FileNotFoundError(
+            f"no {args.team_size}v{args.team_size} replay files in {args.replay_dir}"
+        )
     if replay_dir != args.replay_dir:
-        print(f"Using 1v1 replays from {replay_dir}")
+        print(f"Using {args.team_size}v{args.team_size} replays from {replay_dir}")
         args.replay_dir = replay_dir
+
+    if args.team_size == 2 and not (args.factorize and args.transformer_global):
+        raise ValueError("2v2 needs --factorize and --transformer-global")
+    if args.team_size == 2 and (args.recurrent_global or args.ase_diversity
+                                or args.exp_log_odds_reward):
+        raise ValueError("2v2 Transformer needs log-odds rewards without recurrent GRU/ASE")
+    if args.team_size == 1 and args.transformer_global:
+        raise ValueError("--transformer-global currently needs --team-size 2")
 
     positive = (
         "n_sim",
@@ -5139,6 +5657,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "trajectory_length",
         "discriminator_context_length",
         "discriminator_context_stride",
+        "discriminator_bptt_length",
         "discriminator_batch",
         "discriminator_microbatch",
         "discriminator_epochs",
@@ -5163,6 +5682,8 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in positive:
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.discriminator_bptt_length > args.discriminator_context_length:
+        raise ValueError("--discriminator-bptt-length must fit --discriminator-context-length")
 
     if args.no_touch_timeout is not None and (
         not math.isfinite(args.no_touch_timeout) or args.no_touch_timeout <= 0.0
@@ -5257,14 +5778,14 @@ def validate_args(args: argparse.Namespace) -> None:
 
     generated_windows = max(
         0, args.rollout - (args.trajectory_length - 2)
-    ) * args.n_sim * N_CARS
+    ) * args.n_sim * (args.team_size * N_CARS)
     if generated_windows < args.discriminator_batch:
         raise ValueError(
             f"rollout is too short to produce a discriminator batch: "
             f"{generated_windows} generated windows, batch size {args.discriminator_batch}"
         )
 
-    n_envs = args.n_sim * 2
+    n_envs = args.n_sim * (args.team_size * N_CARS)
     if args.ppo_batch > args.rollout * n_envs:
         raise ValueError("--ppo-batch must fit the rollout size")
     if args.ase_diversity and args.gru:
@@ -5296,8 +5817,8 @@ def validate_args(args: argparse.Namespace) -> None:
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
     return CARLTorchVectorEnv(
         n_sim=args.n_sim,
-        n_blue=1,
-        n_orange=1,
+        n_blue=getattr(args, "team_size", 1),
+        n_orange=getattr(args, "team_size", 1),
         seed=args.seed,
         frameskip=args.frameskip,
         max_ticks=args.max_ticks,
@@ -5342,12 +5863,19 @@ def build_discriminator(
     args: argparse.Namespace,
 ) -> SceneDiscriminator | FactorizedSceneDiscriminator:
     model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
-    return model(
+    options = dict(
         frame_embedding=args.frame_embedding,
         temporal_hidden=args.temporal_hidden,
         hidden_size=args.discriminator_hidden,
         recurrent_global=getattr(args, "recurrent_global", False),
     )
+    if args.factorize:
+        options.update(
+            n_cars=2 * getattr(args, "team_size", 1),
+            transformer_global=getattr(args, "transformer_global", False),
+            context_length=getattr(args, "discriminator_context_length", GLOBAL_CONTEXT_LENGTH),
+        )
+    return model(**options)
 
 
 def build_runner(
@@ -5363,7 +5891,9 @@ def build_runner(
         captures.append(AdvancedTouchCapture(gameplay))
         if getattr(args, "ase_diversity", False) or getattr(args, "factorize", False):
             captures.append(ASEBallTouchCapture(gameplay))
-    captures.append(SceneWindowCapture(args.trajectory_length))
+    captures.append(SceneWindowCapture(
+        args.trajectory_length, n_cars=2 * getattr(args, "team_size", 1),
+    ))
     return Runner(env, policy, buffer, captures=captures)
 
 
@@ -5405,6 +5935,7 @@ def main() -> None:
         base_env.n_sim,
         base_env.device,
         math.ceil(args.no_touch_timeout * 120.0 / args.frameskip),
+        n_cars=2 * args.team_size,
     ))
     skill_env = (
         SkillConditionedEnv(base_env, args.ase_skill_dim, args.ase_skill_steps, args.seed)
@@ -5441,6 +5972,7 @@ def main() -> None:
         skill_sampling=args.curated_skill_sampling,
         driving_fraction=args.general_driving_fraction,
         kickoff_fraction=args.kickoff_fraction,
+        n_cars=2 * args.team_size,
     )
     if expert.train_total < 1:
         raise ValueError("expert dataset contains no training windows")
@@ -5454,7 +5986,12 @@ def main() -> None:
     )
     reset_miner = (
         ConfidentExpertResetTransform(
-            expert, reset_dataset, discriminator, args.discriminator_microbatch,
+            expert, reset_dataset, discriminator,
+            (bounded_context_batch_size(
+                args.discriminator_microbatch, args.discriminator_context_length,
+                8 if args.transformer_global else 64,
+            ) if args.recurrent_global or args.transformer_global
+             else args.discriminator_microbatch),
             context_length=args.discriminator_context_length,
         ) if args.hard_positive_mining else None
     )
@@ -5475,15 +6012,16 @@ def main() -> None:
     history_options = dict(
         capacity=args.history_capacity, trajectory_length=args.trajectory_length,
         device=env.device, seed=args.seed,
+        scene_size=BALL_SIZE + 2 * args.team_size * CAR_SIZE,
     )
     history = (
         RecencyReplayBuffer(
             **history_options, reservoir_fraction=args.history_reservoir_fraction,
         )
         if args.recency_replay else HistoricalReplayBuffer(**history_options)
-    ) if not args.recurrent_global or args.factorize else None
+    ) if not (args.recurrent_global or args.transformer_global) or args.factorize else None
     context_history = None
-    if args.recurrent_global:
+    if args.recurrent_global or args.transformer_global:
         context_options = dict(
             capacity=max(
                 2 if args.recency_replay else 1,
@@ -5492,6 +6030,7 @@ def main() -> None:
             ),
             trajectory_length=args.discriminator_context_length,
             device=env.device, seed=args.seed,
+            scene_size=BALL_SIZE + 2 * args.team_size * CAR_SIZE,
         )
         context_history = (
             RecencyReplayBuffer(
@@ -5560,6 +6099,7 @@ def main() -> None:
         reset_miner=reset_miner,
         context_length=args.discriminator_context_length,
         context_stride=args.discriminator_context_stride,
+        context_bptt_length=args.discriminator_bptt_length,
         context_history=context_history,
     )
 
@@ -5652,6 +6192,12 @@ def main() -> None:
             ("train_near_ball_fraction", "D near-ball fraction"),
         ):
             logger.register_progress_metric("Discriminator", key, label, ".3f")
+    if args.recurrent_global or args.transformer_global:
+        for key, label in (
+            ("train_context_steps", "D context steps"),
+            ("train_burnin_steps", "D burn-in steps"),
+        ):
+            logger.register_progress_metric("Discriminator", key, label, ".1f")
     if args.hard_positive_mining:
         logger.register_progress_metric(
             "Discriminator", "reset_mined_fraction", "D mined reset frac", ".3f",

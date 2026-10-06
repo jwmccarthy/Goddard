@@ -14,7 +14,7 @@ import torch as th
 
 from gaifo import (
     BLUE_START, ConfidentExpertResetTransform, ORANGE_START, POSITION_SCALE,
-    load_resume_checkpoint, main,
+    SceneDiscriminator, load_resume_checkpoint, main,
 )
 
 
@@ -23,6 +23,17 @@ from gaifo import (
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
+    def test_cuda_long_context_burnin_and_gradient(self):
+        model = SceneDiscriminator(8, 8, 8, recurrent_global=True).cuda()
+        scenes = th.randn(3, 96, 51, device="cuda", requires_grad=True)
+        ages = th.tensor([96, 72, 7], device="cuda")
+        logits = model.score_context(scenes, ages, bptt_length=64)
+        th.testing.assert_close(logits, model.score_context(scenes, ages))
+        logits.sum().backward()
+        self.assertTrue(th.isfinite(scenes.grad).all())
+        self.assertGreater(scenes.grad[0, 32].abs().sum().item(), 0)
+        th.testing.assert_close(scenes.grad[0, :32], th.zeros_like(scenes.grad[0, :32]))
+
     def _short_window_training(
         self, factorize: bool, hard_positive_mining: bool = False,
         exp_log_odds_reward: bool = False, recency_replay: bool = False,
@@ -72,7 +83,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             if exp_log_odds_reward:
                 flags.append("--exp-log-odds-reward")
             if recency_replay:
-                flags.append("--recency-replay")
+                flags.extend((
+                    "--recency-replay", "--discriminator-context-length", "24",
+                    "--discriminator-bptt-length", "8",
+                ))
             output = io.StringIO()
             ready_resets = []
             original_reset = ConfidentExpertResetTransform.__call__
@@ -89,7 +103,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             self.assertGreaterEqual(len(checkpoints), 2)
             saved = load_resume_checkpoint(max(checkpoints))
             self.assertTrue(saved["config"]["recurrent_global"])
-            self.assertEqual(saved["config"]["discriminator_context_length"], 16)
+            self.assertEqual(saved["config"]["discriminator_context_length"],
+                             24 if recency_replay else 128)
+            self.assertEqual(saved["config"]["discriminator_bptt_length"],
+                             8 if recency_replay else 64)
             optimizer = saved["discriminator_optimizer"]
             self.assertEqual(len(optimizer["state"]), len(optimizer["param_groups"][0]["params"]))
             return saved, output.getvalue(), ready_resets

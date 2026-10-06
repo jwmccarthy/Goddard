@@ -13,10 +13,13 @@ import torch as th
 from gymnasium.spaces import Box, MultiDiscrete
 from http.server import ThreadingHTTPServer
 
-from gaifo import GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, build_policy
+from gaifo import (
+    GAIFO_ARCHITECTURE, GAIFO_DOUBLES_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+    build_policy,
+)
 from watch_checkpoints import (
-    CheckpointRegistry, SpectatorState, load_policy_checkpoint, make_handler,
-    parse_args,
+    CheckpointRegistry, SpectatorState, load_match, load_policy_checkpoint, make_handler,
+    parse_args, render_frame,
 )
 
 
@@ -87,6 +90,74 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             legacy = parse_args()
         self.assertEqual(vars(canonical), vars(legacy))
         self.assertEqual(canonical.hidden_size, 16)
+
+    def test_team_size_selects_matching_default_replay_directory(self):
+        with patch.object(sys, "argv", ["watch_checkpoints.py"]):
+            duels = parse_args()
+        with patch.object(sys, "argv", ["watch_checkpoints.py", "--team-size", "2"]):
+            doubles = parse_args()
+        self.assertEqual(duels.replay_dir.name, "pro_1v1_fs4")
+        self.assertEqual(doubles.replay_dir.name, "pro_2v2_fs4")
+
+    def test_four_car_checkpoint_and_frame_rendering(self):
+        env = FakeEnv()
+        env.single_observation_space = Box(-1.0, 1.0, shape=(191,), dtype=np.float32)
+        observations = th.randn(2, 191)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            paths = []
+            for gru in (False, True):
+                with self.subTest(gru=gru):
+                    path = folder / f"gaifo_{int(gru) + 1:012d}.pt"
+                    paths.append(path)
+                    reference = build_policy(
+                        env, argparse.Namespace(policy_hidden=16, policy_layers=2, gru=gru),
+                    ).eval()
+                    th.save({
+                        "config": {
+                            "architecture": GAIFO_DOUBLES_ARCHITECTURE,
+                            "team_size": 2,
+                            "frameskip": 4,
+                            "policy_hidden": 16,
+                            "policy_layers": 2,
+                            "gru": gru,
+                        },
+                        "policy": reference.state_dict(),
+                    }, path)
+                    policy, signature = load_policy_checkpoint(path, env, 4, None, team_size=2)
+                    self.assertEqual(signature, (
+                        "gaifo", 16, GAIFO_DOUBLES_ARCHITECTURE, 2, gru,
+                    ))
+                    with th.inference_mode():
+                        expected = reference.act(
+                            observations, reference.initial_state(2), deterministic=True,
+                        )
+                        actual = policy.act(
+                            observations, policy.initial_state(2), deterministic=True,
+                        )
+                    th.testing.assert_close(actual.action, expected.action)
+                    self.assertEqual(actual.action.shape[0], 2)
+                    if gru:
+                        th.testing.assert_close(actual.next_state, expected.next_state)
+                    with self.assertRaisesRegex(ValueError, "team size"):
+                        load_policy_checkpoint(path, env, 4, None, team_size=1)
+            with self.assertRaisesRegex(ValueError, "different trainer architectures"):
+                load_match(paths[0], paths[1], env, 4, None, team_size=2)
+
+            raw = th.zeros(1, 9 + 4 * 22)
+            cars = raw[:, 9:].view(1, 4, 22)
+            cars[0, :, 0] = th.arange(4) * 100
+            cars[0, :, 9] = 1
+            cars[0, :, 14] = 1
+            frame = render_frame(raw, folder, paths[0], paths[1], 1, 2, 3, 40, team_size=2)
+            self.assertEqual(
+                [(car["team"], car["player"]) for car in frame["cars"]],
+                [(0, 1), (0, 2), (1, 1), (1, 2)],
+            )
+            for index, car in enumerate(frame["cars"]):
+                self.assertAlmostEqual(car["pos"][0], index * 100 + 13.8757, places=4)
+            self.assertEqual((frame["blue"]["score"], frame["orange"]["score"]),
+                             (1, 2))
 
     def test_load_and_play_mlp_and_gru(self):
         th.manual_seed(0)
@@ -221,6 +292,8 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             checkpoint = folder / "gaifo_000000000001.pt"
             checkpoint.touch()
             (folder / "lbifo_000000000099.pt").touch()
+            (folder / "pulse_000000000099.pt").touch()
+            (folder / "self_play_000000000099.pt").touch()
             registry = CheckpointRegistry(folder)
             self.assertEqual([item.path for item in registry.list()], [checkpoint])
             self.assertEqual(registry.newest_pair(), (checkpoint, checkpoint))

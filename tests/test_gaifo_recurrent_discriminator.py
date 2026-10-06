@@ -10,24 +10,33 @@ import torch as th
 from gaifo import (
     BALL_NEAR_DISTANCE, BLUE_START, GLOBAL_DISCRIMINATOR_WEIGHT, ORANGE_START,
     POSITION_SCALE, SPECIALIST_DISCRIMINATOR_WEIGHT,
-    ConfidentExpertResetTransform, ExpertSceneDataset,
-    FactorizedSceneDiscriminator, GlobalContextLoss, GlobalContextMinibatches,
+    AdaptiveDiscriminatorUpdate, ConfidentExpertResetTransform, ExpertSceneDataset,
+    FactorizedSceneDiscriminator, GeneratedContextTimeline, GlobalContextLoss,
+    GlobalContextMinibatches,
     SceneDiscriminator, SceneDiscriminatorLoss, SceneDiscriminatorReward,
-    generated_context_frames, nearest_ball_distance, train_discriminator_minibatch,
+    generated_context_frames, nearest_ball_distance, simulation_episode_ends,
+    train_discriminator_minibatch,
 )
 from jarl.data import TensorBatch
 
 
-def write_experts(folder: Path) -> ExpertSceneDataset:
+def write_experts(
+    folder: Path, length: int = 12, reject_discontinuities: bool = False,
+) -> ExpertSceneDataset:
     for index in range(2):
-        rows = np.zeros((12, 161), np.float32)
-        rows[:, 0] = (index + 1) / 10 + np.arange(12) / 1_000
+        rows = np.zeros((length, 161), np.float32)
+        rows[:, 0] = (index + 1) / 10 + np.arange(length) / 1_000
         rows[:, 2] = 91.25 / POSITION_SCALE[2]
         for car in (BLUE_START, ORANGE_START):
             rows[:, car + 2] = 17 / POSITION_SCALE[2]
             rows[:, car + 9] = rows[:, car + 14] = rows[:, car + 16] = 1
+        if reject_discontinuities:
+            rows[length // 2, -1] = 1
         np.save(folder / f"{index}-period.npy", rows)
-    return ExpertSceneDataset(folder, trajectory_length=2, heldout_size=3)
+    return ExpertSceneDataset(
+        folder, trajectory_length=2, heldout_size=3,
+        reject_discontinuities=reject_discontinuities,
+    )
 
 
 class AccumulatingGlobal(th.nn.Module):
@@ -79,6 +88,157 @@ def stepwise_sequence(model, scenes, reset, initial_state):
 
 
 class RecurrentDiscriminatorTests(unittest.TestCase):
+    def test_long_context_carries_burnin_state_and_backpropagates_beyond_16_frames(self):
+        th.manual_seed(31)
+        model = SceneDiscriminator(8, 8, 12, recurrent_global=True)
+        scenes = th.randn(3, 96, 51, requires_grad=True)
+        ages = th.tensor([96, 77, 9])
+        logits = model.score_context(scenes, ages, bptt_length=64)
+        th.testing.assert_close(logits, model.score_context(scenes, ages))
+        gradients = th.autograd.grad(logits.sum(), scenes)[0]
+        th.testing.assert_close(gradients[:2, :32], th.zeros_like(gradients[:2, :32]))
+        th.testing.assert_close(gradients[2, :87], th.zeros_like(gradients[2, :87]))
+        self.assertGreater(gradients[0, 32].abs().sum().item(), 0)
+        self.assertGreater(gradients[1, 32].abs().sum().item(), 0)
+
+    def test_cross_rollout_training_contexts_and_expert_gaps_are_causal(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = write_experts(
+                Path(directory), length=256, reject_discontinuities=True,
+            )
+            for heldout in (False, True):
+                starts = (expert.heldout_window_starts if heldout
+                          else expert.train_window_starts)
+                gaps = (starts[1:] != starts[:-1] + 1).nonzero(as_tuple=True)[0]
+                self.assertEqual(len(gaps), 1)
+                first_after_gap = starts[gaps[0] + 1]
+                context, age = expert.context_frames(
+                    th.tensor([[int(first_after_gap), 0]]), 96,
+                    heldout=heldout, return_age=True,
+                )
+                self.assertEqual(age.tolist(), [1])
+                th.testing.assert_close(context[0], context[0, :1].expand_as(context[0]))
+                late, age = expert.context_frames(
+                    th.tensor([[int(starts[-1]), 0]]), 96,
+                    heldout=heldout, return_age=True,
+                )
+                self.assertEqual(age.tolist(), [96])
+                self.assertGreater((late[0, -1, 0] - late[0, 0, 0]).item(), .09)
+
+            def windows(start, steps):
+                sample = th.zeros(steps, 4, 2, 51)
+                times = th.arange(start, start + steps)[:, None, None]
+                actors = th.arange(4)[None, :, None] / 10
+                sample[..., 0] = .11 + (times + actors) / 1_000
+                sample[..., 2] = 91.25 / POSITION_SCALE[2]
+                for car in (BLUE_START, ORANGE_START):
+                    sample[..., car + 2] = 17 / POSITION_SCALE[2]
+                    sample[..., car + 9] = 1
+                    sample[..., car + 14] = 1
+                    sample[..., car + 16] = 1
+                return sample
+
+            previous = windows(0, 72)
+            current = windows(72, 40)
+            old_ends = th.zeros(72, 4, dtype=th.bool)
+            old_ends[70, 3] = True
+            timeline = GeneratedContextTimeline(
+                current.flatten(0, 1), 4, th.zeros(40, 4, dtype=th.bool),
+                previous[:, :, -1], simulation_episode_ends(old_ends),
+            )
+            chosen = th.tensor([39 * 4, 39 * 4 + 2])
+            context, ages = timeline.contexts(chosen, 96)
+            self.assertEqual(ages.tolist(), [96, 41])
+            th.testing.assert_close(context[0, :, 0], .11 + th.arange(16, 112) / 1_000)
+            th.testing.assert_close(context[1, -41:, 0],
+                                    .11 + (th.arange(71, 112) + .2) / 1_000)
+            th.testing.assert_close(context[1, :55, 0], context[1, :1, 0].expand(55))
+
+            sampler = GlobalContextMinibatches(
+                expert, batch_size=8, epochs=1, noise_std=0,
+                context_length=96, stride=1,
+            )
+            sample = next(sampler.sample_contexts(
+                current.flatten(0, 1), chosen, 4, timeline=timeline,
+            ))
+            n = len(sample["is_agent"]) // 2
+            self.assertEqual(n, 2)
+            th.testing.assert_close(sample["age"][:n], sample["age"][n:])
+            self.assertTrue((sample["age"][:n] <= 96).all())
+            self.assertTrue(th.isin(sample["window"][:n, -1, 0], context[:, -1, 0]).all())
+            self.assertEqual(sampler.batch_size, 8)
+
+    def test_update_retains_cross_rollout_history_when_unscheduled(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = write_experts(Path(directory), length=64)
+            model = SceneDiscriminator(8, 8, 8, recurrent_global=True)
+            update = AdaptiveDiscriminatorUpdate(
+                expert=expert, history=None, batch_size=2, epochs=1,
+                noise_std=0, heldout_size=3, accuracy_target=0,
+                history_add_size=0, history_mix_fraction=0, max_grad_norm=1,
+                discriminator=model, optimizer=th.optim.SGD(model.parameters(), lr=0),
+                loss=SceneDiscriminatorLoss(model), update_interval=3,
+                microbatch_size=2, context_length=12, context_stride=1,
+                context_bptt_length=4,
+            )
+
+            def rollout(start, end=False):
+                windows = th.zeros(5, 4, 2, 51)
+                windows[:, :, :, 0] = .11 + th.arange(start, start + 5)[:, None, None] / 100
+                windows[..., 2] = 91.25 / POSITION_SCALE[2]
+                for car in (BLUE_START, ORANGE_START):
+                    windows[..., car + 2] = 17 / POSITION_SCALE[2]
+                    windows[..., car + 9] = 1
+                    windows[..., car + 14] = 1
+                    windows[..., car + 16] = 1
+                terminated = th.zeros(5, 4, dtype=th.bool)
+                terminated[3, 1] = end
+                return TensorBatch({
+                    "scene_window": windows,
+                    "scene_window_valid": th.ones(5, 4, dtype=th.bool),
+                    "terminated": terminated,
+                })
+
+            _, first = update.run(rollout(0))
+            self.assertEqual(first["Discriminator"]["updated"], 1)
+            _, second = update.run(rollout(5, end=True))
+            self.assertEqual(second["Discriminator"]["scheduled"], 0)
+            self.assertEqual(len(update._recent_context_frames), 10)
+
+            third = rollout(10)
+            timeline = GeneratedContextTimeline(
+                third["scene_window"].flatten(0, 1), 4, third["terminated"],
+                update._recent_context_frames, update._recent_context_ends,
+            )
+            context, ages = timeline.contexts(th.tensor([0, 1, 2]), 12)
+            self.assertEqual(ages.tolist(), [2, 2, 11])
+            th.testing.assert_close(context[2, -11:, 0], .11 + th.arange(11) / 100)
+            _, third_metrics = update.run(third)
+            self.assertEqual(third_metrics["Discriminator"]["scheduled"], 0)
+            self.assertEqual(len(update._recent_context_frames), 11)
+
+    def test_sparse_matched_situations_still_train_global_branch(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            expert = write_experts(Path(directory), length=32)
+            windows = th.zeros(8, 2, 2, 51)
+            windows[..., 2] = 91.25 / POSITION_SCALE[2]
+            for car in (BLUE_START, ORANGE_START):
+                windows[..., car + 2] = 17 / POSITION_SCALE[2]
+                windows[..., car + 14] = 1
+                windows[..., car + 16] = 1
+            windows[-1, :, :, 0] = .11  # Only these two endpoints have expert matches.
+            sampler = GlobalContextMinibatches(
+                expert, batch_size=4, epochs=1, noise_std=0,
+                context_length=32, stride=16,
+            )
+            for seed in range(10):
+                th.manual_seed(seed)
+                sample = next(sampler.sample_contexts(
+                    windows.flatten(0, 1), th.arange(16), 2,
+                ))
+                self.assertEqual(len(sample["is_agent"]), 2)
+                th.testing.assert_close(sample["window"][0, -1, 0], th.tensor(.11))
+
     def test_packed_context_preserves_padded_gradients(self):
         th.manual_seed(17)
         model = SceneDiscriminator(8, 8, 12, recurrent_global=True)
@@ -300,6 +460,29 @@ class RecurrentDiscriminatorTests(unittest.TestCase):
             valid, th.zeros_like(valid),
         )
         th.testing.assert_close(later[0, :, 2], th.exp(th.tensor([-2.4, -2., -2.8, -2.4])))
+
+    def test_reward_rebuilds_long_memory_after_training_over_short_rollouts(self):
+        model = AccumulatingFactorized()
+        reward = SceneDiscriminatorReward(
+            model, noise_std=0, trajectory_length=2, context_length=32,
+            exp_log_odds_reward=True, max_magnitude=100, batch_size=2,
+        )
+        valid = th.ones(8, 4, dtype=th.bool)
+        ended = th.zeros_like(valid)
+        for _ in range(4):
+            windows = th.zeros(8, 4, 2, 51)
+            windows[:, :, -1, 0] = .01
+            reward._score_windows(windows, valid, ended)
+
+        model.global_discriminator.gain.data.fill_(2)
+        model.context_version += 1
+        next_windows = th.zeros(1, 4, 2, 51)
+        next_windows[:, :, -1, 0] = .02
+        logits = reward._score_windows(
+            next_windows, th.ones(1, 4, dtype=th.bool),
+            th.zeros(1, 4, dtype=th.bool),
+        )
+        th.testing.assert_close(logits[0, :, 2], th.exp(th.full((4,), -.68)))
 
 
 if __name__ == "__main__":

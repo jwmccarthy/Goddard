@@ -12,10 +12,7 @@ const blueCheckpoint = document.getElementById('blueCheckpoint');
 const orangeCheckpoint = document.getElementById('orangeCheckpoint');
 const resetType = document.getElementById('resetType');
 const resetMatch = document.getElementById('resetMatch');
-const blueBoost = document.getElementById('blue-boost');
-const orangeBoost = document.getElementById('orange-boost');
-const blueBoostFill = document.getElementById('blue-boost-fill');
-const orangeBoostFill = document.getElementById('orange-boost-fill');
+const boostGrid = document.getElementById('boost-grid');
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
@@ -130,7 +127,8 @@ function makeCar(color) {
   return { group, material };
 }
 
-const cars = [makeCar(0x145bd7), makeCar(0xe65b35)];
+const carColors = [[0x145bd7, 0x468af4], [0xe65b35, 0xf49a4a]];
+const cars = [];
 const ball = new THREE.Mesh(
   new THREE.SphereGeometry(91.25, 28, 20),
   new THREE.MeshStandardMaterial({ color: 0xf8fbfc, roughness: 0.3, metalness: 0.04 }),
@@ -143,6 +141,7 @@ const right = new THREE.Vector3();
 const up = new THREE.Vector3();
 
 function setCar(index, state) {
+  if (!cars[index]) cars[index] = makeCar(carColors[state.team][state.player - 1]);
   const rig = cars[index];
   rig.group.visible = !state.demoed;
   rig.group.position.fromArray(state.pos);
@@ -152,6 +151,32 @@ function setCar(index, state) {
   basis.makeBasis(forward, right, up);
   rig.group.quaternion.setFromRotationMatrix(basis);
   rig.material.emissiveIntensity = state.boosting ? 1.2 : 0;
+}
+
+let boostMeters = [];
+function updateBoostMeters(states) {
+  if (boostMeters.length !== states.length) {
+    boostGrid.replaceChildren();
+    boostMeters = states.map((state) => {
+      const meter = document.createElement('div');
+      meter.className = `boost-meter${state.team ? ' orange' : ''}`;
+      const header = document.createElement('header');
+      const label = document.createElement('span');
+      label.textContent = `${state.team ? 'Orange' : 'Blue'}${states.length > 2 ? ` ${state.player}` : ''} boost`;
+      const output = document.createElement('output');
+      const track = document.createElement('i');
+      const fill = document.createElement('b');
+      header.append(label, output);
+      track.append(fill);
+      meter.append(header, track);
+      boostGrid.append(meter);
+      return { output, fill };
+    });
+  }
+  states.forEach((state, index) => {
+    boostMeters[index].output.textContent = state.boost.toFixed(0);
+    boostMeters[index].fill.style.width = `${state.boost}%`;
+  });
 }
 
 let initialSelection = false;
@@ -167,17 +192,14 @@ source.onmessage = ({ data }) => {
     connection.classList.remove('live');
     return;
   }
-  setCar(0, frame.cars[0]);
-  setCar(1, frame.cars[1]);
+  frame.cars.forEach((car, index) => setCar(index, car));
+  for (let index = frame.cars.length; index < cars.length; index += 1) cars[index].group.visible = false;
+  updateBoostMeters(frame.cars);
   ball.position.fromArray(frame.ball.pos);
   blueLabel.textContent = frame.blue.checkpoint;
   orangeLabel.textContent = frame.orange.checkpoint;
   goals.textContent = `${frame.blue.score} - ${frame.orange.score}`;
   roundLabel.textContent = `round ${frame.round} | tick ${frame.tick}`;
-  blueBoost.textContent = frame.cars[0].boost.toFixed(0);
-  orangeBoost.textContent = frame.cars[1].boost.toFixed(0);
-  blueBoostFill.style.width = `${frame.cars[0].boost}%`;
-  orangeBoostFill.style.width = `${frame.cars[1].boost}%`;
   if (!initialSelection) {
     blueCheckpoint.value = frame.blue.path;
     orangeCheckpoint.value = frame.orange.path;

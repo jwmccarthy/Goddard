@@ -1,0 +1,376 @@
+"""Four-car replay views, episode boundaries, and CARL replay resets."""
+
+import io
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+import torch as th
+
+from carl.gymnasium.state import (
+    BOOST_PAD_POSITIONS, CARLObservation, CarlEvents, CarlState, RewardContext,
+)
+from carl.gymnasium import CARLTorchVectorEnv
+from gaifo import (
+    AdaptiveDiscriminatorUpdate, CausalSceneTransformer, ExpertSceneDataset,
+    FactorizedSceneDiscriminator, GAIFO_DOUBLES_ARCHITECTURE,
+    GameplayDiagnostics, GeneratedContextTimeline,
+    SceneDiscriminatorLoss,
+    SceneDiscriminatorReward, SceneWindowCapture, actor_view, simulation_episode_ends,
+    build_policy, load_resume_checkpoint, main,
+)
+from jarl.data import TensorBatch
+from jarl.envs import DatasetResetSampler
+from jarl.transform import PrepareContext
+from replay_resets import ReplayResetProvider
+from watch_checkpoints import CheckpointRegistry, SpectatorState, simulate
+
+
+def write_four_povs(folder: Path, game: str, *, offset: float = 0) -> None:
+    scenes = th.zeros(32, 93)
+    scenes[:, 2] = 91.25 / 2076
+    for actor in range(4):
+        start = 9 + actor * 21
+        scenes[:, start] = (actor + 1) * 0.1 + offset
+        scenes[:, start + 2] = 17 / 2076
+        scenes[:, start + 9] = 1
+        scenes[:, start + 14] = 1
+        scenes[:, start + 16] = 1
+    for actor in range(4):
+        rows = np.zeros((len(scenes), 215), dtype=np.float32)
+        rows[:, :93] = actor_view(scenes, actor).numpy()
+        rows[:, 191] = 1  # This POV's exact, rather than inferred, internal state.
+        rows[:, 191 + 6] = actor + 0.25
+        if actor == 1:
+            rows[7, -2] = 1  # Discontinuity anywhere in the scene excludes the clip.
+        if actor == 2:
+            rows[9, 210] = 1  # Touch by a different stored POV is an unsafe reset.
+        name = folder / f"player{actor}-0-{game}"
+        np.save(name.with_suffix(".npy"), rows)
+        unsafe = np.zeros(len(rows), dtype=bool)
+        unsafe[8] = actor == 3
+        np.savez(name.with_suffix(".unsafe-starts.npz"), unsafe=unsafe,
+                 pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4)
+
+
+class DoublesDataTests(unittest.TestCase):
+    def test_all_recorded_povs_and_four_car_internal_states_are_split_by_game(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            write_four_povs(folder, "game-a")
+            write_four_povs(folder, "game-b", offset=0.05)
+            expert = ExpertSceneDataset(
+                folder, 3, frame_skip=4, heldout_size=8,
+                reject_discontinuities=True, n_cars=4,
+            )
+            self.assertEqual(expert.frames.shape, (8 * 34, 93))
+            self.assertEqual(expert.internal_states.shape, (8 * 34, 4, 19))
+            self.assertEqual(len(set(expert.segment_replay_keys)), 2)
+            self.assertTrue(expert.train_total > 0 and expert.heldout_total > 0)
+            frame_to_game = {}
+            cursor = 0
+            for length, game in zip(expert.lengths, expert.segment_replay_keys):
+                frame_to_game.update({index: game for index in range(cursor, cursor + length)})
+                cursor += length
+            train_games = {frame_to_game[int(start)] for start in expert.train_window_starts}
+            heldout_games = {frame_to_game[int(start)] for start in expert.heldout_window_starts}
+            self.assertFalse(train_games & heldout_games)
+
+            # Four physical ego views, rather than synthetic opponent rotations,
+            # survive as separate expert segments.
+            focal = expert.frames[expert.real_frame_indices, 9].unique()
+            self.assertGreaterEqual(len(focal), 4)
+            first = expert.internal_states[expert.segment_frame_indices[0][0]]
+            th.testing.assert_close(first[:, 6], th.tensor([.25, 1.25, 2.25, 3.25]))
+            self.assertTrue((first[:, 0] == 1).all())
+            self.assertFalse(bool(expert.opponent_pov_available.any()))
+            self.assertEqual(expert.sample(5, "cpu").shape, (5, 3, 93))
+
+            # Safety flags from *any* matching POV apply to every player's reset.
+            for segment in expert.segment_frame_indices:
+                self.assertFalse(bool(th.isin(segment[[7, 8, 9]], expert.reset_indices).any()),
+                                 (expert.internal_states[segment[0], :, 6],
+                                  expert.unsafe_reset_frames[segment[[7, 8, 9]]]))
+            sampler = DatasetResetSampler(expert.reset_dataset(), seed=4)
+            reset = ReplayResetProvider(
+                sampler, expert.frames, expert.internal_states,
+            )(th.tensor([True, False, True]))
+            self.assertEqual(reset.cars.shape, (2, 4, 21))
+            self.assertEqual(reset.car_internal_state.shape, (2, 4, 19))
+            self.assertTrue(reset.normalized)
+
+    def test_simulation_terminations_reset_all_four_histories(self):
+        done = th.tensor([[False, True, False, False, False, False, False, False]])
+        th.testing.assert_close(simulation_episode_ends(done, 4), th.tensor([
+            [True, True, True, True, False, False, False, False],
+        ]))
+        windows = th.zeros(3 * 4, 2, 93)
+        windows[:, -1, 0] = th.arange(3).repeat_interleave(4)
+        timeline = GeneratedContextTimeline(
+            windows, 4, th.tensor([
+                [False, False, False, False],
+                [False, False, True, False],
+                [False, False, False, False],
+            ]), n_cars=4,
+        )
+        contexts, ages = timeline.contexts(th.tensor([8, 9, 10, 11]), 3)
+        th.testing.assert_close(ages, th.ones(4, dtype=th.long))
+        th.testing.assert_close(contexts[:, :, 0], th.full((4, 3), 2.0))
+
+        capture = SceneWindowCapture(3, n_cars=4)
+        capture.reset(4)
+        obs = th.zeros(4, 191)
+        obs[:, 9] = th.arange(4)
+        context = SimpleNamespace(
+            observation=obs, env_step=SimpleNamespace(
+                next_obs=obs.clone(), done=th.tensor([False, True, False, False]),
+            ),
+        )
+        first = capture._capture(context)
+        self.assertEqual(first["scene_window"].shape, (4, 3, 93))
+        self.assertTrue(first["scene_window_valid"].all())
+        th.testing.assert_close(capture.history_age, th.zeros(4, dtype=th.long))
+
+    def test_team_goals_and_opponent_touch_credit_use_opposite_team(self):
+        raw = th.zeros(1, 9 + 22 * 4 + len(BOOST_PAD_POSITIONS))
+        raw[0, 2] = 700
+        cars = raw[:, 9:97].view(1, 4, 22)
+        cars[0, 0, 2] = 600
+        cars[0, 0, 21] = 1
+        previous = raw.clone()
+        observation = CARLObservation.from_tensor(th.zeros(4, 191), 4)
+        signs = th.tensor([1., 1., -1., -1.])
+        pads = th.tensor(BOOST_PAD_POSITIONS)
+        context = RewardContext(
+            current=CarlState.from_raw(raw, 4, pads, signs),
+            previous=CarlState.from_raw(previous, 4, pads, signs),
+            current_observation=observation, previous_observation=observation,
+            events=CarlEvents(
+                score_delta=th.tensor([1.]), done=th.tensor([True]),
+                terminated=th.tensor([True]), truncated=th.tensor([False]),
+            ),
+            actions=th.zeros(4, 7), score_difference=th.zeros(1),
+            episode_ticks=th.zeros(1), overtime=th.zeros(1, dtype=th.bool),
+        )
+        gameplay = GameplayDiagnostics(1, th.device("cpu"), 100, n_cars=4)
+        th.testing.assert_close(gameplay(context), signs[None])
+        th.testing.assert_close(gameplay.last_ego_ball_touch,
+                                th.tensor([True, False, False, False]))
+        th.testing.assert_close(gameplay.last_opponent_ball_touch,
+                                th.tensor([False, False, True, True]))
+        aerial = gameplay.last_aerial_touch_score
+        self.assertGreater(aerial[0].item(), 0)
+        self.assertEqual(aerial[1].item(), 0)
+        th.testing.assert_close(aerial[2:], th.full((2,), -aerial[0] / 2))
+
+
+class DoublesTransformerTests(unittest.TestCase):
+    def test_causal_context_ignores_padding_future_and_opponent_order(self):
+        th.manual_seed(9)
+        model = CausalSceneTransformer(8, 16, 16, max_context=4, layers=1)
+        model.eval()
+        scenes = th.randn(2, 4, 93) * .1
+        ages = th.tensor([4, 2])
+        score, prior = model.score_context(scenes, ages, return_previous=True)
+        changed = scenes.clone()
+        changed[0, -1] += .5
+        next_score, next_prior = model.score_context(changed, ages, return_previous=True)
+        th.testing.assert_close(prior[0], next_prior[0], rtol=0, atol=1e-6)
+        self.assertGreater((next_score[0] - score[0]).abs().item(), 1e-6)
+        changed = scenes.clone()
+        changed[1, :2] += 100  # These are padding, not real history.
+        th.testing.assert_close(model.score_context(changed, ages)[1], score[1])
+        swapped = scenes.clone()
+        swapped[..., 51:72] = scenes[..., 72:93]
+        swapped[..., 72:93] = scenes[..., 51:72]
+        th.testing.assert_close(model.score_context(swapped, ages), score, atol=1e-6, rtol=0)
+        with self.assertRaisesRegex(ValueError, "Transformer context"):
+            model(th.zeros(2, 5, 93))
+        scenes.requires_grad_()
+        model.score_context(scenes, ages).sum().backward()
+        self.assertGreater(scenes.grad[0, 0].abs().sum().item(), 0)
+
+    def test_global_reward_does_not_credit_expiration_of_old_frame(self):
+        class SummingGlobal(th.nn.Module):
+            def score_context(self, scenes, ages, *, return_previous=False):
+                valid = th.arange(scenes.shape[1])[None] >= scenes.shape[1] - ages[:, None]
+                score = (scenes[..., 0] * valid).sum(-1)
+                previous = score - scenes[:, -1, 0]
+                return (score, previous) if return_previous else score
+
+        class Heads(th.nn.Module):
+            factorized = True
+            transformer_global = True
+            recurrent_global = False
+            n_cars = 4
+            scene_size = 93
+
+            def __init__(self):
+                super().__init__()
+                self.global_discriminator = SummingGlobal()
+
+            def specialist_logits(self, scenes):
+                return scenes.new_zeros((len(scenes), 2))
+
+        windows = th.zeros(5, 4, 2, 93)
+        windows[0, 0, -1, 0] = 3
+        batch = TensorBatch({
+            "scene_window": windows, "scene_window_valid": th.ones(5, 4, dtype=th.bool),
+            "observation": th.zeros(5, 4, 191), "reward": th.zeros(5, 4),
+            "terminated": th.zeros(5, 4, dtype=th.bool),
+        })
+        result = SceneDiscriminatorReward(
+            Heads(), noise_std=0, trajectory_length=2, context_length=4,
+        )(batch, PrepareContext())
+        th.testing.assert_close(result["global_imitation_reward"][:, 0],
+                                th.tensor([-1.5, 0, 0, 0, 0]))
+
+    def test_factorized_specialists_and_variable_global_context_train_together(self):
+        previous_threads = th.get_num_threads()
+        th.set_num_threads(1)
+        try:
+            with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+                folder = Path(directory)
+                write_four_povs(folder, "game-a")
+                write_four_povs(folder, "game-b", offset=.05)
+                expert = ExpertSceneDataset(
+                    folder, 3, frame_skip=4, heldout_size=8,
+                    reject_discontinuities=True, n_cars=4,
+                )
+                discriminator = FactorizedSceneDiscriminator(
+                    8, 16, 16, n_cars=4, transformer_global=True, context_length=8,
+                )
+                scene = expert.sample(1, "cpu").repeat(4 * 8, 1, 1)
+                scene[:, -1, 3] += .1
+                windows = scene.reshape(4, 8, 3, 93)
+                experience = TensorBatch({
+                    "scene_window": windows,
+                    "scene_window_valid": th.ones(4, 8, dtype=th.bool),
+                    "terminated": th.zeros(4, 8, dtype=th.bool),
+                    "reward": th.zeros(4, 8),
+                })
+                update = AdaptiveDiscriminatorUpdate(
+                    expert, None, batch_size=8, epochs=1, noise_std=0,
+                    heldout_size=8, accuracy_target=1.0, history_add_size=0,
+                    history_mix_fraction=0, max_grad_norm=1,
+                    discriminator=discriminator,
+                    optimizer=th.optim.Adam(discriminator.parameters(), lr=1e-3),
+                    loss=SceneDiscriminatorLoss(discriminator), microbatch_size=2,
+                    context_length=8, context_stride=1,
+                )
+                _, result = update.run(experience)
+                self.assertGreater(result["Discriminator"]["minibatches"], 0)
+                self.assertGreater(result["Discriminator"]["train_context_steps"], 0)
+                self.assertTrue(np.isfinite(result["Discriminator"]["heldout_accuracy"]))
+                self.assertGreater(discriminator.context_version, 0)
+        finally:
+            th.set_num_threads(previous_threads)
+
+
+@unittest.skipUnless(
+    os.environ.get("GODDARD_GPU_SMOKE") == "1" and th.cuda.is_available(),
+    "opt-in CUDA/CARL 2v2 integration smoke",
+)
+class DoublesGpuSmokeTests(unittest.TestCase):
+    def test_full_four_actor_rollout_discriminator_ppo_and_checkpoint(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            replays = root / "replays"
+            replays.mkdir()
+            write_four_povs(replays, "game-a")
+            write_four_povs(replays, "game-b", offset=.05)
+            flags = [
+                "gaifo.py", "--team-size", "2", "--replay-dir", str(replays),
+                "--n-sim", "2", "--rollout", "8", "--trajectory-length", "3",
+                "--replay-reset-fraction", "1", "--timesteps", "64",
+                "--max-ticks", "3600", "--ppo-batch", "8", "--ppo-epochs", "1",
+                "--policy-hidden", "16", "--critic-hidden", "16",
+                "--discriminator-hidden", "16", "--frame-embedding", "8",
+                "--temporal-hidden", "16", "--discriminator-context-length", "8",
+                "--discriminator-context-stride", "2", "--discriminator-batch", "8",
+                "--discriminator-microbatch", "2", "--discriminator-heldout-size", "8",
+                "--discriminator-accuracy-target", "1.0",
+                "--discriminator-update-interval", "1", "--history-capacity", "32",
+                "--history-add-size", "8", "--log-dir", str(root / "runs"),
+                "--checkpoint-dir", str(root / "checkpoints"),
+            ]
+            output = io.StringIO()
+            with patch.object(sys, "argv", flags), redirect_stdout(output):
+                main()
+            paths = list((root / "checkpoints").rglob("gaifo_*.pt"))
+            self.assertGreaterEqual(len(paths), 2)
+            saved = load_resume_checkpoint(max(paths))
+            self.assertEqual(saved["step"], 64)
+            self.assertEqual(saved["config"]["team_size"], 2)
+            self.assertTrue(saved["config"]["factorize"])
+            self.assertTrue(saved["config"]["transformer_global"])
+            self.assertIn("global_discriminator.position.weight", saved["discriminator"])
+            self.assertGreater(len(saved["discriminator_optimizer"]["state"]), 0)
+            self.assertIn("D global accuracy", output.getvalue())
+
+    def test_viewer_plays_and_renders_four_cars_from_a_doubles_checkpoint(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            replays = root / "replays"
+            replays.mkdir()
+            write_four_povs(replays, "game-a")
+            write_four_povs(replays, "game-b", offset=.05)
+            path = root / "gaifo_000000000001.pt"
+            env = CARLTorchVectorEnv(
+                n_sim=1, n_blue=2, n_orange=2, seed=3, frameskip=4,
+                max_ticks=3600, normalize=True, discrete_actions=True,
+            )
+            try:
+                policy = build_policy(
+                    env, SimpleNamespace(policy_hidden=16, policy_layers=2, gru=False),
+                )
+                th.save({
+                    "config": {
+                        "architecture": GAIFO_DOUBLES_ARCHITECTURE,
+                        "team_size": 2, "frameskip": 4,
+                        "policy_hidden": 16, "policy_layers": 2, "gru": False,
+                    },
+                    "policy": policy.state_dict(),
+                }, path)
+            finally:
+                env.close()
+
+            args = SimpleNamespace(
+                replay_dir=replays, frameskip=4, reset_state_limit=32,
+                reset_corpus_limit=0, seed=3, max_ticks=3600, hidden_size=None,
+                blue_skill_seed=0, orange_skill_seed=1, sample=False, team_size=2,
+            )
+            state = SpectatorState()
+            thread = threading.Thread(
+                target=simulate,
+                args=(state, CheckpointRegistry(root), path, path, args),
+                daemon=True,
+            )
+            thread.start()
+            try:
+                with state.condition:
+                    self.assertTrue(state.condition.wait_for(
+                        lambda: state.frame is not None, timeout=30,
+                    ))
+                    frame = state.frame
+                self.assertNotIn("error", frame, frame)
+                self.assertEqual(
+                    [(car["team"], car["player"]) for car in frame["cars"]],
+                    [(0, 1), (0, 2), (1, 1), (1, 2)],
+                )
+                self.assertEqual(frame["tick"], 4)
+            finally:
+                state.stop.set()
+                thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+
+
+if __name__ == "__main__":
+    unittest.main()
