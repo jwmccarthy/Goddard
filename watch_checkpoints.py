@@ -255,12 +255,13 @@ def load_curated_reset_provider(
     corpus_limit: int | None,
     seed: int,
     team_size: int = 1,
+    show_progress: bool = False,
 ) -> CuratedViewerResetProvider:
     """Classify complete replay periods, then retain a bounded GPU reset cache."""
     expert = ExpertSceneDataset(
         replay_dir, trajectory_length=8, limit=corpus_limit, seed=seed,
         frame_skip=frame_skip, device="cpu", reject_discontinuities=True,
-        skill_sampling=True, n_cars=2 * team_size,
+        skill_sampling=True, n_cars=2 * team_size, show_progress=show_progress,
     )
     transform = CuratedReplayResetTransform(expert)
     weights = transform.weights.cpu().numpy()
@@ -292,10 +293,15 @@ def load_curated_reset_provider(
         for index, category in enumerate(SKILL_CATEGORIES)
     ])
     active_weights /= active_weights.sum()
-    return CuratedViewerResetProvider(
+    if show_progress:
+        print(f"Viewer reset cache: uploading {offset:,} states to {device}", flush=True)
+    provider = CuratedViewerResetProvider(
         th.cat(frames).to(device), th.cat(internals).to(device),
         pools, active_weights, seed,
     )
+    if show_progress:
+        print("Viewer reset cache ready", flush=True)
+    return provider
 
 
 def load_policy_checkpoint(
@@ -504,6 +510,7 @@ def simulate(
         reset_provider = load_curated_reset_provider(
             args.replay_dir, "cuda:0", args.frameskip, args.reset_state_limit,
             args.reset_corpus_limit or None, args.seed, args.team_size,
+            show_progress=True,
         )
         state.configure_reset_types(tuple(reset_provider.providers))
         base = CARLTorchVectorEnv(
