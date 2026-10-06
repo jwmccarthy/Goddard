@@ -22,9 +22,9 @@ from gaifo import (
     AdaptiveDiscriminatorUpdate, CausalSceneTransformer, CompactSceneWindows,
     DRIVING_SKILL, ExpertSceneDataset, GROUND_MANEUVER_START, TEAM_BALL_ROLES,
     FactorizedSceneDiscriminator, GAIFO_DOUBLES_ARCHITECTURE,
-    GAIFO_DOUBLES_MLP_ARCHITECTURE,
+    GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE,
     GameplayDiagnostics, GeneratedContextTimeline,
-    SceneDiscriminatorLoss,
+    SceneDiscriminator, SceneDiscriminatorLoss,
     SceneDiscriminatorReward, SceneWindowCapture, ShortWindowMLPDiscriminator,
     SceneGAIFOMinibatches, actor_view, build_discriminator, nearest_ball_distance, parse_args,
     scene_match_ids, scene_situation_ids,
@@ -132,17 +132,36 @@ class DoublesDataTests(unittest.TestCase):
             self.assertFalse(standard.factorize)
             self.assertFalse(standard.transformer_global)
 
-            for option in ("--factorize", "--transformer", "--transformer-global"):
+            for option in ("--transformer", "--transformer-global"):
                 with patch.object(sys, "argv", [*flags, option]):
                     mismatched, _ = parse_args()
-                with self.assertRaisesRegex(ValueError, "--factorize and --transformer together"):
+                with self.assertRaisesRegex(ValueError, "--transformer requires --factorize"):
                     validate_args(mismatched)
+
+            with patch.object(sys, "argv", [*flags, "--factorize"]):
+                factorized, _ = parse_args()
+            validate_args(factorized)
+            self.assertFalse(factorized.transformer_global)
+            separate = build_discriminator(factorized)
+            self.assertIsInstance(separate, FactorizedSceneDiscriminator)
+            self.assertIsInstance(separate.global_discriminator, SceneDiscriminator)
+            scenes = th.randn(3, factorized.trajectory_length, 93, requires_grad=True)
+            swapped = scenes.detach().clone()
+            swapped[..., 51:72], swapped[..., 72:93] = scenes[..., 72:93], scenes[..., 51:72]
+            logits = separate(scenes)
+            self.assertEqual(logits.shape, (3, 3))
+            th.testing.assert_close(separate(swapped), logits, rtol=0, atol=0)
+            logits.sum().backward()
+            self.assertGreater(scenes.grad[..., 51:72].abs().sum().item(), 0)
+            self.assertGreater(scenes.grad[..., 72:93].abs().sum().item(), 0)
 
             for transformer_flag in ("--transformer", "--transformer-global"):
                 with patch.object(sys, "argv", [*flags, "--factorize", transformer_flag]):
                     contextual, _ = parse_args()
                 validate_args(contextual)
-                self.assertIsInstance(build_discriminator(contextual), FactorizedSceneDiscriminator)
+                self.assertIsInstance(
+                    build_discriminator(contextual).global_discriminator, CausalSceneTransformer,
+                )
 
             for option, value in (("--ppo-lr-end", "-0.01"),
                                   ("--discriminator-lr-end", "nan"),
@@ -495,11 +514,11 @@ class DoublesGpuSmokeTests(unittest.TestCase):
             )
 
     def test_full_four_actor_rollout_discriminator_ppo_and_checkpoint(self):
-        for mlp in (False, True):
-            with self.subTest(mlp=mlp):
-                self._run_four_actor_training(mlp)
+        for mode in ("mlp", "factorized", "transformer"):
+            with self.subTest(mode=mode):
+                self._run_four_actor_training(mode)
 
-    def _run_four_actor_training(self, mlp: bool):
+    def _run_four_actor_training(self, mode: str):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
             replays = root / "replays"
@@ -521,8 +540,10 @@ class DoublesGpuSmokeTests(unittest.TestCase):
                 "--history-add-size", "8", "--log-dir", str(root / "runs"),
                 "--checkpoint-dir", str(root / "checkpoints"),
             ]
-            if not mlp:
+            if mode == "transformer":
                 flags.extend(("--factorize", "--transformer"))
+            elif mode == "factorized":
+                flags.append("--factorize")
             else:
                 flags.extend(("--ppo-lr-end", "0.00003",
                               "--discriminator-lr-end", "0.00003"))
@@ -534,48 +555,58 @@ class DoublesGpuSmokeTests(unittest.TestCase):
             saved = load_resume_checkpoint(max(paths))
             self.assertEqual(saved["step"], 128)
             self.assertEqual(saved["config"]["team_size"], 2)
-            self.assertEqual(saved["config"]["factorize"], not mlp)
-            self.assertEqual(saved["config"]["transformer_global"], not mlp)
-            self.assertEqual(saved["config"]["architecture"], (
-                GAIFO_DOUBLES_MLP_ARCHITECTURE if mlp else GAIFO_DOUBLES_ARCHITECTURE
-            ))
+            self.assertEqual(saved["config"]["factorize"], mode != "mlp")
+            self.assertEqual(saved["config"]["transformer_global"], mode == "transformer")
+            self.assertEqual(saved["config"]["architecture"], {
+                "mlp": GAIFO_DOUBLES_MLP_ARCHITECTURE,
+                "factorized": GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
+                "transformer": GAIFO_DOUBLES_ARCHITECTURE,
+            }[mode])
             self.assertIn(
-                "mlp.0.weight" if mlp else "global_discriminator.position.weight",
+                "mlp.0.weight" if mode == "mlp" else
+                "global_discriminator.gru.weight_ih_l0" if mode == "factorized" else
+                "global_discriminator.position.weight",
                 saved["discriminator"],
             )
             self.assertGreater(len(saved["discriminator_optimizer"]["state"]), 0)
-            if mlp:
+            if mode == "mlp":
                 self.assertAlmostEqual(saved["policy_optimizer"]["param_groups"][0]["lr"], 3e-5)
                 self.assertAlmostEqual(saved["critic_optimizer"]["param_groups"][0]["lr"], 3e-5)
                 self.assertAlmostEqual(saved["discriminator_optimizer"]["param_groups"][0]["lr"], 3e-5)
             self.assertIn("D heldout accuracy", output.getvalue())
-            if mlp:
+            if mode == "mlp":
                 self.assertNotIn("D global accuracy", output.getvalue())
-                with patch.object(sys, "argv", [
-                    "gaifo.py", "--resume-checkpoint", str(max(paths)),
-                    "--timesteps", "192",
-                ]):
-                    resumed, payload = parse_args()
-                validate_resume_args(resumed, payload)
-                self.assertIsInstance(build_discriminator(resumed), ShortWindowMLPDiscriminator)
+            else:
+                self.assertIn("D global accuracy", output.getvalue())
+            resume_flags = [
+                "gaifo.py", "--resume-checkpoint", str(max(paths)),
+                "--timesteps", "192",
+            ]
+            with patch.object(sys, "argv", resume_flags):
+                resumed, payload = parse_args()
+            validate_resume_args(resumed, payload)
+            self.assertEqual(resumed.factorize, mode != "mlp")
+            self.assertEqual(resumed.transformer_global, mode == "transformer")
+            self.assertIsInstance(
+                build_discriminator(resumed),
+                ShortWindowMLPDiscriminator if mode == "mlp" else FactorizedSceneDiscriminator,
+            )
+            if mode == "mlp":
                 self.assertAlmostEqual(resumed.ppo_lr_end, 3e-5)
                 self.assertAlmostEqual(resumed.discriminator_lr_end, 3e-5)
-                with patch.object(sys, "argv", [
-                    "gaifo.py", "--resume-checkpoint", str(max(paths)),
-                    "--timesteps", "192", "--factorize", "--transformer",
-                ]):
+                with patch.object(sys, "argv", [*resume_flags, "--factorize"]):
                     mismatched, payload = parse_args()
                 with self.assertRaisesRegex(ValueError, "--factorize must match"):
                     validate_resume_args(mismatched, payload)
-            else:
-                self.assertIn("D global accuracy", output.getvalue())
-                with patch.object(sys, "argv", [
-                    "gaifo.py", "--resume-checkpoint", str(max(paths)),
-                    "--timesteps", "192",
-                ]):
-                    resumed, payload = parse_args()
-                validate_resume_args(resumed, payload)
-                self.assertIsInstance(build_discriminator(resumed), FactorizedSceneDiscriminator)
+            elif mode == "factorized":
+                with patch.object(sys, "argv", [*resume_flags, "--transformer"]):
+                    mismatched, payload = parse_args()
+                with self.assertRaisesRegex(ValueError, "--transformer-global must match"):
+                    validate_resume_args(mismatched, payload)
+                invalid = root / "mislabelled.pt"
+                th.save({**saved, "config": {**saved["config"], "factorize": False}}, invalid)
+                with self.assertRaisesRegex(ValueError, "checkpoint discriminator mode"):
+                    load_resume_checkpoint(invalid)
 
     def test_viewer_plays_and_renders_four_cars_from_a_doubles_checkpoint(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

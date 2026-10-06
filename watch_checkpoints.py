@@ -28,6 +28,7 @@ from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_ASE_ARCHITECTURE,
     GAIFO_DOUBLES_ARCHITECTURE,
+    GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
     GAIFO_DOUBLES_MLP_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
     SKILL_CATEGORIES,
@@ -342,10 +343,14 @@ def load_policy_checkpoint(
         architecture = config.get("architecture")
         if architecture not in (
             GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
-            GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE,
+            GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
+            GAIFO_DOUBLES_MLP_ARCHITECTURE,
         ):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
-        doubles = architecture in (GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE)
+        doubles = architecture in (
+            GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
+            GAIFO_DOUBLES_MLP_ARCHITECTURE,
+        )
         if int(config.get("team_size", 1)) != team_size or (
             doubles != (team_size == 2)
         ):

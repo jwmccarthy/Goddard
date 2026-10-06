@@ -109,16 +109,17 @@ or you can choose different 2v2 checkpoints from that run in the viewer.
 
 2v2 defaults to a unified short-window MLP on the concatenated eight-frame
 four-car scenes, pooling the two opponents without depending on their POV
-order. It scores each window independently. To use factorized far/near
-specialists with a causal global Transformer instead, add both `--factorize`
-and `--transformer` (`--transformer-global` also works). Its capped context
+order. It scores each window independently. Add `--factorize` for independent
+far/near specialists and a global short-window GRU, which also pools the two
+opponents. Add `--factorize --transformer` to replace that global judge with a
+causal Transformer (`--transformer-global` also works). Its capped context
 trains on matched-length, contiguous agent/expert clips; global reward is the
 expert-log-odds change between a window and that **same window without its
-newest frame**, so an expiring old frame earns nothing. Every recorded expert
-POV is eligible, with held-out validation grouped by replay ID. The choice is
-saved in each checkpoint and restored when resuming a run. `--max-ticks 3600`
-is 30 seconds of game time at 120 physics ticks per second; use more ticks for
-longer episodes.
+newest frame**, so an expiring old frame earns nothing. `--transformer` alone
+requires `--factorize`. Every recorded expert POV is eligible, with held-out
+validation grouped by replay ID. The mode is saved in each checkpoint and
+restored when resuming a run. `--max-ticks 3600` is 30 seconds of game time at
+120 physics ticks per second; use more ticks for longer episodes.
 
 To anneal learning rates linearly over the total `--timesteps`, add, for example,
 `--ppo-lr-end 3e-5 --discriminator-lr-end 3e-5`. The policy and critic share the
@@ -126,10 +127,10 @@ PPO schedule; the discriminator has its own. Both rates stay constant unless
 an end value is supplied. Resumed runs restore the schedule from their saved
 settings and training step.
 
-Both 2v2 modes retain the curated aerial-touch, aerial-maneuver, dribble,
+All three 2v2 modes retain the curated aerial-touch, aerial-maneuver, dribble,
 flick, driving, and kickoff quotas. Generated and expert windows are paired
 within the same focal car/distance situation **and** ball role: closest ego,
 teammate, either opponent, or nobody within 1,500 units. Complete maneuvers
-can also be paired by setup, action, and recovery phase in both modes. These
+can also be paired by setup, action, and recovery phase in every mode. These
 role labels distinguish team context; they do not claim to identify passes or
 rotations without additional event-level labels.

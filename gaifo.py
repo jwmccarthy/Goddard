@@ -79,6 +79,7 @@ GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v3"
 GAIFO_GRU_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-gru"
 GAIFO_ASE_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-ase"
 GAIFO_DOUBLES_ARCHITECTURE = "scene-marl-gaifo-2v2-v1-transformer"
+GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE = "scene-marl-gaifo-2v2-v1-factorized"
 GAIFO_DOUBLES_MLP_ARCHITECTURE = "scene-marl-gaifo-2v2-v1-mlp"
 BALL_SIZE = 9
 CAR_SIZE = 21
@@ -2639,7 +2640,8 @@ class SceneDiscriminator(nn.Module):
             nn.ReLU(),
         )
         self.gru = nn.GRU(
-            frame_embedding * (n_cars + 1), temporal_hidden, batch_first=True
+            frame_embedding * (4 if n_cars == DOUBLES_N_CARS else n_cars + 1),
+            temporal_hidden, batch_first=True,
         )
         if recurrent_global:
             # The GRU's update gate retains old state. Its default ~0.5 gate
@@ -2657,7 +2659,12 @@ class SceneDiscriminator(nn.Module):
         ).view(1, 1, self.n_cars, 1)
         car_in = th.cat((cars, sign.expand(B, T, -1, -1)), dim=-1)
         ball_emb = self.ball_encoder(ball)
-        car_emb = self.car_encoder(car_in).flatten(-2)
+        car_emb = self.car_encoder(car_in)
+        if self.n_cars == DOUBLES_N_CARS:
+            # Opponents have the same role; their replay file order must not
+            # distinguish an expert POV from a generated one.
+            car_emb = th.cat((car_emb[:, :, :2], car_emb[:, :, 2:].mean(2, keepdim=True)), 2)
+        car_emb = car_emb.flatten(-2)
         return th.cat((ball_emb, car_emb), dim=-1)
 
     def forward(self, windows: th.Tensor) -> th.Tensor:
@@ -5515,6 +5522,7 @@ class GAIFOCheckpoints:
             "config": {
                 "architecture": (
                     (GAIFO_DOUBLES_ARCHITECTURE if self.args.transformer_global
+                     else GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE if self.args.factorize
                      else GAIFO_DOUBLES_MLP_ARCHITECTURE)
                     if getattr(self.args, "team_size", 1) == 2
                     else GAIFO_ASE_ARCHITECTURE if getattr(self.args, "ase_diversity", False) else (
@@ -5570,10 +5578,14 @@ def load_resume_checkpoint(path: Path) -> dict:
     architecture = config.get("architecture")
     if architecture not in (
         GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
-        GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE,
+        GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
+        GAIFO_DOUBLES_MLP_ARCHITECTURE,
     ):
         raise ValueError(f"incompatible GAIFO architecture in {path}")
-    doubles = architecture in (GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE)
+    doubles = architecture in (
+        GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
+        GAIFO_DOUBLES_MLP_ARCHITECTURE,
+    )
     if (not doubles
             and config.get("gru", False) != (architecture == GAIFO_GRU_ARCHITECTURE)):
         raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
@@ -5581,11 +5593,16 @@ def load_resume_checkpoint(path: Path) -> dict:
         raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
     if (config.get("team_size", 1) == 2) != doubles:
         raise ValueError(f"checkpoint team size does not match architecture in {path}")
-    if doubles and (
-        bool(config.get("transformer_global", False)) != (architecture == GAIFO_DOUBLES_ARCHITECTURE)
-        or bool(config.get("factorize", False)) != (architecture == GAIFO_DOUBLES_ARCHITECTURE)
-    ):
-        raise ValueError(f"checkpoint discriminator mode does not match architecture in {path}")
+    if doubles:
+        expected = (
+            GAIFO_DOUBLES_ARCHITECTURE if config.get("transformer_global", False)
+            else GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE if config.get("factorize", False)
+            else GAIFO_DOUBLES_MLP_ARCHITECTURE
+        )
+        if architecture != expected or (
+            config.get("transformer_global", False) and not config.get("factorize", False)
+        ):
+            raise ValueError(f"checkpoint discriminator mode does not match architecture in {path}")
     step = payload.get("step")
     if type(step) is not int or step < 0:
         raise ValueError(f"checkpoint has an invalid training step: {path}")
@@ -5821,7 +5838,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--factorize", action=argparse.BooleanOptionalAction, default=False,
-        help="train a global discriminator with far/near specialists (in 2v2, use together with --transformer; default: off)",
+        help="train a short-window global discriminator with far/near specialists; optionally add --transformer in 2v2 (default: off)",
     )
     parser.add_argument(
         "--hard-positive-mining", action=argparse.BooleanOptionalAction, default=False,
@@ -6031,8 +6048,8 @@ def validate_args(args: argparse.Namespace) -> None:
         print(f"Using {args.team_size}v{args.team_size} replays from {replay_dir}")
         args.replay_dir = replay_dir
 
-    if args.team_size == 2 and args.factorize != args.transformer_global:
-        raise ValueError("2v2 needs --factorize and --transformer together (or neither)")
+    if args.team_size == 2 and args.transformer_global and not args.factorize:
+        raise ValueError("2v2 --transformer requires --factorize")
     if args.team_size == 2 and (args.recurrent_global or args.ase_diversity):
         raise ValueError("2v2 does not support recurrent discriminator/ASE")
     if args.team_size == 2 and args.transformer_global and args.exp_log_odds_reward:
