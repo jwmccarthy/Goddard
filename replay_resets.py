@@ -37,15 +37,9 @@ class ReplayResetProvider:
         frames: th.Tensor,
         internal_states: th.Tensor,
     ) -> None:
-        if frames.ndim != 2 or frames.shape[1] not in (51, 93):
-            raise ValueError("replay resets need two- or four-car physical scenes")
-        n_cars = (frames.shape[1] - 9) // 21
-        if internal_states.shape != (len(frames), n_cars, INTERNAL_SIZE):
-            raise ValueError("replay internal states must match all cars and frames")
         self.sampler = sampler
         self.frames = frames
         self.internal_states = internal_states
-        self.n_cars = n_cars
 
     def __call__(self, reset_mask: th.Tensor) -> CARLResetState | None:
         sample = self.sampler(reset_mask)
@@ -53,15 +47,11 @@ class ReplayResetProvider:
             return None
         indices = sample["frame_index"]
         scenes = self.frames[indices]
-        internal_indices = indices.to(self.internal_states.device)
-        internal = self.internal_states[internal_indices].to(scenes.device)
         return CARLResetState(
             simulation_indices=sample["simulation_indices"],
             ball=CARLBall.from_tensor(scenes[:, :9]),
-            cars=CARLCars.from_tensor(
-                scenes[:, 9:].reshape(-1, self.n_cars, 21), self.n_cars // 2,
-            ),
-            car_internal_state=internal,
+            cars=CARLCars.from_tensor(scenes[:, 9:SCENE_SIZE].view(-1, 2, 21), 2),
+            car_internal_state=self.internal_states[indices],
             normalized=True,
         )
 

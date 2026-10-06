@@ -14,7 +14,7 @@ import torch as th
 
 from gaifo import (
     BLUE_START, ConfidentExpertResetTransform, ORANGE_START, POSITION_SCALE,
-    SceneDiscriminator, load_resume_checkpoint, main,
+    load_resume_checkpoint, main,
 )
 
 
@@ -23,20 +23,10 @@ from gaifo import (
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
-    def test_cuda_long_context_burnin_and_gradient(self):
-        model = SceneDiscriminator(8, 8, 8, recurrent_global=True).cuda()
-        scenes = th.randn(3, 96, 51, device="cuda", requires_grad=True)
-        ages = th.tensor([96, 72, 7], device="cuda")
-        logits = model.score_context(scenes, ages, bptt_length=64)
-        th.testing.assert_close(logits, model.score_context(scenes, ages))
-        logits.sum().backward()
-        self.assertTrue(th.isfinite(scenes.grad).all())
-        self.assertGreater(scenes.grad[0, 32].abs().sum().item(), 0)
-        th.testing.assert_close(scenes.grad[0, :32], th.zeros_like(scenes.grad[0, :32]))
-
     def _short_window_training(
         self, factorize: bool, hard_positive_mining: bool = False,
         exp_log_odds_reward: bool = False, recency_replay: bool = False,
+        transformer: bool = False,
     ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -62,7 +52,6 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "--replay-reset-fraction", "1",
                 "--n-sim", "2",
                 "--rollout", "8", "--trajectory-length", "8",
-                "--recurrent-global",
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
                 "--discriminator-hidden", "16", "--frame-embedding", "8",
@@ -76,6 +65,12 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "--log-dir", str(root / "runs"),
                 "--checkpoint-dir", str(root / "checkpoints"),
             ]
+            if transformer:
+                flags.extend(("--transformer", "--discriminator-context-length", "8",
+                              "--discriminator-context-stride", "2",
+                              "--ppo-lr-end", "1e-5", "--discriminator-lr-end", "1e-5"))
+            else:
+                flags.append("--recurrent-global")
             if factorize:
                 flags.append("--factorize")
             if hard_positive_mining:
@@ -83,10 +78,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             if exp_log_odds_reward:
                 flags.append("--exp-log-odds-reward")
             if recency_replay:
-                flags.extend((
-                    "--recency-replay", "--discriminator-context-length", "24",
-                    "--discriminator-bptt-length", "8",
-                ))
+                flags.append("--recency-replay")
             output = io.StringIO()
             ready_resets = []
             original_reset = ConfidentExpertResetTransform.__call__
@@ -102,11 +94,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)
             saved = load_resume_checkpoint(max(checkpoints))
-            self.assertTrue(saved["config"]["recurrent_global"])
+            self.assertEqual(saved["config"]["recurrent_global"], not transformer)
+            self.assertEqual(saved["config"].get("transformer_global", False), transformer)
             self.assertEqual(saved["config"]["discriminator_context_length"],
-                             24 if recency_replay else 128)
-            self.assertEqual(saved["config"]["discriminator_bptt_length"],
-                             8 if recency_replay else 64)
+                             8 if transformer else 16)
             optimizer = saved["discriminator_optimizer"]
             self.assertEqual(len(optimizer["state"]), len(optimizer["param_groups"][0]["params"]))
             return saved, output.getvalue(), ready_resets
@@ -138,6 +129,21 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         self.assertIn("D far accuracy", output)
         self.assertIn("D near accuracy", output)
         self.assertIn("D global accuracy", output)
+
+    def test_transformer_trains_and_rewards_in_both_1v1_modes(self):
+        for factorize in (False, True):
+            with self.subTest(factorize=factorize):
+                saved, output, _ = self._short_window_training(
+                    factorize, transformer=True,
+                )
+                self.assertEqual(saved["step"], 64)
+                self.assertIn("D heldout accuracy", output)
+                self.assertEqual(saved["config"]["ppo_lr_end"], 1e-5)
+                self.assertIn("PPO LR", output)
+                self.assertIn("D LR", output)
+                self.assertTrue(any(key.startswith(
+                    "global_discriminator.temporal." if factorize else "temporal."
+                ) for key in saved["discriminator"]))
 
     def test_hard_positive_mining_in_unified_and_factorized_modes(self):
         for factorize in (False, True):

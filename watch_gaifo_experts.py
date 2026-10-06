@@ -26,12 +26,13 @@ import torch as th
 from gaifo import (
     BALL_NEAR_DISTANCE, BALL_RADIUS, BLUE_START, CAR_SIZE,
     GLOBAL_DISCRIMINATOR_WEIGHT, SPECIALIST_DISCRIMINATOR_WEIGHT, GAIFO_ARCHITECTURE,
-    GAIFO_ASE_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GROUND_MANEUVERS,
+    GAIFO_GRU_ARCHITECTURE, GROUND_MANEUVERS,
     GROUND_MANEUVER_START, DRIVING_SKILL, KICKOFF_SKILL,
     ORANGE_START, POSITION_SCALE,
     SKILL_CATEGORIES,
     ExpertSceneDataset, FactorizedSceneDiscriminator, build_discriminator,
-    load_discriminator_state, nearest_ball_distance, opponent_view,
+    bounded_context_batch_size, load_discriminator_state, nearest_ball_distance,
+    opponent_view,
 )
 from watch_checkpoints import CheckpointRegistry
 
@@ -73,12 +74,14 @@ def load_discriminator(path: Path, device: th.device):
         raise ValueError(f"invalid GAIFO checkpoint: {path}")
     config = payload["config"]
     if config.get("architecture") not in (
-        GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
+        GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
     ) or "discriminator" not in payload:
         raise ValueError(f"checkpoint has no supported 1v1 discriminator: {path}")
     args = argparse.Namespace(
         factorize=bool(config.get("factorize", False)),
         recurrent_global=bool(config.get("recurrent_global", False)),
+        transformer_global=bool(config.get("transformer_global", False)),
+        discriminator_context_length=int(config.get("discriminator_context_length", 16)),
         discriminator_hidden=int(config["discriminator_hidden"]),
         frame_embedding=int(config["frame_embedding"]),
         temporal_hidden=int(config["temporal_hidden"]),
@@ -257,6 +260,8 @@ def score_sequences(
     heads = ("combined",)
     if getattr(model, "factorized", False):
         heads = HEADS if getattr(model, "global_discriminator", None) is not None else LEGACY_HEADS
+    if getattr(model, "transformer_global", False):
+        batch_size = bounded_context_batch_size(batch_size, model.context_length, 8)
     for record in records:
         record.probabilities = np.empty((record.length, len(heads)), dtype=np.float32)
     total = sum(record.length for record in records)
@@ -271,7 +276,8 @@ def score_sequences(
         chosen = th.tensor(pairs, dtype=th.long, device=expert.frames.device)
         windows = expert._windows_for_povs(chosen).to(device)
         with th.inference_mode():
-            if getattr(model, "recurrent_global", False):
+            if (getattr(model, "recurrent_global", False)
+                    or getattr(model, "transformer_global", False)):
                 context = windows.new_empty((len(pairs), model.context_length, windows.shape[-1]))
                 ages = chosen.new_empty((len(pairs),))
                 heldout = th.tensor(

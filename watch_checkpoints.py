@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch Basic 1v1 or GAIFO 1v1/2v2 checkpoints play in the browser."""
+"""Watch Basic or GAIFO 1v1 checkpoints play in the browser."""
 
 import argparse
 import json
@@ -16,27 +16,18 @@ from pathlib import Path
 import carl
 import numpy as np
 import torch as th
-from rich.progress import (
-    BarColumn, DownloadColumn, Progress, TextColumn, TimeElapsedColumn,
-)
-
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
 
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
 from gaifo import (
     GAIFO_ARCHITECTURE,
-    GAIFO_ASE_ARCHITECTURE,
-    GAIFO_DOUBLES_ARCHITECTURE,
-    GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
-    GAIFO_DOUBLES_MLP_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
     SKILL_CATEGORIES,
     CuratedReplayResetTransform,
     ExpertSceneDataset,
     build_policy as build_gaifo_policy,
 )
-from gaifo_ase import SkillObservationSpace, SkillViewerPolicy
 from replay_resets import (
     ReplayResetProvider, reset_index_dataset,
 )
@@ -259,14 +250,12 @@ def load_curated_reset_provider(
     state_limit: int,
     corpus_limit: int | None,
     seed: int,
-    team_size: int = 1,
-    show_progress: bool = False,
 ) -> CuratedViewerResetProvider:
     """Classify complete replay periods, then retain a bounded GPU reset cache."""
     expert = ExpertSceneDataset(
         replay_dir, trajectory_length=8, limit=corpus_limit, seed=seed,
         frame_skip=frame_skip, device="cpu", reject_discontinuities=True,
-        skill_sampling=True, n_cars=2 * team_size, show_progress=show_progress,
+        skill_sampling=True,
     )
     transform = CuratedReplayResetTransform(expert)
     weights = transform.weights.cpu().numpy()
@@ -298,25 +287,8 @@ def load_curated_reset_provider(
         for index, category in enumerate(SKILL_CATEGORIES)
     ])
     active_weights /= active_weights.sum()
-    gpu_progress = show_progress and th.device(device).type == "cuda"
-    upload_bytes = sum(
-        tensor.numel() * tensor.element_size()
-        for tensor in (*frames, *internals)
-    ) if gpu_progress else 0
-    with Progress(
-        TextColumn("{task.description}"), BarColumn(), DownloadColumn(binary_units=True),
-        TimeElapsedColumn(), disable=not gpu_progress,
-    ) as progress:
-        task = progress.add_task(f"Viewer reset cache to {device}", total=upload_bytes)
-        cached_frames = th.cat(frames).to(device)
-        if gpu_progress:
-            progress.advance(task, cached_frames.numel() * cached_frames.element_size())
-        cached_internals = th.cat(internals).to(device)
-        if gpu_progress:
-            progress.advance(task, cached_internals.numel() * cached_internals.element_size())
-            progress.update(task, description=f"Viewer reset cache ready: {offset:,} states")
     provider = CuratedViewerResetProvider(
-        cached_frames, cached_internals, pools, active_weights, seed,
+        th.cat(frames).to(device), th.cat(internals).to(device), pools, active_weights, seed,
     )
     return provider
 
@@ -326,9 +298,6 @@ def load_policy_checkpoint(
     env: CARLTorchVectorEnv,
     frameskip: int,
     hidden_size: int | None,
-    *,
-    skill_seed: int = 0,
-    team_size: int = 1,
 ):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
@@ -341,45 +310,21 @@ def load_policy_checkpoint(
     kind = checkpoint_kind(path)
     if kind == "gaifo":
         architecture = config.get("architecture")
-        if architecture not in (
-            GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
-            GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
-            GAIFO_DOUBLES_MLP_ARCHITECTURE,
-        ):
+        if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
-        doubles = architecture in (
-            GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_FACTORIZED_ARCHITECTURE,
-            GAIFO_DOUBLES_MLP_ARCHITECTURE,
-        )
-        if int(config.get("team_size", 1)) != team_size or (
-            doubles != (team_size == 2)
-        ):
-            raise ValueError(
-                f"checkpoint team size does not match --team-size {team_size}: {path}"
-            )
-        gru = architecture == GAIFO_GRU_ARCHITECTURE or (
-            doubles and config.get("gru", False)
-        )
-        if not doubles and config.get("gru", False) != gru:
+        if config.get("team_size", 1) != 1:
+            raise ValueError(f"checkpoint team size is not 1v1: {path}")
+        gru = architecture == GAIFO_GRU_ARCHITECTURE
+        if config.get("gru", False) != gru:
             raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
-        if config.get("ase_diversity", False) != (architecture == GAIFO_ASE_ARCHITECTURE):
-            raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
         hidden = int(config["policy_hidden"])
         layers = int(config.get("policy_layers", 1))
-        skill_size = (
-            int(config["ase_skill_dim"])
-            if architecture == GAIFO_ASE_ARCHITECTURE else 0
-        )
-        if architecture == GAIFO_ASE_ARCHITECTURE and skill_size < 2:
-            raise ValueError(f"checkpoint ASE skill dimension is invalid: {path}")
         policy = build_gaifo_policy(
-            SkillObservationSpace(env, skill_size) if skill_size else env,
+            env,
             argparse.Namespace(policy_hidden=hidden, policy_layers=layers, gru=gru),
         )
         policy_state = payload["policy"]
     else:
-        if team_size != 1:
-            raise ValueError("Basic checkpoints support 1v1 viewing only")
         checkpoint = policy_checkpoint(payload, path)
         policy_state = checkpoint.state
         hidden = checkpoint.hidden_size
@@ -403,17 +348,7 @@ def load_policy_checkpoint(
             )
 
     policy.load_state_dict(policy_state)
-    if kind == "gaifo" and architecture == GAIFO_ASE_ARCHITECTURE:
-        wrapped = SkillViewerPolicy(
-            policy.eval().requires_grad_(False), skill_size, skill_seed,
-        )
-        return wrapped.eval().requires_grad_(False), (
-            "gaifo", hidden, layers, architecture, skill_size,
-        )
     signature = (
-        # Match 2v2 policies with identical shapes regardless of their judge.
-        (kind, hidden, GAIFO_DOUBLES_ARCHITECTURE, layers, gru)
-        if kind == "gaifo" and team_size == 2 else
         (kind, hidden, architecture, layers) if architecture is not None else
         (kind, hidden, architecture)
     )
@@ -426,22 +361,12 @@ def load_match(
     base: CARLTorchVectorEnv,
     frameskip: int,
     hidden_size: int | None,
-    blue_skill_seed: int = 0,
-    orange_skill_seed: int = 1,
-    *,
-    team_size: int = 1,
 ):
     kind = checkpoint_kind(blue_path)
     if kind != checkpoint_kind(orange_path):
         raise ValueError("selected policies use different trainer architectures")
-    blue, blue_signature = load_policy_checkpoint(
-        blue_path, base, frameskip, hidden_size,
-        skill_seed=blue_skill_seed, team_size=team_size,
-    )
-    orange, orange_signature = load_policy_checkpoint(
-        orange_path, base, frameskip, hidden_size,
-        skill_seed=orange_skill_seed, team_size=team_size,
-    )
+    blue, blue_signature = load_policy_checkpoint(blue_path, base, frameskip, hidden_size)
+    orange, orange_signature = load_policy_checkpoint(orange_path, base, frameskip, hidden_size)
     if blue_signature != orange_signature:
         raise ValueError("selected policies use different trainer architectures")
     return base, blue, orange
@@ -465,10 +390,9 @@ def render_frame(
     orange_score: int,
     round_number: int,
     tick: int,
-    team_size: int = 1,
 ) -> dict:
     raw = raw[0].cpu()
-    cars = raw[9:9 + 44 * team_size].view(2 * team_size, 22)
+    cars = raw[9:53].view(2, 22)
     rendered = []
     for index, car in enumerate(cars):
         forward = car[9:12]
@@ -481,8 +405,8 @@ def render_frame(
             + up * CAR_OFFSET[2]
         )
         rendered.append({
-            "team": index // team_size,
-            "player": index % team_size + 1,
+            "team": index,
+            "player": 1,
             "pos": vector(center),
             "fwd": vector(forward),
             "rgt": vector(right),
@@ -532,14 +456,13 @@ def simulate(
     try:
         reset_provider = load_curated_reset_provider(
             args.replay_dir, "cuda:0", args.frameskip, args.reset_state_limit,
-            args.reset_corpus_limit or None, args.seed, args.team_size,
-            show_progress=True,
+            args.reset_corpus_limit or None, args.seed,
         )
         state.configure_reset_types(tuple(reset_provider.providers))
         base = CARLTorchVectorEnv(
             n_sim=1,
-            n_blue=args.team_size,
-            n_orange=args.team_size,
+            n_blue=1,
+            n_orange=1,
             seed=args.seed,
             frameskip=args.frameskip,
             max_ticks=args.max_ticks,
@@ -550,12 +473,10 @@ def simulate(
         )
         env, blue, orange = load_match(
             blue_path, orange_path, base, args.frameskip, args.hidden_size,
-            args.blue_skill_seed, args.orange_skill_seed,
-            team_size=args.team_size,
         )
         observation = env.reset()
-        blue_state = blue.initial_state(args.team_size)
-        orange_state = orange.initial_state(args.team_size)
+        blue_state = blue.initial_state(1)
+        orange_state = orange.initial_state(1)
         blue_score = orange_score = 0
         round_number = 1
         tick = 0
@@ -568,8 +489,6 @@ def simulate(
                     next_env, next_blue, next_orange = load_match(
                         pending[0], pending[1], base, args.frameskip,
                         args.hidden_size,
-                        args.blue_skill_seed, args.orange_skill_seed,
-                        team_size=args.team_size,
                     )
                 except Exception as error:
                     state.publish({"error": f"{type(error).__name__}: {error}"})
@@ -577,8 +496,8 @@ def simulate(
                     blue_path, orange_path = pending
                     env = next_env
                     blue, orange = next_blue, next_orange
-                    blue_state = blue.initial_state(args.team_size)
-                    orange_state = orange.initial_state(args.team_size)
+                    blue_state = blue.initial_state(1)
+                    orange_state = orange.initial_state(1)
                     state.request_reset()
 
             request = state.take_reset_request()
@@ -586,19 +505,19 @@ def simulate(
                 kickoff, reset_type = request
                 reset_provider.select(reset_type)
                 observation = reset_observation(env, kickoff)
-                blue_state = blue.initial_state(args.team_size)
-                orange_state = orange.initial_state(args.team_size)
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
                 blue_score = orange_score = 0
                 round_number = 1
                 tick = 0
 
             with th.inference_mode():
                 blue_output = blue.act(
-                    observation[:args.team_size], blue_state,
+                    observation[:1], blue_state,
                     deterministic=not args.sample,
                 )
                 orange_output = orange.act(
-                    observation[args.team_size:], orange_state,
+                    observation[1:], orange_state,
                     deterministic=not args.sample,
                 )
                 blue_state = blue_output.next_state
@@ -611,8 +530,8 @@ def simulate(
             blue_score += max(goal, 0)
             orange_score += max(-goal, 0)
             if (terminated | truncated).any():
-                blue_state = blue.initial_state(args.team_size)
-                orange_state = orange.initial_state(args.team_size)
+                blue_state = blue.initial_state(1)
+                orange_state = orange.initial_state(1)
                 round_number += 1
                 tick = 0
 
@@ -625,7 +544,6 @@ def simulate(
                 orange_score,
                 round_number,
                 tick,
-                args.team_size,
             ))
             next_step += args.frameskip / 120.0
             delay = next_step - time.perf_counter()
@@ -751,10 +669,9 @@ def make_handler(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "checkpoints")
-    parser.add_argument("--team-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--replay-dir", type=Path,
-        help="parsed POV directory (default: pro_1v1_fs4 or pro_2v2_fs4)",
+        help="parsed POV directory (default: pro_1v1_fs4)",
     )
     parser.add_argument("--blue")
     parser.add_argument("--orange")
@@ -770,16 +687,13 @@ def parse_args() -> argparse.Namespace:
         help="replay frames to classify for curated resets (0 scans the full corpus)",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--blue-skill-seed", type=int, default=0)
-    parser.add_argument("--orange-skill-seed", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
     if args.replay_dir is None:
-        team = args.team_size
-        args.replay_dir = ROOT / f"parsed_replays/pro_{team}v{team}_fs4"
+        args.replay_dir = ROOT / "parsed_replays/pro_1v1_fs4"
     if (args.blue is None) != (args.orange is None):
         parser.error("--blue and --orange must be provided together")
     if args.frameskip < 1 or args.max_ticks < 1 or args.reset_state_limit < 1:

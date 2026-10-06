@@ -15,15 +15,12 @@ from unittest.mock import patch
 from uuid import UUID
 
 import numpy as np
-import pandas as pd
 
 from ballchasing_replays.download_mechanical_duels import (
     accepted_replay, choose_focal_povs, downloaded_replay_ids, existing_replay_ids,
     fair_download_order, main, replay_player_ids, select_replays,
 )
-from ballchasing_replays.parse_replays import (
-    _mark_discontinuities, _parse, _resample_observations, _valid_replay, parse,
-)
+from ballchasing_replays.parse_replays import _parse, parse
 
 
 def entry(number, date="2026-07-10T12:00:00Z", *, playlist="ranked-duels",
@@ -356,144 +353,6 @@ class MechanicalDuelsTests(unittest.TestCase):
             self.assertEqual([path.name for path in Path(directory).glob("*.npy")],
                              ["2-0-sample-game.npy"])
             self.assertEqual(set(seen_car_ids), {("2", "1")})
-
-    def test_ranked_doubles_selects_only_verified_four_car_matches(self):
-        after = datetime(2025, 4, 3, tzinfo=timezone.utc)
-        before = datetime(2026, 10, 4, tzinfo=timezone.utc)
-        four = entry(101, playlist="ranked-doubles")
-        four["blue"]["players"].append({
-            "id": {"platform": "epic", "id": "333"},
-        })
-        four["orange"]["players"].append({
-            "id": {"platform": "steam", "id": "444"},
-        })
-        self.assertEqual(replay_player_ids(four, 2), (
-            "steam:111", "epic:333", "epic:222", "steam:444",
-        ))
-        self.assertTrue(accepted_replay(
-            four, "steam:111", after, before, playlist="ranked-doubles",
-        ))
-        self.assertFalse(accepted_replay(four, "steam:111", after, before))
-        invalid = entry(102, playlist="ranked-doubles")
-        client = FakeClient([four, invalid, entry(103)])
-        roster = {"players": [{"name": "Zen", "platform_ids": ["steam:111"]}]}
-        selected, counts = select_replays(
-            client, roster, after, before, playlist="ranked-doubles",
-            max_per_player=6,
-        )
-        self.assertEqual(list(selected), [four["id"]])
-        self.assertEqual(selected[four["id"]]["target_online_ids"], {"Zen": "111"})
-        self.assertEqual(counts["Zen"]["total"], 1)
-        self.assertTrue(all(q["playlist"] == "ranked-doubles" for q in client.queries))
-
-    def test_ranked_doubles_download_uses_one_verified_pov_and_four_car_parser(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            root = Path(directory)
-            roster = root / "roster.json"
-            roster.write_text(json.dumps({"players": [
-                {"name": "Zen", "platform_ids": ["steam:111"]},
-                {"name": "Atow", "platform_ids": ["epic:333"]},
-            ]}))
-            replay = entry(104, playlist="ranked-doubles")
-            replay["blue"]["players"].append({
-                "id": {"platform": "epic", "id": "333"},
-            })
-            replay["orange"]["players"].append({
-                "id": {"platform": "steam", "id": "444"},
-            })
-            client = FakeClient([replay, entry(105)])
-            raw = root / "raw"
-            flags = [
-                "download_mechanical_duels.py", "--roster", str(roster),
-                "--playlist", "ranked-doubles", "--replay-dir", str(raw),
-                "--parsed-dir", str(root / "parsed"), "--since", "2025-04-03",
-                "--until", "2026-10-04", "--max-per-player", "6",
-                "--max-downloads", "1", "--parse",
-            ]
-            with (patch.object(sys, "argv", flags),
-                  patch.dict(os.environ, {"BALLCHASING_TOKEN": "test"}),
-                  patch("ballchasing_replays.download_mechanical_duels.BallchasingClient",
-                        return_value=client),
-                  patch("ballchasing_replays.download_mechanical_duels.parse") as parser,
-                  redirect_stdout(io.StringIO())):
-                main()
-            self.assertEqual(client.downloads, [replay["id"]])
-            self.assertEqual(parser.call_args.kwargs["team_size"], 2)
-            self.assertEqual(parser.call_args.kwargs["replay_ids"], {replay["id"]})
-            self.assertTrue(parser.call_args.kwargs["require_pov_manifest"])
-            selection = json.loads((raw / "ranked_selection.json").read_text())
-            self.assertEqual(selection["playlist"], "ranked-doubles")
-            focal = json.loads((raw / "pov_players.json").read_text())
-            self.assertIn(focal[replay["id"]], (["111"], ["333"]))
-
-    def test_doubles_parser_writes_four_car_scene_and_safety_for_one_pov(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            cars = {
-                str(index): SimpleNamespace(team_num=int(index > 2))
-                for index in range(1, 5)
-            }
-            replay = SimpleNamespace(
-                metadata={"players": [{
-                    "unique_id": str(i), "online_id": str(i),
-                    "is_orange": bool(i > 2),
-                } for i in range(1, 5)]},
-                player_dfs={str(i): None for i in range(1, 5)},
-                game_df={"delta": pd.Series(np.full(20, 1 / 30)),
-                         "time": pd.Series(np.arange(20, dtype=float) / 30)},
-                analyzer={"gameplay_periods": [{"goal_frame": None}]},
-            )
-            self.assertTrue(_valid_replay(replay, team_size=2))
-            self.assertFalse(_valid_replay(replay, team_size=1))
-            frames = [[(
-                SimpleNamespace(state=SimpleNamespace(cars=cars, tick_count=4 * index)),
-                {"1": {"position": 151}} if index == 10 else {},
-            ) for index in range(20)]]
-            seen = []
-
-            def observation(frame, car_ids):
-                seen.append(tuple(car_ids))
-                result = np.zeros(213, dtype=np.float32)
-                for i, car_id in enumerate(car_ids):
-                    start = 9 + 21 * i
-                    result[start] = float(car_id) / 10
-                    result[start + 9] = 1
-                    result[start + 14] = 1
-                    result[start + 16] = 1
-                result[191] = 1  # Ego on-ground internal state.
-                return result
-
-            with (patch("ballchasing_replays.parse_replays._get_active_frames",
-                        return_value=frames),
-                  patch("ballchasing_replays.parse_replays._build_observation",
-                        side_effect=observation)):
-                self.assertEqual(_parse(replay, "doubles", Path(directory), 4, ("3",)), 1)
-            self.assertEqual(set(seen), {("3", "4", "1", "2")})
-            saved = list(Path(directory).glob("*.npy"))
-            self.assertEqual([p.name for p in saved], ["3-0-doubles.npy"])
-            rows = np.load(saved[0])
-            self.assertEqual(rows.shape, (20, 215))
-            np.testing.assert_allclose(rows[0, [9, 30, 51, 72]], [.3, .4, .1, .2])
-            self.assertEqual(rows[10, -2], 1)  # Correction to any of four cars.
-            with np.load(saved[0].with_suffix(".unsafe-starts.npz")) as metadata:
-                self.assertEqual(set(metadata), {"unsafe", "frame_skip", "pre_goal"})
-                self.assertEqual(metadata["unsafe"].shape, (20,))
-                self.assertEqual(int(metadata["frame_skip"]), 4)
-
-    def test_doubles_resampler_handles_last_car_orientation_and_contact(self):
-        ticks = np.array([0, 8], dtype=int)
-        source = np.zeros((2, 214), dtype=np.float32)
-        for index in range(4):
-            start = 9 + 21 * index
-            source[:, start + 9] = 1
-            source[:, start + 14] = 1
-        source[0, 72 + 16] = 1
-        source[1, 72 + 16] = 0
-        source[1, 210] = 1
-        output = _resample_observations(ticks, source, 4)
-        self.assertEqual(output.shape, (3, 214))
-        self.assertEqual(output[:, 72 + 16].tolist(), [1, 1, 0])
-        self.assertEqual(output[:, 210].tolist(), [0, 0, 1])
-        self.assertEqual(_mark_discontinuities(output, 4).shape, (3, 215))
 
 
 if __name__ == "__main__":

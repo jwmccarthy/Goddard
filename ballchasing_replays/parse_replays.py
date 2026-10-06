@@ -40,7 +40,6 @@ MAX_REPLAY_QUATERNION_ERROR = 0.05
 INTERNAL_STATE_SIZE = 19
 EVENT_FEATURES = 4
 SCHEMA_VERSION = 9
-DOUBLES_SCHEMA_VERSION = 10
 
 OWN_GOAL = np.array([0, -5120, 321.3875])
 OPP_GOAL = np.array([0,  5120, 321.3875])
@@ -71,7 +70,7 @@ def _safe_load(path: Path) -> ParsedReplay:
         return
 
 
-def _valid_replay(replay: ParsedReplay, team_size: int = 1) -> bool:
+def _valid_replay(replay: ParsedReplay) -> bool:
     players = {
         str(player["unique_id"]): player
         for player in replay.metadata.get("players", [])
@@ -79,9 +78,9 @@ def _valid_replay(replay: ParsedReplay, team_size: int = 1) -> bool:
     active = [players.get(str(player_id)) for player_id in replay.player_dfs]
     delta = replay.game_df["delta"].to_numpy()
     return (
-        len(active) == 2 * team_size
+        len(active) == 2
         and all(player is not None for player in active)
-        and sum(bool(player["is_orange"]) for player in active) == team_size
+        and sum(bool(player["is_orange"]) for player in active) == 1
         and np.isfinite(delta).all()
         and np.isfinite(replay.game_df["time"]).all()
         and 25 < 1 / delta.mean() < 35
@@ -256,11 +255,6 @@ def _resample_observations(
     observations: np.ndarray,
     tick_skip:    int,
 ) -> np.ndarray:
-    # The source contains the ego's internal state, three contact flags and
-    # one replay-correction flag after the physical/relative observations.
-    n_cars, remainder = divmod(observations.shape[1] - 106, 27)
-    if n_cars not in (2, 4) or remainder:
-        raise ValueError("replay observations need two or four cars")
     ticks, unique = np.unique(ticks, return_index=True)
     observations = observations[unique].copy()
 
@@ -268,7 +262,7 @@ def _resample_observations(
         return observations.astype(np.float32, copy=False)
 
     physics = [(0, NORM_BALL_VEL, None)] + [
-        (9 + 21 * index, NORM_CAR_VEL, NORM_CAR_ANG) for index in range(n_cars)
+        (9 + 21 * index, NORM_CAR_VEL, NORM_CAR_ANG) for index in range(2)
     ]
 
     for start, velocity_scale, angular_scale in physics:
@@ -324,7 +318,7 @@ def _resample_observations(
 
     discrete = []
 
-    for index in range(n_cars):
+    for index in range(2):
         car_start = 9 + 21 * index
         discrete.extend(range(car_start + 16, car_start + 21))
 
@@ -334,10 +328,10 @@ def _resample_observations(
         up -= np.sum(up * forward, axis=-1, keepdims=True) * forward
         up /= np.linalg.norm(up, axis=-1, keepdims=True).clip(1e-8)
 
-    boost_start = 9 + 21 * n_cars
+    boost_start = 51
     discrete.extend(range(boost_start, boost_start + len(BOOST_PAD_POSITIONS)))
 
-    internal_start = 83 + 27 * n_cars
+    internal_start = 137
     internal_discrete = (0, 3, 4, 5, 7, 8, 9, 11, 17)
     discrete.extend(internal_start + field for field in internal_discrete)
 
@@ -364,12 +358,7 @@ def _mark_discontinuities(
         | observations[1:, -EVENT_FEATURES:].any(axis=-1)
     )
     discontinuity = np.zeros(len(observations) - 1, dtype=bool)
-    n_cars, remainder = divmod(observations.shape[1] - 106, 27)
-    if n_cars not in (2, 4) or remainder:
-        raise ValueError("replay observations need two or four cars")
-    physics = [(0, NORM_BALL_VEL)] + [
-        (9 + 21 * index, NORM_CAR_VEL) for index in range(n_cars if n_cars == 4 else 1)
-    ]
+    physics = [(0, NORM_BALL_VEL), (9, NORM_CAR_VEL)]
 
     for start, velocity_scale in physics:
         position = observations[:, start:start + 3] * NORM_POS
@@ -424,12 +413,6 @@ def _parse(
 
     first = next(frames[0][0] for frames in active_frames if frames)
     ego_ids = list(first.state.cars.keys())
-    n_cars = len(ego_ids)
-    if n_cars not in (2, 4) or any(
-        sum(car.team_num == team for car in first.state.cars.values()) != n_cars // 2
-        for team in (0, 1)
-    ):
-        return 0
     times = replay.game_df["time"].to_numpy() * 120.0
 
     if pov_players is not None:
@@ -447,13 +430,11 @@ def _parse(
 
     for ego_id in ego_ids:
         ego = first.state.cars[ego_id]
-        car_ids = [ego_id] + [
-            car_id for car_id, car in first.state.cars.items()
-            if car_id != ego_id and car.team_num == ego.team_num
-        ] + [
+        opponent_id = next(
             car_id for car_id, car in first.state.cars.items()
             if car.team_num != ego.team_num
-        ]
+        )
+        car_ids = [ego_id, opponent_id]
 
         for i, samples in enumerate(active_frames):
             if not samples:
@@ -473,8 +454,7 @@ def _parse(
                 for f, _ in samples
             ]).astype(np.float32, copy=False)
             corrections = np.asarray([
-                any(_large_replay_correction(errors.get(car_id)) for car_id in car_ids)
-                if n_cars == 4 else _large_replay_correction(errors.get(ego_id))
+                _large_replay_correction(errors.get(ego_id))
                 for _, errors in samples
             ], dtype=np.float32)
             observations = np.concatenate((
@@ -523,9 +503,9 @@ def _parse(
     return written
 
 def _parse_path(
-    args: tuple[str, str, int, tuple[str, ...] | None, int]
+    args: tuple[str, str, int, tuple[str, ...] | None]
 ) -> tuple[str, str]:
-    replay_path, output_path, frame_skip, pov_players, team_size = args
+    replay_path, output_path, frame_skip, pov_players = args
     path = Path(replay_path)
     output_dir = Path(output_path)
     pov_suffix = ""
@@ -533,8 +513,7 @@ def _parse_path(
         digest = hashlib.sha256(",".join(pov_players).encode()).hexdigest()[:12]
         pov_suffix = f"-pov-{digest}"
     complete = output_dir / (
-        f".{path.stem}.v{SCHEMA_VERSION if team_size == 1 else DOUBLES_SCHEMA_VERSION}"
-        f"-fs{frame_skip}{pov_suffix}.complete"
+        f".{path.stem}.v{SCHEMA_VERSION}-fs{frame_skip}{pov_suffix}.complete"
     )
 
     if complete.exists():
@@ -545,7 +524,7 @@ def _parse_path(
 
         if replay is None:
             return path.name, "failed to load"
-        if not _valid_replay(replay, team_size):
+        if not _valid_replay(replay):
             return path.name, "filtered"
 
         with TemporaryDirectory(dir=output_dir) as temporary:
@@ -583,10 +562,7 @@ def parse(
     replay_ids: set[str] | None = None,
     require_pov_manifest: bool = False,
     fail_on_errors: bool = False,
-    team_size: int = 1,
 ) -> None:
-    if team_size not in (1, 2):
-        raise ValueError("team size must be one or two")
     replay_dir = Path(replay_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -618,7 +594,6 @@ def parse(
             str(output_dir),
             frame_skip,
             tuple(manifest[path.stem.lower()]) if path.stem.lower() in manifest else None,
-            team_size,
         )
         for path in paths
     ]
@@ -654,7 +629,6 @@ if __name__ == "__main__":
     parser.add_argument("--pov-manifest")
     parser.add_argument("--replay-glob", default="*.replay")
     parser.add_argument("--require-pov-manifest", action="store_true")
-    parser.add_argument("--team-size", type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
     parse(
         args.replay_dir,
@@ -664,5 +638,4 @@ if __name__ == "__main__":
         pov_manifest=args.pov_manifest,
         replay_glob=args.replay_glob,
         require_pov_manifest=args.require_pov_manifest,
-        team_size=args.team_size,
     )
