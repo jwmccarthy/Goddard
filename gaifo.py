@@ -5803,8 +5803,9 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="carry the always-on discriminator's GRU memory across scene windows (default: off)",
     )
     parser.add_argument(
-        "--transformer-global", action=argparse.BooleanOptionalAction, default=None,
-        help="use capped causal Transformer context and step-difference global reward (default: on for 2v2; disable with --no-factorize for the short-window MLP)",
+        "--transformer", "--transformer-global", dest="transformer_global",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="with --factorize in 2v2, use capped causal Transformer context and step-difference global reward (default: off)",
     )
     parser.add_argument(
         "--discriminator-context-length", type=int, default=GLOBAL_CONTEXT_LENGTH,
@@ -5819,8 +5820,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="differentiable final frames of each global context; earlier frames burn in detached memory (default: up to 64)",
     )
     parser.add_argument(
-        "--factorize", action=argparse.BooleanOptionalAction, default=None,
-        help="train an always-on global discriminator with far/near specialists (default: on for 2v2; disable with --no-transformer-global for the short-window MLP)",
+        "--factorize", action=argparse.BooleanOptionalAction, default=False,
+        help="train a global discriminator with far/near specialists (in 2v2, use together with --transformer; default: off)",
     )
     parser.add_argument(
         "--hard-positive-mining", action=argparse.BooleanOptionalAction, default=False,
@@ -5869,6 +5870,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument("--discriminator-epochs", type=int, default=1)
     parser.add_argument("--discriminator-update-interval", type=int, default=4)
     parser.add_argument("--discriminator-lr", type=float, default=3e-4)
+    parser.add_argument(
+        "--discriminator-lr-end", type=float, default=None,
+        help="linearly anneal the discriminator learning rate to this value over --timesteps (default: constant)",
+    )
     parser.add_argument("--discriminator-hidden", type=int, default=128)
     parser.add_argument("--discriminator-heldout-size", type=int, default=None)
     parser.add_argument("--discriminator-accuracy-target", type=float, default=0.80)
@@ -5921,6 +5926,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="steps per recurrent PPO training sequence when --gru is enabled",
     )
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
+    parser.add_argument(
+        "--ppo-lr-end", type=float, default=None,
+        help="linearly anneal policy and critic learning rates to this value over --timesteps (default: constant)",
+    )
     parser.add_argument("--ppo-clip", type=float, default=0.2)
     parser.add_argument("--value-clip", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
@@ -5975,10 +5984,6 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         args.n_sim = 256 if args.team_size == 2 else 16_384
     if args.discriminator_heldout_size is None:
         args.discriminator_heldout_size = 512 if args.team_size == 2 else 16_384
-    if args.factorize is None:
-        args.factorize = args.team_size == 2
-    if args.transformer_global is None:
-        args.transformer_global = args.team_size == 2
     if args.discriminator_bptt_length is None:
         args.discriminator_bptt_length = min(
             GLOBAL_CONTEXT_BPTT_LENGTH, args.discriminator_context_length,
@@ -6027,7 +6032,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.replay_dir = replay_dir
 
     if args.team_size == 2 and args.factorize != args.transformer_global:
-        raise ValueError("2v2 needs --factorize with --transformer-global, or --no-factorize with --no-transformer-global")
+        raise ValueError("2v2 needs --factorize and --transformer together (or neither)")
     if args.team_size == 2 and (args.recurrent_global or args.ase_diversity):
         raise ValueError("2v2 does not support recurrent discriminator/ASE")
     if args.team_size == 2 and args.transformer_global and args.exp_log_odds_reward:
@@ -6105,6 +6110,12 @@ def validate_args(args: argparse.Namespace) -> None:
         or args.discriminator_lr <= 0.0
     ):
         raise ValueError("learning rates must be positive")
+    for name in ("ppo_lr", "discriminator_lr"):
+        end = getattr(args, f"{name}_end")
+        if end is not None and (not math.isfinite(end) or not 0.0 <= end <= getattr(args, name)):
+            raise ValueError(
+                f"--{name.replace('_', '-')}-end must be finite and between zero and --{name.replace('_', '-')}"
+            )
     if not math.isfinite(args.gamma) or not 0.0 < args.gamma <= 1.0:
         raise ValueError("--gamma must be in (0, 1]")
     if not math.isfinite(args.lambda_) or not 0.0 <= args.lambda_ <= 1.0:
@@ -6310,6 +6321,33 @@ def build_entropy_scheduler(
         LinearSchedule(args.entropy, args.entropy_end),
         set_entropy_coef,
     ))
+
+
+def build_training_scheduler(
+    args: argparse.Namespace, ppo_loss: PPOLoss,
+    policy_optimizer: th.optim.Optimizer, critic_optimizer: th.optim.Optimizer,
+    discriminator_optimizer: th.optim.Optimizer,
+) -> ValueScheduler | None:
+    entropy_scheduler = build_entropy_scheduler(args, ppo_loss)
+    values = list(entropy_scheduler.values) if entropy_scheduler is not None else []
+
+    def set_learning_rate(value: float, *optimizers: th.optim.Optimizer) -> None:
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = value
+
+    if args.ppo_lr_end is not None:
+        values.append(ScheduledValue(
+            "ppo_lr", LinearSchedule(args.ppo_lr, args.ppo_lr_end),
+            lambda value: set_learning_rate(value, policy_optimizer, critic_optimizer),
+        ))
+    if args.discriminator_lr_end is not None:
+        values.append(ScheduledValue(
+            "discriminator_lr",
+            LinearSchedule(args.discriminator_lr, args.discriminator_lr_end),
+            lambda value: set_learning_rate(value, discriminator_optimizer),
+        ))
+    return ValueScheduler(*values) if values else None
 
 
 def main() -> None:
@@ -6553,7 +6591,9 @@ def main() -> None:
         ),
         section="PPO",
     )
-    value_scheduler = build_entropy_scheduler(args, ppo_loss)
+    value_scheduler = build_training_scheduler(
+        args, ppo_loss, policy_optimizer, critic_optimizer, discriminator_optimizer,
+    )
 
     learner = Algorithm(discriminator_update, *(
         (skill_update,) if skill_update is not None else ()
@@ -6620,10 +6660,13 @@ def main() -> None:
                 ("ball_alignment", "ASE owned-ball alignment"),
             ):
                 logger.register_progress_metric("Skill", key, label, ".3f")
-    if value_scheduler is not None:
-        logger.register_progress_metric(
-            "Schedule", "entropy_coef", "entropy coef", ".4f"
-        )
+    for enabled, key, label, fmt in (
+        (args.entropy_end is not None, "entropy_coef", "entropy coef", ".4f"),
+        (args.ppo_lr_end is not None, "ppo_lr", "PPO LR", ".2e"),
+        (args.discriminator_lr_end is not None, "discriminator_lr", "D LR", ".2e"),
+    ):
+        if enabled:
+            logger.register_progress_metric("Schedule", key, label, fmt)
 
     checkpoints = GAIFOCheckpoints(
         args.checkpoint_dir / run_id,

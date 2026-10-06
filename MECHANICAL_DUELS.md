@@ -91,7 +91,7 @@ Start a bounded 2v2 GAIFO pilot using that existing four-car corpus:
   --replay-dir parsed_replays/pro_2v2_fs4 \
   --expert-frame-limit 120000 --n-sim 64 --rollout 32 \
   --discriminator-batch 2048 --discriminator-microbatch 64 \
-  --ppo-batch 4096 --discriminator-context-length 128 \
+  --ppo-batch 4096 \
   --max-ticks 3600 --timesteps 5000000
 ```
 
@@ -107,20 +107,24 @@ If other runs are newer, set `--checkpoint-dir` to the 2v2 run's own
 `checkpoints/gaifo/gaifo-*` directory. Both teams can use the same checkpoint,
 or you can choose different 2v2 checkpoints from that run in the viewer.
 
-2v2 automatically enables the factorized far/near specialists and a causal
-global Transformer. Its capped context trains on matched-length, contiguous
-agent/expert clips; global reward is the expert-log-odds change between a
-window and that **same window without its newest frame**, so an expiring old
-frame earns nothing. Every recorded expert POV is eligible, with held-out
-validation grouped by replay ID. `--max-ticks 3600` is 30 seconds of game time
-at 120 physics ticks per second; use more ticks for longer episodes.
+2v2 defaults to a unified short-window MLP on the concatenated eight-frame
+four-car scenes, pooling the two opponents without depending on their POV
+order. It scores each window independently. To use factorized far/near
+specialists with a causal global Transformer instead, add both `--factorize`
+and `--transformer` (`--transformer-global` also works). Its capped context
+trains on matched-length, contiguous agent/expert clips; global reward is the
+expert-log-odds change between a window and that **same window without its
+newest frame**, so an expiring old frame earns nothing. Every recorded expert
+POV is eligible, with held-out validation grouped by replay ID. The choice is
+saved in each checkpoint and restored when resuming a run. `--max-ticks 3600`
+is 30 seconds of game time at 120 physics ticks per second; use more ticks for
+longer episodes.
 
-For a unified short-window discriminator instead, add
-`--no-factorize --no-transformer-global` to the training command. This uses an
-MLP on the concatenated eight-frame four-car scenes, pooling the two opponents
-without depending on their POV order. It scores each window independently
-instead of using a GRU or long causal context. The choice is saved in each
-checkpoint and must match when resuming a run.
+To anneal learning rates linearly over the total `--timesteps`, add, for example,
+`--ppo-lr-end 3e-5 --discriminator-lr-end 3e-5`. The policy and critic share the
+PPO schedule; the discriminator has its own. Both rates stay constant unless
+an end value is supplied. Resumed runs restore the schedule from their saved
+settings and training step.
 
 Both 2v2 modes retain the curated aerial-touch, aerial-maneuver, dribble,
 flick, driving, and kickoff quotas. Generated and expert windows are paired
