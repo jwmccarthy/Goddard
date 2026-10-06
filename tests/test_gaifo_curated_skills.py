@@ -356,19 +356,21 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             # A category needs at least 16 examples to reserve four for phase alignment.
             generated = th.cat((generated, generated[-1:].expand(120, -1, -1)))
             touches = th.cat((touches, th.zeros(120, 1, dtype=th.bool)))
-            sample = next(SceneGAIFOMinibatches(
-                expert, batch_size=len(generated), epochs=1, noise_std=0,
-                factorize=True,
-            ).sample_windows(generated, th.arange(len(generated)), n_envs=1,
-                             ego_ball_touch=touches))
-            aligned = sample["phase_aligned"][:len(generated)]
-            self.assertGreaterEqual(int(aligned.sum()), 4)
-            self.assertTrue((sample["skill_category"][:len(generated)][aligned]
-                             == clip.skill_category).all())
-            allowed = expert.frames[expert.curated_pools()[clip.skill_category][:, 0] + 7, 8]
-            self.assertTrue(th.isin(
-                sample["window"][len(generated):, -1, 8][aligned], allowed,
-            ).all())
+            for factorize in (False, True):
+                with self.subTest(factorize=factorize):
+                    sample = next(SceneGAIFOMinibatches(
+                        expert, batch_size=len(generated), epochs=1, noise_std=0,
+                        factorize=factorize,
+                    ).sample_windows(generated, th.arange(len(generated)), n_envs=1,
+                                     ego_ball_touch=touches))
+                    aligned = sample["phase_aligned"][:len(generated)]
+                    self.assertGreaterEqual(int(aligned.sum()), 4)
+                    self.assertTrue((sample["skill_category"][:len(generated)][aligned]
+                                     == clip.skill_category).all())
+                    allowed = expert.frames[expert.curated_pools()[clip.skill_category][:, 0] + 7, 8]
+                    self.assertTrue(th.isin(
+                        sample["window"][len(generated):, -1, 8][aligned], allowed,
+                    ).all())
 
     def test_archived_generated_flight_still_pairs_with_curated_aerial_phases(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

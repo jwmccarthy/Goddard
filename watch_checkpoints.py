@@ -28,6 +28,7 @@ from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_ASE_ARCHITECTURE,
     GAIFO_DOUBLES_ARCHITECTURE,
+    GAIFO_DOUBLES_MLP_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
     SKILL_CATEGORIES,
     CuratedReplayResetTransform,
@@ -341,19 +342,20 @@ def load_policy_checkpoint(
         architecture = config.get("architecture")
         if architecture not in (
             GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
-            GAIFO_DOUBLES_ARCHITECTURE,
+            GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE,
         ):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
+        doubles = architecture in (GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE)
         if int(config.get("team_size", 1)) != team_size or (
-            (architecture == GAIFO_DOUBLES_ARCHITECTURE) != (team_size == 2)
+            doubles != (team_size == 2)
         ):
             raise ValueError(
                 f"checkpoint team size does not match --team-size {team_size}: {path}"
             )
         gru = architecture == GAIFO_GRU_ARCHITECTURE or (
-            architecture == GAIFO_DOUBLES_ARCHITECTURE and config.get("gru", False)
+            doubles and config.get("gru", False)
         )
-        if architecture != GAIFO_DOUBLES_ARCHITECTURE and config.get("gru", False) != gru:
+        if not doubles and config.get("gru", False) != gru:
             raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
         if config.get("ase_diversity", False) != (architecture == GAIFO_ASE_ARCHITECTURE):
             raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
@@ -404,8 +406,9 @@ def load_policy_checkpoint(
             "gaifo", hidden, layers, architecture, skill_size,
         )
     signature = (
-        (kind, hidden, architecture, layers, gru)
-        if kind == "gaifo" and architecture == GAIFO_DOUBLES_ARCHITECTURE else
+        # Match 2v2 policies with identical shapes regardless of their judge.
+        (kind, hidden, GAIFO_DOUBLES_ARCHITECTURE, layers, gru)
+        if kind == "gaifo" and team_size == 2 else
         (kind, hidden, architecture, layers) if architecture is not None else
         (kind, hidden, architecture)
     )

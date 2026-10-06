@@ -79,6 +79,7 @@ GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v3"
 GAIFO_GRU_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-gru"
 GAIFO_ASE_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-ase"
 GAIFO_DOUBLES_ARCHITECTURE = "scene-marl-gaifo-2v2-v1-transformer"
+GAIFO_DOUBLES_MLP_ARCHITECTURE = "scene-marl-gaifo-2v2-v1-mlp"
 BALL_SIZE = 9
 CAR_SIZE = 21
 N_CARS = 2
@@ -106,6 +107,7 @@ CAR_SITUATIONS = ("grounded", "wall", "low_air", "mid_air", "high_air", "ceiling
 GROUND_MANEUVERS = ("dribble", "flick")
 GROUND_MANEUVER_START = len(DISTANCE_BANDS) * len(CAR_SITUATIONS)
 N_SITUATIONS = GROUND_MANEUVER_START + len(GROUND_MANEUVERS)
+TEAM_BALL_ROLES = ("ego", "teammate", "opponents", "loose_ball")
 SKILL_CATEGORIES = (
     "aerial_touch", "aerial_maneuver", "dribble", "flick", "driving", "kickoff",
 )
@@ -223,6 +225,30 @@ def scene_situation_ids(windows: th.Tensor, car_start: int = BLUE_START) -> th.T
     band = th.where(approach_distance < BALL_CLOSE_DISTANCE, 0,
                     th.where(approach_distance < BALL_NEAR_DISTANCE, 1, 2))
     return situation * len(DISTANCE_BANDS) + band
+
+
+def scene_match_ids(windows: th.Tensor) -> th.Tensor:
+    """Match focal situations and, in doubles, who is nearest a playable ball.
+
+    The two opponents share a label regardless of their stored ordering. A
+    loose ball has its own label so off-ball rotations do not become examples
+    of attacking or defending a controlled ball.
+    """
+    label = scene_situation_ids(windows)
+    if scene_car_count(windows) == N_CARS:
+        return label
+    current = windows[:, -1]
+    distances = th.stack([
+        _ball_distances(current, BALL_SIZE + actor * CAR_SIZE)
+        for actor in range(DOUBLES_N_CARS)
+    ], dim=-1)
+    closest, actor = distances.min(dim=-1)
+    role = th.where(
+        closest < BALL_NEAR_DISTANCE,
+        actor.clamp(max=2),
+        len(TEAM_BALL_ROLES) - 1,
+    )
+    return label + role * GROUND_MANEUVER_START
 
 
 @dataclass(frozen=True)
@@ -1862,9 +1888,8 @@ class ExpertSceneDataset:
         if self.skill_sampling:
             groups = self.curated_labeled_pools(heldout=heldout)
             pools = [
-                group[label] for group in groups
-                for label in range(GROUND_MANEUVER_START) if label % 3 != 2
-                and len(group[label])
+                pool for group in groups for label, pool in enumerate(group)
+                if label % len(DISTANCE_BANDS) != len(DISTANCE_BANDS) - 1 and len(pool)
             ]
             starts = self.heldout_window_starts if heldout else self.train_window_starts
             pairs = th.cat(pools) if pools else starts.new_empty((0, 2))
@@ -2031,10 +2056,12 @@ class ExpertSceneDataset:
         if not self.skill_sampling:
             return self.situation_pools(heldout=heldout)
         if heldout not in self._context_situation_pools:
-            groups: list[list[th.Tensor]] = [[] for _ in range(N_SITUATIONS)]
+            groups: list[list[th.Tensor]] = [[] for _ in range(
+                GROUND_MANEUVER_START * (len(TEAM_BALL_ROLES) if self.n_cars == DOUBLES_N_CARS else 1)
+            )]
             for pool in self.curated_pools(heldout=heldout):
                 for chunk in pool.split(8_192):
-                    labels = scene_situation_ids(self._windows_for_povs(chunk))
+                    labels = scene_match_ids(self._windows_for_povs(chunk))
                     for label in labels.unique().tolist():
                         groups[label].append(chunk[labels == label])
             empty = self.train_window_starts.new_empty((0, 2))
@@ -2329,10 +2356,12 @@ class ExpertSceneDataset:
             return self._curated_labeled_pools[heldout]
         categories = []
         for pairs in self.curated_pools(heldout=heldout):
-            groups: list[list[th.Tensor]] = [[] for _ in range(GROUND_MANEUVER_START)]
+            groups: list[list[th.Tensor]] = [[] for _ in range(
+                GROUND_MANEUVER_START * (len(TEAM_BALL_ROLES) if self.n_cars == DOUBLES_N_CARS else 1)
+            )]
             for chunk in pairs.split(8_192):
                 windows = self.frames[chunk[:, 0, None] + self.window_offsets]
-                labels = scene_situation_ids(windows)
+                labels = scene_match_ids(windows)
                 opposite = chunk[:, 1].bool()
                 if opposite.any():
                     labels[opposite] = scene_situation_ids(windows[opposite], ORANGE_START)
@@ -2544,6 +2573,39 @@ class RecencyReplayBuffer:
         )[:n_old]
         old = self.reservoir[indices].to(device, non_blocking=False)
         return th.cat((recent, old), dim=0) if n_recent else old
+
+
+class ShortWindowMLPDiscriminator(nn.Module):
+    """Judge concatenated four-car scenes without recurrent or long-term context."""
+
+    def __init__(self, trajectory_length: int, hidden_size: int = 128) -> None:
+        super().__init__()
+        if trajectory_length < 2 or hidden_size < 1:
+            raise ValueError("short-window MLP needs positive dimensions and at least two frames")
+        self.n_cars = DOUBLES_N_CARS
+        self.scene_size = DOUBLES_SCENE_SIZE
+        self.trajectory_length = trajectory_length
+        self.mlp = nn.Sequential(
+            nn.Linear(trajectory_length * self.scene_size, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, windows: th.Tensor) -> th.Tensor:
+        if windows.ndim != 3 or windows.shape[1:] != (
+            self.trajectory_length, self.scene_size,
+        ):
+            raise ValueError("short-window MLP needs fixed-length four-car scene windows")
+        # Swapping the two opponents' file order must not reveal the POV label.
+        opponents = windows[..., BALL_SIZE + 2 * CAR_SIZE:].reshape(
+            len(windows), self.trajectory_length, 2, CAR_SIZE,
+        )
+        first, second = opponents.unbind(-2)
+        scenes = th.cat((
+            windows[..., :BALL_SIZE + 2 * CAR_SIZE],
+            (first + second) * 0.5, (first - second).abs(),
+        ), dim=-1)
+        return self.mlp(scenes.flatten(1)).squeeze(-1)
 
 
 class SceneDiscriminator(nn.Module):
@@ -3060,7 +3122,7 @@ class ConfidentExpertResetTransform:
         self,
         expert: ExpertSceneDataset,
         dataset: TensorDataset,
-        discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+        discriminator: ShortWindowMLPDiscriminator | SceneDiscriminator | FactorizedSceneDiscriminator,
         microbatch_size: int,
         context_length: int = 16,
     ) -> None:
@@ -3229,7 +3291,7 @@ class SceneDiscriminatorLoss:
     """BCE-with-logits loss for generated-vs-expert scene windows."""
 
     def __init__(
-        self, discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+        self, discriminator: ShortWindowMLPDiscriminator | SceneDiscriminator | FactorizedSceneDiscriminator,
         *, specialists_only: bool = False,
     ) -> None:
         if specialists_only and not getattr(discriminator, "factorized", False):
@@ -3876,6 +3938,7 @@ class GlobalContextMinibatches:
             )
         pools = self.expert.context_situation_pools()
         available = th.tensor([bool(len(pool)) for pool in pools], device=windows.device)
+        match_ids = scene_match_ids if self.expert.skill_sampling else scene_situation_ids
         for _ in range(self.epochs):
             shuffled = indices[th.randperm(len(indices), device=indices.device)]
             remaining = max(1, math.ceil(len(shuffled) / self.stride))
@@ -3884,7 +3947,7 @@ class GlobalContextMinibatches:
             # a short rollout may pick only unmatched situations and never
             # train the global branch at all.
             for chunk in shuffled.split(self.batch_size):
-                labels = scene_situation_ids(windows[chunk])
+                labels = match_ids(windows[chunk])
                 matched = available[labels]
                 if matched.any():
                     selected.append(chunk[matched][:remaining])
@@ -3912,7 +3975,7 @@ class GlobalContextMinibatches:
                     past = self.history.sample(n_history, windows.device)
                     context = th.cat((context, past))
                     ages = th.cat((ages, ages.new_full((n_history,), self.context_length)))
-                    labels = th.cat((labels, scene_situation_ids(
+                    labels = th.cat((labels, match_ids(
                         past[:, -min(self.expert.trajectory_length, self.context_length):],
                     )))
                 matched = available[labels]
@@ -3990,16 +4053,13 @@ class SceneGAIFOMinibatches:
             raise ValueError("curated discriminator needs generated windows")
         expert_groups = self.expert.curated_labeled_pools()
         weights = self.expert.curated_weights()
-        agent_flights = (
-            generated_maneuver_pools(
-                windows, indices, n_envs, episode_end,
-                ego_ball_touch=ego_ball_touch, goal_scored=goal_scored,
-                timeline=timeline,
-            )
-            if self.factorize else tuple([] for _ in range(N_SITUATIONS))
+        agent_flights = generated_maneuver_pools(
+            windows, indices, n_envs, episode_end,
+            ego_ball_touch=ego_ball_touch, goal_scored=goal_scored,
+            timeline=timeline,
         )
         archived_windows = None
-        if self.factorize and archived_flights is not None:
+        if archived_flights is not None:
             if len(archived_flights) != N_SITUATIONS:
                 raise ValueError("archived flights must have one pool per situation")
             saved = []
@@ -4050,10 +4110,10 @@ class SceneGAIFOMinibatches:
                         agents[:count - n_history],
                         self.history.sample(n_history, agents.device),
                     ))
-                agent_labels = scene_situation_ids(agents)
+                agent_labels = scene_match_ids(agents)
                 agent_groups = tuple(
                     (agent_labels == label).nonzero(as_tuple=True)[0]
-                    for label in range(GROUND_MANEUVER_START)
+                    for label in range(len(expert_groups[0]))
                 )
                 shared = tuple(
                     tuple(label for label, pool in enumerate(category)
@@ -4132,8 +4192,8 @@ class SceneGAIFOMinibatches:
                         sampled_experts[chosen] = expert_pairs
                         expert_phases = self.expert._windows_for_povs(expert_pairs)
                         exactly_matched[chosen] = (
-                            scene_situation_ids(sampled_agents[chosen])
-                            == scene_situation_ids(expert_phases)
+                            scene_match_ids(sampled_agents[chosen])
+                            == scene_match_ids(expert_phases)
                         )
                         phase_aligned[chosen] = True
                         consumed += len(agent_ids)
@@ -4379,7 +4439,7 @@ class SceneGAIFOMinibatches:
 
 def train_discriminator_minibatch(
     sample: TensorBatch,
-    discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+    discriminator: ShortWindowMLPDiscriminator | SceneDiscriminator | FactorizedSceneDiscriminator,
     optimizer: th.optim.Optimizer,
     loss: SceneDiscriminatorLoss | GlobalContextLoss,
     microbatch_size: int,
@@ -4462,7 +4522,7 @@ class SceneDiscriminatorReward:
 
     def __init__(
         self,
-        discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+        discriminator: ShortWindowMLPDiscriminator | SceneDiscriminator | FactorizedSceneDiscriminator,
         noise_std: float,
         trajectory_length: int,
         goal_reward_weight: float = 1.0,
@@ -4835,7 +4895,7 @@ class AdaptiveDiscriminatorUpdate:
         history_add_size: int,
         history_mix_fraction: float,
         max_grad_norm: float,
-        discriminator: SceneDiscriminator | FactorizedSceneDiscriminator,
+        discriminator: ShortWindowMLPDiscriminator | SceneDiscriminator | FactorizedSceneDiscriminator,
         optimizer: th.optim.Optimizer,
         loss: SceneDiscriminatorLoss,
         section: str = "Discriminator",
@@ -4907,7 +4967,9 @@ class AdaptiveDiscriminatorUpdate:
         self._rollouts_since_update = 0
 
         self.maneuver_tracker = (
-            GeneratedManeuverTracker() if getattr(discriminator, "factorized", False) else None
+            GeneratedManeuverTracker()
+            if getattr(discriminator, "factorized", False)
+            or (expert.skill_sampling and not self.contextual_global) else None
         )
 
     def set_progress_callback(self, callback) -> None:
@@ -5452,7 +5514,9 @@ class GAIFOCheckpoints:
             "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
             "config": {
                 "architecture": (
-                    GAIFO_DOUBLES_ARCHITECTURE if getattr(self.args, "team_size", 1) == 2
+                    (GAIFO_DOUBLES_ARCHITECTURE if self.args.transformer_global
+                     else GAIFO_DOUBLES_MLP_ARCHITECTURE)
+                    if getattr(self.args, "team_size", 1) == 2
                     else GAIFO_ASE_ARCHITECTURE if getattr(self.args, "ase_diversity", False) else (
                         GAIFO_GRU_ARCHITECTURE if self.args.gru else GAIFO_ARCHITECTURE
                     )
@@ -5506,19 +5570,22 @@ def load_resume_checkpoint(path: Path) -> dict:
     architecture = config.get("architecture")
     if architecture not in (
         GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE, GAIFO_ASE_ARCHITECTURE,
-        GAIFO_DOUBLES_ARCHITECTURE,
+        GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE,
     ):
         raise ValueError(f"incompatible GAIFO architecture in {path}")
-    if (architecture != GAIFO_DOUBLES_ARCHITECTURE
+    doubles = architecture in (GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE)
+    if (not doubles
             and config.get("gru", False) != (architecture == GAIFO_GRU_ARCHITECTURE)):
         raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
     if config.get("ase_diversity", False) != (architecture == GAIFO_ASE_ARCHITECTURE):
         raise ValueError(f"checkpoint ASE setting does not match architecture in {path}")
-    if (config.get("team_size", 1) == 2) != (architecture == GAIFO_DOUBLES_ARCHITECTURE):
+    if (config.get("team_size", 1) == 2) != doubles:
         raise ValueError(f"checkpoint team size does not match architecture in {path}")
-    if (architecture == GAIFO_DOUBLES_ARCHITECTURE
-            and not config.get("transformer_global", False)):
-        raise ValueError(f"checkpoint Transformer setting does not match architecture in {path}")
+    if doubles and (
+        bool(config.get("transformer_global", False)) != (architecture == GAIFO_DOUBLES_ARCHITECTURE)
+        or bool(config.get("factorize", False)) != (architecture == GAIFO_DOUBLES_ARCHITECTURE)
+    ):
+        raise ValueError(f"checkpoint discriminator mode does not match architecture in {path}")
     step = payload.get("step")
     if type(step) is not int or step < 0:
         raise ValueError(f"checkpoint has an invalid training step: {path}")
@@ -5737,7 +5804,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--transformer-global", action=argparse.BooleanOptionalAction, default=None,
-        help="use capped causal Transformer context and step-difference global reward (default: on for 2v2)",
+        help="use capped causal Transformer context and step-difference global reward (default: on for 2v2; disable with --no-factorize for the short-window MLP)",
     )
     parser.add_argument(
         "--discriminator-context-length", type=int, default=GLOBAL_CONTEXT_LENGTH,
@@ -5753,7 +5820,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--factorize", action=argparse.BooleanOptionalAction, default=None,
-        help="train an always-on global scene discriminator and proximity-gated far-car and near-car/ball specialists",
+        help="train an always-on global discriminator with far/near specialists (default: on for 2v2; disable with --no-transformer-global for the short-window MLP)",
     )
     parser.add_argument(
         "--hard-positive-mining", action=argparse.BooleanOptionalAction, default=False,
@@ -5959,11 +6026,12 @@ def validate_args(args: argparse.Namespace) -> None:
         print(f"Using {args.team_size}v{args.team_size} replays from {replay_dir}")
         args.replay_dir = replay_dir
 
-    if args.team_size == 2 and not (args.factorize and args.transformer_global):
-        raise ValueError("2v2 needs --factorize and --transformer-global")
-    if args.team_size == 2 and (args.recurrent_global or args.ase_diversity
-                                or args.exp_log_odds_reward):
-        raise ValueError("2v2 Transformer needs log-odds rewards without recurrent GRU/ASE")
+    if args.team_size == 2 and args.factorize != args.transformer_global:
+        raise ValueError("2v2 needs --factorize with --transformer-global, or --no-factorize with --no-transformer-global")
+    if args.team_size == 2 and (args.recurrent_global or args.ase_diversity):
+        raise ValueError("2v2 does not support recurrent discriminator/ASE")
+    if args.team_size == 2 and args.transformer_global and args.exp_log_odds_reward:
+        raise ValueError("2v2 Transformer needs log-odds rewards")
     if args.team_size == 1 and args.transformer_global:
         raise ValueError("--transformer-global currently needs --team-size 2")
 
@@ -6179,7 +6247,9 @@ def build_critic(env, args: argparse.Namespace) -> Critic:
 
 def build_discriminator(
     args: argparse.Namespace,
-) -> SceneDiscriminator | FactorizedSceneDiscriminator:
+) -> ShortWindowMLPDiscriminator | SceneDiscriminator | FactorizedSceneDiscriminator:
+    if getattr(args, "team_size", 1) == 2 and not args.factorize:
+        return ShortWindowMLPDiscriminator(args.trajectory_length, args.discriminator_hidden)
     model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
     options = dict(
         frame_embedding=args.frame_embedding,

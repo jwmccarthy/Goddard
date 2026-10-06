@@ -20,13 +20,16 @@ from carl.gymnasium.state import (
 from carl.gymnasium import CARLTorchVectorEnv
 from gaifo import (
     AdaptiveDiscriminatorUpdate, CausalSceneTransformer, CompactSceneWindows,
-    ExpertSceneDataset,
+    DRIVING_SKILL, ExpertSceneDataset, GROUND_MANEUVER_START, TEAM_BALL_ROLES,
     FactorizedSceneDiscriminator, GAIFO_DOUBLES_ARCHITECTURE,
+    GAIFO_DOUBLES_MLP_ARCHITECTURE,
     GameplayDiagnostics, GeneratedContextTimeline,
     SceneDiscriminatorLoss,
-    SceneDiscriminatorReward, SceneWindowCapture, actor_view, nearest_ball_distance,
+    SceneDiscriminatorReward, SceneWindowCapture, ShortWindowMLPDiscriminator,
+    SceneGAIFOMinibatches, actor_view, build_discriminator, nearest_ball_distance, parse_args,
+    scene_match_ids, scene_situation_ids,
     simulation_episode_ends,
-    build_policy, load_resume_checkpoint, main,
+    build_policy, load_resume_checkpoint, main, validate_args, validate_resume_args,
 )
 from jarl.data import TensorBatch
 from jarl.envs import DatasetResetSampler
@@ -37,12 +40,17 @@ from watch_checkpoints import CheckpointRegistry, SpectatorState, simulate
 
 def write_four_povs(
     folder: Path, game: str, *, offset: float = 0, invalid_rotations: bool = False,
+    ball_chaser: int | None = None, loose_ball: bool = False,
 ) -> None:
     scenes = th.zeros(32, 93)
     scenes[:, 2] = 91.25 / 2076
     for actor in range(4):
         start = 9 + actor * 21
-        scenes[:, start] = (actor + 1) * 0.1 + offset
+        scenes[:, start] = (
+            0.5 if loose_ball or ball_chaser is not None else (actor + 1) * 0.1 + offset
+        )
+        if actor == ball_chaser:
+            scenes[:, start] = 0.02
         scenes[:, start + 2] = 17 / 2076
         scenes[:, start + 9] = 1
         scenes[:, start + 14] = 1
@@ -72,6 +80,82 @@ def write_four_povs(
 
 
 class DoublesDataTests(unittest.TestCase):
+    def test_four_car_matching_preserves_ball_role_and_scene_situation(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            write_four_povs(folder, "ego", ball_chaser=0)
+            write_four_povs(folder, "mate", ball_chaser=1)
+            write_four_povs(folder, "opponent", ball_chaser=2)
+            write_four_povs(folder, "loose", loose_ball=True)
+            expert = ExpertSceneDataset(
+                folder, 3, frame_skip=4, reject_discontinuities=True,
+                skill_sampling=True, n_cars=4,
+            )
+            roles = expert.curated_labeled_pools()[DRIVING_SKILL]
+            self.assertEqual(len(roles), GROUND_MANEUVER_START * len(TEAM_BALL_ROLES))
+            self.assertEqual(len(expert.context_situation_pools()), len(roles))
+            ids = (0, 2 + GROUND_MANEUVER_START, 2 + 2 * GROUND_MANEUVER_START,
+                   2 + 3 * GROUND_MANEUVER_START)
+            self.assertTrue(all(len(roles[label]) >= 8 for label in ids))
+            pairs = th.cat([roles[label][:8] for label in ids])
+            windows = expert._windows_for_povs(pairs)
+            self.assertTrue(th.equal(scene_match_ids(windows), th.tensor(ids).repeat_interleave(8)))
+            self.assertTrue(th.equal(
+                scene_match_ids(windows) % GROUND_MANEUVER_START,
+                scene_situation_ids(windows),
+            ))
+            swapped = windows.clone()
+            swapped[..., 51:72], swapped[..., 72:93] = (
+                windows[..., 72:93], windows[..., 51:72],
+            )
+            th.testing.assert_close(scene_match_ids(swapped), scene_match_ids(windows))
+
+            batch = next(SceneGAIFOMinibatches(
+                expert, batch_size=len(windows), epochs=1, noise_std=0, factorize=False,
+            ).sample_windows(
+                windows, th.arange(len(windows)), n_envs=len(windows),
+            ))
+            self.assertTrue(batch["situation_matched"].all())
+            self.assertTrue(th.equal(
+                scene_match_ids(batch["window"][:len(windows)]),
+                scene_match_ids(batch["window"][len(windows):]),
+            ))
+
+    def test_four_car_discriminator_modes_and_short_window_mlp(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            write_four_povs(folder, "game-a")
+            flags = ["gaifo.py", "--team-size", "2", "--replay-dir", str(folder)]
+            with patch.object(sys, "argv", flags):
+                contextual, _ = parse_args()
+            validate_args(contextual)
+            self.assertIsInstance(build_discriminator(contextual), FactorizedSceneDiscriminator)
+
+            for option in ("--no-factorize", "--no-transformer-global"):
+                with patch.object(sys, "argv", [*flags, option]):
+                    mismatched, _ = parse_args()
+                with self.assertRaisesRegex(ValueError, "--no-factorize with --no-transformer-global"):
+                    validate_args(mismatched)
+
+            with patch.object(sys, "argv", [
+                *flags, "--no-factorize", "--no-transformer-global",
+            ]):
+                standard, _ = parse_args()
+            validate_args(standard)
+            model = build_discriminator(standard)
+            self.assertIsInstance(model, ShortWindowMLPDiscriminator)
+            windows = th.randn(3, standard.trajectory_length, 93, requires_grad=True)
+            swapped = windows.detach().clone()
+            swapped[..., 51:72], swapped[..., 72:93] = (
+                windows[..., 72:93], windows[..., 51:72],
+            )
+            scores = model(windows)
+            self.assertEqual(scores.shape, (3,))
+            th.testing.assert_close(model(swapped), scores, rtol=0, atol=0)
+            scores.sum().backward()
+            self.assertGreater(windows.grad[:, 0].abs().sum().item(), 0)
+            self.assertGreater(windows.grad[:, -1].abs().sum().item(), 0)
+
     def test_all_recorded_povs_and_four_car_internal_states_are_split_by_game(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
@@ -401,6 +485,11 @@ class DoublesGpuSmokeTests(unittest.TestCase):
             )
 
     def test_full_four_actor_rollout_discriminator_ppo_and_checkpoint(self):
+        for mlp in (False, True):
+            with self.subTest(mlp=mlp):
+                self._run_four_actor_training(mlp)
+
+    def _run_four_actor_training(self, mlp: bool):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
             replays = root / "replays"
@@ -422,6 +511,8 @@ class DoublesGpuSmokeTests(unittest.TestCase):
                 "--history-add-size", "8", "--log-dir", str(root / "runs"),
                 "--checkpoint-dir", str(root / "checkpoints"),
             ]
+            if mlp:
+                flags.extend(("--no-factorize", "--no-transformer-global"))
             output = io.StringIO()
             with patch.object(sys, "argv", flags), redirect_stdout(output):
                 main()
@@ -430,11 +521,35 @@ class DoublesGpuSmokeTests(unittest.TestCase):
             saved = load_resume_checkpoint(max(paths))
             self.assertEqual(saved["step"], 128)
             self.assertEqual(saved["config"]["team_size"], 2)
-            self.assertTrue(saved["config"]["factorize"])
-            self.assertTrue(saved["config"]["transformer_global"])
-            self.assertIn("global_discriminator.position.weight", saved["discriminator"])
+            self.assertEqual(saved["config"]["factorize"], not mlp)
+            self.assertEqual(saved["config"]["transformer_global"], not mlp)
+            self.assertEqual(saved["config"]["architecture"], (
+                GAIFO_DOUBLES_MLP_ARCHITECTURE if mlp else GAIFO_DOUBLES_ARCHITECTURE
+            ))
+            self.assertIn(
+                "mlp.0.weight" if mlp else "global_discriminator.position.weight",
+                saved["discriminator"],
+            )
             self.assertGreater(len(saved["discriminator_optimizer"]["state"]), 0)
-            self.assertIn("D global accuracy", output.getvalue())
+            self.assertIn("D heldout accuracy", output.getvalue())
+            if mlp:
+                self.assertNotIn("D global accuracy", output.getvalue())
+                with patch.object(sys, "argv", [
+                    "gaifo.py", "--resume-checkpoint", str(max(paths)),
+                    "--timesteps", "192",
+                ]):
+                    resumed, payload = parse_args()
+                validate_resume_args(resumed, payload)
+                self.assertIsInstance(build_discriminator(resumed), ShortWindowMLPDiscriminator)
+                with patch.object(sys, "argv", [
+                    "gaifo.py", "--resume-checkpoint", str(max(paths)),
+                    "--timesteps", "192", "--factorize", "--transformer-global",
+                ]):
+                    mismatched, payload = parse_args()
+                with self.assertRaisesRegex(ValueError, "--factorize must match"):
+                    validate_resume_args(mismatched, payload)
+            else:
+                self.assertIn("D global accuracy", output.getvalue())
 
     def test_viewer_plays_and_renders_four_cars_from_a_doubles_checkpoint(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

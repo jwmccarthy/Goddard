@@ -114,3 +114,18 @@ window and that **same window without its newest frame**, so an expiring old
 frame earns nothing. Every recorded expert POV is eligible, with held-out
 validation grouped by replay ID. `--max-ticks 3600` is 30 seconds of game time
 at 120 physics ticks per second; use more ticks for longer episodes.
+
+For a unified short-window discriminator instead, add
+`--no-factorize --no-transformer-global` to the training command. This uses an
+MLP on the concatenated eight-frame four-car scenes, pooling the two opponents
+without depending on their POV order. It scores each window independently
+instead of using a GRU or long causal context. The choice is saved in each
+checkpoint and must match when resuming a run.
+
+Both 2v2 modes retain the curated aerial-touch, aerial-maneuver, dribble,
+flick, driving, and kickoff quotas. Generated and expert windows are paired
+within the same focal car/distance situation **and** ball role: closest ego,
+teammate, either opponent, or nobody within 1,500 units. Complete maneuvers
+can also be paired by setup, action, and recovery phase in both modes. These
+role labels distinguish team context; they do not claim to identify passes or
+rotations without additional event-level labels.

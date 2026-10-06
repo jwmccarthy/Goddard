@@ -14,7 +14,8 @@ from gymnasium.spaces import Box, MultiDiscrete
 from http.server import ThreadingHTTPServer
 
 from gaifo import (
-    GAIFO_ARCHITECTURE, GAIFO_DOUBLES_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+    GAIFO_ARCHITECTURE, GAIFO_DOUBLES_ARCHITECTURE,
+    GAIFO_DOUBLES_MLP_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
     build_policy,
 )
 from watch_checkpoints import (
@@ -31,6 +32,37 @@ class FakeEnv:
 
 
 class WatchGAIFOCheckpointsTests(unittest.TestCase):
+    def test_four_car_mlp_and_transformer_policies_can_play_each_other(self):
+        env = FakeEnv()
+        env.single_observation_space = Box(-1.0, 1.0, shape=(191,), dtype=np.float32)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            paths = []
+            reference = build_policy(
+                env, argparse.Namespace(policy_hidden=16, policy_layers=2, gru=False),
+            )
+            for index, architecture in enumerate((
+                GAIFO_DOUBLES_ARCHITECTURE, GAIFO_DOUBLES_MLP_ARCHITECTURE,
+            )):
+                path = Path(directory) / f"gaifo_{index:012d}.pt"
+                th.save({
+                    "config": {
+                        "architecture": architecture, "team_size": 2, "frameskip": 4,
+                        "policy_hidden": 16, "policy_layers": 2, "gru": False,
+                    },
+                    "policy": reference.state_dict(),
+                }, path)
+                paths.append(path)
+            _, blue, orange = load_match(*paths, env, 4, None, team_size=2)
+            observations = th.randn(4, 191)
+            with th.inference_mode():
+                expected = reference.act(
+                    observations, reference.initial_state(4), deterministic=True,
+                ).action
+                for policy in (blue, orange):
+                    th.testing.assert_close(policy.act(
+                        observations, policy.initial_state(4), deterministic=True,
+                    ).action, expected)
+
     def test_reset_type_api_offers_loaded_pools_and_rejects_unavailable_choices(self):
         state = SpectatorState()
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
