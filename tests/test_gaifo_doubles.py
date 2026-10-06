@@ -33,7 +33,9 @@ from replay_resets import ReplayResetProvider
 from watch_checkpoints import CheckpointRegistry, SpectatorState, simulate
 
 
-def write_four_povs(folder: Path, game: str, *, offset: float = 0) -> None:
+def write_four_povs(
+    folder: Path, game: str, *, offset: float = 0, invalid_rotations: bool = False,
+) -> None:
     scenes = th.zeros(32, 93)
     scenes[:, 2] = 91.25 / 2076
     for actor in range(4):
@@ -43,6 +45,13 @@ def write_four_povs(folder: Path, game: str, *, offset: float = 0) -> None:
         scenes[:, start + 9] = 1
         scenes[:, start + 14] = 1
         scenes[:, start + 16] = 1
+    if invalid_rotations:
+        # Demoed opponents can have no axes even though other cars are usable.
+        scenes[12, 9 + 3 * 21 + 9:9 + 3 * 21 + 15] = 0
+        scenes[12, 9 + 3 * 21 + 17] = 1
+        scenes[13, 9 + 1 * 21 + 12:9 + 1 * 21 + 15] = scenes[
+            13, 9 + 1 * 21 + 9:9 + 1 * 21 + 12
+        ]  # Up parallel to forward cannot define a rotation either.
     for actor in range(4):
         rows = np.zeros((len(scenes), 215), dtype=np.float32)
         rows[:, :93] = actor_view(scenes, actor).numpy()
@@ -105,6 +114,37 @@ class DoublesDataTests(unittest.TestCase):
             self.assertEqual(reset.cars.shape, (2, 4, 21))
             self.assertEqual(reset.car_internal_state.shape, (2, 4, 19))
             self.assertTrue(reset.normalized)
+
+    def test_bad_rotations_in_any_car_only_exclude_reset_frames(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            write_four_povs(folder, "game-a", invalid_rotations=True)
+            expert = ExpertSceneDataset(
+                folder, 3, frame_skip=4, reject_discontinuities=True,
+                skill_sampling=True, n_cars=4,
+            )
+            self.assertEqual(expert.frames.shape, (4 * 34, 93))
+            self.assertEqual(expert.total_windows, 4 * 32)
+            self.assertEqual(expert.train_total, 4 * 29)  # Only the existing correction is removed.
+            self.assertGreater(len(expert.reset_indices), 0)
+            for segment in expert.segment_frame_indices:
+                bad = segment[[12, 13]]
+                self.assertTrue(expert.unsafe_reset_frames[bad].all())
+                self.assertFalse(bool(th.isin(bad, expert.reset_indices).any()))
+                self.assertTrue(th.isin(bad - expert.partition_span,
+                                        expert.train_window_starts).all())
+                self.assertTrue((expert.frames[bad[0], 9:93].view(4, 21)[:, 9:15]
+                                 == 0).all(dim=-1).any())
+            for pool in expert._curated_reset_pools:
+                self.assertTrue(th.isin(pool, expert.reset_indices).all())
+
+            reset = ReplayResetProvider(
+                DatasetResetSampler(expert.reset_dataset(), seed=4),
+                expert.frames, expert.internal_states,
+            )(th.ones(256, dtype=th.bool))
+            forward, up = reset.cars.forward, reset.cars.up
+            self.assertTrue((forward.square().sum(-1) >= 1e-8).all())
+            self.assertTrue((th.linalg.cross(up, forward).square().sum(-1) >= 1e-8).all())
 
     def test_simulation_terminations_reset_all_four_histories(self):
         done = th.tensor([[False, True, False, False, False, False, False, False]])
@@ -284,7 +324,7 @@ class DoublesGpuSmokeTests(unittest.TestCase):
             root = Path(directory)
             replays = root / "replays"
             replays.mkdir()
-            write_four_povs(replays, "game-a")
+            write_four_povs(replays, "game-a", invalid_rotations=True)
             write_four_povs(replays, "game-b", offset=.05)
             flags = [
                 "gaifo.py", "--team-size", "2", "--replay-dir", str(replays),

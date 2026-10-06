@@ -10,6 +10,10 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from rich.progress import (
+    BarColumn, DownloadColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+    TextColumn, TimeElapsedColumn,
+)
 
 from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium.state import RewardContext
@@ -703,6 +707,21 @@ def _unsafe_replay_reset_frames(
     return unsafe | pre_goal | np.asarray(stored[:, -5:], dtype=bool).any(axis=-1)
 
 
+def _invalid_reset_rotations(scenes: np.ndarray, n_cars: int) -> np.ndarray:
+    """Find frames with any car axes CARL cannot convert to a reset rotation."""
+    cars = scenes[:, BALL_SIZE:].reshape(-1, n_cars, CAR_SIZE)
+    forward = cars[:, :, 9:12]
+    up = cars[:, :, 12:15]
+    right = np.cross(up, forward)
+    valid = (
+        np.isfinite(forward).all(axis=(1, 2))
+        & np.isfinite(up).all(axis=(1, 2))
+        & (np.square(forward).sum(axis=-1) >= 1e-8).all(axis=1)
+        & (np.square(right).sum(axis=-1) >= 1e-8).all(axis=1)
+    )
+    return ~valid
+
+
 def _replay_goal_scorer(path: Path, stored: np.ndarray) -> int | None:
     """Identify the scorer at a period boundary, including legacy replay files.
 
@@ -1073,30 +1092,20 @@ class ExpertSceneDataset:
         self.driving_fraction = driving_fraction
         self.kickoff_fraction = kickoff_fraction
         target_device = th.device(device)
-        last_milestone: dict[str, int] = {}
-
-        def report(stage: str, done: int, expected: int) -> None:
-            if not show_progress:
-                return
-            steps = min(10, max(1, expected // 10))
-            milestone = min(steps, done * steps // max(1, expected))
-            if milestone > last_milestone.get(stage, -1):
-                last_milestone[stage] = milestone
-                print(f"Expert replays {stage}: {done:,}/{expected:,} "
-                      f"({min(100, done * 100 // max(1, expected))}%)", flush=True)
-
         rng = np.random.default_rng(seed)
-        if show_progress:
-            print(f"Expert replays: discovering POV files in {replay_dir}", flush=True)
         paths = sorted(Path(replay_dir).glob("*.npy"))
-        report("indexed", 0, len(paths))
         groups: dict[tuple[str, ...], list[Path]] = {}
-        for scanned, path in enumerate(paths, 1):
-            source = np.load(path, mmap_mode="r")
-            if source.ndim == 2 and source.shape[1] == 161 + 27 * (n_cars - N_CARS):
-                key = self._dedup_key(path)
-                groups.setdefault(key, []).append(path)
-            report("indexed", scanned, len(paths))
+        with Progress(
+            TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn(),
+            TimeElapsedColumn(), disable=not show_progress,
+        ) as progress:
+            indexed = progress.add_task("Indexing expert POVs", total=len(paths))
+            for path in paths:
+                source = np.load(path, mmap_mode="r")
+                if source.ndim == 2 and source.shape[1] == 161 + 27 * (n_cars - N_CARS):
+                    key = self._dedup_key(path)
+                    groups.setdefault(key, []).append(path)
+                progress.advance(indexed)
 
         selected = [sorted(groups[key]) for key in sorted(groups)]
         if n_cars == DOUBLES_N_CARS:
@@ -1112,7 +1121,6 @@ class ExpertSceneDataset:
         if limit is not None:
             rng.shuffle(selected)
         read_target = limit if limit is not None else len(selected)
-        report("loaded", 0, read_target)
 
         frames: list[th.Tensor] = []
         internal_states: list[th.Tensor] = []
@@ -1125,6 +1133,15 @@ class ExpertSceneDataset:
         goal_actors: list[int | None] = []
         replay_keys: list[str] = []
         total = 0
+        loading = Progress(
+            TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn(),
+            TimeElapsedColumn(), disable=not show_progress,
+        )
+        loaded = loading.add_task(
+            "Loading expert frames" if limit is not None else "Loading expert POVs",
+            total=read_target,
+        )
+        loading.start()
         for group in selected:
             path = group[0]
             if frame_skip is not None:
@@ -1301,6 +1318,11 @@ class ExpertSceneDataset:
                     unsafe_reset = unsafe_reset[:keep]
                 if skill_sampling:
                     touches = touches[:keep]
+            if n_cars == DOUBLES_N_CARS:
+                # Demoed cars in some 2v2 POVs have zero forward/up vectors.
+                # Keep those scenes for the discriminator, but never reset CARL
+                # from a frame where any of the four cars lacks a rotation.
+                unsafe_reset |= _invalid_reset_rotations(source, n_cars)
             real_length = len(source)
             # Every kickoff belongs to a causal window, including the first
             # frame of each replay period. Repeating its initial state provides
@@ -1335,16 +1357,14 @@ class ExpertSceneDataset:
             goal_actors.append(goal_actor if real_length == full_length else None)
             replay_keys.append(self._dedup_key(path)[-1])
             total += real_length
-            report("loaded", total if limit is not None else len(frames), read_target)
+            loading.advance(loaded, real_length if limit is not None else 1)
             if limit is not None and total >= limit:
                 break
+        loading.stop()
 
         if not frames:
             raise ValueError(f"no expert frames loaded from {replay_dir}")
 
-        if show_progress:
-            print(f"Expert replays: packing {total:,} frames from {len(frames):,} POVs",
-                  flush=True)
         gpu_progress = show_progress and target_device.type == "cuda"
         upload_bytes = sum(
             tensor.numel() * tensor.element_size()
@@ -1352,46 +1372,36 @@ class ExpertSceneDataset:
                            ego_touches, unsafe_reset_frames, invalid_frames)
             for tensor in pieces
         ) if gpu_progress else 0
-        upload_count = (3 + 2 * reject_discontinuities + skill_sampling
-                        + self.safety_sampling)
-        scale = 2**20 if upload_bytes >= 2**20 else 2**10
-        unit = "MiB" if scale == 2**20 else "KiB"
-        uploaded_bytes = 0
-        uploaded_count = 0
-        if gpu_progress:
-            print(f"Expert replays: uploading {upload_bytes / scale:.1f} {unit} "
-                  f"in {upload_count} tensors to {target_device}", flush=True)
 
         def upload(label: str, pieces: list[th.Tensor]) -> th.Tensor:
-            nonlocal uploaded_bytes, uploaded_count
+            if gpu_progress:
+                progress.update(transfer, description=f"GPU transfer: {label}")
             packed = th.cat(pieces)
             size = packed.numel() * packed.element_size()
-            if gpu_progress and size >= 2**20:
-                print(f"Expert replays: uploading {label} "
-                      f"({size / 2**20:.1f} MiB)", flush=True)
             result = packed.to(device)
             if gpu_progress:
-                uploaded_bytes += size
-                uploaded_count += 1
-                if size >= 2**20 or uploaded_count == upload_count:
-                    print(f"Expert replays GPU upload: {uploaded_count}/{upload_count} "
-                          f"tensors, {uploaded_bytes / scale:.1f}/"
-                          f"{upload_bytes / scale:.1f} {unit}", flush=True)
+                progress.advance(transfer, size)
             return result
 
-        self.frames = upload("scenes", frames)
-        self.internal_states = upload("car states", internal_states)
-        self.opponent_pov_available = upload("POV flags", opponent_povs)
-        self.contact_frames = (
-            upload("contact flags", contact_frames) if reject_discontinuities else None
-        )
-        self.ego_touches = upload("touch flags", ego_touches) if skill_sampling else None
-        self.unsafe_reset_frames = (
-            upload("reset safety", unsafe_reset_frames) if self.safety_sampling else None
-        )
-        if show_progress:
-            print(f"Expert replays: building windows and reset indexes on {target_device}",
-                  flush=True)
+        with Progress(
+            TextColumn("{task.description}"), BarColumn(), DownloadColumn(binary_units=True),
+            TimeElapsedColumn(), disable=not gpu_progress,
+        ) as progress:
+            transfer = progress.add_task(f"GPU transfer to {target_device}", total=upload_bytes)
+            self.frames = upload("scenes", frames)
+            self.internal_states = upload("car states", internal_states)
+            self.opponent_pov_available = upload("POV flags", opponent_povs)
+            self.contact_frames = (
+                upload("contact flags", contact_frames) if reject_discontinuities else None
+            )
+            self.ego_touches = upload("touch flags", ego_touches) if skill_sampling else None
+            self.unsafe_reset_frames = (
+                upload("reset safety", unsafe_reset_frames) if self.safety_sampling else None
+            )
+            invalid = upload("discontinuity flags", invalid_frames) if reject_discontinuities else None
+            if gpu_progress:
+                progress.update(transfer, description="Expert replay GPU transfer complete")
+
         self.lengths = lengths
         self.segment_goal_actors = goal_actors
         self.segment_replay_keys = replay_keys
@@ -1399,17 +1409,23 @@ class ExpertSceneDataset:
         segment_window_starts = []
         segment_frame_indices = []
         offset = 0
-        for length in lengths:
-            count = max(0, length - trajectory_length + 1)
-            # Prefix copies are context, not additional physical reset states.
-            segment_frame_indices.append(th.arange(
-                offset + self.partition_span, offset + length,
-            ))
-            starts = th.arange(offset, offset + count)
-            segment_window_starts.append(starts)
-            if count:
-                window_starts.append(starts)
-            offset += length
+        with Progress(
+            TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn(),
+            TimeElapsedColumn(), disable=not show_progress,
+        ) as progress:
+            indexed = progress.add_task("Building expert window indexes", total=len(lengths))
+            for length in lengths:
+                count = max(0, length - trajectory_length + 1)
+                # Prefix copies are context, not additional physical reset states.
+                segment_frame_indices.append(th.arange(
+                    offset + self.partition_span, offset + length,
+                ))
+                starts = th.arange(offset, offset + count)
+                segment_window_starts.append(starts)
+                if count:
+                    window_starts.append(starts)
+                offset += length
+                progress.advance(indexed)
         if not window_starts:
             raise ValueError(
                 f"expert files are too short to build windows of length {trajectory_length}"
@@ -1423,7 +1439,6 @@ class ExpertSceneDataset:
 
         self._split_heldout(device, seed)
         if reject_discontinuities:
-            invalid = upload("discontinuity flags", invalid_frames)
             prefix = F.pad(invalid.long().cumsum(0), (1, 0))
 
             def safe_starts(starts: th.Tensor) -> th.Tensor:
@@ -1452,13 +1467,19 @@ class ExpertSceneDataset:
         self._context_situation_pools: dict[bool, tuple[th.Tensor, ...]] = {}
         self._curated_reset_pools: tuple[th.Tensor, ...] | None = None
         self._context_run_starts: dict[bool, th.Tensor] = {}
-        if skill_sampling:
-            if show_progress:
-                print("Expert replays: classifying curated situations", flush=True)
-            self.curated_pools()
-        if show_progress:
-            print(f"Expert replays ready: {total:,} frames from {len(frames):,} POVs "
-                  f"on {target_device}", flush=True)
+        with Progress(
+            SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
+            TimeElapsedColumn(), disable=not show_progress,
+        ) as progress:
+            ready = progress.add_task("Finalizing expert replays", total=None)
+            if skill_sampling:
+                progress.update(ready, description="Classifying curated expert situations")
+                self.curated_pools()
+            progress.update(
+                ready, description=(f"Expert replays ready: {total:,} frames "
+                                    f"from {len(frames):,} POVs on {target_device}"),
+                total=1, completed=1,
+            )
 
     def _split_heldout(self, device: str | th.device, seed: int) -> None:
         split_rng = th.Generator(device=device).manual_seed(seed)

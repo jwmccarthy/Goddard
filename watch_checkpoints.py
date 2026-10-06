@@ -16,6 +16,9 @@ from pathlib import Path
 import carl
 import numpy as np
 import torch as th
+from rich.progress import (
+    BarColumn, DownloadColumn, Progress, TextColumn, TimeElapsedColumn,
+)
 
 from carl.gymnasium import CARLTorchVectorEnv
 from jarl.envs import DatasetResetSampler
@@ -293,14 +296,26 @@ def load_curated_reset_provider(
         for index, category in enumerate(SKILL_CATEGORIES)
     ])
     active_weights /= active_weights.sum()
-    if show_progress:
-        print(f"Viewer reset cache: uploading {offset:,} states to {device}", flush=True)
+    gpu_progress = show_progress and th.device(device).type == "cuda"
+    upload_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (*frames, *internals)
+    ) if gpu_progress else 0
+    with Progress(
+        TextColumn("{task.description}"), BarColumn(), DownloadColumn(binary_units=True),
+        TimeElapsedColumn(), disable=not gpu_progress,
+    ) as progress:
+        task = progress.add_task(f"Viewer reset cache to {device}", total=upload_bytes)
+        cached_frames = th.cat(frames).to(device)
+        if gpu_progress:
+            progress.advance(task, cached_frames.numel() * cached_frames.element_size())
+        cached_internals = th.cat(internals).to(device)
+        if gpu_progress:
+            progress.advance(task, cached_internals.numel() * cached_internals.element_size())
+            progress.update(task, description=f"Viewer reset cache ready: {offset:,} states")
     provider = CuratedViewerResetProvider(
-        th.cat(frames).to(device), th.cat(internals).to(device),
-        pools, active_weights, seed,
+        cached_frames, cached_internals, pools, active_weights, seed,
     )
-    if show_progress:
-        print("Viewer reset cache ready", flush=True)
     return provider
 
 
