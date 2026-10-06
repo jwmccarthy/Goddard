@@ -53,13 +53,15 @@ class ReplayResetProvider:
             return None
         indices = sample["frame_index"]
         scenes = self.frames[indices]
+        internal_indices = indices.to(self.internal_states.device)
+        internal = self.internal_states[internal_indices].to(scenes.device)
         return CARLResetState(
             simulation_indices=sample["simulation_indices"],
             ball=CARLBall.from_tensor(scenes[:, :9]),
             cars=CARLCars.from_tensor(
                 scenes[:, 9:].reshape(-1, self.n_cars, 21), self.n_cars // 2,
             ),
-            car_internal_state=self.internal_states[indices],
+            car_internal_state=internal,
             normalized=True,
         )
 

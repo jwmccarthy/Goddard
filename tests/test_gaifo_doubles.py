@@ -19,11 +19,13 @@ from carl.gymnasium.state import (
 )
 from carl.gymnasium import CARLTorchVectorEnv
 from gaifo import (
-    AdaptiveDiscriminatorUpdate, CausalSceneTransformer, ExpertSceneDataset,
+    AdaptiveDiscriminatorUpdate, CausalSceneTransformer, CompactSceneWindows,
+    ExpertSceneDataset,
     FactorizedSceneDiscriminator, GAIFO_DOUBLES_ARCHITECTURE,
     GameplayDiagnostics, GeneratedContextTimeline,
     SceneDiscriminatorLoss,
-    SceneDiscriminatorReward, SceneWindowCapture, actor_view, simulation_episode_ends,
+    SceneDiscriminatorReward, SceneWindowCapture, actor_view, nearest_ball_distance,
+    simulation_episode_ends,
     build_policy, load_resume_checkpoint, main,
 )
 from jarl.data import TensorBatch
@@ -178,6 +180,58 @@ class DoublesDataTests(unittest.TestCase):
         self.assertTrue(first["scene_window_valid"].all())
         th.testing.assert_close(capture.history_age, th.zeros(4, dtype=th.long))
 
+    def test_compact_rollout_recovers_exact_windows_across_simulation_resets(self):
+        horizon, n_envs, length = 5, 8, 4
+        dense = SceneWindowCapture(length, n_cars=4)
+        compact = SceneWindowCapture(length, n_cars=4, compact_rollout=horizon)
+        dense.reset(n_envs)
+        compact.reset(n_envs)
+        full, scored, observed, endings = [], [], [], []
+        previous = None
+        previous_end = None
+        for step in range(12):
+            obs = th.zeros(n_envs, 191)
+            obs[:, 0] = th.arange(n_envs) * .1 + step
+            obs[:, 9] = .03 * (step + 1)
+            if previous is not None:
+                obs[:, 0] = th.where(previous_end, obs[:, 0] + 100, previous[:, 0])
+                obs[:, 9] = th.where(previous_end, obs[:, 9], previous[:, 9])
+            next_obs = obs.clone()
+            next_obs[:, 0] += .25
+            next_obs[:, 9] += .01
+            done = th.zeros(n_envs, dtype=th.bool)
+            if step in (1, 8):
+                done[1] = True
+            if step in (4, 6):
+                done[7] = True
+            context = SimpleNamespace(
+                observation=obs, env_step=SimpleNamespace(next_obs=next_obs, done=done),
+            )
+            full.append(dense._capture(context)["scene_window"])
+            small = compact._capture(context)["scene_window"]
+            self.assertEqual(small.shape, (n_envs, 93))
+            scored.append(small)
+            observed.append(obs[:, :93])
+            endings.append(done)
+            previous, previous_end = next_obs, done.view(2, 4).any(-1).repeat_interleave(4)
+
+            if (step + 1) % horizon == 0 or step == 11:
+                subset = slice(step - (step % horizon), step + 1)
+                reference = th.stack(full[subset])
+                compressed = CompactSceneWindows(
+                    th.stack(scored[subset]), th.stack(observed[subset]),
+                    compact.initial_windows, th.stack(endings[subset]), 4,
+                )
+                th.testing.assert_close(
+                    compressed[th.arange(len(compressed))], reference.flatten(0, 1),
+                    rtol=0, atol=0,
+                )
+                th.testing.assert_close(
+                    nearest_ball_distance(compressed), nearest_ball_distance(reference),
+                    rtol=0, atol=0,
+                )
+                th.testing.assert_close(compressed[:, -2], th.stack(observed[subset]).flatten(0, 1))
+
     def test_team_goals_and_opponent_touch_credit_use_opposite_team(self):
         raw = th.zeros(1, 9 + 22 * 4 + len(BOOST_PAD_POSITIONS))
         raw[0, 2] = 700
@@ -319,6 +373,33 @@ class DoublesTransformerTests(unittest.TestCase):
     "opt-in CUDA/CARL 2v2 integration smoke",
 )
 class DoublesGpuSmokeTests(unittest.TestCase):
+    def test_cuda_reset_uses_exact_four_car_timers_from_host_memory(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            write_four_povs(folder, "game-a", invalid_rotations=True)
+            expert = ExpertSceneDataset(
+                folder, 3, frame_skip=4, device="cuda", n_cars=4,
+                reject_discontinuities=True, skill_sampling=True,
+            )
+            self.assertEqual(expert.frames.device.type, "cuda")
+            self.assertEqual(expert.internal_states.device.type, "cpu")
+            chosen = expert.reset_indices[:2]
+
+            class FixedSampler:
+                def __call__(self, mask):
+                    return TensorBatch({
+                        "frame_index": chosen,
+                        "simulation_indices": th.arange(len(chosen), device=chosen.device),
+                    })
+
+            reset = ReplayResetProvider(
+                FixedSampler(), expert.frames, expert.internal_states,
+            )(th.ones(len(chosen), dtype=th.bool, device="cuda"))
+            self.assertEqual(reset.car_internal_state.device.type, "cuda")
+            th.testing.assert_close(
+                reset.car_internal_state.cpu(), expert.internal_states[chosen.cpu()],
+            )
+
     def test_full_four_actor_rollout_discriminator_ppo_and_checkpoint(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -329,7 +410,7 @@ class DoublesGpuSmokeTests(unittest.TestCase):
             flags = [
                 "gaifo.py", "--team-size", "2", "--replay-dir", str(replays),
                 "--n-sim", "2", "--rollout", "8", "--trajectory-length", "3",
-                "--replay-reset-fraction", "1", "--timesteps", "64",
+                "--replay-reset-fraction", "1", "--timesteps", "128",
                 "--max-ticks", "3600", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
                 "--discriminator-hidden", "16", "--frame-embedding", "8",
@@ -347,7 +428,7 @@ class DoublesGpuSmokeTests(unittest.TestCase):
             paths = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(paths), 2)
             saved = load_resume_checkpoint(max(paths))
-            self.assertEqual(saved["step"], 64)
+            self.assertEqual(saved["step"], 128)
             self.assertEqual(saved["config"]["team_size"], 2)
             self.assertTrue(saved["config"]["factorize"])
             self.assertTrue(saved["config"]["transformer_global"])
