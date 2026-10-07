@@ -323,11 +323,11 @@ def load_policy_checkpoint(
             raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
         hidden = int(config["policy_hidden"])
         layers = int(config.get("policy_layers", 1))
+        policy_state = payload["policy"]
         policy = build_gaifo_policy(
-            policy_environment(env, bool(config.get("expired_dodge_mask", False))),
+            checkpoint_policy_environment(env, policy_state, path, config),
             argparse.Namespace(policy_hidden=hidden, policy_layers=layers, gru=gru),
         )
-        policy_state = payload["policy"]
     else:
         checkpoint = policy_checkpoint(payload, path)
         policy_state = checkpoint.state
@@ -337,13 +337,14 @@ def load_policy_checkpoint(
             None if checkpoint.architecture == BASIC_POLICY_ARCHITECTURE
             else checkpoint.architecture
         )
+        policy_env = checkpoint_policy_environment(env, policy_state, path, config)
         if architecture is None:
             policy, _ = build_policy_and_critic(
-                policy_environment(env, False), argparse.Namespace(hidden_size=hidden)
+                policy_env, argparse.Namespace(hidden_size=hidden)
             )
         else:
             policy = build_gaifo_policy(
-                policy_environment(env, bool(config.get("expired_dodge_mask", False))),
+                policy_env,
                 argparse.Namespace(
                     policy_hidden=hidden,
                     policy_layers=layers,
@@ -375,6 +376,27 @@ def policy_environment(env: CARLTorchVectorEnv, dodge_window: bool):
         ),
         single_action_space=env.single_action_space,
     )
+
+
+def checkpoint_policy_environment(
+    env: CARLTorchVectorEnv, state: dict, path: Path, config: dict,
+):
+    """Match the network's saved input width to CARL or its jump-age extension."""
+    foot = state.get("foot.model.0.weight")
+    if not isinstance(foot, th.Tensor) or foot.ndim != 2:
+        raise ValueError(f"checkpoint has no supported policy encoder: {path}")
+    raw_size = getattr(env, "raw_observation_size", env.single_observation_space.shape[0])
+    input_size = foot.shape[1]
+    if input_size not in (raw_size, raw_size + 1):
+        raise ValueError(
+            f"checkpoint policy needs {input_size} observation features; "
+            f"viewer supports {raw_size} or {raw_size + 1}: {path}"
+        )
+    dodge_window = input_size == raw_size + 1
+    if ("expired_dodge_mask" in config
+            and bool(config["expired_dodge_mask"]) != dodge_window):
+        raise ValueError(f"checkpoint dodge-window setting does not match weights: {path}")
+    return policy_environment(env, dodge_window)
 
 
 def policy_observation(policy, observation: th.Tensor) -> th.Tensor:

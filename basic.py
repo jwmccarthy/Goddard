@@ -52,6 +52,7 @@ from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
+from dodge_window import DodgeAwareCARLTorchVectorEnv
 from reward_spec import RewardSpec
 from replay_resets import (
     ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
@@ -74,6 +75,7 @@ class PolicyCheckpoint:
     architecture: str
     hidden_size: int
     state: dict[str, torch.Tensor]
+    observation_size: int
     policy_layers: int = 1
 
 
@@ -133,7 +135,7 @@ def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
             raise ValueError(f"checkpoint has no supported policy layers: {path}")
         if config.get("policy_layers", policy_layers) != policy_layers:
             raise ValueError(f"checkpoint policy layers do not match weights: {path}")
-    return PolicyCheckpoint(architecture, hidden_size, state, policy_layers)
+    return PolicyCheckpoint(architecture, hidden_size, state, foot.shape[1], policy_layers)
 
 
 def load_policy_checkpoint(path: Path) -> tuple[PolicyCheckpoint, dict]:
@@ -152,6 +154,8 @@ def configure_starting_checkpoint(
 
     starting = None
     resumed_reference = False
+    arguments.checkpoint_observation_size = None
+    arguments.expired_dodge_mask = False
     source = arguments.start_checkpoint or arguments.resume_checkpoint
     if source is not None:
         checkpoint, payload = load_policy_checkpoint(source)
@@ -173,6 +177,9 @@ def configure_starting_checkpoint(
             )
         arguments.policy_architecture = checkpoint.architecture
         arguments.policy_layers = checkpoint.policy_layers
+        arguments.checkpoint_observation_size = checkpoint.observation_size
+        # The GAIFO dodge-window policy stores jump age after CARL's 137 features.
+        arguments.expired_dodge_mask = checkpoint.observation_size == 138
 
         if arguments.start_kl_coef is None and resumed_reference:
             arguments.start_kl_coef = payload.get("config", {}).get(
@@ -1003,6 +1010,7 @@ def build_ppo(
         "config": {
             "policy_architecture": arguments.policy_architecture,
             "hidden_size": arguments.hidden_size,
+            "expired_dodge_mask": getattr(arguments, "expired_dodge_mask", False),
             **(
                 {"policy_layers": getattr(arguments, "policy_layers", 1)}
                 if arguments.policy_architecture in (
@@ -1013,6 +1021,39 @@ def build_ppo(
             "sparse": arguments.sparse,
         },
     }
+
+
+def build_training_environment(
+    arguments: argparse.Namespace,
+    reset_provider: SyntheticMatchResetProvider,
+) -> CARLTorchVectorEnv:
+    environment_type = (
+        DodgeAwareCARLTorchVectorEnv if getattr(arguments, "expired_dodge_mask", False)
+        else CARLTorchVectorEnv
+    )
+    environment = environment_type(
+        n_sim=arguments.num_simulations,
+        n_blue=1,
+        n_orange=1,
+        seed=arguments.seed,
+        frameskip=arguments.frameskip,
+        max_ticks=arguments.max_ticks,
+        no_touch_timeout_seconds=arguments.no_touch_timeout,
+        synchronize=False,
+        reward_scale=arguments.reward_scale,
+        reset_state_provider=reset_provider,
+        normalize=arguments.normalize,
+        discrete_actions=True,
+    )
+    saved_size = getattr(arguments, "checkpoint_observation_size", None)
+    actual_size = environment.single_observation_space.shape[0]
+    if saved_size is not None and saved_size != actual_size:
+        environment.close()
+        raise ValueError(
+            f"checkpoint policy needs {saved_size} observation features, "
+            f"but CARL provides {actual_size}"
+        )
+    return environment
 
 
 def main() -> None:
@@ -1044,20 +1085,7 @@ def main() -> None:
     reset_provider = SyntheticMatchResetProvider(
         ReplayResetProvider(reset_sampler, replay_frames, replay_internal)
     )
-    environment = CARLTorchVectorEnv(
-        n_sim=arguments.num_simulations,
-        n_blue=1,
-        n_orange=1,
-        seed=arguments.seed,
-        frameskip=arguments.frameskip,
-        max_ticks=arguments.max_ticks,
-        no_touch_timeout_seconds=arguments.no_touch_timeout,
-        synchronize=False,
-        reward_scale=arguments.reward_scale,
-        reset_state_provider=reset_provider,
-        normalize=arguments.normalize,
-        discrete_actions=True,
-    )
+    environment = build_training_environment(arguments, reset_provider)
     reward_function = environment.register_reward(
         DiagnosticRewardSpec(
             normalize=arguments.normalize_rewards,

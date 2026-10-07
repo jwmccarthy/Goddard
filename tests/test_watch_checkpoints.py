@@ -13,6 +13,7 @@ import torch as th
 from gymnasium.spaces import Box, MultiDiscrete
 from http.server import ThreadingHTTPServer
 
+from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic
 from gaifo import (
     GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
     build_policy,
@@ -207,8 +208,48 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                 enhanced.act(policy_observation(enhanced, observation), deterministic=True)
                 .action[:, 6].tolist(), [0, 0],
             )
-            with self.assertRaisesRegex(ValueError, "requires dodge-window observations"):
+            without_flag = th.load(paths[1], weights_only=True)
+            del without_flag["config"]["expired_dodge_mask"]
+            implicit = Path(directory) / "gaifo_000000000002.pt"
+            th.save(without_flag, implicit)
+            loaded, _ = load_policy_checkpoint(implicit, env, 4, None)
+            self.assertEqual(loaded.foot.model[0].in_features, 138)
+            with self.assertRaisesRegex(ValueError, "checkpoint policy needs 138 observation features"):
                 load_policy_checkpoint(paths[1], FakeEnv(), 4, None)
+
+    def test_basic_checkpoints_and_snapshots_infer_dodge_window_from_weights(self):
+        class DodgeAwareEnv(FakeEnv):
+            dodge_window_features = True
+            raw_observation_size = 137
+            n_cars = 2
+            action_codec = DodgeWindowActionCodec(137)
+            single_observation_space = Box(-np.inf, np.inf, (138,), np.float32)
+            single_action_space = MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
+
+        env = DodgeAwareEnv()
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            for architecture in (GAIFO_ARCHITECTURE, BASIC_POLICY_ARCHITECTURE):
+                with self.subTest(architecture=architecture):
+                    reference = (
+                        build_policy(env, argparse.Namespace(policy_hidden=16, gru=False))
+                        if architecture == GAIFO_ARCHITECTURE else
+                        build_policy_and_critic(env, argparse.Namespace(hidden_size=16))[0]
+                    )
+                    training = Path(directory) / "training_latest.pt"
+                    snapshot = Path(directory) / "actor_critic_final.pt"
+                    th.save({
+                        "modules": {"policy": reference.state_dict()},
+                        "config": {
+                            "policy_architecture": architecture, "hidden_size": 16,
+                        },
+                    }, training)
+                    th.save(reference.state_dict(), snapshot)
+                    for path in (training, snapshot):
+                        loaded, _ = load_policy_checkpoint(path, env, 4, None)
+                        self.assertEqual(loaded.foot.model[0].in_features, 138)
+                        th.testing.assert_close(
+                            loaded.foot.model[0].weight, reference.foot.model[0].weight,
+                        )
 
     def test_mismatched_gru_metadata_is_rejected(self):
         env = FakeEnv()

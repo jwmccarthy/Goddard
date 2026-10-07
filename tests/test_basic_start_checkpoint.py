@@ -1,5 +1,6 @@
 import argparse
 import copy
+import os
 import sys
 import tempfile
 import unittest
@@ -20,11 +21,16 @@ from basic import (
     build_policy_and_critic,
     build_policy_loss,
     build_ppo,
+    build_training_environment,
     configure_starting_checkpoint,
     load_policy_checkpoint,
     parse_arguments,
 )
-from gaifo import GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE
+from dodge_window import DodgeAwareCARLTorchVectorEnv
+from gaifo import (
+    GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+    build_policy as build_gaifo_policy,
+)
 from jarl.collect.capture import CaptureContext
 from jarl.data import TensorBatch
 from jarl.learn import PPOConfig, PPOLoss
@@ -178,6 +184,132 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                     snapshot, _ = load_policy_checkpoint(path)
                     self.assertEqual(snapshot.architecture, architecture)
                     self.assertEqual(snapshot.policy_layers, layers)
+
+    def test_start_and_resume_preserve_gaifo_dodge_window_observation_width(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            for width, architecture in (
+                (137, GAIFO_ARCHITECTURE), (138, GAIFO_ARCHITECTURE),
+                (138, GAIFO_GRU_ARCHITECTURE),
+            ):
+                with self.subTest(width=width, architecture=architecture):
+                    env = FakeEnv()
+                    env.single_observation_space = Box(
+                        -1, 1, shape=(width,), dtype=np.float32,
+                    )
+                    initial_args = argparse.Namespace(hidden_size=16)
+                    reference, critic = build_policy_and_critic(
+                        env, initial_args, architecture,
+                    )
+                    gaifo_path = Path(directory) / "gaifo.pt"
+                    torch.save({
+                        "policy": reference.state_dict(),
+                        "config": {
+                            "architecture": architecture, "policy_hidden": 16,
+                            "gru": architecture == GAIFO_GRU_ARCHITECTURE,
+                            "expired_dodge_mask": width == 138,
+                        },
+                    }, gaifo_path)
+
+                    start_args = checkpoint_args(start=gaifo_path)
+                    starting, _ = configure_starting_checkpoint(start_args)
+                    self.assertEqual(start_args.checkpoint_observation_size, width)
+                    self.assertEqual(start_args.expired_dodge_mask, width == 138)
+                    start_args.num_simulations = 2
+                    start_args.seed = 0
+                    start_args.frameskip = 4
+                    start_args.max_ticks = 100
+                    start_args.no_touch_timeout = 30
+                    start_args.reward_scale = 1
+                    start_args.normalize = True
+                    with patch("basic.CARLTorchVectorEnv", return_value=env) as legacy, \
+                            patch("basic.DodgeAwareCARLTorchVectorEnv", return_value=env) as dodge:
+                        built = build_training_environment(start_args, None)
+                        (dodge if width == 138 else legacy).assert_called_once()
+                        (legacy if width == 138 else dodge).assert_not_called()
+                    initialized, initialized_critic = build_policy_and_critic(
+                        built, start_args, start_args.policy_architecture,
+                    )
+                    initialized.load_state_dict(starting.state)
+                    torch.testing.assert_close(
+                        initialized.foot.model[0].weight, reference.foot.model[0].weight,
+                    )
+
+                    if width == 138 and architecture == GAIFO_ARCHITECTURE:
+                        training_path = Path(directory) / "training_latest.pt"
+                        training_args = ppo_args(architecture)
+                        training_args.start_kl_coef = 0
+                        training_args.expired_dodge_mask = start_args.expired_dodge_mask
+                        training_objects = build_ppo(
+                            env, initialized, initialized_critic,
+                            DiagnosticRewardSpec(normalize=False), training_args,
+                            Path(directory) / "snapshot-pool",
+                        )[-1]
+                        self.assertTrue(training_objects["config"]["expired_dodge_mask"])
+                        checkpointer = TrainingCheckpointer(
+                            training_path, **training_objects,
+                        )
+                        checkpointer(SimpleNamespace(clock=Clock(
+                            vector_steps=1, env_steps=4, learner_updates=1,
+                        )))
+                        resume_args = checkpoint_args(resume=training_path)
+                        resumed, _ = configure_starting_checkpoint(resume_args)
+                        self.assertIsNone(resumed)
+                        self.assertTrue(resume_args.expired_dodge_mask)
+                        self.assertEqual(resume_args.checkpoint_observation_size, 138)
+                        resumed_policy, resumed_critic = build_policy_and_critic(
+                            env, resume_args, resume_args.policy_architecture,
+                        )
+                        TrainingCheckpointer.load_modules(
+                            training_path, {"policy": resumed_policy, "critic": resumed_critic},
+                            "cpu",
+                        )
+
+    @unittest.skipUnless(
+        os.environ.get("GODDARD_GPU_SMOKE") == "1" and torch.cuda.is_available(),
+        "opt-in CARL/CUDA Basic checkpoint integration",
+    )
+    def test_real_carl_basic_warm_start_from_dodge_aware_gaifo(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            source = DodgeAwareCARLTorchVectorEnv(
+                n_sim=1, n_blue=1, n_orange=1, frameskip=4,
+                normalize=True, discrete_actions=True,
+            )
+            try:
+                reference = build_gaifo_policy(
+                    source, argparse.Namespace(policy_hidden=16, gru=False),
+                )
+                path = Path(directory) / "gaifo_000000000000.pt"
+                torch.save({
+                    "policy": reference.state_dict(),
+                    "config": {
+                        "architecture": GAIFO_ARCHITECTURE, "policy_hidden": 16,
+                        "expired_dodge_mask": True,
+                    },
+                }, path)
+                arguments = checkpoint_args(start=path)
+                starting, _ = configure_starting_checkpoint(arguments)
+                arguments.num_simulations = 1
+                arguments.seed = 0
+                arguments.frameskip = 4
+                arguments.max_ticks = 100
+                arguments.no_touch_timeout = 30
+                arguments.reward_scale = 1
+                arguments.normalize = True
+                env = build_training_environment(arguments, None)
+                try:
+                    observation = env.reset()
+                    self.assertEqual(tuple(observation.shape), (2, 138))
+                    policy, _ = build_policy_and_critic(
+                        env, arguments, arguments.policy_architecture,
+                    )
+                    policy.load_state_dict(starting.state)
+                    with torch.no_grad():
+                        action = policy.act(observation, deterministic=True).action
+                    self.assertEqual(tuple(action.shape), (2, 7))
+                finally:
+                    env.close()
+            finally:
+                source.close()
 
     def test_gaifo_style_flags_accept_legacy_basic_spellings(self):
         aliases = (
