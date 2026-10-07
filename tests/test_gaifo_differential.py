@@ -1,4 +1,4 @@
-"""Differential GAIFO rewards compare the same context in log-odds or odds."""
+"""Differential GAIFO rewards compare the same context in log-odds or discounted odds."""
 
 import math
 import unittest
@@ -79,7 +79,7 @@ class FactorizedTransformer(th.nn.Module):
 
 
 class DifferentialRewardTests(unittest.TestCase):
-    def test_short_window_compares_capped_odds_without_rewarding_old_frames(self):
+    def test_short_window_discounts_capped_odds_without_rewarding_old_frames(self):
         windows = th.zeros(1, 6, 3, 51)
         windows[0, :, 0, 0] = th.tensor([100., -100., 100., -100., 2., -2.])
         windows[0, :, 1, 0] = th.tensor([math.log(2), 0., -100., 0., 0., -100.])
@@ -88,14 +88,15 @@ class DifferentialRewardTests(unittest.TestCase):
         odds = SceneDiscriminatorReward(
             PositionJudge(), noise_std=0, trajectory_length=3,
             differential=True, exp_log_odds_reward=True, max_magnitude=10,
-            batch_size=2,
+            batch_size=2, gamma=0.9,
         )
         th.testing.assert_close(
-            odds._score_windows(windows, valid), th.tensor([[0.5, -0.5, 0., 9., 0., 0.]]),
+            odds._score_windows(windows, valid),
+            th.tensor([[0.55, -0.4, 1., 9.1, 0.1, 0.]]),
         )
         log_odds = SceneDiscriminatorReward(
             PositionJudge(), noise_std=0, trajectory_length=3,
-            differential=True, max_magnitude=10, batch_size=2,
+            differential=True, max_magnitude=10, batch_size=2, gamma=0.9,
         )
         th.testing.assert_close(
             log_odds._score_windows(windows, valid),
@@ -120,12 +121,12 @@ class DifferentialRewardTests(unittest.TestCase):
         })
         reward = SceneDiscriminatorReward(
             CoordinateHeads(), noise_std=0, trajectory_length=2,
-            differential=True, exp_log_odds_reward=True, max_magnitude=10,
+            differential=True, exp_log_odds_reward=True, max_magnitude=10, gamma=0.9,
         )(batch, PrepareContext())
-        th.testing.assert_close(reward["far_imitation_reward"], th.tensor([[0., -0.25]]))
-        th.testing.assert_close(reward["near_imitation_reward"], th.tensor([[0.25, 0.]]))
-        th.testing.assert_close(reward["global_imitation_reward"], th.tensor([[0.5, -4.5]]))
-        th.testing.assert_close(reward["imitation_reward"], th.tensor([[0.75, -4.75]]))
+        th.testing.assert_close(reward["far_imitation_reward"], th.tensor([[0., -0.2]]))
+        th.testing.assert_close(reward["near_imitation_reward"], th.tensor([[0.275, 0.]]))
+        th.testing.assert_close(reward["global_imitation_reward"], th.tensor([[0.55, -4.]]))
+        th.testing.assert_close(reward["imitation_reward"], th.tensor([[0.825, -4.2]]))
 
     def test_recurrent_odds_rebases_after_updates_and_resets_both_povs(self):
         def windows(values):
@@ -141,6 +142,7 @@ class DifferentialRewardTests(unittest.TestCase):
                 reward = SceneDiscriminatorReward(
                     judge, noise_std=0, trajectory_length=2, context_length=3,
                     differential=True, exp_log_odds_reward=True, batch_size=1,
+                    gamma=0.9,
                 )
 
                 def global_head(scenes, ends):
@@ -149,13 +151,13 @@ class DifferentialRewardTests(unittest.TestCase):
 
                 first = global_head(windows([[.1, .1], [.2, .2]]), none_end)
                 th.testing.assert_close(first, th.tensor([
-                    [math.exp(-.1) - 1] * 2,
-                    [math.exp(-.3) - math.exp(-.1)] * 2,
+                    [math.exp(-.1) - 0.9] * 2,
+                    [math.exp(-.3) - 0.9 * math.exp(-.1)] * 2,
                 ]))
                 second = global_head(windows([[.3, .3], [.4, .4]]), none_end)
                 th.testing.assert_close(second, th.tensor([
-                    [math.exp(-.6) - math.exp(-.3)] * 2,
-                    [math.exp(-1.) - math.exp(-.6)] * 2,
+                    [math.exp(-.6) - 0.9 * math.exp(-.3)] * 2,
+                    [math.exp(-1.) - 0.9 * math.exp(-.6)] * 2,
                 ]))
 
                 model = judge.global_discriminator if factorized else judge
@@ -165,13 +167,13 @@ class DifferentialRewardTests(unittest.TestCase):
                 ending[1, 0] = True
                 later = global_head(windows([[.1, .1], [.2, .2]]), ending)
                 th.testing.assert_close(later, th.tensor([
-                    [math.exp(-2.) - math.exp(-1.8)] * 2,
-                    [math.exp(-2.4) - math.exp(-2.)] * 2,
+                    [math.exp(-2.) - 0.9 * math.exp(-1.8)] * 2,
+                    [math.exp(-2.4) - 0.9 * math.exp(-2.)] * 2,
                 ]))
                 reset = global_head(windows([[.1, .1], [.2, .2]]), none_end)
                 th.testing.assert_close(reset, th.tensor([
-                    [math.exp(-.2) - 1] * 2,
-                    [math.exp(-.6) - math.exp(-.2)] * 2,
+                    [math.exp(-.2) - 0.9] * 2,
+                    [math.exp(-.6) - 0.9 * math.exp(-.2)] * 2,
                 ]))
 
     def test_transformer_odds_uses_same_capped_context_across_rollouts(self):
@@ -189,8 +191,9 @@ class DifferentialRewardTests(unittest.TestCase):
                 reward = SceneDiscriminatorReward(
                     FactorizedTransformer() if factorized else FirstFrameTransformer(),
                     noise_std=0, trajectory_length=2, context_length=3,
-                    differential=differential, exp_log_odds_reward=True,
+                    differential=differential, exp_log_odds_reward=True, gamma=0.9,
                 )
+                discount = 0.9 if differential else 1.0
 
                 def global_head(scenes, ends):
                     scores = reward._score_windows(scenes, valid, ends)
@@ -198,14 +201,19 @@ class DifferentialRewardTests(unittest.TestCase):
 
                 first = global_head(windows([[.1, .4], [.2, .5]]), ending)
                 th.testing.assert_close(first, th.tensor([
-                    [math.exp(-.1) - 1, math.exp(-.4) - 1], [0., 0.],
+                    [math.exp(-.1) - discount, math.exp(-.4) - discount],
+                    [(1 - discount) * math.exp(-.1), (1 - discount) * math.exp(-.4)],
                 ]))
                 second = global_head(windows([[.3, .6], [.7, .9]]), th.zeros_like(ending))
                 th.testing.assert_close(second, th.tensor([
-                    [math.exp(-.3) - 1, math.exp(-.6) - 1], [0., 0.],
+                    [math.exp(-.3) - discount, math.exp(-.6) - discount],
+                    [(1 - discount) * math.exp(-.3), (1 - discount) * math.exp(-.6)],
                 ]))
                 third = global_head(windows([[.8, .8], [.9, .9]]), th.zeros_like(ending))
-                th.testing.assert_close(third, th.zeros_like(third))
+                th.testing.assert_close(third, th.tensor([
+                    [(1 - discount) * math.exp(-.3), (1 - discount) * math.exp(-.6)],
+                    [(1 - discount) * math.exp(-.7), (1 - discount) * math.exp(-.9)],
+                ]))
 
 
 if __name__ == "__main__":

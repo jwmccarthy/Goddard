@@ -3958,9 +3958,10 @@ class SceneDiscriminatorReward:
 
     Short windows receive normalized expert log-odds by default, or capped
     expert-to-agent odds with the optional exponential reward. Differential
-    mode rewards the change in expert log-odds or capped expert odds as a scene
-    frame is added. Physical bonuses are zero-sum in 1v1; goal and touch
-    transitions remain learnable before imitation windows are valid.
+    mode rewards the change in expert log-odds or discount-adjusted capped
+    expert odds as a scene frame is added. Physical bonuses are zero-sum in
+    1v1; goal and touch transitions remain learnable before imitation windows
+    are valid.
     """
 
     def __init__(
@@ -3976,6 +3977,7 @@ class SceneDiscriminatorReward:
         exp_log_odds_reward: bool = False,
         context_length: int = 16,
         differential: bool = False,
+        gamma: float = 0.99,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -3989,6 +3991,8 @@ class SceneDiscriminatorReward:
             raise ValueError("flip reset reward weight must be non-negative")
         if context_length < 1:
             raise ValueError("recurrent context length must be positive")
+        if not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
+            raise ValueError("reward gamma must be in (0, 1]")
         self.discriminator = discriminator
         self.factorize = getattr(discriminator, "factorized", False)
         self.recurrent_global = getattr(discriminator, "recurrent_global", False)
@@ -4002,6 +4006,7 @@ class SceneDiscriminatorReward:
         self.max_magnitude = max_magnitude
         self.exp_log_odds_reward = exp_log_odds_reward
         self.differential = differential
+        self.gamma = gamma
         self.context_length = context_length
         self._recent_frames: th.Tensor | None = None
         self._recent_ends: th.Tensor | None = None
@@ -4028,7 +4033,10 @@ class SceneDiscriminatorReward:
 
     def _score_change(self, current: th.Tensor, previous: th.Tensor) -> th.Tensor:
         if self.exp_log_odds_reward:
-            return self._expert_odds(current) - self._expert_odds(previous)
+            previous_odds = self._expert_odds(previous)
+            return self._expert_odds(current) - (
+                self.gamma if self.differential else 1.0
+            ) * previous_odds
         return previous - current
 
     def _score_global_sequence(
@@ -5169,7 +5177,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--differential", action=argparse.BooleanOptionalAction, default=False,
-        help="reward the change in expert log-odds, or capped expert odds with --exp-log-odds-reward, when a frame is added to the same causal context (Transformer global reward already uses this)",
+        help="reward expert log-odds changes, or current capped expert odds minus --gamma times previous capped odds with --exp-log-odds-reward (Transformer global reward is already differential)",
     )
     parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,
@@ -5803,6 +5811,7 @@ def main() -> None:
                 exp_log_odds_reward=args.exp_log_odds_reward,
                 context_length=args.discriminator_context_length,
                 differential=args.differential,
+                gamma=args.gamma,
             ),
             GAE(
                 gamma=args.gamma,

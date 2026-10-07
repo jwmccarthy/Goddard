@@ -63,13 +63,15 @@ Add `--differential` to use that same before/after reward with the short-window
 GRU: score a window with and without its newest frame, then reward the change
 in expert log-odds. This mode clips the raw change rather than normalizing
 scores across the rollout. With `--exp-log-odds-reward`, differential reward is
-instead the change in capped expert-to-agent odds; unchanged scores give zero
-reward, and worsening scores give a negative reward. Each odds score is capped
-at `--reward-max-magnitude` before subtraction. With `--factorize`,
+instead the current capped expert-to-agent odds minus `--gamma` times the
+previous capped odds. An unchanged score earns `(1 - gamma)` times its odds;
+larger declines still give negative rewards. Each odds score is capped at
+`--reward-max-magnitude` before subtraction. With `--factorize`,
 `--differential` also differences the far-car and near-ball heads before the
-usual proximity gate. The Transformer global head is differential regardless
-of this flag; a recurrent global GRU carries its previous score across
-rollouts and clears it at game boundaries.
+usual proximity gate. The Transformer global head compares before/after scores
+even without this flag, but only discounts the previous odds when it is set;
+a recurrent global GRU carries its previous score across rollouts and clears
+it at game boundaries.
 `--factorize --transformer` also trains the existing near-ball and far-car
 specialists. `--gru` independently controls the policy and critic; it does not
 select the discriminator. `--transformer` cannot be combined with
