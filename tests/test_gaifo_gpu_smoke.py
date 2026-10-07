@@ -26,7 +26,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
     def _short_window_training(
         self, factorize: bool, hard_positive_mining: bool = False,
         exp_log_odds_reward: bool = False, recency_replay: bool = False,
-        transformer: bool = False,
+        transformer: bool = False, differential: bool = False,
     ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -77,6 +77,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 flags.extend(("--hard-positive-mining", "--no-touch-timeout", "0.3"))
             if exp_log_odds_reward:
                 flags.append("--exp-log-odds-reward")
+            if differential:
+                flags.append("--differential")
             if recency_replay:
                 flags.append("--recency-replay")
             output = io.StringIO()
@@ -170,6 +172,19 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertTrue(saved["config"]["exp_log_odds_reward"])
                 self.assertTrue(saved["config"]["recency_replay"])
                 self.assertIn("D heldout accuracy", output)
+
+    def test_differential_exponential_odds_trains_across_discriminator_modes(self):
+        for transformer in (False, True):
+            for factorize in (False, True):
+                with self.subTest(transformer=transformer, factorize=factorize):
+                    saved, output, _ = self._short_window_training(
+                        factorize, transformer=transformer,
+                        differential=True, exp_log_odds_reward=True,
+                    )
+                    self.assertEqual(saved["step"], 64)
+                    self.assertTrue(saved["config"]["differential"])
+                    self.assertTrue(saved["config"]["exp_log_odds_reward"])
+                    self.assertIn("D heldout accuracy", output)
 
 
 if __name__ == "__main__":

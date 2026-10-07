@@ -59,14 +59,27 @@ GAIFO retains its short-window GRU discriminator by default. Add `--transformer`
 to judge a capped causal history of the ball and both cars instead. Transformer
 reward is the change in expert log-odds when the newest frame is added to the
 **same** capped context, with both POVs reset together at game boundaries.
+Add `--differential` to use that same before/after reward with the short-window
+GRU: score a window with and without its newest frame, then reward the change
+in expert log-odds. This mode clips the raw change rather than normalizing
+scores across the rollout. With `--exp-log-odds-reward`, differential reward is
+instead the change in capped expert-to-agent odds; unchanged scores give zero
+reward, and worsening scores give a negative reward. Each odds score is capped
+at `--reward-max-magnitude` before subtraction. With `--factorize`,
+`--differential` also differences the far-car and near-ball heads before the
+usual proximity gate. The Transformer global head is differential regardless
+of this flag; a recurrent global GRU carries its previous score across
+rollouts and clears it at game boundaries.
 `--factorize --transformer` also trains the existing near-ball and far-car
 specialists. `--gru` independently controls the policy and critic; it does not
 select the discriminator. `--transformer` cannot be combined with
-`--recurrent-global` or `--exp-log-odds-reward`.
+`--recurrent-global`.
 
 ```bash
 .venv/bin/python gaifo.py --replay-dir parsed_replays/pro_1v1_fs4 \
   --transformer --ppo-lr-end 3e-5 --discriminator-lr-end 3e-5
+.venv/bin/python gaifo.py --replay-dir parsed_replays/pro_1v1_fs4 \
+  --differential --exp-log-odds-reward
 ```
 
 Transformer defaults to a 128-frame context, 256 simulations, a 2,048-window

@@ -239,6 +239,33 @@ class FactorizedGAIFOTests(unittest.TestCase):
         self.assertEqual(result["imitation_reward"][0, 4].item(), 0.0)
         self.assertTrue(result["learner_mask"].all())
 
+    def test_differential_reward_keeps_raw_head_changes_and_proximity_gate(self):
+        windows = th.zeros(1, 2, 2, 51)
+        windows[0, 0, 0, BLUE_START + 15] = 10  # Far head must not score a near play.
+        windows[0, 0, 0, 3] = 1
+        windows[0, 0, 1, 3] = -1
+        windows[0, 0, 1, ORANGE_START + 15] = -2
+        windows[0, 1, :, BLUE_START] = 3_000 / 4_108
+        windows[0, 1, 0, BLUE_START + 15] = 2
+        windows[0, 1, 1, BLUE_START + 15] = -1
+        windows[0, 1, 0, 3] = 100  # Near head must not score a far play.
+        windows[0, 1, 1, 3] = -100
+        windows[0, 1, 1, ORANGE_START + 15] = 1
+        batch = TensorBatch({
+            "observation": th.zeros(1, 2, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+            "reward": th.zeros(1, 2),
+        })
+        result = SceneDiscriminatorReward(
+            CoordinateHeads(), noise_std=0, trajectory_length=2,
+            differential=True,
+        )(batch, PrepareContext())
+        th.testing.assert_close(result["far_imitation_reward"], th.tensor([[0., 1.5]]))
+        th.testing.assert_close(result["near_imitation_reward"], th.tensor([[1., 0.]]))
+        th.testing.assert_close(result["global_imitation_reward"], th.tensor([[1., -0.5]]))
+        th.testing.assert_close(result["imitation_reward"], th.tensor([[2., 1.]]))
+
     def test_exp_log_odds_rewards_keep_global_and_one_specialist_per_window(self):
         windows = th.zeros(1, 2, 2, 51)
         windows[0, :, :, BLUE_START + 15] = th.log(th.tensor(2.0))

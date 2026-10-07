@@ -52,6 +52,7 @@ class GAIFOTransformerTests(unittest.TestCase):
         with patch.object(sys, "argv", ["gaifo.py", "--replay-dir", "parsed_replays"]):
             standard, _ = parse_args()
         self.assertFalse(standard.transformer_global)
+        self.assertFalse(standard.differential)
         self.assertEqual(standard.n_sim, 16_384)
         self.assertEqual(standard.discriminator_batch, 16_384)
         self.assertEqual(standard.discriminator_heldout_size, 16_384)
@@ -78,6 +79,59 @@ class GAIFOTransformerTests(unittest.TestCase):
                              (2, 3) if factorize else (2,))
             if factorize:
                 self.assertIsInstance(model, FactorizedSceneDiscriminator)
+
+    def test_differential_flag_resumes_and_accepts_exponential_rewards(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            self.write_corpus(folder)
+            flags = ["gaifo.py", "--replay-dir", str(folder), "--differential"]
+            with patch.object(sys, "argv", flags):
+                args, _ = parse_args()
+            self.assertTrue(args.differential)
+            validate_args(args)
+
+            with patch.object(sys, "argv", [*flags, "--exp-log-odds-reward"]):
+                combined, _ = parse_args()
+            self.assertTrue(combined.exp_log_odds_reward)
+            validate_args(combined)
+            with patch.object(sys, "argv", [*flags, "--transformer", "--exp-log-odds-reward"]):
+                transformer, _ = parse_args()
+            validate_args(transformer)
+            with patch.object(sys, "argv", [
+                "gaifo.py", "--replay-dir", str(folder), "--transformer",
+                "--exp-log-odds-reward",
+            ]):
+                implicit, _ = parse_args()
+            self.assertFalse(implicit.differential)
+            validate_args(implicit)
+            for model in (SceneDiscriminator(8, 8, 16),
+                          CausalSceneTransformer(8, 8, 16, max_context=8)):
+                SceneDiscriminatorReward(
+                    model, noise_std=0,
+                    trajectory_length=2, differential=True, exp_log_odds_reward=True,
+                )
+
+            checkpoint = folder / "gaifo_000000000000.pt"
+            th.save({
+                "step": 0,
+                "config": {"architecture": GAIFO_ARCHITECTURE, **{
+                    name: str(value) if isinstance(value, Path) else value
+                    for name, value in vars(args).items()
+                }},
+                **{name: {} for name in (
+                    "policy", "critic", "discriminator", "policy_optimizer",
+                    "critic_optimizer", "discriminator_optimizer",
+                )},
+            }, checkpoint)
+            resume_flags = ["gaifo.py", "--resume-checkpoint", str(checkpoint)]
+            with patch.object(sys, "argv", resume_flags):
+                resumed, payload = parse_args()
+            self.assertTrue(resumed.differential)
+            validate_resume_args(resumed, payload)
+            with patch.object(sys, "argv", [*resume_flags, "--no-differential"]):
+                changed, payload = parse_args()
+            self.assertFalse(changed.differential)
+            validate_resume_args(changed, payload)
 
     def test_causal_attention_ignores_padding_and_last_frame_does_not_affect_previous(self):
         th.manual_seed(42)

@@ -263,6 +263,51 @@ class RecurrentDiscriminatorTests(unittest.TestCase):
                                       + SPECIALIST_DISCRIMINATOR_WEIGHT * selected)
                         th.testing.assert_close(miner._score(starts), th.sigmoid(-logits))
 
+    def test_differential_reward_carries_scores_and_rebases_after_weight_updates(self):
+        def windows(values):
+            scene = th.zeros(2, 4, 2, 51)
+            scene[:, :, -1, 0] = th.as_tensor(values)
+            return scene
+
+        for factorized in (False, True):
+            with self.subTest(factorized=factorized):
+                model = AccumulatingFactorized() if factorized else AccumulatingGlobal()
+                if not factorized:
+                    model.recurrent_global = True
+                    model.context_version = 0
+                reward = SceneDiscriminatorReward(
+                    model, noise_std=0, trajectory_length=2,
+                    differential=True, context_length=3, batch_size=1,
+                )
+                valid = th.ones(2, 4, dtype=th.bool)
+                initial_valid = valid.clone()
+                initial_valid[1, 3] = False
+                ending = th.zeros_like(valid)
+                ending[1, 1] = True
+                first_values = th.tensor([[.1] * 4, [.2] * 4])
+                first = reward._score_windows(windows(first_values), initial_valid, ending)
+                first_global = first[..., 2] if factorized else first
+                expected = -first_values.clone()
+                expected[1, 3] = 0
+                th.testing.assert_close(first_global, expected)
+
+                second_values = th.tensor([[.3, .4, .5, .6], [.4, .5, .6, .7]])
+                second = reward._score_windows(
+                    windows(second_values), valid, th.zeros_like(valid),
+                )
+                second_global = second[..., 2] if factorized else second
+                th.testing.assert_close(second_global, -second_values)
+
+                global_model = model.global_discriminator if factorized else model
+                global_model.gain.data.fill_(2)
+                model.context_version += 1
+                later_values = th.tensor([[.5, .1, .5, .1], [.6, .2, .6, .2]])
+                later = reward._score_windows(
+                    windows(later_values), valid, th.zeros_like(valid),
+                )
+                later_global = later[..., 2] if factorized else later
+                th.testing.assert_close(later_global, -2 * later_values)
+
     def test_reward_carries_state_and_rebuilds_it_after_weight_update(self):
         model = AccumulatingFactorized()
         reward = SceneDiscriminatorReward(

@@ -3957,9 +3957,10 @@ class SceneDiscriminatorReward:
     """Combine imitation, goal, and physical touch rewards per actor.
 
     Short windows receive normalized expert log-odds by default, or capped
-    expert-to-agent odds with the optional exponential reward. Physical bonuses
-    are zero-sum in 1v1; goal and touch transitions remain learnable before
-    imitation windows are valid.
+    expert-to-agent odds with the optional exponential reward. Differential
+    mode rewards the change in expert log-odds or capped expert odds as a scene
+    frame is added. Physical bonuses are zero-sum in 1v1; goal and touch
+    transitions remain learnable before imitation windows are valid.
     """
 
     def __init__(
@@ -3974,6 +3975,7 @@ class SceneDiscriminatorReward:
         max_magnitude: float = 10.0,
         exp_log_odds_reward: bool = False,
         context_length: int = 16,
+        differential: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -3991,8 +3993,6 @@ class SceneDiscriminatorReward:
         self.factorize = getattr(discriminator, "factorized", False)
         self.recurrent_global = getattr(discriminator, "recurrent_global", False)
         self.transformer_global = getattr(discriminator, "transformer_global", False)
-        if self.transformer_global and exp_log_odds_reward:
-            raise ValueError("Transformer differential reward requires log-odds rewards")
         self.noise_std = noise_std
         self.trajectory_length = trajectory_length
         self.goal_reward_weight = goal_reward_weight
@@ -4001,10 +4001,12 @@ class SceneDiscriminatorReward:
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
         self.exp_log_odds_reward = exp_log_odds_reward
+        self.differential = differential
         self.context_length = context_length
         self._recent_frames: th.Tensor | None = None
         self._recent_ends: th.Tensor | None = None
         self._last_state: th.Tensor | None = None
+        self._last_global_logits: th.Tensor | None = None
         self._context_version: int | None = None
 
     @staticmethod
@@ -4020,6 +4022,15 @@ class SceneDiscriminatorReward:
             raise ValueError(f"{name} must match the actor rollout shape")
         return score.to(reference.dtype) * weight
 
+    def _expert_odds(self, logits: th.Tensor) -> th.Tensor:
+        # D = sigmoid(-logits), so expert-to-agent odds are exp(-logits).
+        return (-logits).clamp(max=math.log(self.max_magnitude)).exp()
+
+    def _score_change(self, current: th.Tensor, previous: th.Tensor) -> th.Tensor:
+        if self.exp_log_odds_reward:
+            return self._expert_odds(current) - self._expert_odds(previous)
+        return previous - current
+
     def _score_global_sequence(
         self, windows: th.Tensor, valid: th.Tensor,
         episode_end: th.Tensor | None,
@@ -4034,7 +4045,10 @@ class SceneDiscriminatorReward:
                         and self._recent_frames.shape[1:] == current_frames.shape[1:])
         version = getattr(self.discriminator, "context_version", 0)
         carry = (have_history and self._last_state is not None
-                 and self._context_version == version)
+                 and self._context_version == version
+                 and (not self.differential or
+                      (self._last_global_logits is not None
+                       and self._last_global_logits.shape == (windows.shape[1],))))
         need_prefix = have_history and (not carry or len(current_frames) < self.context_length)
         history_frames = (
             th.cat((self._recent_frames, current_frames)) if need_prefix
@@ -4064,7 +4078,27 @@ class SceneDiscriminatorReward:
                 resets[:, start:stop],
                 self._last_state[:, start:stop] if carry else None,
             )
-            scores.append(logits[-len(windows):])
+            current = logits[-len(windows):]
+            if self.differential:
+                if (self._last_global_logits is None
+                        or self._last_global_logits.shape != (windows.shape[1],)):
+                    self._last_global_logits = current.new_empty(windows.shape[1])
+                if carry:
+                    previous = self._last_global_logits[start:stop]
+                elif need_prefix:
+                    # Re-score the cached history after discriminator updates;
+                    # subtracting a logit from old weights would create reward.
+                    previous = logits[-len(windows) - 1]
+                else:
+                    previous = current.new_zeros(stop - start)
+                baseline = th.cat((previous[None], current[:-1]), dim=0)
+                baseline = baseline.masked_fill(
+                    resets[-len(windows):, start:stop], 0,
+                )
+                scores.append(self._score_change(current, baseline))
+                self._last_global_logits[start:stop] = current[-1].detach()
+            else:
+                scores.append(current)
             states.append(state)
         self._last_state = th.cat(states, dim=1).detach()
         self._context_version = version
@@ -4102,7 +4136,7 @@ class SceneDiscriminatorReward:
             )
             # Both logits use the identical capped window. An old frame expiring
             # from the context cannot earn reward just by disappearing.
-            result[chunk] = (previous - current).clamp(
+            result[chunk] = self._score_change(current, previous).clamp(
                 -self.max_magnitude, self.max_magnitude,
             )
         return result.reshape_as(valid)
@@ -4141,6 +4175,31 @@ class SceneDiscriminatorReward:
         )
         for start in range(0, len(indices), self.batch_size):
             stop = min(start + self.batch_size, len(indices))
+            if self.differential:
+                if self.recurrent_global and not self.factorize:
+                    delta = global_scores[indices[start:stop]]
+                else:
+                    noisy = add_scene_noise(
+                        flat_windows[indices[start:stop]], self.noise_std
+                    )
+                    if self.recurrent_global or self.transformer_global:
+                        current = self.discriminator.specialist_logits(noisy)
+                        previous = self.discriminator.specialist_logits(noisy[:, :-1])
+                        global_delta = global_scores[indices[start:stop]]
+                        delta = th.cat((
+                            self._score_change(current, previous), global_delta[:, None],
+                        ), dim=-1)
+                    else:
+                        previous = self.discriminator(noisy[:, :-1])
+                        current = self.discriminator(noisy)
+                        delta = self._score_change(current, previous)
+                expected = (stop - start, 3) if self.factorize else (stop - start,)
+                if delta.shape != expected:
+                    raise ValueError(f"discriminator returned {tuple(delta.shape)}, expected {expected}")
+                selected_scores[start:stop] = delta.clamp(
+                    -self.max_magnitude, self.max_magnitude,
+                )
+                continue
             if self.recurrent_global and not self.factorize:
                 logits = global_scores[indices[start:stop]]
             else:
@@ -4162,11 +4221,7 @@ class SceneDiscriminatorReward:
             if logits.shape != expected:
                 raise ValueError(f"discriminator returned {tuple(logits.shape)}, expected {expected}")
             if self.exp_log_odds_reward:
-                # D = sigmoid(-logits) is the expert probability, so
-                # exp(log D - log(1-D)) = exp(-logits).
-                selected_scores[start:stop] = (-logits).clamp(
-                    max=math.log(self.max_magnitude)
-                ).exp()
+                selected_scores[start:stop] = self._expert_odds(logits)
             else:
                 selected_scores[start:stop] = (-logits).clamp(
                     -self.max_magnitude, self.max_magnitude
@@ -4180,7 +4235,7 @@ class SceneDiscriminatorReward:
             gated = th.zeros_like(selected_scores)
             for head, active in enumerate((~near, near, th.ones_like(near))):
                 values = selected_scores[active, head]
-                if head == 2 and self.transformer_global:
+                if self.differential or (head == 2 and self.transformer_global):
                     gated[active, head] = values
                 elif self.exp_log_odds_reward:
                     gated[active, head] = values
@@ -4191,7 +4246,7 @@ class SceneDiscriminatorReward:
                             -self.max_magnitude, self.max_magnitude,
                         )
             flat_scores[indices] = gated
-        elif self.exp_log_odds_reward:
+        elif self.differential or self.exp_log_odds_reward:
             flat_scores[indices] = selected_scores
         else:
             std = selected_scores.std(unbiased=False)
@@ -5113,6 +5168,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="reward exp(log D - log(1-D)) instead of normalized log-odds (D = expert probability)",
     )
     parser.add_argument(
+        "--differential", action=argparse.BooleanOptionalAction, default=False,
+        help="reward the change in expert log-odds, or capped expert odds with --exp-log-odds-reward, when a frame is added to the same causal context (Transformer global reward already uses this)",
+    )
+    parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,
         help="scale the +/-1 goal reward per actor (0 disables it)",
     )
@@ -5290,8 +5349,6 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.transformer_global and args.recurrent_global:
         raise ValueError("--transformer and --recurrent-global are mutually exclusive")
-    if args.transformer_global and args.exp_log_odds_reward:
-        raise ValueError("Transformer differential reward needs log-odds rewards")
     if args.transformer_global and args.discriminator_context_length < 2:
         raise ValueError("--discriminator-context-length must be at least two with --transformer")
     if args.transformer_global and args.temporal_hidden % 4:
@@ -5745,6 +5802,7 @@ def main() -> None:
                 max_magnitude=args.reward_max_magnitude,
                 exp_log_odds_reward=args.exp_log_odds_reward,
                 context_length=args.discriminator_context_length,
+                differential=args.differential,
             ),
             GAE(
                 gamma=args.gamma,
