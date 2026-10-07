@@ -5108,8 +5108,28 @@ def restore_training_checkpoint(
     )
 
 
+def parse_feature_bool(value: str) -> bool:
+    """Parse an explicit value for a positive-only feature option."""
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
+def add_feature_option(
+    parser: argparse.ArgumentParser, *names: str,
+    default: bool | None = False, **kwargs,
+) -> None:
+    """Enable with --feature, or override a default/checkpoint with --feature false."""
+    parser.add_argument(
+        *names, default=default, nargs="?", const=True,
+        type=parse_feature_bool, metavar="BOOL", **kwargs,
+    )
+
+
 def parse_args() -> tuple[argparse.Namespace, dict | None]:
-    resume_parser = argparse.ArgumentParser(add_help=False)
+    resume_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     resume_parser.add_argument("--resume-checkpoint", type=Path)
     preliminary, _ = resume_parser.parse_known_args()
     resume = (
@@ -5118,6 +5138,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
 
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="GAIfO imitation learning for 1v1 Rocket League via CARL and JARL."
     )
     parser.add_argument(
@@ -5135,8 +5156,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="parallel simulations (default: 16384 for GRU, 256 for Transformer)",
     )
     parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument(
-        "--expired-dodge-mask", action=argparse.BooleanOptionalAction, default=True,
+    add_feature_option(
+        parser, "--expired-dodge-mask", default=True,
         help="track CARL's dodge window in policy observations and mask expired airborne jumps",
     )
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
@@ -5146,13 +5167,12 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--trajectory-length", type=int, default=8,
         help="frames in the short discriminator scene window",
     )
-    parser.add_argument(
-        "--recurrent-global", action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--recurrent-global",
         help="carry the always-on discriminator's GRU memory across scene windows (default: off)",
     )
-    parser.add_argument(
-        "--transformer", "--transformer-global", dest="transformer_global",
-        action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--transformer", "--transformer-global", dest="transformer_global",
         help="use a capped causal Transformer for the 1v1 global discriminator (default: GRU)",
     )
     parser.add_argument(
@@ -5163,20 +5183,20 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--discriminator-context-stride", type=int, default=None,
         help="sample one global context endpoint per this many steps (default: 4 for GRU, 16 for Transformer)",
     )
-    parser.add_argument(
-        "--factorize", action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--factorize",
         help="train an always-on global scene discriminator and proximity-gated far-car and near-car/ball specialists",
     )
-    parser.add_argument(
-        "--hard-positive-mining", action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--hard-positive-mining",
         help="bias replay resets toward window starts the trained discriminator confidently recognizes as expert",
     )
-    parser.add_argument(
-        "--exp-log-odds-reward", action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--exp-log-odds-reward",
         help="reward exp(log D - log(1-D)) instead of normalized log-odds (D = expert probability)",
     )
-    parser.add_argument(
-        "--differential", action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--differential",
         help="reward expert log-odds changes, or current capped expert odds minus --gamma times previous capped odds with --exp-log-odds-reward (Transformer global reward is already differential)",
     )
     parser.add_argument(
@@ -5193,9 +5213,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--replay-reset-fraction", type=float, default=None)
-    parser.add_argument(
-        "--curated-skill-sampling", action=argparse.BooleanOptionalAction,
-        default=True,
+    add_feature_option(
+        parser, "--curated-skill-sampling", default=True,
         help="restrict replay resets and discriminator positives to matched aerial, dribble, flick, driving, and kickoff clips",
     )
     parser.add_argument(
@@ -5233,8 +5252,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument("--history-capacity", type=int, default=262_144)
     parser.add_argument("--history-add-size", type=int, default=16_384)
     parser.add_argument("--history-mix-fraction", type=float, default=0.5)
-    parser.add_argument(
-        "--recency-replay", action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--recency-replay",
         help="favor recent generated windows while keeping older ones in a reservoir",
     )
     parser.add_argument(
@@ -5247,8 +5266,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument("--ppo-batch", type=int, default=16_384)
     parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument(
-        "--gru", action=argparse.BooleanOptionalAction, default=False,
+    add_feature_option(
+        parser, "--gru",
         help="use GRU policy and critic with recurrent PPO (default: MLP)",
     )
     parser.add_argument(

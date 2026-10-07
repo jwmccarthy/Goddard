@@ -141,7 +141,7 @@ class CuratedSkillSamplingTests(unittest.TestCase):
         self.assertEqual(args.kickoff_fraction, 0.05)
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",
-            "--no-curated-skill-sampling",
+            "--curated-skill-sampling", "false",
         ]):
             legacy, _ = parse_args()
         self.assertEqual(legacy.replay_reset_fraction, .70)
@@ -161,7 +161,9 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             ]):
                 explicit, _ = parse_args()
             self.assertEqual(explicit.replay_reset_fraction, .6)
-            with patch.object(sys, "argv", [*base, "--no-curated-skill-sampling"]):
+            with patch.object(sys, "argv", [
+                *base, "--curated-skill-sampling", "false",
+            ]):
                 legacy, _ = parse_args()
             self.assertEqual(legacy.replay_reset_fraction, .25)
 

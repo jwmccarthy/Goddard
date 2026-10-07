@@ -61,6 +61,7 @@ from training_checkpoint import TrainingCheckpointer
 from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
+    add_feature_option,
     build_critic as build_gaifo_critic,
     build_policy as build_gaifo_policy,
 )
@@ -371,6 +372,7 @@ if not hasattr(Critic, "build_composed"):
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="Train a BASIC Rocket League agent"
     )
     parser.add_argument(
@@ -412,10 +414,8 @@ def parse_arguments() -> argparse.Namespace:
         dest="learning_rate_end_factor", type=float, default=0.5,
         metavar="PPO_LR_END_FACTOR",
     )
-    parser.add_argument(
-        "--bf16",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+    add_feature_option(
+        parser, "--bf16", default=True,
         help="use BF16 autocast for PPO updates",
     )
     parser.add_argument(
@@ -439,14 +439,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--reward-scale",               type=float, default=1.0)
     parser.add_argument("--goal-score-weight",          type=float, default=10.0)
     parser.add_argument("--goal-score-weight-end",      type=float, default=10.0)
-    parser.add_argument(
-        "--sparse", action=argparse.BooleanOptionalAction, default=None,
+    add_feature_option(
+        parser, "--sparse", default=None,
         help="focus rewards on goals, shots, air dribble setups, fast aerial approaches, high aerial touches and demos (inherited on resume)",
     )
-    parser.add_argument(
-        "--normalize-rewards",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+    add_feature_option(
+        parser, "--normalize-rewards", default=True,
     )
     parser.add_argument("--discount-half-life",         type=float, default=10.0)
     parser.add_argument("--discount-half-life-end",     type=float, default=20.0)
@@ -485,10 +483,8 @@ def parse_arguments() -> argparse.Namespace:
         metavar="REPLAY_RESET_FRACTION",
     )
     parser.add_argument("--reset-state-limit",          type=int,   default=100_000)
-    parser.add_argument(
-        "--normalize",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+    add_feature_option(
+        parser, "--normalize", default=True,
     )
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)

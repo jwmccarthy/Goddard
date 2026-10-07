@@ -1,7 +1,9 @@
 import argparse
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
@@ -64,9 +66,10 @@ class GAIFOGruTests(unittest.TestCase):
         )
 
     def test_gru_flag(self):
-        for flag, expected in (("--gru", True), ("--no-gru", False)):
-            with self.subTest(flag=flag), patch.object(sys, "argv", [
-                "gaifo.py", "--replay-dir", "parsed_replays", flag,
+        for flags, expected in (((), False), (("--gru",), True),
+                                (("--gru", "false"), False)):
+            with self.subTest(flags=flags), patch.object(sys, "argv", [
+                "gaifo.py", "--replay-dir", "parsed_replays", *flags,
                 "--sequence-length", "8",
             ]):
                 parsed, resumed = parse_args()
@@ -80,13 +83,40 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertEqual(parsed.discriminator_context_length, 16)
                 self.assertEqual(parsed.discriminator_context_stride, 4)
 
-        for flag, expected in (("--recurrent-global", True),
-                               ("--no-recurrent-global", False)):
-            with self.subTest(flag=flag), patch.object(sys, "argv", [
-                "gaifo.py", "--replay-dir", "parsed_replays", flag,
+        for flags, expected in (((), False), (("--recurrent-global",), True),
+                                (("--recurrent-global", "false"), False)):
+            with self.subTest(flags=flags), patch.object(sys, "argv", [
+                "gaifo.py", "--replay-dir", "parsed_replays", *flags,
             ]):
                 parsed, _ = parse_args()
                 self.assertEqual(parsed.recurrent_global, expected)
+
+    def test_feature_flags_require_full_names_and_accept_explicit_false(self):
+        with patch.object(sys, "argv", [
+            "gaifo.py", "--replay-dir", "parsed_replays",
+            "--expired-dodge-mask", "false", "--curated-skill-sampling", "false",
+            "--exp-log-odds-reward", "true", "--recency-replay", "false",
+            "--aerial-touch-reward-weight", "1.0",
+        ]):
+            parsed, _ = parse_args()
+        self.assertFalse(parsed.expired_dodge_mask)
+        self.assertFalse(parsed.curated_skill_sampling)
+        self.assertTrue(parsed.exp_log_odds_reward)
+        self.assertFalse(parsed.recency_replay)
+        self.assertEqual(parsed.aerial_touch_reward_weight, 1.0)
+        self.assertEqual(parsed.replay_reset_fraction, 0.70)
+
+        for flags in (("--no-gru",), ("--no-exp-log-odds-reward",),
+                      ("--aerial-touch-reward", "5.0")):
+            error = io.StringIO()
+            with (self.subTest(flags=flags),
+                  patch.object(sys, "argv", [
+                      "gaifo.py", "--replay-dir", "parsed_replays", *flags,
+                  ]), redirect_stderr(error),
+                  self.assertRaises(SystemExit) as exited):
+                parse_args()
+            self.assertEqual(exited.exception.code, 2)
+            self.assertIn(f"unrecognized arguments: {flags[0]}", error.getvalue())
 
     def test_policy_and_critic_depths_can_differ(self):
         for gru in (False, True):

@@ -70,13 +70,12 @@ def frame_ids(resets: TensorBatch) -> th.Tensor:
 
 class HardPositiveMiningTests(unittest.TestCase):
     def test_flag_is_opt_in(self):
-        for flag, expected in ((None, False), ("--hard-positive-mining", True),
-                               ("--no-hard-positive-mining", False)):
-            with self.subTest(flag=flag):
-                flags = ["gaifo.py", "--replay-dir", "parsed_replays"]
-                if flag is not None:
-                    flags.append(flag)
-                with patch.object(sys, "argv", flags):
+        for flags, expected in (((), False), (("--hard-positive-mining",), True),
+                                (("--hard-positive-mining", "false"), False)):
+            with self.subTest(flags=flags):
+                with patch.object(sys, "argv", [
+                    "gaifo.py", "--replay-dir", "parsed_replays", *flags,
+                ]):
                     parsed, _ = parse_args()
                 self.assertIs(parsed.hard_positive_mining, expected)
 

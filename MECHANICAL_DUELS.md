@@ -84,6 +84,12 @@ select the discriminator. `--transformer` cannot be combined with
   --differential --exp-log-odds-reward
 ```
 
+Feature switches use positive names: `--differential` enables it, while
+`--differential false` disables it. Omitting the switch retains its default or
+checkpoint setting. Spell out option names: `--aerial-touch-reward` no longer
+abbreviates `--aerial-touch-reward-weight`. `--no-touch-timeout` still specifies
+the no-touch timeout in seconds.
+
 Transformer defaults to a 128-frame context, 256 simulations, a 2,048-window
 discriminator batch and 512 held-out windows; all remain configurable. Without
 `--transformer`, the original 1v1 simulation, replay-sampling, and

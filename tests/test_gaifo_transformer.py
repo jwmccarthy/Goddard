@@ -128,7 +128,7 @@ class GAIFOTransformerTests(unittest.TestCase):
                 resumed, payload = parse_args()
             self.assertTrue(resumed.differential)
             validate_resume_args(resumed, payload)
-            with patch.object(sys, "argv", [*resume_flags, "--no-differential"]):
+            with patch.object(sys, "argv", [*resume_flags, "--differential", "false"]):
                 changed, payload = parse_args()
             self.assertFalse(changed.differential)
             validate_resume_args(changed, payload)
@@ -240,7 +240,8 @@ class GAIFOTransformerTests(unittest.TestCase):
             self.assertEqual(resumed.discriminator_context_length, 8)
             validate_resume_args(resumed, payload)
             with patch.object(sys, "argv", [
-                "gaifo.py", "--resume-checkpoint", str(checkpoint), "--no-transformer",
+                "gaifo.py", "--resume-checkpoint", str(checkpoint),
+                "--transformer", "false",
             ]):
                 changed, payload = parse_args()
             with self.assertRaisesRegex(ValueError, "--transformer must match"):

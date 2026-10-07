@@ -1,9 +1,11 @@
 import argparse
 import copy
+import io
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -356,7 +358,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires --start-checkpoint"):
             configure_starting_checkpoint(arguments)
 
-        with patch.object(sys, "argv", ["basic.py", "--no-sparse"]):
+        with patch.object(sys, "argv", ["basic.py", "--sparse", "false"]):
             self.assertFalse(parse_arguments().sparse)
 
         arguments = checkpoint_args()
@@ -365,6 +367,31 @@ class BasicStartingCheckpointTests(unittest.TestCase):
         self.assertEqual(arguments.start_kl_coef, 0.0)
         self.assertEqual(arguments.hidden_size, 256)
         self.assertFalse(arguments.sparse)
+
+    def test_positive_only_feature_options_keep_existing_defaults(self):
+        with patch.object(sys, "argv", ["basic.py"]):
+            defaults = parse_arguments()
+        self.assertTrue(defaults.bf16)
+        self.assertTrue(defaults.normalize)
+        self.assertTrue(defaults.normalize_rewards)
+        self.assertIsNone(defaults.sparse)
+
+        with patch.object(sys, "argv", [
+            "basic.py", "--bf16", "false", "--normalize", "false",
+            "--normalize-rewards", "false", "--sparse",
+        ]):
+            flags = parse_arguments()
+        self.assertFalse(flags.bf16)
+        self.assertFalse(flags.normalize)
+        self.assertFalse(flags.normalize_rewards)
+        self.assertTrue(flags.sparse)
+
+        for flag in ("--no-sparse", "--no-bf16", "--norm"):
+            with (self.subTest(flag=flag), patch.object(sys, "argv", ["basic.py", flag]),
+                  redirect_stderr(io.StringIO()),
+                  self.assertRaises(SystemExit) as exited):
+                parse_arguments()
+            self.assertEqual(exited.exception.code, 2)
 
     def test_legacy_basic_resume_needs_no_starting_policy(self):
         policy, critic = build_policy_and_critic(

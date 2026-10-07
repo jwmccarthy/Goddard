@@ -508,7 +508,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertTrue(resumed.hard_positive_mining)
             validate_resume_args(resumed, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
-                                            "--no-factorize"]):
+                                            "--factorize", "false"]):
                 mismatch, _ = parse_args()
             with self.assertRaisesRegex(ValueError, "--factorize must match"):
                 validate_resume_args(mismatch, payload)
