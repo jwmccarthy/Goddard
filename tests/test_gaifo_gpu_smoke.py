@@ -96,6 +96,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             saved = load_resume_checkpoint(max(checkpoints))
             self.assertEqual(saved["config"]["recurrent_global"], not transformer)
             self.assertEqual(saved["config"].get("transformer_global", False), transformer)
+            self.assertTrue(saved["config"]["expired_dodge_mask"])
+            self.assertEqual(saved["policy"]["foot.model.0.weight"].shape[1], 138)
             self.assertEqual(saved["config"]["discriminator_context_length"],
                              8 if transformer else 16)
             optimizer = saved["discriminator_optimizer"]

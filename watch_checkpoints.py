@@ -12,14 +12,18 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import carl
 import numpy as np
 import torch as th
 from carl.gymnasium import CARLTorchVectorEnv
+from carl.gymnasium.action import CARLActionCodec
+from gymnasium.spaces import Box
 from jarl.envs import DatasetResetSampler
 
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
+from dodge_window import DodgeAwareCARLTorchVectorEnv
 from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
@@ -320,7 +324,7 @@ def load_policy_checkpoint(
         hidden = int(config["policy_hidden"])
         layers = int(config.get("policy_layers", 1))
         policy = build_gaifo_policy(
-            env,
+            policy_environment(env, bool(config.get("expired_dodge_mask", False))),
             argparse.Namespace(policy_hidden=hidden, policy_layers=layers, gru=gru),
         )
         policy_state = payload["policy"]
@@ -335,11 +339,11 @@ def load_policy_checkpoint(
         )
         if architecture is None:
             policy, _ = build_policy_and_critic(
-                env, argparse.Namespace(hidden_size=hidden)
+                policy_environment(env, False), argparse.Namespace(hidden_size=hidden)
             )
         else:
             policy = build_gaifo_policy(
-                env,
+                policy_environment(env, bool(config.get("expired_dodge_mask", False))),
                 argparse.Namespace(
                     policy_hidden=hidden,
                     policy_layers=layers,
@@ -353,6 +357,29 @@ def load_policy_checkpoint(
         (kind, hidden, architecture)
     )
     return policy.eval().requires_grad_(False), signature
+
+
+def policy_environment(env: CARLTorchVectorEnv, dodge_window: bool):
+    """Build legacy networks against CARL's original observation and codec."""
+    if dodge_window:
+        if not getattr(env, "dodge_window_features", False):
+            raise ValueError("checkpoint requires dodge-window observations")
+        return env
+    if not getattr(env, "dodge_window_features", False):
+        return env
+    return SimpleNamespace(
+        device=env.device,
+        action_codec=CARLActionCodec().to(env.device),
+        single_observation_space=Box(
+            -np.inf, np.inf, (env.raw_observation_size,), np.float32,
+        ),
+        single_action_space=env.single_action_space,
+    )
+
+
+def policy_observation(policy, observation: th.Tensor) -> th.Tensor:
+    """New policies see the jump age; older policies retain their saved width."""
+    return observation[..., :policy.foot.model[0].in_features]
 
 
 def load_match(
@@ -459,7 +486,7 @@ def simulate(
             args.reset_corpus_limit or None, args.seed,
         )
         state.configure_reset_types(tuple(reset_provider.providers))
-        base = CARLTorchVectorEnv(
+        base = DodgeAwareCARLTorchVectorEnv(
             n_sim=1,
             n_blue=1,
             n_orange=1,
@@ -513,11 +540,11 @@ def simulate(
 
             with th.inference_mode():
                 blue_output = blue.act(
-                    observation[:1], blue_state,
+                    policy_observation(blue, observation[:1]), blue_state,
                     deterministic=not args.sample,
                 )
                 orange_output = orange.act(
-                    observation[1:], orange_state,
+                    policy_observation(orange, observation[1:]), orange_state,
                     deterministic=not args.sample,
                 )
                 blue_state = blue_output.next_state

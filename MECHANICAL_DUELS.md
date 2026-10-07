@@ -71,9 +71,19 @@ select the discriminator. `--transformer` cannot be combined with
 
 Transformer defaults to a 128-frame context, 256 simulations, a 2,048-window
 discriminator batch and 512 held-out windows; all remain configurable. Without
-`--transformer`, the original 1v1 defaults are unchanged. Both learning rates
+`--transformer`, the original 1v1 simulation, replay-sampling, and
+discriminator defaults are unchanged. The dodge-window mask below is new for
+fresh runs. Both learning rates
 stay constant unless an end value is supplied; schedules resume from checkpoint
 settings and the restored training step.
+
+New GAIFO runs include CARL's jump age in each policy observation. The tracker
+starts from the replay's internal jump timer, advances with the simulator's
+jump-hold rules, and resets on landings and flip restores. An airborne jump
+is masked after CARL's 1.25-second dodge window; the same saved observation
+supplies the mask during PPO updates. Resuming an older checkpoint retains its
+original observation width and action mask. The checkpoint viewer accepts both
+observation versions, including matches between them.
 
 ## Ranked doubles coverage
 

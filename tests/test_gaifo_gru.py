@@ -75,6 +75,7 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertEqual(parsed.sequence_length, 8)
                 self.assertEqual((parsed.policy_hidden, parsed.critic_hidden), (320, 320))
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (2, 2))
+                self.assertTrue(parsed.expired_dodge_mask)
                 self.assertFalse(parsed.recurrent_global)
                 self.assertEqual(parsed.discriminator_context_length, 16)
                 self.assertEqual(parsed.discriminator_context_stride, 4)
@@ -284,6 +285,7 @@ class GAIFOGruTests(unittest.TestCase):
                     parsed, resumed = parse_args()
                 self.assertIsNotNone(resumed)
                 self.assertEqual(parsed.gru, gru)
+                self.assertFalse(parsed.expired_dodge_mask)
                 self.assertEqual(parsed.entropy_end, args.entropy_end)
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (layers, layers))
                 self.assertEqual(parsed.recurrent_global, layers == 2)
@@ -293,6 +295,10 @@ class GAIFOGruTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "--recurrent-global must match"):
                     validate_resume_args(parsed, resumed)
                 parsed.recurrent_global = layers == 2
+                parsed.expired_dodge_mask = True
+                with self.assertRaisesRegex(ValueError, "--expired-dodge-mask must match"):
+                    validate_resume_args(parsed, resumed)
+                parsed.expired_dodge_mask = False
                 if parsed.recurrent_global:
                     parsed.discriminator_context_length += 1
                     with self.assertRaisesRegex(ValueError, "--discriminator-context-length must match"):

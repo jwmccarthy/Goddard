@@ -17,9 +17,10 @@ from gaifo import (
     GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
     build_policy,
 )
+from dodge_window import DodgeWindowActionCodec
 from watch_checkpoints import (
     CheckpointRegistry, SpectatorState, load_match, load_policy_checkpoint, make_handler,
-    parse_args,
+    parse_args, policy_environment, policy_observation,
 )
 
 
@@ -158,6 +159,56 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                             th.testing.assert_close(restarted.next_state, first_state)
 
         self.assertNotEqual(signatures[0], signatures[1])
+
+    def test_viewer_can_pair_legacy_and_dodge_aware_gaifo_policies(self):
+        class DodgeAwareEnv(FakeEnv):
+            dodge_window_features = True
+            raw_observation_size = 137
+            n_cars = 2
+            action_codec = DodgeWindowActionCodec(137)
+            single_observation_space = Box(
+                -np.inf, np.inf, (138,), dtype=np.float32,
+            )
+            single_action_space = MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
+
+        env = DodgeAwareEnv()
+        args = argparse.Namespace(policy_hidden=16, policy_layers=1, gru=False)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            paths = []
+            for enabled in (False, True):
+                reference = build_policy(
+                    policy_environment(env, enabled), args,
+                )
+                with th.no_grad():
+                    reference.head.model[-1].weight.zero_()
+                    reference.head.model[-1].bias.zero_()
+                    reference.head.model[-1].bias[17] = 10
+                path = Path(directory) / f"gaifo_{int(enabled):012d}.pt"
+                th.save({
+                    "config": {
+                        "architecture": GAIFO_ARCHITECTURE,
+                        "policy_hidden": 16, "policy_layers": 1,
+                        "frameskip": 4, "expired_dodge_mask": enabled,
+                    },
+                    "policy": reference.state_dict(),
+                }, path)
+                paths.append(path)
+
+            _, legacy, enhanced = load_match(paths[0], paths[1], env, 4, None)
+            observation = th.zeros(2, 138)
+            observation[:, -1] = 1.25
+            self.assertEqual(policy_observation(legacy, observation).shape[-1], 137)
+            self.assertEqual(policy_observation(enhanced, observation).shape[-1], 138)
+            self.assertEqual(
+                legacy.act(policy_observation(legacy, observation), deterministic=True)
+                .action[:, 6].tolist(), [1, 1],
+            )
+            self.assertEqual(
+                enhanced.act(policy_observation(enhanced, observation), deterministic=True)
+                .action[:, 6].tolist(), [0, 0],
+            )
+            with self.assertRaisesRegex(ValueError, "requires dodge-window observations"):
+                load_policy_checkpoint(paths[1], FakeEnv(), 4, None)
 
     def test_mismatched_gru_metadata_is_rejected(self):
         env = FakeEnv()

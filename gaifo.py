@@ -51,6 +51,7 @@ from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
+from dodge_window import DodgeAwareCARLTorchVectorEnv
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
 )
@@ -4978,6 +4979,10 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         )
     if args.factorize != config.get("factorize", False):
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
+    if getattr(args, "expired_dodge_mask", config.get("expired_dodge_mask", False)) != (
+        config.get("expired_dodge_mask", False)
+    ):
+        raise ValueError("--expired-dodge-mask must match the checkpoint when resuming")
     if args.transformer_global != config.get("transformer_global", False):
         raise ValueError("--transformer must match the checkpoint discriminator when resuming")
     if args.recurrent_global != config.get("recurrent_global", False):
@@ -5067,6 +5072,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="parallel simulations (default: 16384 for GRU, 256 for Transformer)",
     )
     parser.add_argument("--frameskip", type=int, default=4)
+    parser.add_argument(
+        "--expired-dodge-mask", action=argparse.BooleanOptionalAction, default=True,
+        help="track CARL's dodge window in policy observations and mask expired airborne jumps",
+    )
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
     parser.add_argument("--rollout", type=int, default=32)
@@ -5229,6 +5238,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         # Checkpoints predating configurable depth used one hidden layer.
         inherited.setdefault("policy_layers", 1)
         inherited.setdefault("critic_layers", 1)
+        inherited.setdefault("expired_dodge_mask", False)
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
         parser.set_defaults(**inherited)
@@ -5437,7 +5447,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
-    return CARLTorchVectorEnv(
+    env_type = (DodgeAwareCARLTorchVectorEnv if getattr(args, "expired_dodge_mask", True)
+                else CARLTorchVectorEnv)
+    return env_type(
         n_sim=args.n_sim,
         n_blue=1,
         n_orange=1,
