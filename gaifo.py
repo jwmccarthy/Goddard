@@ -3959,9 +3959,10 @@ class SceneDiscriminatorReward:
     Short windows receive normalized expert log-odds by default, or capped
     expert-to-agent odds with the optional exponential reward. Differential
     mode rewards the change in expert log-odds or discount-adjusted capped
-    expert odds as a scene frame is added. Physical bonuses are zero-sum in
-    1v1; goal and touch transitions remain learnable before imitation windows
-    are valid.
+    expert odds as a scene frame is added. The Transformer global head always
+    compares before and after that frame, including in exponential mode.
+    Physical bonuses are zero-sum in 1v1; goal and touch transitions remain
+    learnable before imitation windows are valid.
     """
 
     def __init__(
@@ -5197,7 +5198,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     add_feature_option(
         parser, "--differential",
-        help="reward expert log-odds changes, or current capped expert odds minus --gamma times previous capped odds with --exp-log-odds-reward (Transformer global reward is already differential)",
+        help="reward expert log-odds changes, or current capped expert odds minus --gamma times previous capped odds with --exp-log-odds-reward (Transformer global reward always compares before and after)",
     )
     parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,

@@ -139,18 +139,21 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
 
     def test_transformer_trains_and_rewards_in_both_1v1_modes(self):
         for factorize in (False, True):
-            with self.subTest(factorize=factorize):
-                saved, output, _ = self._short_window_training(
-                    factorize, transformer=True,
-                )
-                self.assertEqual(saved["step"], 64)
-                self.assertIn("D heldout accuracy", output)
-                self.assertEqual(saved["config"]["ppo_lr_end"], 1e-5)
-                self.assertIn("PPO LR", output)
-                self.assertIn("D LR", output)
-                self.assertTrue(any(key.startswith(
-                    "global_discriminator.temporal." if factorize else "temporal."
-                ) for key in saved["discriminator"]))
+            for exponential in (False, True):
+                with self.subTest(factorize=factorize, exponential=exponential):
+                    saved, output, _ = self._short_window_training(
+                        factorize, transformer=True, exp_log_odds_reward=exponential,
+                    )
+                    self.assertEqual(saved["step"], 64)
+                    self.assertIn("D heldout accuracy", output)
+                    self.assertEqual(saved["config"]["ppo_lr_end"], 1e-5)
+                    self.assertEqual(saved["config"]["exp_log_odds_reward"], exponential)
+                    self.assertFalse(saved["config"]["differential"])
+                    self.assertIn("PPO LR", output)
+                    self.assertIn("D LR", output)
+                    self.assertTrue(any(key.startswith(
+                        "global_discriminator.temporal." if factorize else "temporal."
+                    ) for key in saved["discriminator"]))
 
     def test_hard_positive_mining_in_unified_and_factorized_modes(self):
         for factorize in (False, True):

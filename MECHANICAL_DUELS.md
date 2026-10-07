@@ -59,6 +59,8 @@ GAIFO retains its short-window GRU discriminator by default. Add `--transformer`
 to judge a capped causal history of the ball and both cars instead. Transformer
 reward is the change in expert log-odds when the newest frame is added to the
 **same** capped context, with both POVs reset together at game boundaries.
+With `--exp-log-odds-reward`, its global head instead pays the change in capped
+expert-to-agent odds, even without `--differential`.
 Add `--differential` to use that same before/after reward with the short-window
 GRU: score a window with and without its newest frame, then reward the change
 in expert log-odds. This mode clips the raw change rather than normalizing
@@ -68,10 +70,10 @@ previous capped odds. An unchanged score earns `(1 - gamma)` times its odds;
 larger declines still give negative rewards. Each odds score is capped at
 `--reward-max-magnitude` before subtraction. With `--factorize`,
 `--differential` also differences the far-car and near-ball heads before the
-usual proximity gate. The Transformer global head compares before/after scores
-even without this flag, but only discounts the previous odds when it is set;
-a recurrent global GRU carries its previous score across rollouts and clears
-it at game boundaries.
+usual proximity gate. The Transformer global head always compares before/after
+scores; `--differential` discounts its previous capped odds when exponential
+rewards are enabled. A recurrent global GRU carries its previous score across
+rollouts and clears it at game boundaries.
 `--factorize --transformer` also trains the existing near-ball and far-car
 specialists. `--gru` independently controls the policy and critic; it does not
 select the discriminator. `--transformer` cannot be combined with

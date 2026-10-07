@@ -176,7 +176,7 @@ class DifferentialRewardTests(unittest.TestCase):
                     [math.exp(-.6) - 0.9 * math.exp(-.2)] * 2,
                 ]))
 
-    def test_transformer_odds_uses_same_capped_context_across_rollouts(self):
+    def test_transformer_odds_always_compare_same_capped_context(self):
         def windows(values):
             scenes = th.zeros(2, 2, 2, 51)
             scenes[:, :, -1, 0] = th.tensor(values)
