@@ -83,7 +83,43 @@
       "region": "NA",
       "platform_ids": ["steam:76561198351218981"],
       "evidence": "https://ballchasing.com/player/steam/76561198351218981"
+    },
+    {
+      "name": "A7mD",
+      "region": "MENA",
+      "platform_ids": ["steam:76561198350967122"],
+      "evidence": "https://ballchasing.com/player/steam/76561198350967122"
+    },
+    {
+      "name": "Nush",
+      "region": "MENA",
+      "platform_ids": ["steam:76561199170815325"],
+      "evidence": "https://ballchasing.com/replay/c99620c7-557f-47c4-94c2-c7ab6182d997"
+    },
+    {
+      "name": "DrKnown",
+      "region": "MENA",
+      "platform_ids": ["steam:76561198283318718"],
+      "evidence": "https://ballchasing.com/player/steam/76561198283318718"
+    },
+    {
+      "name": "Oski",
+      "region": "EU",
+      "platform_ids": ["steam:76561198381037239"],
+      "evidence": "https://ballchasing.com/player/steam/76561198381037239"
+    },
+    {
+      "name": "Kofyr",
+      "region": "NA",
+      "platform_ids": ["steam:76561198224723032"],
+      "evidence": "https://ballchasing.com/player/steam/76561198224723032"
+    },
+    {
+      "name": "Trk511",
+      "region": "MENA",
+      "platform_ids": ["steam:76561198994793330"],
+      "evidence": "https://ballchasing.com/replay/73f6726a-fd4a-4973-bc5e-3e3ef50589f5"
     }
   ],
-  "unverified_candidates": ["Daniel", "trk511", "Joreuz", "ApparentlyJack", "Dark(?)"]
+  "unverified_candidates": ["Daniel", "Joreuz", "ApparentlyJack", "Dark(?)"]
 }

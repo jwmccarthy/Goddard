@@ -350,7 +350,7 @@ class TeamSizeUnitTests(unittest.TestCase):
                     "config": {
                         "architecture": GAIFO_TEAM_ARCHITECTURE, "team_size": size,
                         "discriminator_hidden": 16, "frame_embedding": 8,
-                        "temporal_hidden": 8,
+                        "temporal_hidden": 8, "discriminator_relative_positions": True,
                     },
                     "discriminator": model.state_dict(),
                 }, path)

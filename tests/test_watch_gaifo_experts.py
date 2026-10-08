@@ -94,10 +94,12 @@ def write_periods(folder: Path) -> None:
 
 
 def checkpoint(path: Path, replay_dir: Path, *, factorize: bool = True,
-               legacy: bool = False, opponent_context: bool = False) -> None:
+               legacy: bool = False, opponent_context: bool = False,
+               relative_positions: bool | None = None) -> None:
     model_args = argparse.Namespace(
         factorize=factorize, frame_embedding=8, temporal_hidden=8,
         discriminator_hidden=8,
+        discriminator_relative_positions=bool(relative_positions),
     )
     model = (
         FactorizedSceneDiscriminator(
@@ -125,6 +127,8 @@ def checkpoint(path: Path, replay_dir: Path, *, factorize: bool = True,
             "replay_dir": str(replay_dir), "frameskip": 4,
             "seed": 0, "discriminator_heldout_size": 16,
             "general_driving_fraction": .10, "kickoff_fraction": .05,
+            **({"discriminator_relative_positions": relative_positions}
+               if relative_positions is not None else {}),
         },
         "discriminator": model.state_dict(),
     }, path)
@@ -139,6 +143,30 @@ class MarkerDiscriminator(th.nn.Module):
 
 
 class ExpertInspectorTests(unittest.TestCase):
+    def test_inspector_loads_relative_global_heads_and_older_checkpoints(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
+            folder = Path(temporary)
+            for factorize in (False, True):
+                for relative_positions in (None, True):
+                    with self.subTest(factorize=factorize, relative_positions=relative_positions):
+                        path = folder / "gaifo_000000000042.pt"
+                        checkpoint(path, folder, factorize=factorize,
+                                   relative_positions=relative_positions)
+                        restored, config, _ = load_discriminator(path, th.device("cpu"))
+                        global_model = (
+                            restored.global_discriminator if factorize else restored
+                        )
+                        self.assertEqual(global_model.relative_positions,
+                                         bool(relative_positions))
+                        self.assertEqual(
+                            global_model.car_encoder[0].in_features,
+                            21 + 1 + (6 if relative_positions else 0),
+                        )
+                        self.assertEqual(
+                            config.get("discriminator_relative_positions", False),
+                            bool(relative_positions),
+                        )
+
     def test_inspector_can_load_legacy_factorized_weights(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
             folder = Path(temporary)
@@ -203,7 +231,9 @@ class ExpertInspectorTests(unittest.TestCase):
             checkpoint(path, folder)
             saved = th.load(path, map_location="cpu", weights_only=True)
             th.manual_seed(4)
-            reference = FactorizedSceneDiscriminator(8, 8, 8, recurrent_global=True)
+            reference = FactorizedSceneDiscriminator(
+                8, 8, 8, recurrent_global=True, relative_positions=False,
+            )
             saved["discriminator"] = reference.state_dict()
             saved["config"]["recurrent_global"] = True
             saved["config"]["discriminator_context_length"] = 4

@@ -601,6 +601,15 @@ def actor_views(scenes: th.Tensor) -> th.Tensor:
     )
 
 
+def relative_scene_positions(ball: th.Tensor, cars: th.Tensor) -> th.Tensor:
+    """Give each car ball-to-car and car-to-ego offsets in scene coordinates."""
+    positions = cars[..., :3]
+    return th.cat((
+        ball[..., None, :3] - positions,
+        positions - positions[..., :1, :],
+    ), dim=-1)
+
+
 def _resample_coordinates(
     length: int,
     source_frame_skip: int,
@@ -2256,6 +2265,7 @@ class SceneDiscriminator(nn.Module):
         hidden_size: int = 128,
         *, n_cars: int = N_CARS, recurrent_global: bool = False,
         flip_state_features: bool = False,
+        relative_positions: bool = True,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
@@ -2264,6 +2274,7 @@ class SceneDiscriminator(nn.Module):
             raise ValueError("scene discriminator needs two, four, or six cars")
         self.n_cars = n_cars
         self.flip_state_features = flip_state_features
+        self.relative_positions = relative_positions
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE + (
             FLIP_STATE_SIZE if flip_state_features else 0
         )
@@ -2275,7 +2286,8 @@ class SceneDiscriminator(nn.Module):
             nn.ReLU(),
         )
         self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + 1 + (FLIP_STATE_SIZE if flip_state_features else 0), hidden_size),
+            nn.Linear(CAR_SIZE + 1 + (FLIP_STATE_SIZE if flip_state_features else 0)
+                      + (6 if relative_positions else 0), hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding),
             nn.ReLU(),
@@ -2299,6 +2311,8 @@ class SceneDiscriminator(nn.Module):
             car_flip = cars.new_zeros((B, T, self.n_cars, FLIP_STATE_SIZE))
             car_flip[:, :, 0] = scenes[..., -FLIP_STATE_SIZE:]
             car_in = th.cat((car_in, car_flip), dim=-1)
+        if self.relative_positions:
+            car_in = th.cat((car_in, relative_scene_positions(ball, cars)), dim=-1)
         ball_emb = self.ball_encoder(ball)
         car_emb = self.car_encoder(car_in).flatten(-2)
         return th.cat((ball_emb, car_emb), dim=-1)
@@ -2401,6 +2415,7 @@ class CausalSceneTransformer(nn.Module):
         self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
         *, max_context: int = 128, layers: int = 2, n_cars: int = N_CARS,
         flip_state_features: bool = False,
+        relative_positions: bool = True,
     ) -> None:
         super().__init__()
         if (min(frame_embedding, temporal_hidden, hidden_size, max_context, layers) < 1
@@ -2410,6 +2425,7 @@ class CausalSceneTransformer(nn.Module):
             raise ValueError("Transformer needs two, four, or six cars")
         self.n_cars = n_cars
         self.flip_state_features = flip_state_features
+        self.relative_positions = relative_positions
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE + (
             FLIP_STATE_SIZE if flip_state_features else 0
         )
@@ -2419,8 +2435,8 @@ class CausalSceneTransformer(nn.Module):
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + n_cars + (FLIP_STATE_SIZE if flip_state_features else 0),
-                      hidden_size), nn.ReLU(),
+            nn.Linear(CAR_SIZE + n_cars + (FLIP_STATE_SIZE if flip_state_features else 0)
+                      + (6 if relative_positions else 0), hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.frame_projection = nn.Linear(frame_embedding * (n_cars + 1), temporal_hidden)
@@ -2446,6 +2462,10 @@ class CausalSceneTransformer(nn.Module):
             car_flip = cars.new_zeros((count, steps, self.n_cars, FLIP_STATE_SIZE))
             car_flip[:, :, 0] = scenes[..., -FLIP_STATE_SIZE:]
             car_in = th.cat((car_in, car_flip), dim=-1)
+        if self.relative_positions:
+            car_in = th.cat((
+                car_in, relative_scene_positions(scenes[..., :BALL_SIZE], cars),
+            ), dim=-1)
         encoded = self.car_encoder(car_in)
         combined = th.cat((
             self.ball_encoder(scenes[..., :BALL_SIZE]),
@@ -2535,6 +2555,7 @@ class FactorizedSceneDiscriminator(nn.Module):
         _legacy_opponent_context: bool = False, recurrent_global: bool = False,
         transformer_global: bool = False, context_length: int = 128,
         flip_state_features: bool = False,
+        relative_positions: bool = True,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
@@ -2549,6 +2570,7 @@ class FactorizedSceneDiscriminator(nn.Module):
             raise ValueError("Transformer requires a non-recurrent global head")
         self.n_cars = n_cars
         self.flip_state_features = flip_state_features
+        self.relative_positions = relative_positions
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE + (
             FLIP_STATE_SIZE if flip_state_features else 0
         )
@@ -2584,9 +2606,11 @@ class FactorizedSceneDiscriminator(nn.Module):
             None if _legacy_two_heads else CausalSceneTransformer(
                 frame_embedding, temporal_hidden, hidden_size, max_context=context_length,
                 n_cars=n_cars, flip_state_features=flip_state_features,
+                relative_positions=relative_positions,
             ) if transformer_global else SceneDiscriminator(
                 frame_embedding, temporal_hidden, hidden_size, n_cars=n_cars,
                 recurrent_global=recurrent_global, flip_state_features=flip_state_features,
+                relative_positions=relative_positions,
             )
         )
 
@@ -5250,6 +5274,10 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
     if getattr(args, "flip_state_features", False) != config.get("flip_state_features", False):
         raise ValueError("--flip-state-features must match the checkpoint when resuming")
+    if getattr(args, "discriminator_relative_positions", False) != (
+        config.get("discriminator_relative_positions", False)
+    ):
+        raise ValueError("--discriminator-relative-positions must match the checkpoint when resuming")
     if getattr(args, "team_size", 1) != config.get("team_size", 1):
         raise ValueError("--team-size must match the checkpoint when resuming")
     if getattr(args, "expired_dodge_mask", config.get("expired_dodge_mask", False)) != (
@@ -5376,6 +5404,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     add_feature_option(
         parser, "--flip-state-features", default=True,
         help="give the policy and discriminator focal flip availability and remaining dodge time",
+    )
+    add_feature_option(
+        parser, "--discriminator-relative-positions", default=True,
+        help="give global discriminator explicit ball-to-car and car-to-ego positions",
     )
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
@@ -5544,6 +5576,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("critic_layers", 1)
         inherited.setdefault("expired_dodge_mask", False)
         inherited.setdefault("flip_state_features", False)
+        inherited.setdefault("discriminator_relative_positions", False)
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
         parser.set_defaults(**inherited)
@@ -5808,12 +5841,14 @@ def build_discriminator(
 ) -> SceneDiscriminator | CausalSceneTransformer | FactorizedSceneDiscriminator:
     n_cars = team_car_count(getattr(args, "team_size", 1))
     flip_state_features = getattr(args, "flip_state_features", False)
+    relative_positions = getattr(args, "discriminator_relative_positions", False)
     if getattr(args, "transformer_global", False) and not args.factorize:
         return CausalSceneTransformer(
             args.frame_embedding, args.temporal_hidden, args.discriminator_hidden,
             max_context=args.discriminator_context_length,
             n_cars=n_cars,
             flip_state_features=flip_state_features,
+            relative_positions=relative_positions,
         )
     model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
     options = dict(
@@ -5823,6 +5858,7 @@ def build_discriminator(
         n_cars=n_cars,
         recurrent_global=getattr(args, "recurrent_global", False),
         flip_state_features=flip_state_features,
+        relative_positions=relative_positions,
     )
     if args.factorize:
         options.update(

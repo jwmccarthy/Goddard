@@ -15,6 +15,7 @@ from gaifo import (
     BALL_NEAR_DISTANCE,
     BLUE_START,
     CAR_SIZE,
+    GAIFO_ARCHITECTURE,
     ORANGE_START,
     GAIFOCheckpoints,
     ExpertSceneDataset,
@@ -24,6 +25,7 @@ from gaifo import (
     SceneDiscriminatorReward,
     SceneGAIFOMinibatches,
     build_discriminator,
+    extract_scene_observations,
     generated_scene_timeline,
     load_discriminator_state,
     load_resume_checkpoint,
@@ -78,6 +80,136 @@ class NearMistakeHeads(th.nn.Module):
 
 
 class FactorizedGAIFOTests(unittest.TestCase):
+    def test_old_factorized_checkpoint_retains_original_global_inputs_on_resume(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            with patch.object(sys, "argv", [
+                "gaifo.py", "--replay-dir", directory, "--factorize",
+                "--discriminator-relative-positions", "false", "--n-sim", "1",
+                "--rollout", "4", "--discriminator-hidden", "16",
+                "--frame-embedding", "8", "--temporal-hidden", "8",
+            ]):
+                args, _ = parse_args()
+            original = build_discriminator(args)
+            original_modules = {
+                "policy": th.nn.Linear(1, 1), "critic": th.nn.Linear(1, 1),
+                "discriminator": original,
+            }
+            original_optimizers = {
+                name: th.optim.Adam(module.parameters())
+                for name, module in original_modules.items()
+            }
+            config = {
+                name: str(value) if isinstance(value, Path) else value
+                for name, value in vars(args).items()
+            }
+            config["architecture"] = GAIFO_ARCHITECTURE
+            config.pop("discriminator_relative_positions")
+            checkpoint = Path(directory) / "gaifo_000000000000.pt"
+            th.save({
+                "step": 0, "config": config,
+                **{name: module.state_dict() for name, module in original_modules.items()},
+                **{f"{name}_optimizer": optimizer.state_dict()
+                   for name, optimizer in original_optimizers.items()},
+            }, checkpoint)
+            with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(checkpoint)]):
+                resumed, payload = parse_args()
+            self.assertFalse(resumed.discriminator_relative_positions)
+            validate_resume_args(resumed, payload)
+            restored_modules = {
+                name: th.nn.Linear(1, 1) if name != "discriminator" else build_discriminator(resumed)
+                for name in original_modules
+            }
+            restored_optimizers = {
+                name: th.optim.Adam(module.parameters())
+                for name, module in restored_modules.items()
+            }
+            restore_training_checkpoint(
+                payload, resumed, restored_modules, restored_optimizers,
+            )
+            self.assertFalse(restored_modules["discriminator"].global_discriminator.relative_positions)
+            for name, value in original.state_dict().items():
+                th.testing.assert_close(value, restored_modules["discriminator"].state_dict()[name])
+
+    def test_near_ball_receives_relative_positions_for_expert_and_live_scenes(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            rows = np.zeros((32, 161), dtype=np.float32)
+            rows[:, :3] = [0.5, 0.0, 91.25 / 2076]
+            rows[:, BLUE_START:BLUE_START + 3] = [0.25, -0.25, 17 / 2076]
+            rows[:, BLUE_START + 9] = rows[:, BLUE_START + 14] = 1
+            rows[:, BLUE_START + 16] = 1
+            rows[:, ORANGE_START + 9] = rows[:, ORANGE_START + 14] = 1
+            rows[1, :3] = [0.75, 0.125, 91.25 / 2076]
+            rows[1, 3:6] = [0.5, 0.0, 0.0]
+            rows[1, BLUE_START + 3:BLUE_START + 6] = [0.25, 0.0, 0.0]
+            # The discriminator must derive positions from the physical scene,
+            # not trust the stored policy-relative block or any missing live block.
+            rows[:, 119:131] = 99
+            np.save(Path(directory) / "focal-0-match.npy", rows)
+            expert = ExpertSceneDataset(Path(directory), trajectory_length=2)
+            expert_window = expert._windows_for_povs(th.tensor([[1, 0]]))
+            live_window = extract_scene_observations(th.from_numpy(rows[:2, :137]), 2)[None]
+            th.testing.assert_close(expert_window, live_window)
+
+            near = FactorizedSceneDiscriminator(8, 8, 16).near_discriminator
+            recorded = []
+            hook = near.encoder[0].register_forward_pre_hook(
+                lambda _module, inputs: recorded.append(inputs[0].detach().clone())
+            )
+            try:
+                near(expert_window)
+                near(live_window)
+            finally:
+                hook.remove()
+            self.assertEqual(len(recorded), 2)
+            th.testing.assert_close(recorded[0], recorded[1])
+            th.testing.assert_close(
+                recorded[0][0, :, 30:33],
+                th.tensor([[0.25, 0.25, (91.25 - 17) / 2076],
+                           [0.5, 0.375, (91.25 - 17) / 2076]]),
+            )
+            self.assertAlmostEqual(recorded[0][0, 1, 33].item(),
+                                   0.5 - 0.25 * 2300 / 6000, places=6)
+
+    def test_global_heads_see_ball_to_car_and_car_to_ego_offsets(self):
+        for n_cars in (2, 4, 6):
+            for transformer in (False, True):
+                with self.subTest(n_cars=n_cars, transformer=transformer):
+                    model = FactorizedSceneDiscriminator(
+                        8, 8, 16, n_cars=n_cars, transformer_global=transformer,
+                        context_length=4, flip_state_features=True,
+                    )
+                    windows = th.zeros(1, 3, model.scene_size)
+                    windows[..., :3] = th.tensor([0.6, -0.3, 0.2])
+                    for car in range(n_cars):
+                        start = 9 + 21 * car
+                        windows[..., start:start + 3] = th.tensor(
+                            [0.1 * car, -0.05 * car, 0.05],
+                        )
+                    recorded = []
+                    hook = model.global_discriminator.car_encoder[0].register_forward_pre_hook(
+                        lambda _module, inputs: recorded.append(inputs[0].detach().clone())
+                    )
+                    try:
+                        self.assertEqual(model(windows).shape, (1, 3))
+                    finally:
+                        hook.remove()
+                    self.assertEqual(len(recorded), 1)
+                    car_inputs = recorded[0]
+                    positions = th.stack([
+                        windows[..., 9 + 21 * car:12 + 21 * car]
+                        for car in range(n_cars)
+                    ], dim=-2)
+                    th.testing.assert_close(
+                        car_inputs[..., -6:-3], windows[..., None, :3] - positions,
+                    )
+                    th.testing.assert_close(
+                        car_inputs[..., -3:], positions - positions[..., :1, :],
+                    )
+                    self.assertEqual(
+                        model.global_discriminator.car_encoder[0].in_features,
+                        21 + (n_cars if transformer else 1) + 2 + 6,
+                    )
+
     def test_only_global_head_sees_teammates_and_opponents_at_any_frame(self):
         th.manual_seed(4)
         for n_cars, others in ((2, (30,)), (4, (30, 51, 72))):
@@ -473,6 +605,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
         with patch.object(sys, "argv", ["gaifo.py", "--replay-dir", "parsed_replays"]):
             default, _ = parse_args()
         self.assertFalse(default.factorize)
+        self.assertTrue(default.discriminator_relative_positions)
         self.assertFalse(default.hard_positive_mining)
         self.assertIsInstance(build_discriminator(default), SceneDiscriminator)
 
@@ -502,15 +635,22 @@ class FactorizedGAIFOTests(unittest.TestCase):
             payload = load_resume_checkpoint(path)
             self.assertTrue(payload["config"]["factorize"])
             self.assertTrue(payload["config"]["hard_positive_mining"])
+            self.assertTrue(payload["config"]["discriminator_relative_positions"])
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)]):
                 resumed, _ = parse_args()
             self.assertTrue(resumed.factorize)
             self.assertTrue(resumed.hard_positive_mining)
+            self.assertTrue(resumed.discriminator_relative_positions)
             validate_resume_args(resumed, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
                                             "--factorize", "false"]):
                 mismatch, _ = parse_args()
             with self.assertRaisesRegex(ValueError, "--factorize must match"):
+                validate_resume_args(mismatch, payload)
+            with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
+                                             "--discriminator-relative-positions", "false"]):
+                mismatch, _ = parse_args()
+            with self.assertRaisesRegex(ValueError, "--discriminator-relative-positions must match"):
                 validate_resume_args(mismatch, payload)
 
             restored = {"policy": th.nn.Linear(1, 1), "critic": th.nn.Linear(1, 1),

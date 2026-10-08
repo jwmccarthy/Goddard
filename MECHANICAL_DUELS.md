@@ -1,10 +1,11 @@
 # Recent ranked demonstrations (1v1, 2v2, 3v3)
 
-`mechanical_duels_roster.json` lists 14 players (Zen, Atow, Warden, Nass,
-Mawkzy, Rw9, Kiileerrz, Dralii, Nwpo, Diaz, Wahvey, Vatira, Firstkiller, and
-Frosty), their platform IDs, and public replay or verified pro-profile pages
-confirming those IDs. These pages do **not** establish how many ranked-duels
-uploads exist for each player. Additional names under `unverified_candidates`,
+`mechanical_duels_roster.json` lists 20 players (Zen, Atow, Warden, Nass,
+Mawkzy, Rw9, Kiileerrz, Dralii, Nwpo, Diaz, Wahvey, Vatira, Firstkiller,
+Frosty, A7mD, Nush, DrKnown, Oski, Kofyr, and Trk511), their platform IDs,
+and public replay or verified pro-profile pages confirming those IDs. These
+pages do **not** establish how many ranked-duels uploads exist for each player.
+Additional names under `unverified_candidates`,
 including Dark(?), are not queried on name alone.
 
 The downloader searches eight approximately three-month intervals over the last
@@ -72,6 +73,34 @@ rows with the current schema:
   --output-dir parsed_replays/pro_2v2_fs4 --require-pov-manifest --workers 2
 ```
 
+### Two-pro 1v1 dataset from Ballchasing
+
+`download_pro_duels.py` queries and downloads directly from the authenticated
+Ballchasing API. It accepts private and ranked games with exactly one recorded
+player per team, and requires **both** player platform IDs to be verified pros:
+either the ID appears in the evidence-backed roster or Ballchasing explicitly
+marks it as a pro. Display names alone are not evidence. Replay IDs are checked
+against the existing corpus; Rocket League match and participant IDs deduplicate
+the new selection. Matches are then balanced over players and approximately
+three-month periods. Files come from Ballchasing's replay-download endpoint.
+`parsed_replays/duels/` contains the raw `.replay` files, source metadata,
+pro evidence, checksums, single-POV manifests, and parsed training rows in
+one directory. The previous 1v1 corpus remains in `parsed_replays/pro_1v1_fs4/`.
+
+```bash
+.venv/bin/python -m ballchasing_replays.download_pro_duels \
+  --since 2024-10-08 --until 2026-10-09 --max-downloads 1000 \
+  --list-rate 8 --download-rate 2 --parse --workers 2
+```
+
+The date bounds are UTC, with `--until` exclusive. Without overrides they
+cover the past 24 months through today. The rates shown are suitable for a GC
+API token; the default rates are lower. The script stores a reusable candidate
+selection so interrupted batches can resume without repeating the API search.
+Check the final parsed count: games filtered by the parser do not provide usable
+demonstrations. Rerun with a higher `--max-downloads` while keeping
+`--target-parsed 1000` to draw replacements.
+
 ## Train GAIFO
 
 GAIFO retains its short-window GRU discriminator by default. Add `--transformer`
@@ -93,15 +122,22 @@ usual proximity gate. The Transformer global head always compares before/after
 scores; `--differential` discounts its previous capped odds when exponential
 rewards are enabled. A recurrent global GRU carries its previous score across
 rollouts and clears it at game boundaries.
+The global GRU and Transformer frame encoders receive explicit normalized
+ball-to-car and car-to-focal positions for every car, computed identically from
+expert and live scenes. The factorized near-ball head already receives the
+per-frame ball-to-ego position and relative velocity; its far-car head uses
+the initial relative ball context. New runs enable the global relative inputs
+by default, using the existing parsed files without reparsing. Checkpoint
+resumes retain their saved discriminator inputs.
 `--factorize --transformer` also trains the existing near-ball and far-car
 specialists. `--gru` independently controls the policy and critic; it does not
 select the discriminator. `--transformer` cannot be combined with
 `--recurrent-global`.
 
 ```bash
-.venv/bin/python gaifo.py --replay-dir parsed_replays/pro_1v1_fs4 \
+.venv/bin/python gaifo.py --replay-dir parsed_replays/duels \
   --transformer --ppo-lr-end 3e-5 --discriminator-lr-end 3e-5
-.venv/bin/python gaifo.py --replay-dir parsed_replays/pro_1v1_fs4 \
+.venv/bin/python gaifo.py --replay-dir parsed_replays/duels \
   --differential --exp-log-odds-reward
 
 .venv/bin/python gaifo.py --team-size 2 \
@@ -148,7 +184,7 @@ the checkpoint and inspects its recorded POVs.
 ## Ranked doubles coverage
 
 An API audit of 2024-10-03 through 2026-10-04 found at least 6,740 distinct
-ranked-doubles uploads involving the 14 verified IDs in the sampled pages.
+ranked-doubles uploads involving the original 14 verified IDs in the sampled pages.
 Several accounts exceeded the 200-results-per-page limit in individual
 half-year intervals, so the actual number is higher. Every verified player
 has ranked-doubles uploads dated in 2026; Firstkiller and Frosty have hundreds

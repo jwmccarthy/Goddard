@@ -84,6 +84,9 @@ def load_discriminator(path: Path, device: th.device):
         team_size=int(config.get("team_size", 1)),
         factorize=bool(config.get("factorize", False)),
         flip_state_features=bool(config.get("flip_state_features", False)),
+        discriminator_relative_positions=bool(
+            config.get("discriminator_relative_positions", False)
+        ),
         recurrent_global=bool(config.get("recurrent_global", False)),
         transformer_global=bool(config.get("transformer_global", False)),
         discriminator_context_length=int(config.get("discriminator_context_length", 16)),
