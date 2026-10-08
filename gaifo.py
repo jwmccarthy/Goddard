@@ -1261,17 +1261,16 @@ class ExpertSceneDataset:
                     unsafe_reset = unsafe_reset[:keep]
                     touches = touches[:keep]
             real_length = len(source)
-            if self.n_cars > N_CARS:
-                # Demoed teammates or opponents may have zero or parallel axes.
-                # Keep their scenes for the discriminator, but never reset CARL
-                # from a frame where any car cannot define a rotation.
-                bad_rotations = _invalid_reset_rotations(source, self.n_cars)
-                if skill_sampling:
-                    unsafe_reset |= bad_rotations
-                else:
-                    invalid_rotation_frames.append(th.from_numpy(np.pad(
-                        bad_rotations, (self.partition_span, 0), constant_values=True,
-                    )))
+            # Any car, including the 1v1 opponent, may have zero or parallel
+            # axes when demoed. Keep the scene for imitation, but never reset
+            # CARL from a frame whose axes cannot define a rotation.
+            bad_rotations = _invalid_reset_rotations(source, self.n_cars)
+            if skill_sampling:
+                unsafe_reset |= bad_rotations
+            else:
+                invalid_rotation_frames.append(th.from_numpy(np.pad(
+                    bad_rotations, (self.partition_span, 0), constant_values=True,
+                )))
             # Every kickoff belongs to a causal window, including the first
             # frame of each replay period. Repeating its initial state provides
             # history without borrowing frames from another segment or the future.

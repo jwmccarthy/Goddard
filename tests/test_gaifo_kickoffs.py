@@ -18,6 +18,7 @@ from gaifo import (
 def save_period(folder: Path, name: str, marker: int, paired: bool = False) -> None:
     rows = np.zeros((8, 161), dtype=np.float32)
     rows[:, 3] = marker + np.arange(8)
+    rows[:, BLUE_START + 9] = rows[:, ORANGE_START + 9] = 1
     rows[:, BLUE_START + 14] = rows[:, ORANGE_START + 14] = 1
     rows[:, BLUE_START + 16] = rows[:, ORANGE_START + 16] = 1
     np.save(folder / f"100-0-{name}.npy", rows)

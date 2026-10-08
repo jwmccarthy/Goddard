@@ -53,13 +53,13 @@ def write_team_povs(
         rows[:, car + 9] = rows[:, car + 14] = rows[:, car + 16] = 1
         rows[:, car + 15] = 0.5
     if invalid_rotations:
-        # Demoed opponents may have no axes; another player's up can be parallel
+        # Demoed opponents may have no axes; another car's up can be parallel
         # to its forward. Neither can be converted to a CARL reset rotation.
         last_car = 9 + (n_cars - 1) * 21
         rows[28, last_car + 9:last_car + 15] = 0
         rows[28, last_car + 17] = 1
-        teammate = 9 + 21
-        rows[29, teammate + 12:teammate + 15] = rows[29, teammate + 9:teammate + 12]
+        other_car = 9 + 21
+        rows[29, other_car + 12:other_car + 15] = rows[29, other_car + 9:other_car + 12]
     internal = team_observation_size(team_size)
     rows[:, internal] = 1
     rows[:, internal + 5] = 0.1
@@ -152,7 +152,7 @@ class TeamSizeUnitTests(unittest.TestCase):
                                         th.tensor([0., 0.]))
 
     def test_invalid_car_rotations_are_excluded_from_resets_but_not_expert_scenes(self):
-        for size in (2, 3):
+        for size in (1, 2, 3):
             with self.subTest(team_size=size), tempfile.TemporaryDirectory(
                 dir="/tmp/opencode",
             ) as directory:

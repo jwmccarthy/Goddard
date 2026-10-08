@@ -30,6 +30,8 @@ def write_pov(folder: Path, name: str, ball_x: float, paired: bool) -> None:
     rows[:, 0] = ball_x
     rows[:, BLUE_START] = -0.8  # The stored focal car is off-ball.
     rows[:, ORANGE_START] = ball_x + 0.01  # The opponent is near the ball.
+    for car in (BLUE_START, ORANGE_START):
+        rows[:, car + 9] = rows[:, car + 14] = 1
     np.save(folder / f"100-0-{name}.npy", rows)
     if paired:
         other = rows.copy()

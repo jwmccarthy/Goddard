@@ -13,7 +13,8 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    BLUE_START, ConfidentExpertResetTransform, ORANGE_START, POSITION_SCALE,
+    BLUE_START, ConfidentExpertResetTransform, ExpertSceneDataset,
+    ORANGE_START, POSITION_SCALE,
     load_resume_checkpoint, main,
 )
 from replay_layout import team_live_observation_size
@@ -29,6 +30,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         exp_log_odds_reward: bool = False, recency_replay: bool = False,
         transformer: bool = False, differential: bool = False,
         gamma: float | None = None,
+        invalid_rotations: bool = False, recurrent_global: bool = True,
+        trajectory_length: int = 8,
     ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -43,17 +46,28 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 rows[:, car + 14] = 1
                 rows[:, car + 16] = 1
             rows[:, 137] = 1
+            if invalid_rotations:
+                rows[12:32, ORANGE_START + 9:ORANGE_START + 15] = 0
+                rows[12:32, ORANGE_START + 17] = 1
             np.save(replays / "replay.npy", rows)
             np.savez_compressed(
                 replays / "replay.unsafe-starts.npz",
                 unsafe=np.zeros(len(rows), dtype=bool),
                 pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
             )
+            if invalid_rotations:
+                expert = ExpertSceneDataset(
+                    replays, trajectory_length, frame_skip=4,
+                    reject_discontinuities=True, skill_sampling=True,
+                )
+                bad = expert.real_frame_indices[12:32]
+                self.assertFalse(th.isin(bad, expert.reset_indices).any())
+                self.assertGreater(len(expert.reset_indices), 0)
             flags = [
                 "gaifo.py", "--replay-dir", str(replays),
                 "--replay-reset-fraction", "1",
                 "--n-sim", "2",
-                "--rollout", "8", "--trajectory-length", "8",
+                "--rollout", "8", "--trajectory-length", str(trajectory_length),
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
                 "--discriminator-hidden", "16", "--frame-embedding", "8",
@@ -71,7 +85,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 flags.extend(("--transformer", "--discriminator-context-length", "8",
                               "--discriminator-context-stride", "2",
                               "--ppo-lr-end", "1e-5", "--discriminator-lr-end", "1e-5"))
-            else:
+            elif recurrent_global:
                 flags.append("--recurrent-global")
             if factorize:
                 flags.append("--factorize")
@@ -100,7 +114,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)
             saved = load_resume_checkpoint(max(checkpoints))
-            self.assertEqual(saved["config"]["recurrent_global"], not transformer)
+            self.assertEqual(saved["config"]["recurrent_global"], recurrent_global and not transformer)
             self.assertEqual(saved["config"].get("transformer_global", False), transformer)
             self.assertTrue(saved["config"]["expired_dodge_mask"])
             self.assertTrue(saved["config"]["flip_state_features"])
@@ -139,6 +153,16 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         self.assertIn("D far accuracy", output)
         self.assertIn("D near accuracy", output)
         self.assertIn("D global accuracy", output)
+
+    def test_factorized_1v1_training_skips_invalid_opponent_rotations(self):
+        saved, output, _ = self._short_window_training(
+            True, exp_log_odds_reward=True, invalid_rotations=True,
+            recurrent_global=False, trajectory_length=4,
+        )
+        self.assertEqual(saved["step"], 64)
+        self.assertTrue(saved["config"]["factorize"])
+        self.assertTrue(saved["config"]["exp_log_odds_reward"])
+        self.assertIn("D near accuracy", output)
 
     def test_transformer_trains_and_rewards_in_both_1v1_modes(self):
         for factorize in (False, True):
