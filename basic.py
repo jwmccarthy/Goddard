@@ -78,6 +78,60 @@ class PolicyCheckpoint:
     state: dict[str, torch.Tensor]
     observation_size: int
     policy_layers: int = 1
+    policy_gru_layers: int = 1
+
+
+def _weight_count(state: dict[str, torch.Tensor], prefix: str) -> int:
+    return sum(name.startswith(prefix) and name.endswith(".weight") for name in state)
+
+
+def _gru_layers(state: dict[str, torch.Tensor], path: Path, model: str) -> int:
+    prefix = "body.rnn.weight_ih_l"
+    layers = sum(name.startswith(prefix) for name in state)
+    if not layers or any(f"{prefix}{index}" not in state for index in range(layers)):
+        raise ValueError(f"checkpoint has invalid {model} GRU layers: {path}")
+    return layers
+
+
+def _critic_checkpoint_layers(
+    payload: dict, path: Path, architecture: str,
+) -> tuple[int, int]:
+    modules = payload["modules"]
+    state = modules.get("critic", modules.get("value_function"))
+    if not isinstance(state, dict):
+        raise ValueError(f"checkpoint has no critic weights: {path}")
+    if architecture == GAIFO_ARCHITECTURE:
+        layers = _weight_count(state, "body.model.")
+        gru_layers = 1
+    else:
+        layers = _weight_count(state, "head.model.") - 1
+        gru_layers = _gru_layers(state, path, "critic")
+    if layers < 1:
+        raise ValueError(f"checkpoint has no supported critic layers: {path}")
+    config = payload.get("config", {})
+    if config.get("critic_layers", layers) != layers:
+        raise ValueError(f"checkpoint critic layers do not match weights: {path}")
+    if config.get("critic_gru_layers", gru_layers) != gru_layers:
+        raise ValueError(f"checkpoint critic GRU layers do not match weights: {path}")
+    return layers, gru_layers
+
+
+def _model_layers(arguments: argparse.Namespace, architecture: str) -> tuple[int, int, int, int]:
+    policy_layers = getattr(arguments, "policy_layers", None)
+    if policy_layers is None:
+        policy_layers = 2 if architecture == BASIC_POLICY_ARCHITECTURE else 1
+    critic_layers = getattr(arguments, "critic_layers", None)
+    if critic_layers is None:
+        critic_layers = policy_layers if architecture == GAIFO_ARCHITECTURE else 2
+    policy_gru_layers = getattr(arguments, "policy_gru_layers", None)
+    critic_gru_layers = getattr(arguments, "critic_gru_layers", None)
+    if architecture == GAIFO_ARCHITECTURE and critic_gru_layers not in (None, 1):
+        raise ValueError("--critic-gru-layers requires a recurrent critic")
+    return (
+        policy_layers, critic_layers,
+        1 if policy_gru_layers is None else policy_gru_layers,
+        1 if critic_gru_layers is None else critic_gru_layers,
+    )
 
 
 def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
@@ -98,12 +152,16 @@ def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
     if not isinstance(foot, torch.Tensor) or foot.ndim != 2:
         raise ValueError(f"checkpoint has no supported policy encoder: {path}")
     if "body.rnn.weight_ih_l0" in state:
-        intermediate = state.get("head.model.2.weight")
+        head_layers = _weight_count(state, "head.model.")
+        hidden = [state.get(f"head.model.{2 * index}.weight")
+                  for index in range(head_layers - 1)]
         architecture = (
-            BASIC_POLICY_ARCHITECTURE if "head.model.4.weight" in state
-            and isinstance(intermediate, torch.Tensor)
-            and intermediate.shape[0] == foot.shape[0] // 2
-            else GAIFO_GRU_ARCHITECTURE
+            BASIC_POLICY_ARCHITECTURE if head_layers >= 2
+            and all(isinstance(weight, torch.Tensor) and weight.ndim == 2
+                    for weight in hidden)
+            and [weight.shape[0] for weight in hidden] == (
+                [foot.shape[0]] * (len(hidden) - 1) + [foot.shape[0] // 2]
+            ) else GAIFO_GRU_ARCHITECTURE
         )
     elif "body.model.0.weight" in state:
         architecture = GAIFO_ARCHITECTURE
@@ -125,18 +183,25 @@ def policy_checkpoint(payload: dict, path: Path) -> PolicyCheckpoint:
     saved_hidden = config.get("policy_hidden", config.get("hidden_size"))
     if saved_hidden is not None and saved_hidden != hidden_size:
         raise ValueError(f"checkpoint hidden size does not match weights: {path}")
-    if architecture == BASIC_POLICY_ARCHITECTURE:
-        policy_layers = 1
-    else:
-        prefix = "body.model." if architecture == GAIFO_ARCHITECTURE else "head.model."
-        policy_layers = sum(
-            name.startswith(prefix) and name.endswith(".weight") for name in state
-        )
-        if policy_layers < 1:
-            raise ValueError(f"checkpoint has no supported policy layers: {path}")
-        if config.get("policy_layers", policy_layers) != policy_layers:
-            raise ValueError(f"checkpoint policy layers do not match weights: {path}")
-    return PolicyCheckpoint(architecture, hidden_size, state, foot.shape[1], policy_layers)
+    policy_layers = (
+        _weight_count(state, "body.model.") if architecture == GAIFO_ARCHITECTURE
+        else _weight_count(state, "head.model.")
+        - (architecture == BASIC_POLICY_ARCHITECTURE)
+    )
+    if policy_layers < 1:
+        raise ValueError(f"checkpoint has no supported policy layers: {path}")
+    if config.get("policy_layers", policy_layers) != policy_layers:
+        raise ValueError(f"checkpoint policy layers do not match weights: {path}")
+    policy_gru_layers = (
+        1 if architecture == GAIFO_ARCHITECTURE
+        else _gru_layers(state, path, "policy")
+    )
+    if config.get("policy_gru_layers", policy_gru_layers) != policy_gru_layers:
+        raise ValueError(f"checkpoint policy GRU layers do not match weights: {path}")
+    return PolicyCheckpoint(
+        architecture, hidden_size, state, foot.shape[1],
+        policy_layers, policy_gru_layers,
+    )
 
 
 def load_policy_checkpoint(path: Path) -> tuple[PolicyCheckpoint, dict]:
@@ -177,7 +242,30 @@ def configure_starting_checkpoint(
                 f"--policy-hidden must match checkpoint ({checkpoint.hidden_size})"
             )
         arguments.policy_architecture = checkpoint.architecture
-        arguments.policy_layers = checkpoint.policy_layers
+        for name, saved in (
+            ("policy_layers", checkpoint.policy_layers),
+            ("policy_gru_layers", checkpoint.policy_gru_layers),
+        ):
+            requested = getattr(arguments, name, None)
+            if requested is not None and requested != saved:
+                raise ValueError(
+                    f"--{name.replace('_', '-')} must match checkpoint ({saved})"
+                )
+            setattr(arguments, name, saved)
+        if arguments.resume_checkpoint is not None:
+            critic_layers, critic_gru_layers = _critic_checkpoint_layers(
+                payload, source, checkpoint.architecture,
+            )
+            for name, saved in (
+                ("critic_layers", critic_layers),
+                ("critic_gru_layers", critic_gru_layers),
+            ):
+                requested = getattr(arguments, name, None)
+                if requested is not None and requested != saved:
+                    raise ValueError(
+                        f"--{name.replace('_', '-')} must match checkpoint ({saved})"
+                    )
+                setattr(arguments, name, saved)
         arguments.checkpoint_observation_size = checkpoint.observation_size
         # Legacy policies used 137/138 features; new ones include CARL's two
         # focal flip features before the optional tracked jump age.
@@ -192,6 +280,10 @@ def configure_starting_checkpoint(
         arguments.hidden_size = 256
     if source is None:
         arguments.policy_architecture = BASIC_POLICY_ARCHITECTURE
+    (
+        arguments.policy_layers, arguments.critic_layers,
+        arguments.policy_gru_layers, arguments.critic_gru_layers,
+    ) = _model_layers(arguments, arguments.policy_architecture)
     if arguments.start_kl_coef is None:
         arguments.start_kl_coef = (
             DEFAULT_START_KL_COEF if starting is not None else 0.0
@@ -399,6 +491,22 @@ def parse_arguments() -> argparse.Namespace:
         help="shared policy and critic width (default: 256, inferred from a checkpoint)",
     )
     parser.add_argument(
+        "--policy-layers", type=int, default=None,
+        help="policy hidden layers after the encoder/GRU (default: 2 for BASIC)",
+    )
+    parser.add_argument(
+        "--critic-layers", type=int, default=None,
+        help="critic hidden layers after the encoder/GRU (default: 2 for BASIC)",
+    )
+    parser.add_argument(
+        "--policy-gru-layers", type=int, default=None,
+        help="stacked policy GRU layers (default: 1)",
+    )
+    parser.add_argument(
+        "--critic-gru-layers", type=int, default=None,
+        help="stacked critic GRU layers (default: 1)",
+    )
+    parser.add_argument(
         "--timesteps", "--total-timesteps", dest="total_timesteps",
         type=int, default=10_000_000_000, metavar="TIMESTEPS",
     )
@@ -496,6 +604,11 @@ def parse_arguments() -> argparse.Namespace:
         and arguments.resume_checkpoint is None
     ):
         arguments.hidden_size = 256
+    if arguments.start_checkpoint is None and arguments.resume_checkpoint is None:
+        (
+            arguments.policy_layers, arguments.critic_layers,
+            arguments.policy_gru_layers, arguments.critic_gru_layers,
+        ) = _model_layers(arguments, BASIC_POLICY_ARCHITECTURE)
     return arguments
 
 
@@ -507,6 +620,10 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "rollout":                arguments.rollout_steps,
         "sequence-length":        arguments.sequence_length,
         "policy-hidden":          arguments.hidden_size,
+        "policy-layers":          arguments.policy_layers,
+        "critic-layers":          arguments.critic_layers,
+        "policy-gru-layers":      arguments.policy_gru_layers,
+        "critic-gru-layers":      arguments.critic_gru_layers,
         "timesteps":              arguments.total_timesteps,
         "ppo-batch":              arguments.minibatch_size,
         "ppo-lr":                 arguments.learning_rate,
@@ -599,12 +716,17 @@ def build_policy_and_critic(
     arguments: argparse.Namespace,
     architecture: str = BASIC_POLICY_ARCHITECTURE,
 ):
+    policy_layers, critic_layers, policy_gru_layers, critic_gru_layers = (
+        _model_layers(arguments, architecture)
+    )
     if architecture in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+        if policy_gru_layers != 1:
+            raise ValueError("GAIFO policy checkpoints require one GRU layer")
         gaifo_args = argparse.Namespace(
             policy_hidden=arguments.hidden_size,
             critic_hidden=arguments.hidden_size,
-            policy_layers=getattr(arguments, "policy_layers", 1),
-            critic_layers=getattr(arguments, "policy_layers", 1),
+            policy_layers=policy_layers,
+            critic_layers=critic_layers,
             gru=architecture == GAIFO_GRU_ARCHITECTURE,
         )
         actor = build_gaifo_policy(environment, gaifo_args)
@@ -612,12 +734,15 @@ def build_policy_and_critic(
             return actor, build_gaifo_critic(environment, gaifo_args)
     elif architecture == BASIC_POLICY_ARCHITECTURE:
         actor_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
-        actor_body = GRU(hidden_size=arguments.hidden_size).build(actor_head.feats)
+        actor_body = GRU(
+            hidden_size=arguments.hidden_size, num_layers=policy_gru_layers,
+        ).build(actor_head.feats)
         actor = MultiCategoricalPolicy(
             foot=actor_head,
             body=actor_body,
             head=MLP(
-                dims=[arguments.hidden_size, arguments.hidden_size // 2],
+                dims=[arguments.hidden_size] * (policy_layers - 1)
+                + [arguments.hidden_size // 2],
                 func=nn.LeakyReLU,
                 out_init_func=orthogonal_init(std=0.01),
             ),
@@ -628,12 +753,15 @@ def build_policy_and_critic(
         raise ValueError(f"unsupported starting policy architecture: {architecture}")
 
     critic_head = LinearEncoder(arguments.hidden_size, func=nn.ReLU).build(environment)
-    critic_body = GRU(hidden_size=arguments.hidden_size).build(critic_head.feats)
+    critic_body = GRU(
+        hidden_size=arguments.hidden_size, num_layers=critic_gru_layers,
+    ).build(critic_head.feats)
     critic = Critic(
         foot=critic_head,
         body=critic_body,
         head=MLP(
-            dims=[arguments.hidden_size // 2, arguments.hidden_size // 4],
+            dims=[arguments.hidden_size // 2] * (critic_layers - 1)
+            + [arguments.hidden_size // 4],
             func=nn.LeakyReLU,
             out_init_func=orthogonal_init(std=1.0),
         ),
@@ -820,6 +948,9 @@ def build_ppo(
 ) -> tuple[SelfPlayRunner, RolloutBuffer, Algorithm, ValueScheduler, dict]:
     if arguments.start_kl_coef and reference_policy is None:
         raise ValueError("KL penalty requires a frozen starting policy")
+    policy_layers, critic_layers, policy_gru_layers, critic_gru_layers = (
+        _model_layers(arguments, arguments.policy_architecture)
+    )
     recurrent = policy.initial_state(1) is not None
     rollout = RolloutBuffer(
         horizon=arguments.rollout_steps,
@@ -1008,12 +1139,10 @@ def build_ppo(
             "policy_architecture": arguments.policy_architecture,
             "hidden_size": arguments.hidden_size,
             "expired_dodge_mask": getattr(arguments, "expired_dodge_mask", False),
-            **(
-                {"policy_layers": getattr(arguments, "policy_layers", 1)}
-                if arguments.policy_architecture in (
-                    GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
-                ) else {}
-            ),
+            "policy_layers": policy_layers,
+            "critic_layers": critic_layers,
+            "policy_gru_layers": policy_gru_layers,
+            "critic_gru_layers": critic_gru_layers,
             "start_kl_coef": arguments.start_kl_coef,
             "sparse": arguments.sparse,
         },

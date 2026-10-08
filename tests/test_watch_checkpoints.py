@@ -329,6 +329,53 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                             loaded.foot.model[0].weight, reference.foot.model[0].weight,
                         )
 
+    def test_deeper_basic_snapshots_and_training_checkpoints_are_watchable(self):
+        env = FakeEnv()
+        observation = th.randn(2, 51)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            for layers, gru_layers in ((1, 2), (2, 1), (3, 3)):
+                with self.subTest(layers=layers, gru_layers=gru_layers):
+                    reference, _ = build_policy_and_critic(
+                        env, argparse.Namespace(
+                            hidden_size=16, policy_layers=layers,
+                            policy_gru_layers=gru_layers,
+                        ),
+                    )
+                    paths = (
+                        Path(directory) / "training_latest.pt",
+                        Path(directory) / "actor_critic_final.pt",
+                    )
+                    th.save({
+                        "modules": {"policy": reference.state_dict()},
+                        "config": {
+                            "policy_architecture": BASIC_POLICY_ARCHITECTURE,
+                            "hidden_size": 16,
+                            "policy_layers": layers,
+                            "policy_gru_layers": gru_layers,
+                        },
+                    }, paths[0])
+                    th.save(reference.state_dict(), paths[1])
+                    for path in paths:
+                        loaded, signature = load_policy_checkpoint(path, env, 4, None)
+                        self.assertEqual(
+                            signature, ("basic", 16, None, layers, gru_layers),
+                        )
+                        with th.inference_mode():
+                            expected = reference.act(
+                                observation, reference.initial_state(2), deterministic=True,
+                            )
+                            actual = loaded.act(
+                                observation, loaded.initial_state(2), deterministic=True,
+                            )
+                        th.testing.assert_close(actual.action, expected.action)
+                        th.testing.assert_close(actual.next_state, expected.next_state)
+
+            other, _ = build_policy_and_critic(env, argparse.Namespace(hidden_size=16))
+            old = Path(directory) / "policy_000000000001.pt"
+            th.save(other.state_dict(), old)
+            with self.assertRaisesRegex(ValueError, "different trainer architectures"):
+                load_match(paths[0], old, env, 4, None)
+
     def test_mismatched_gru_metadata_is_rejected(self):
         env = FakeEnv()
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

@@ -27,6 +27,7 @@ from basic import (
     configure_starting_checkpoint,
     load_policy_checkpoint,
     parse_arguments,
+    validate_arguments,
 )
 from dodge_window import DodgeAwareCARLTorchVectorEnv
 from gaifo import (
@@ -37,7 +38,7 @@ from jarl.collect.capture import CaptureContext
 from jarl.data import TensorBatch
 from jarl.learn import PPOConfig, PPOLoss
 from jarl.runtime import Clock
-from jarl.sample import SequenceBatch
+from jarl.sample import RecurrentRolloutMinibatches, SequenceBatch
 from training_checkpoint import TrainingCheckpointer
 
 
@@ -187,6 +188,198 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                     self.assertEqual(snapshot.architecture, architecture)
                     self.assertEqual(snapshot.policy_layers, layers)
 
+    def test_gaifo_mlp_start_rejects_unused_critic_gru_depth(self):
+        policy, _ = build_policy_and_critic(
+            self.env, argparse.Namespace(hidden_size=16), GAIFO_ARCHITECTURE,
+        )
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            path = Path(directory) / "gaifo.pt"
+            torch.save(policy.state_dict(), path)
+            args = checkpoint_args(start=path)
+            args.critic_gru_layers = 2
+            with self.assertRaisesRegex(ValueError, "--critic-gru-layers"):
+                configure_starting_checkpoint(args)
+
+    def test_basic_depth_flags_build_independent_heads_and_grus(self):
+        with patch.object(sys, "argv", [
+            "basic.py", "--policy-hidden", "16", "--policy-layers", "4",
+            "--critic-layers", "3", "--policy-gru-layers", "2",
+            "--critic-gru-layers", "3",
+        ]):
+            args = parse_arguments()
+        configure_starting_checkpoint(args)
+        policy, critic = build_policy_and_critic(self.env, args)
+        self.assertEqual(policy.head.dims, [16, 16, 16, 8])
+        self.assertEqual(critic.head.dims, [8, 8, 4])
+        self.assertEqual(policy.body.rnn.num_layers, 2)
+        self.assertEqual(critic.body.rnn.num_layers, 3)
+        self.assertEqual(policy.initial_state(4).shape, (4, 2, 16))
+        self.assertEqual(critic.initial_state(4).shape, (4, 3, 16))
+
+        for flag in ("--policy-layers", "--critic-layers",
+                     "--policy-gru-layers", "--critic-gru-layers"):
+            with self.subTest(flag=flag), patch.object(
+                sys, "argv", ["basic.py", flag, "0"],
+            ):
+                invalid = parse_arguments()
+                configure_starting_checkpoint(invalid)
+                with self.assertRaisesRegex(ValueError, flag.removeprefix("--")):
+                    validate_arguments(invalid)
+
+    def test_deeper_basic_policy_snapshot_infers_depth_for_warm_start(self):
+        args = argparse.Namespace(
+            hidden_size=16, policy_layers=3, policy_gru_layers=2,
+            critic_layers=4, critic_gru_layers=3,
+        )
+        policy, _ = build_policy_and_critic(self.env, args)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            path = Path(directory) / "policy_000000000001.pt"
+            torch.save(policy.state_dict(), path)
+            checkpoint, _ = load_policy_checkpoint(path)
+            self.assertEqual(checkpoint.architecture, BASIC_POLICY_ARCHITECTURE)
+            self.assertEqual((checkpoint.policy_layers, checkpoint.policy_gru_layers), (3, 2))
+
+            starting_args = checkpoint_args(start=path)
+            starting_args.critic_layers = 5
+            starting_args.critic_gru_layers = 4
+            starting, _ = configure_starting_checkpoint(starting_args)
+            self.assertEqual(
+                (starting_args.policy_layers, starting_args.policy_gru_layers), (3, 2),
+            )
+            new_policy, new_critic = build_policy_and_critic(self.env, starting_args)
+            new_policy.load_state_dict(starting.state)
+            self.assertEqual(new_critic.head.dims, [8, 8, 8, 8, 4])
+            self.assertEqual(new_critic.initial_state(2).shape, (2, 4, 16))
+
+            for name, mismatched in (("policy_layers", 4), ("policy_gru_layers", 3)):
+                with self.subTest(name=name):
+                    wrong = checkpoint_args(start=path)
+                    setattr(wrong, name, mismatched)
+                    with self.assertRaisesRegex(ValueError, f"--{name.replace('_', '-')}"):
+                        configure_starting_checkpoint(wrong)
+
+    def test_deeper_basic_grus_train_and_resume_with_independent_states(self):
+        args = ppo_args(BASIC_POLICY_ARCHITECTURE)
+        args.sequence_length = 4  # Cross the fake episode boundary within a sequence.
+        args.policy_layers, args.critic_layers = 3, 4
+        args.policy_gru_layers, args.critic_gru_layers = 2, 3
+        policy, critic = build_policy_and_critic(self.env, args)
+        reference = copy.deepcopy(policy).eval().requires_grad_(False)
+        reward = DiagnosticRewardSpec(normalize=False)
+        self.env.reward = reward
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            runner, rollout, learner, _, objects = build_ppo(
+                self.env, policy, critic, reward, args,
+                Path(directory) / "snapshots", reference,
+            )
+            runner.reset()
+            for step in range(args.rollout_steps):
+                runner.step()
+                if step == 0:
+                    self.assertGreater(runner.state.abs().sum().item(), 0)
+                if step == 1:
+                    torch.testing.assert_close(runner.state, torch.zeros_like(runner.state))
+            collected = rollout.finish()
+            steps = collected.steps
+            self.assertEqual(steps["policy_state"].shape, (4, 4, 2, 16))
+            self.assertEqual(steps["critic_state"].shape, (4, 4, 3, 16))
+            torch.testing.assert_close(
+                steps["policy_state"][2], torch.zeros_like(steps["policy_state"][2]),
+            )
+            torch.testing.assert_close(
+                steps["critic_state"][2], torch.zeros_like(steps["critic_state"][2]),
+            )
+            prepared = steps.with_fields(
+                advantage=torch.randn_like(steps["reward"]),
+                returns=steps["baseline_value"] + 0.2,
+            )
+            sample = next(iter(RecurrentRolloutMinibatches(
+                args.sequence_length, args.minibatch_size // args.sequence_length,
+            )(prepared)))
+            self.assertEqual(sample.initial_state.shape[1:], (2, 16))
+            self.assertEqual(sample.initial_critic_state.shape[1:], (3, 16))
+            self.assertTrue(sample.reset[2].all().item())
+            evaluation = policy.evaluate_actions(
+                sample.steps["observation"], sample.steps["action"],
+                sample.initial_state, reset=sample.reset,
+            )
+            torch.testing.assert_close(
+                evaluation.log_prob[sample.valid],
+                sample.steps["old_log_prob"][sample.valid], atol=1e-5, rtol=1e-5,
+            )
+            values = critic.evaluate_values(
+                sample.steps["observation"], sample.initial_critic_state,
+                reset=sample.reset,
+            )
+            torch.testing.assert_close(
+                values[sample.valid],
+                sample.steps["baseline_value"][sample.valid], atol=1e-5, rtol=1e-5,
+            )
+            loss = build_policy_loss(policy, critic, 0.01, start_kl_coef=0.5)(sample)
+            loss.loss.backward()
+            self.assertGreater(policy.body.rnn.weight_ih_l1.grad.abs().sum().item(), 0)
+            self.assertGreater(critic.body.rnn.weight_ih_l2.grad.abs().sum().item(), 0)
+            metrics = learner.update(collected)["PPO"]
+            self.assertTrue(np.isfinite(metrics["start_kl"]))
+
+            path = Path(directory) / "training_latest.pt"
+            checkpointer = TrainingCheckpointer(path, **objects)
+            checkpointer(SimpleNamespace(clock=Clock(
+                vector_steps=4, env_steps=16, learner_updates=1,
+            )))
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+            self.assertEqual(
+                tuple(saved["config"][name] for name in (
+                    "policy_layers", "critic_layers", "policy_gru_layers", "critic_gru_layers",
+                )), (3, 4, 2, 3),
+            )
+
+            restored_args = checkpoint_args(resume=path)
+            _, has_reference = configure_starting_checkpoint(restored_args)
+            self.assertTrue(has_reference)
+            self.assertEqual(
+                (restored_args.policy_layers, restored_args.critic_layers,
+                 restored_args.policy_gru_layers, restored_args.critic_gru_layers),
+                (3, 4, 2, 3),
+            )
+            restored_policy, restored_critic = build_policy_and_critic(
+                self.env, restored_args,
+            )
+            restored_reference = copy.deepcopy(restored_policy).eval().requires_grad_(False)
+            restored = TrainingCheckpointer(
+                path,
+                modules={"policy": restored_policy, "critic": restored_critic},
+                optimizers={
+                    "policy": torch.optim.Adam(restored_policy.parameters()),
+                    "critic": torch.optim.Adam(restored_critic.parameters()),
+                },
+                stateful={"start_policy": restored_reference},
+            )
+            self.assertEqual(restored.load(path, "cpu").env_steps, 16)
+            for original, loaded in ((policy, restored_policy),
+                                     (critic, restored_critic),
+                                     (reference, restored_reference)):
+                for key, weight in original.state_dict().items():
+                    torch.testing.assert_close(weight, loaded.state_dict()[key])
+
+            for name in ("policy_layers", "critic_layers",
+                         "policy_gru_layers", "critic_gru_layers"):
+                with self.subTest(name=name):
+                    wrong = checkpoint_args(resume=path)
+                    setattr(wrong, name, saved["config"][name] + 1)
+                    with self.assertRaisesRegex(ValueError, f"--{name.replace('_', '-')}"):
+                        configure_starting_checkpoint(wrong)
+
+                    tampered = Path(directory) / f"wrong-{name}.pt"
+                    invalid = copy.deepcopy(saved)
+                    invalid["config"][name] += 1
+                    torch.save(invalid, tampered)
+                    with self.assertRaisesRegex(ValueError, f"{name.split('_')[0]} .*layers"):
+                        if name.startswith("policy"):
+                            load_policy_checkpoint(tampered)
+                        else:
+                            configure_starting_checkpoint(checkpoint_args(resume=tampered))
+
     def test_start_and_resume_preserve_gaifo_dodge_window_observation_width(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             for width, architecture in (
@@ -313,6 +506,41 @@ class BasicStartingCheckpointTests(unittest.TestCase):
             finally:
                 source.close()
 
+    @unittest.skipUnless(
+        os.environ.get("GODDARD_GPU_SMOKE") == "1" and torch.cuda.is_available(),
+        "opt-in CARL/CUDA Basic checkpoint integration",
+    )
+    def test_real_carl_multilayer_basic_gru_ppo_update(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            env = DodgeAwareCARLTorchVectorEnv(
+                n_sim=1, n_blue=1, n_orange=1, frameskip=4,
+                normalize=True, discrete_actions=True,
+            )
+            try:
+                reward = env.register_reward(DiagnosticRewardSpec(normalize=False))
+                args = ppo_args(BASIC_POLICY_ARCHITECTURE)
+                args.start_kl_coef = 0
+                args.policy_layers, args.critic_layers = 3, 4
+                args.policy_gru_layers, args.critic_gru_layers = 2, 3
+                args.sequence_length, args.minibatch_size = 4, 8
+                args.bf16 = torch.cuda.is_bf16_supported()
+                policy, critic = build_policy_and_critic(env, args)
+                runner, rollout, learner, _, _ = build_ppo(
+                    env, policy, critic, reward, args,
+                    Path(directory) / "snapshots",
+                )
+                runner.reset()
+                for _ in range(args.rollout_steps):
+                    runner.step()
+                steps = rollout.finish()
+                self.assertEqual(steps.steps["policy_state"].shape, (4, 2, 2, 16))
+                self.assertEqual(steps.steps["critic_state"].shape, (4, 2, 3, 16))
+                metrics = learner.update(steps)["PPO"]
+                self.assertTrue(np.isfinite(metrics["policy_loss"]))
+                self.assertEqual(metrics["optimizer_minibatches"], 1)
+            finally:
+                env.close()
+
     def test_gaifo_style_flags_accept_legacy_basic_spellings(self):
         aliases = (
             ("--n-sim", "--num-simulations", "12"),
@@ -346,6 +574,11 @@ class BasicStartingCheckpointTests(unittest.TestCase):
         with patch.object(sys, "argv", ["basic.py"]):
             defaults = parse_arguments()
         self.assertEqual(defaults.hidden_size, 256)
+        self.assertEqual(
+            (defaults.policy_layers, defaults.critic_layers,
+             defaults.policy_gru_layers, defaults.critic_gru_layers),
+            (2, 2, 1, 1),
+        )
         self.assertEqual(defaults.entropy_coef_end, 0.005)
         self.assertEqual(defaults.learning_rate_end_factor, 0.5)
         self.assertEqual(defaults.replay_reset_probability, 0.7)
@@ -421,6 +654,11 @@ class BasicStartingCheckpointTests(unittest.TestCase):
             self.assertEqual(arguments.policy_architecture, BASIC_POLICY_ARCHITECTURE)
             self.assertEqual(arguments.hidden_size, 16)
             self.assertEqual(arguments.start_kl_coef, 0.0)
+            self.assertEqual(
+                (arguments.policy_layers, arguments.critic_layers,
+                 arguments.policy_gru_layers, arguments.critic_gru_layers),
+                (2, 2, 1, 1),
+            )
 
     def test_kl_penalty_uses_starting_distribution_and_valid_steps(self):
         for architecture in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):

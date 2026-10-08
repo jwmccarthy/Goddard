@@ -348,7 +348,10 @@ def load_policy_checkpoint(
         policy_env = checkpoint_policy_environment(env, policy_state, path, config)
         if architecture is None:
             policy, _ = build_policy_and_critic(
-                policy_env, argparse.Namespace(hidden_size=hidden)
+                policy_env, argparse.Namespace(
+                    hidden_size=hidden, policy_layers=layers,
+                    policy_gru_layers=checkpoint.policy_gru_layers,
+                ),
             )
         else:
             policy = build_gaifo_policy(
@@ -361,10 +364,9 @@ def load_policy_checkpoint(
             )
 
     policy.load_state_dict(policy_state)
-    signature = (
-        (kind, hidden, architecture, layers) if architecture is not None else
-        (kind, hidden, architecture)
-    )
+    signature = (kind, hidden, architecture, layers)
+    if architecture is None:
+        signature = (*signature, checkpoint.policy_gru_layers)
     if kind == "gaifo" and team_size > 1:
         signature = (*signature, team_size)
     return policy.eval().requires_grad_(False), signature
