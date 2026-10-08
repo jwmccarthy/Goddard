@@ -233,6 +233,15 @@ def load_replay_prior(
     return reset_provider, expert_goals
 
 
+def contrastive_minibatches(
+    vector_steps: int, last_update_step: int, prefill_end_step: int,
+    updates_per_step: int,
+) -> int:
+    """Count only collection steps with enough replay to train, including prefill's last step."""
+    eligible = vector_steps - max(last_update_step, prefill_end_step - 1)
+    return max(eligible, 0) * updates_per_step
+
+
 def _checkpoint_config(args: argparse.Namespace, observation_size: int) -> dict:
     return {
         "observation_size": observation_size,
@@ -385,10 +394,12 @@ def main(argv: list[str] | None = None) -> None:
                 initial_vector_steps=saved_steps // environment.n_envs,
             )
             last_update_step = saved_steps // environment.n_envs
+            prefill_end_step = last_update_step + args.prefill_steps
             update = ContrastiveUpdate(
                 learner, args.batch_size, args.updates_per_step * args.collect_steps,
-                steps_for_update=lambda: args.updates_per_step * (
-                    runner.vector_steps - last_update_step
+                steps_for_update=lambda: contrastive_minibatches(
+                    runner.vector_steps, last_update_step, prefill_end_step,
+                    args.updates_per_step,
                 ),
             )
             update.gradient_steps = saved_updates

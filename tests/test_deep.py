@@ -14,7 +14,7 @@ from carl.gymnasium.action import ACTION_NVECS
 
 from deep import (
     ContrastiveBatch, ContrastiveLearner, ResidualNetwork, TrajectoryReplay,
-    achieved_goal, goal_size, load_checkpoint, load_replay_prior, main,
+    achieved_goal, contrastive_minibatches, goal_size, load_checkpoint, load_replay_prior, main,
     parse_arguments, save_checkpoint, transition_observation, validate_arguments,
 )
 from dodge_window import DodgeWindowActionCodec
@@ -55,6 +55,13 @@ def write_training_replay(folder: Path) -> None:
 class DeepCRLTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
+
+    def test_prefill_does_not_create_an_optimizer_backlog(self):
+        self.assertEqual(contrastive_minibatches(999, 0, 1000, 12), 0)
+        self.assertEqual(contrastive_minibatches(1000, 0, 1000, 12), 12)
+        self.assertEqual(contrastive_minibatches(1008, 1000, 1000, 12), 96)
+        # Restoring a checkpoint refills replay without replaying old optimizer work.
+        self.assertEqual(contrastive_minibatches(12, 8, 10, 1), 3)
 
     def test_depth_and_checkpointed_residual_gradients(self):
         network = ResidualNetwork(6, 8, 16, 12, checkpoint_activations=True)
@@ -391,7 +398,7 @@ class DeepCARLSmokeTests(unittest.TestCase):
                 weights_only=True, map_location="cpu",
             )
             self.assertEqual(checkpoint["timesteps"], 8)
-            self.assertEqual(checkpoint["updates"], 4)
+            self.assertEqual(checkpoint["updates"], 3)
 
 
 if __name__ == "__main__":
