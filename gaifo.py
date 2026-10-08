@@ -703,6 +703,21 @@ def _unsafe_replay_reset_frames(
     return unsafe | pre_goal | np.asarray(stored[:, -5:], dtype=bool).any(axis=-1)
 
 
+def _invalid_reset_rotations(scenes: np.ndarray, n_cars: int) -> np.ndarray:
+    """Find frames whose car axes CARL cannot convert to reset rotations."""
+    cars = scenes[:, BALL_SIZE:].reshape(-1, n_cars, CAR_SIZE)
+    forward = cars[:, :, 9:12]
+    up = cars[:, :, 12:15]
+    right = np.cross(up, forward)
+    valid = (
+        np.isfinite(forward).all(axis=(1, 2))
+        & np.isfinite(up).all(axis=(1, 2))
+        & (np.square(forward).sum(axis=-1) >= 1e-8).all(axis=1)
+        & (np.square(right).sum(axis=-1) >= 1e-8).all(axis=1)
+    )
+    return ~valid
+
+
 def _replay_goal_scorer(path: Path, stored: np.ndarray) -> int | None:
     """Identify the scorer at a period boundary, including legacy replay files.
 
@@ -1096,6 +1111,7 @@ class ExpertSceneDataset:
         contact_frames: list[th.Tensor] = []
         ego_touches: list[th.Tensor] = []
         unsafe_reset_frames: list[th.Tensor] = []
+        invalid_rotation_frames: list[th.Tensor] = []
         lengths: list[int] = []
         goal_actors: list[int | None] = []
         total = 0
@@ -1201,6 +1217,17 @@ class ExpertSceneDataset:
                     unsafe_reset = unsafe_reset[:keep]
                     touches = touches[:keep]
             real_length = len(source)
+            if self.n_cars > N_CARS:
+                # Demoed teammates or opponents may have zero or parallel axes.
+                # Keep their scenes for the discriminator, but never reset CARL
+                # from a frame where any car cannot define a rotation.
+                bad_rotations = _invalid_reset_rotations(source, self.n_cars)
+                if skill_sampling:
+                    unsafe_reset |= bad_rotations
+                else:
+                    invalid_rotation_frames.append(th.from_numpy(np.pad(
+                        bad_rotations, (self.partition_span, 0), constant_values=True,
+                    )))
             # Every kickoff belongs to a causal window, including the first
             # frame of each replay period. Repeating its initial state provides
             # history without borrowing frames from another segment or the future.
@@ -1293,6 +1320,11 @@ class ExpertSceneDataset:
         if skill_sampling:
             self.reset_indices = self.reset_indices[
                 ~self.unsafe_reset_frames[self.reset_indices]
+            ]
+        if invalid_rotation_frames:
+            invalid_rotations = th.cat(invalid_rotation_frames).to(device)
+            self.reset_indices = self.reset_indices[
+                ~invalid_rotations[self.reset_indices]
             ]
         self._near_frames: th.Tensor | None = None
         self._train_near_pairs: th.Tensor | None = None

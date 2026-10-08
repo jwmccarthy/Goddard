@@ -17,7 +17,7 @@ import torch as th
 from carl.gymnasium.state import (
     BOOST_PAD_POSITIONS, CARLObservation, CarlEvents, CarlState, RewardContext,
 )
-from carl.gymnasium.torch import CARLTorchVectorEnv
+from carl.gymnasium.torch import CARLTorchVectorEnv, _forward_up_to_quat
 from gaifo import (
     ExpertSceneDataset, FactorizedSceneDiscriminator,
     GAIFO_TEAM_ARCHITECTURE,
@@ -35,7 +35,10 @@ from watch_gaifo_experts import (
 )
 
 
-def write_team_povs(folder: Path, team_size: int, extra: tuple[int, ...] = ()) -> np.ndarray:
+def write_team_povs(
+    folder: Path, team_size: int, extra: tuple[int, ...] = (),
+    invalid_rotations: bool = False,
+) -> np.ndarray:
     """Construct genuinely different, consistent player-centric POV files."""
     n_cars = team_car_count(team_size)
     rows = np.zeros((48, team_replay_row_size(team_size)), dtype=np.float32)
@@ -47,6 +50,14 @@ def write_team_povs(folder: Path, team_size: int, extra: tuple[int, ...] = ()) -
         rows[:, car + 2] = 17 / 2076
         rows[:, car + 9] = rows[:, car + 14] = rows[:, car + 16] = 1
         rows[:, car + 15] = 0.5
+    if invalid_rotations:
+        # Demoed opponents may have no axes; another player's up can be parallel
+        # to its forward. Neither can be converted to a CARL reset rotation.
+        last_car = 9 + (n_cars - 1) * 21
+        rows[28, last_car + 9:last_car + 15] = 0
+        rows[28, last_car + 17] = 1
+        teammate = 9 + 21
+        rows[29, teammate + 12:teammate + 15] = rows[29, teammate + 9:teammate + 12]
     internal = team_observation_size(team_size)
     rows[:, internal] = 1
     rows[:, internal + 5] = 0.1
@@ -69,6 +80,41 @@ def write_team_povs(folder: Path, team_size: int, extra: tuple[int, ...] = ()) -
 
 
 class TeamSizeUnitTests(unittest.TestCase):
+    def test_invalid_car_rotations_are_excluded_from_resets_but_not_expert_scenes(self):
+        for size in (2, 3):
+            with self.subTest(team_size=size), tempfile.TemporaryDirectory(
+                dir="/tmp/opencode",
+            ) as directory:
+                folder = Path(directory)
+                write_team_povs(folder, size, invalid_rotations=True)
+                for curated in (False, True):
+                    with self.subTest(curated=curated):
+                        expert = ExpertSceneDataset(
+                            folder, trajectory_length=4, team_size=size, frame_skip=4,
+                            reject_discontinuities=curated, skill_sampling=curated,
+                        )
+                        bad = expert.real_frame_indices[th.tensor([28, 29])]
+                        self.assertEqual(expert.total_windows, 48)
+                        self.assertTrue(th.isin(
+                            bad - expert.partition_span, expert.train_window_starts,
+                        ).all())
+                        self.assertFalse(th.isin(bad, expert.reset_indices).any())
+                        self.assertGreater(len(expert.reset_indices), 0)
+                        if curated:
+                            self.assertTrue(expert.unsafe_reset_frames[bad].all())
+                            for pool in expert._curated_reset_pools:
+                                self.assertFalse(th.isin(bad, pool).any())
+
+                        request = ReplayResetProvider(
+                            DatasetResetSampler(expert.reset_dataset(), seed=7),
+                            expert.frames, expert.internal_states,
+                        )(th.ones(256, dtype=th.bool))
+                        _, cars = request.physical()
+                        self.assertEqual(
+                            _forward_up_to_quat(cars.forward, cars.up).shape,
+                            (256, 2 * size, 4),
+                        )
+
     def test_experts_sample_only_recorded_teammates_or_opponents_and_restore_timers(self):
         for size in (2, 3):
             with self.subTest(team_size=size), tempfile.TemporaryDirectory(
