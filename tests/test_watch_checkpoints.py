@@ -10,10 +10,15 @@ from unittest.mock import patch
 
 import numpy as np
 import torch as th
+from carl.gymnasium.action import ACTION_NVECS
 from gymnasium.spaces import Box, MultiDiscrete
 from http.server import ThreadingHTTPServer
 
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic
+from deep import (
+    ContrastiveLearner, parse_arguments as deep_arguments,
+    save_checkpoint as save_deep_checkpoint,
+)
 from gaifo import (
     GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
     GAIFO_TEAM_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE,
@@ -23,8 +28,8 @@ from dodge_window import DodgeWindowActionCodec
 from replay_layout import team_observation_size
 from watch_checkpoints import (
     CheckpointRegistry, SpectatorState, checkpoint_policy_environment, load_match,
-    load_policy_checkpoint, make_handler, parse_args, policy_environment,
-    policy_observation, render_frame,
+    deep_watch_goal, load_policy_checkpoint, make_handler, parse_args,
+    policy_environment, policy_observation, render_frame,
 )
 
 
@@ -36,6 +41,88 @@ class FakeEnv:
 
 
 class WatchGAIFOCheckpointsTests(unittest.TestCase):
+    def test_deep_checkpoints_and_mixed_1v1_matches_are_watchable(self):
+        class DeepEnv(FakeEnv):
+            n_cars = 2
+            dodge_window_features = True
+            raw_observation_size = 139
+            action_codec = DodgeWindowActionCodec(139)
+            single_observation_space = Box(-np.inf, np.inf, (140,), np.float32)
+            single_action_space = MultiDiscrete(ACTION_NVECS)
+
+        env = DeepEnv()
+        arguments = deep_arguments([
+            "--goal-kind", "both", "--frameskip", "4",
+            "--actor-width", "16", "--actor-depth", "4",
+            "--critic-width", "16", "--critic-depth", "4",
+            "--embedding-size", "8",
+        ])
+        learner = ContrastiveLearner(
+            139, DodgeWindowActionCodec(139, append_age=False),
+            arguments, th.device("cpu"),
+        )
+        observation = th.zeros(1, 140)
+        observation[0, :3] = th.tensor([0.2, 0.1, 0.04])
+        observation[0, 9:12] = th.tensor([-0.2, -0.5, 0.01])
+        observation[0, 25] = 1
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            deep_path = folder / "deep_final.pt"
+            save_deep_checkpoint(deep_path, learner, arguments, 32, 8)
+            registry = CheckpointRegistry(folder)
+            self.assertEqual(registry.newest_pair(), (deep_path, deep_path))
+            self.assertEqual(registry.list()[0].kind, "deep")
+            self.assertEqual(registry.resolve(deep_path.name), deep_path)
+
+            loaded, signature = load_policy_checkpoint(deep_path, env, 4, None)
+            self.assertEqual(signature, ("deep", 139, "both", 16, 4))
+            projected = policy_observation(loaded, observation)
+            self.assertEqual(tuple(projected.shape), (1, 139))
+            target = deep_watch_goal(projected, "both")
+            th.testing.assert_close(target[0, :3], th.tensor([
+                0.0, 5120 / 6000, 321.3875 / 2076,
+            ]))
+            th.testing.assert_close(target[0, 3:], observation[0, :3])
+            with th.inference_mode():
+                actual = loaded.act(projected, loaded.initial_state(1), deterministic=True)
+                expected = learner.act(projected, target, deterministic=True)
+            th.testing.assert_close(actual.action, expected)
+            self.assertIsNone(actual.next_state)
+            th.testing.assert_close(deep_watch_goal(projected, "car"), projected[:, :3])
+            th.testing.assert_close(deep_watch_goal(projected, "ball"), target[:, :3])
+
+            gaifo = build_policy(
+                env, argparse.Namespace(policy_hidden=16, gru=False),
+            )
+            gaifo_path = folder / "gaifo_000000000001.pt"
+            th.save({
+                "config": {
+                    "architecture": GAIFO_ARCHITECTURE, "policy_hidden": 16,
+                    "frameskip": 4,
+                },
+                "policy": gaifo.state_dict(),
+            }, gaifo_path)
+            _, deep, gaifo = load_match(deep_path, gaifo_path, env, 4, None)
+            self.assertEqual(deep.goal_kind, "both")
+            self.assertEqual(gaifo.foot.model[0].in_features, 140)
+
+            with self.assertRaisesRegex(ValueError, "trained at frameskip 4"):
+                load_policy_checkpoint(deep_path, env, 8, None)
+            class TeamEnv(DeepEnv):
+                n_cars = 4
+            with self.assertRaisesRegex(ValueError, "1v1 viewer"):
+                load_policy_checkpoint(deep_path, TeamEnv(), 4, None)
+
+            # Older deep checkpoints lacked a config-level frameskip.
+            legacy = th.load(deep_path, weights_only=True)
+            legacy["config"].pop("frameskip")
+            legacy_path = folder / "deep_000000000032.pt"
+            th.save(legacy, legacy_path)
+            restored, _ = load_policy_checkpoint(legacy_path, env, 4, None)
+            th.testing.assert_close(
+                restored.act(projected, deterministic=True).action, expected,
+            )
+
     def test_new_carl_observations_preserve_old_checkpoint_goal_and_age_fields(self):
         class Env(FakeEnv):
             raw_observation_size = 139

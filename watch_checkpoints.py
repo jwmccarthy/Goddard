@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch Basic or GAIFO checkpoints play in the browser."""
+"""Watch BASIC, GAIFO, or deep contrastive checkpoints play in the browser."""
 
 import argparse
 import json
@@ -17,12 +17,16 @@ from types import SimpleNamespace
 import carl
 import numpy as np
 import torch as th
+import torch.nn as nn
 from carl.gymnasium import CARLTorchVectorEnv
-from carl.gymnasium.action import CARLActionCodec
+from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 from gymnasium.spaces import Box
+from jarl.data.records import PolicyOutput
 from jarl.envs import DatasetResetSampler
+from jarl.modules import GoalActor
 
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
+from deep import ARCHITECTURE as DEEP_ARCHITECTURE, GOAL_SLICES, goal_size
 from dodge_window import DodgeAwareCARLTorchVectorEnv, DodgeWindowActionCodec
 from gaifo import (
     GAIFO_ARCHITECTURE,
@@ -44,6 +48,7 @@ ROOT = Path(__file__).resolve().parent
 CAR_OFFSET = (13.8757, 0.0, 20.755)
 CHECKPOINT_PATTERNS = (
     "gaifo_*.pt",
+    "deep_*.pt",
     "training_latest.pt",
     "actor_critic_final.pt",
     "policy_*.pt",
@@ -54,6 +59,8 @@ CHECKPOINT_PATTERNS = (
 def checkpoint_kind(path: Path) -> str:
     if path.match("gaifo_*.pt"):
         return "gaifo"
+    if path.match("deep_*.pt"):
+        return "deep"
     return "basic"
 
 
@@ -112,7 +119,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no Basic or GAIFO checkpoints found in {self.directory}"
+                f"no BASIC, GAIFO, or deep checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -301,6 +308,84 @@ def load_curated_reset_provider(
     return provider
 
 
+def deep_watch_goal(observation: th.Tensor, kind: str) -> th.Tensor:
+    """Chase the ball and aim its trajectory at the opponent goal in ego space."""
+    if kind not in GOAL_SLICES:
+        raise ValueError(f"unknown deep goal kind: {kind}")
+    if observation.shape[-1] < 12:
+        raise ValueError("deep goals require ball and ego-car positions")
+    ball = observation[..., :3]
+    net = th.zeros_like(ball)
+    # CARL normalizes position by (4108, 6000, 2076) and rotates orange
+    # into the acting car's frame. Both teams therefore attack positive Y.
+    net[..., 1] = 5120.0 / 6000.0
+    net[..., 2] = 321.3875 / 2076.0
+    if kind == "car":
+        return ball
+    if kind == "ball":
+        return net
+    return th.cat((net, ball), dim=-1)
+
+
+class WatchedDeepPolicy(nn.Module):
+    """Adapt a stateless, goal-conditioned actor to the spectator policy API."""
+
+    def __init__(self, actor: GoalActor, kind: str) -> None:
+        super().__init__()
+        self.actor = actor
+        self.goal_kind = kind
+        self.observation_size = actor.observation_size
+
+    def initial_state(self, batch_size: int) -> None:
+        return None
+
+    @th.no_grad()
+    def act(
+        self, observation: th.Tensor, state=None, *, deterministic: bool = False,
+    ) -> PolicyOutput:
+        goal = deep_watch_goal(observation, self.goal_kind)
+        return PolicyOutput(self.actor.act(observation, goal, deterministic=deterministic))
+
+
+def load_deep_policy(path: Path, payload: dict, env: CARLTorchVectorEnv):
+    """Restore either a standalone deep training checkpoint or its final copy."""
+    if payload.get("architecture") != DEEP_ARCHITECTURE:
+        raise ValueError(f"unsupported deep checkpoint architecture in {path}")
+    config = payload.get("config", {})
+    state = payload.get("actor")
+    if not isinstance(config, dict) or not isinstance(state, dict):
+        raise ValueError(f"deep checkpoint has no actor or configuration: {path}")
+    kind = config.get("goal_kind")
+    if kind not in GOAL_SLICES:
+        raise ValueError(f"unsupported deep goal kind in {path}")
+    if getattr(env, "n_cars", 2) != 2:
+        raise ValueError(f"deep checkpoints require the 1v1 viewer: {path}")
+    if tuple(config.get("action_nvec", ())) != tuple(env.single_action_space.nvec):
+        raise ValueError(f"deep checkpoint action space differs from the viewer: {path}")
+    observation_size = int(config["observation_size"])
+    raw_size = getattr(env, "raw_observation_size", env.single_observation_space.shape[0])
+    if (observation_size != raw_size
+            or not getattr(env, "dodge_window_features", False)):
+        raise ValueError(
+            f"checkpoint policy needs {observation_size} dodge-window observation "
+            f"features; viewer provides {raw_size}: {path}"
+        )
+    if state.get("network.stem.0.weight") is None or (
+        state["network.stem.0.weight"].shape[1] != observation_size + goal_size(kind)
+    ):
+        raise ValueError(f"deep checkpoint goal and observation sizes do not match weights: {path}")
+    codec = DodgeWindowActionCodec(observation_size, append_age=False).to(env.device)
+    actor = GoalActor(
+        observation_size, goal_size(kind), int(config["actor_width"]),
+        int(config["actor_depth"]), ACTION_NVECS, codec,
+    ).to(env.device)
+    actor.load_state_dict(state)
+    return WatchedDeepPolicy(actor, kind).eval().requires_grad_(False), (
+        "deep", observation_size, kind, int(config["actor_width"]),
+        int(config["actor_depth"]),
+    )
+
+
 def load_policy_checkpoint(
     path: Path,
     env: CARLTorchVectorEnv,
@@ -309,13 +394,18 @@ def load_policy_checkpoint(
 ):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
-    if "frameskip" in config and int(config["frameskip"]) != frameskip:
+    saved_frameskip = config.get("frameskip")
+    if checkpoint_kind(path) == "deep" and saved_frameskip is None:
+        saved_frameskip = payload.get("arguments", {}).get("frameskip")
+    if saved_frameskip is not None and int(saved_frameskip) != frameskip:
         raise ValueError(
-            f"checkpoint was trained at frameskip {config['frameskip']}, "
-            f"watching at {frameskip}; pass --frameskip {config['frameskip']}"
+            f"checkpoint was trained at frameskip {saved_frameskip}, "
+            f"watching at {frameskip}; pass --frameskip {saved_frameskip}"
         )
 
     kind = checkpoint_kind(path)
+    if kind == "deep":
+        return load_deep_policy(path, payload, env)
     if kind == "gaifo":
         architecture = config.get("architecture")
         if architecture not in (
@@ -431,7 +521,8 @@ def checkpoint_policy_environment(
 
 def policy_observation(policy, observation: th.Tensor) -> th.Tensor:
     """Drop native flip fields only for old networks, preserving their jump age."""
-    width = policy.foot.model[0].in_features
+    width = (policy.observation_size if isinstance(policy, WatchedDeepPolicy)
+             else policy.foot.model[0].in_features)
     if observation.shape[-1] in (140, 194, 248) and width == observation.shape[-1] - 2:
         return th.cat((observation[..., :width - 1], observation[..., -1:]), dim=-1)
     return observation[..., :width]
@@ -444,12 +535,13 @@ def load_match(
     frameskip: int,
     hidden_size: int | None,
 ):
-    kind = checkpoint_kind(blue_path)
-    if kind != checkpoint_kind(orange_path):
+    blue_kind = checkpoint_kind(blue_path)
+    orange_kind = checkpoint_kind(orange_path)
+    if blue_kind != orange_kind and "deep" not in (blue_kind, orange_kind):
         raise ValueError("selected policies use different trainer architectures")
     blue, blue_signature = load_policy_checkpoint(blue_path, base, frameskip, hidden_size)
     orange, orange_signature = load_policy_checkpoint(orange_path, base, frameskip, hidden_size)
-    if blue_signature != orange_signature:
+    if blue_signature != orange_signature and "deep" not in (blue_kind, orange_kind):
         raise ValueError("selected policies use different trainer architectures")
     return base, blue, orange
 
@@ -619,7 +711,7 @@ def simulate(
                 round_number += 1
                 tick = 0
 
-            state.publish(render_frame(
+            frame = render_frame(
                 raw_state(base),
                 registry.directory,
                 blue_path,
@@ -629,7 +721,15 @@ def simulate(
                 round_number,
                 tick,
                 args.team_size,
-            ))
+            )
+            for team, policy in (("blue", blue), ("orange", orange)):
+                if isinstance(policy, WatchedDeepPolicy):
+                    frame[team]["objective"] = (
+                        "chase ball" if policy.goal_kind == "car" else
+                        "shoot at opponent goal" if policy.goal_kind == "ball" else
+                        "chase ball & shoot at goal"
+                    )
+            state.publish(frame)
             next_step += args.frameskip / 120.0
             delay = next_step - time.perf_counter()
             if delay > 0:

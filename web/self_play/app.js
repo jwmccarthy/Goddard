@@ -181,7 +181,11 @@ source.onmessage = ({ data }) => {
   blueLabel.textContent = frame.blue.checkpoint;
   orangeLabel.textContent = frame.orange.checkpoint;
   goals.textContent = `${frame.blue.score} - ${frame.orange.score}`;
-  roundLabel.textContent = `round ${frame.round} | tick ${frame.tick}`;
+  const objectives = [frame.blue.objective, frame.orange.objective]
+    .map((objective, index) => objective ? `${index ? 'orange' : 'blue'}: ${objective}` : null)
+    .filter(Boolean);
+  roundLabel.textContent = `round ${frame.round} | tick ${frame.tick}`
+    + (objectives.length ? ` | ${objectives.join(' | ')}` : '');
   blueBoost.textContent = frame.cars[0].boost.toFixed(0);
   orangeBoost.textContent = frame.cars[orangeIndex].boost.toFixed(0);
   blueBoostFill.style.width = `${frame.cars[0].boost}%`;

@@ -6,14 +6,16 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+import numpy as np
 import torch
 from carl.gymnasium.action import ACTION_NVECS
 
 from deep import (
     ContrastiveBatch, ContrastiveLearner, ResidualNetwork, TrajectoryReplay,
-    achieved_goal, goal_size, load_checkpoint, main, parse_arguments, save_checkpoint,
-    transition_observation, validate_arguments,
+    achieved_goal, goal_size, load_checkpoint, load_replay_prior, main,
+    parse_arguments, save_checkpoint, transition_observation, validate_arguments,
 )
 from dodge_window import DodgeWindowActionCodec
 
@@ -27,6 +29,27 @@ def small_arguments(*extra: str):
     ])
     validate_arguments(arguments)
     return arguments
+
+
+def write_training_replay(folder: Path) -> None:
+    folder.mkdir()
+    rows = np.zeros((16, 161), dtype=np.float32)
+    rows[:, 0] = np.arange(16, dtype=np.float32) / 100
+    rows[:, 2] = 91.25 / 2076
+    rows[:, 9] = np.arange(16, dtype=np.float32) / 200
+    for car in (9, 30):
+        rows[:, car + 2] = 17 / 2076
+        rows[:, car + 9] = 1
+        rows[:, car + 14] = 1
+        rows[:, car + 15] = 0.5
+    rows[:, 30 + 16] = 1
+    rows[:, 137] = 1
+    np.save(folder / "training.npy", rows)
+    np.savez(
+        folder / "training.unsafe-starts.npz",
+        unsafe=np.zeros(16, dtype=bool), pre_goal=np.zeros(16, dtype=bool),
+        frame_skip=4,
+    )
 
 
 class DeepCRLTests(unittest.TestCase):
@@ -221,6 +244,36 @@ class DeepCRLTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "goal_kind"):
                 load_checkpoint(path, new_learner, args)
 
+    def test_replay_resets_and_expert_goals_are_independent_gpu_ready_priors(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory) / "parsed"
+            write_training_replay(folder)
+            base = (
+                "--replay-dataset", str(folder), "--frameskip", "4",
+                "--goal-kind", "both",
+            )
+            arguments = small_arguments(
+                *base, "--replay-reset-fraction", "1",
+                "--expert-goal-fraction", "1", "--reset-state-limit", "16",
+            )
+            provider, expert = load_replay_prior(arguments, torch.device("cpu"))
+            self.assertIsNotNone(provider)
+            self.assertEqual(expert.shape, (16, 6))
+            torch.testing.assert_close(expert[:, :3], provider.frames[:, :3])
+            torch.testing.assert_close(expert[:, 3:], provider.frames[:, 9:12])
+            self.assertIsNotNone(provider(torch.tensor([True, False])))
+            arguments.expert_goal_fraction = 0
+            self.assertIsNone(load_replay_prior(arguments, torch.device("cpu"))[1])
+            arguments.replay_reset_probability = 0
+            arguments.expert_goal_fraction = 1
+            self.assertIsNone(load_replay_prior(arguments, torch.device("cpu"))[0])
+            arguments.expert_goal_fraction = 0
+            self.assertEqual(load_replay_prior(arguments, torch.device("cpu")), (None, None))
+            arguments.replay_reset_probability = 1
+            arguments.replay_dataset = folder / "missing"
+            with self.assertRaisesRegex(ValueError, "Replay directory does not exist"):
+                validate_arguments(arguments)
+
 
 @unittest.skipUnless(
     os.environ.get("GODDARD_GPU_SMOKE") == "1" and torch.cuda.is_available(),
@@ -287,6 +340,58 @@ class DeepCARLSmokeTests(unittest.TestCase):
             )
             self.assertEqual(resumed["timesteps"], 24)
             self.assertGreater(resumed["updates"], payload["updates"])
+
+    def test_replay_resets_and_expert_goals_run_on_cuda(self):
+        from replay_resets import ReplayResetProvider
+        from jarl.collect import ReplayGoalSampler
+
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            corpus = root / "parsed"
+            write_training_replay(corpus)
+            reset_devices = []
+            goal_devices = []
+            original_reset = ReplayResetProvider.__call__
+            original_goals = ReplayGoalSampler.__call__
+
+            def checked_reset(provider, mask):
+                self.assertEqual(mask.device.type, "cuda")
+                self.assertEqual(provider.frames.device.type, "cuda")
+                self.assertEqual(provider.internal_states.device.type, "cuda")
+                reset_devices.append(mask.device)
+                return original_reset(provider, mask)
+
+            def checked_goals(sampler, count, observation=None):
+                goals = original_goals(sampler, count, observation)
+                self.assertEqual(goals.device.type, "cuda")
+                self.assertEqual(sampler.expert_goals.device.type, "cuda")
+                goal_devices.append(goals.device)
+                return goals
+
+            with (patch.object(ReplayResetProvider, "__call__", checked_reset),
+                  patch.object(ReplayGoalSampler, "__call__", checked_goals),
+                  redirect_stdout(io.StringIO())):
+                main([
+                    "--n-sim", "1", "--frameskip", "4", "--max-ticks", "4",
+                    "--timesteps", "8", "--goal-kind", "both",
+                    "--actor-depth", "4", "--critic-depth", "4",
+                    "--actor-width", "16", "--critic-width", "16",
+                    "--embedding-size", "8", "--batch-size", "4",
+                    "--replay-steps", "8", "--prefill-steps", "2",
+                    "--future-horizon", "4", "--updates-per-step", "1",
+                    "--collect-steps", "2", "--replay-dataset", str(corpus),
+                    "--replay-reset-probability", "1", "--expert-goal-fraction", "1",
+                    "--checkpoint-dir", str(root / "checkpoints"),
+                    "--log-dir", str(root / "runs"), "--run-name", "replay",
+                ])
+            self.assertTrue(reset_devices)
+            self.assertGreaterEqual(len(goal_devices), 4)
+            checkpoint = torch.load(
+                root / "checkpoints" / "replay" / "deep_final.pt",
+                weights_only=True, map_location="cpu",
+            )
+            self.assertEqual(checkpoint["timesteps"], 8)
+            self.assertEqual(checkpoint["updates"], 4)
 
 
 if __name__ == "__main__":
