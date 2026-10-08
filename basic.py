@@ -179,8 +179,9 @@ def configure_starting_checkpoint(
         arguments.policy_architecture = checkpoint.architecture
         arguments.policy_layers = checkpoint.policy_layers
         arguments.checkpoint_observation_size = checkpoint.observation_size
-        # The GAIFO dodge-window policy stores jump age after CARL's 137 features.
-        arguments.expired_dodge_mask = checkpoint.observation_size == 138
+        # Legacy policies used 137/138 features; new ones include CARL's two
+        # focal flip features before the optional tracked jump age.
+        arguments.expired_dodge_mask = checkpoint.observation_size in (138, 140)
 
         if arguments.start_kl_coef is None and resumed_reference:
             arguments.start_kl_coef = payload.get("config", {}).get(
@@ -1023,11 +1024,8 @@ def build_training_environment(
     arguments: argparse.Namespace,
     reset_provider: SyntheticMatchResetProvider,
 ) -> CARLTorchVectorEnv:
-    environment_type = (
-        DodgeAwareCARLTorchVectorEnv if getattr(arguments, "expired_dodge_mask", False)
-        else CARLTorchVectorEnv
-    )
-    environment = environment_type(
+    saved_size = getattr(arguments, "checkpoint_observation_size", None)
+    environment = DodgeAwareCARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=1,
         n_orange=1,
@@ -1040,8 +1038,9 @@ def build_training_environment(
         reset_state_provider=reset_provider,
         normalize=arguments.normalize,
         discrete_actions=True,
+        flip_state_features=saved_size not in (137, 138),
+        append_age=getattr(arguments, "expired_dodge_mask", False),
     )
-    saved_size = getattr(arguments, "checkpoint_observation_size", None)
     actual_size = environment.single_observation_space.shape[0]
     if saved_size is not None and saved_size != actual_size:
         environment.close()

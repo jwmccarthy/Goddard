@@ -7,18 +7,50 @@ import unittest
 import numpy as np
 import torch as th
 from carl.gymnasium.action import CARLActionCodec
+from carl.gymnasium import CARLTorchVectorEnv
 from gymnasium.spaces import Box, MultiDiscrete
 from jarl.envs import DatasetResetSampler
 
 from dodge_window import (
     DODGE_WINDOW, DodgeAwareCARLTorchVectorEnv, DodgeWindowActionCodec,
-    DodgeWindowTracker,
+    DodgeWindowTracker, flip_state_from_internal,
 )
 from gaifo import build_policy
 from replay_resets import ReplayResetProvider, reset_index_dataset
 
 
 class DodgeWindowTests(unittest.TestCase):
+    def test_replay_internal_distinguishes_stored_flip_from_expired_dodge(self):
+        internal = th.zeros(4, 19)
+        internal[0, 1] = 0.75
+        internal[0, 3] = 1  # A first jump with an active dodge window.
+        internal[1, 1] = 1.5
+        internal[1, 3] = 1  # Unspent, but its window has expired.
+        internal[2, 8] = 1  # Flip spent, even though its timer is fresh.
+        # Row 3 is an airborne ball reset: no prior jump and a fresh flip.
+        th.testing.assert_close(flip_state_from_internal(internal), th.tensor([
+            [1., 0.5], [0., 0.], [0., 0.], [1., DODGE_WINDOW],
+        ]))
+
+    def test_native_flip_features_mask_only_actionable_dodges(self):
+        observation = th.zeros(4, 140)
+        observation[0, 137:139] = th.tensor([1., 1.25])  # Stored reset.
+        observation[1, 137:139] = th.tensor([1., 0.005])  # Expires before next tick.
+        observation[2, 137:139] = th.tensor([0., 0.])  # Already expired.
+        observation[3, 25] = 1  # Grounded first jump is still available.
+        mask = DodgeWindowActionCodec(139).mask(observation)
+        self.assertEqual(mask[:, 17].tolist(), [True, False, False, True])
+
+    def test_carl_native_mask_handles_asymmetric_team_layouts(self):
+        observation = th.zeros(3, 166)  # Three cars in native CARL.
+        observation[:, -2:] = th.tensor([
+            [1., 1.25], [1., 0.005], [0., 0.],
+        ])
+        self.assertEqual(CARLActionCodec().mask(observation)[:, 17].tolist(),
+                         [True, False, False])
+        self.assertEqual(CARLActionCodec().mask(observation[:, :164])[:, 17].tolist(),
+                         [True, True, True])
+
     def test_jump_mask_expires_at_cutoff_without_changing_carl_other_masks(self):
         for team_size in (1, 2, 3):
             with self.subTest(team_size=team_size):
@@ -54,6 +86,7 @@ class DodgeWindowTests(unittest.TestCase):
         self.assertEqual(tracker.age[1, 0].item(), 0)
         self.assertFalse(tracker.has_jumped[1, 0])
         self.assertGreater(tracker.age[1, 1].item(), 0)
+        th.testing.assert_close(tracker.flip_state()[2], th.tensor([1., DODGE_WINDOW]))
 
     def test_age_starts_when_initial_jump_hold_ends(self):
         tracker = DodgeWindowTracker(1, 2, 4, th.device("cpu"))
@@ -108,6 +141,27 @@ class DodgeWindowTests(unittest.TestCase):
     "opt-in CARL/CUDA dodge integration",
 )
 class DodgeWindowGpuTests(unittest.TestCase):
+    def test_native_carl_observation_exposes_stored_and_expired_dodge(self):
+        for age, available in ((0.0, True), (1.8, False)):
+            with self.subTest(age=age):
+                env = CARLTorchVectorEnv(
+                    n_sim=1, n_blue=1, n_orange=1, frameskip=4,
+                    normalize=True, discrete_actions=True,
+                    reset_state_provider=self.make_provider(age),
+                )
+                try:
+                    observation = env.reset()
+                    self.assertEqual(tuple(observation.shape), (2, 139))
+                    self.assertEqual(bool(observation.ego_has_flip_or_jump[0]), available)
+                    self.assertAlmostEqual(
+                        observation.ego_flip_window_remaining[0].item(),
+                        DODGE_WINDOW if available else 0., places=5,
+                    )
+                    self.assertEqual(bool(env.action_mask(observation)[0, 17]), available)
+                    self.assertTrue(env.action_mask(observation)[1, 17])
+                finally:
+                    env.close()
+
     @staticmethod
     def make_provider(age: float) -> ReplayResetProvider:
         frames = th.zeros(1, 51, device="cuda:0")
@@ -161,7 +215,7 @@ class DodgeWindowGpuTests(unittest.TestCase):
         )
         try:
             observation = env.reset()
-            self.assertEqual(tuple(observation.shape), (4, 138))
+            self.assertEqual(tuple(observation.shape), (4, 140))
             self.assertEqual(observation[[0, 2], -1].tolist(), [1.25, 1.25])
             self.assertFalse(env.action_mask(observation)[0, 17])
             self.assertTrue(env.action_mask(observation)[1, 17])
@@ -224,7 +278,7 @@ class DodgeWindowGpuTests(unittest.TestCase):
             env.reset()
             after, _, _, truncated, info = env.step(self.neutral_actions(2))
             self.assertTrue(truncated.all())
-            self.assertEqual(tuple(info["final_obs"].shape), (2, 138))
+            self.assertEqual(tuple(info["final_obs"].shape), (2, 140))
             self.assertAlmostEqual(after[0, -1].item(), 0.5, places=5)
             self.assertGreater(info["final_obs"][0, -1].item(), after[0, -1].item())
         finally:

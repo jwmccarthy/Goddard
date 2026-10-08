@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -27,7 +28,8 @@ from gaifo import (
 )
 from jarl.envs import DatasetResetSampler
 from replay_layout import (
-    team_car_count, team_observation_size, team_replay_row_size, team_scene_size,
+    team_car_count, team_discriminator_scene_size, team_live_observation_size,
+    team_observation_size, team_replay_row_size, team_scene_size,
 )
 from replay_resets import ReplayResetProvider
 from watch_gaifo_experts import (
@@ -80,6 +82,75 @@ def write_team_povs(
 
 
 class TeamSizeUnitTests(unittest.TestCase):
+    def test_existing_parsed_povs_provide_flip_state_to_all_discriminator_heads(self):
+        for size in (1, 2, 3):
+            with self.subTest(team_size=size), tempfile.TemporaryDirectory(
+                dir="/tmp/opencode",
+            ) as directory:
+                folder = Path(directory)
+                other = 2 * size - 1
+                write_team_povs(folder, size, (other,))
+                internal_start = team_observation_size(size)
+                for actor, age in ((0, 1.5), (other, 0.0)):
+                    path = folder / f"{100 + actor}-0-match.npy"
+                    rows = np.load(path)
+                    rows[:, internal_start + 1] = age
+                    rows[:, internal_start + 3] = actor == 0
+                    np.save(path, rows)
+                expert = ExpertSceneDataset(
+                    folder, trajectory_length=4, team_size=size,
+                    flip_state_features=True,
+                )
+                self.assertEqual(expert.frames.shape[-1], team_scene_size(size))
+                self.assertEqual(expert.discriminator_scene_size,
+                                 team_discriminator_scene_size(size))
+                expired = expert._windows_for_povs(th.tensor([[0, 0]]))
+                stored = expert._windows_for_povs(th.tensor([[0, other]]))
+                th.testing.assert_close(expired[0, -1, -2:], th.tensor([0., 0.]))
+                th.testing.assert_close(stored[0, -1, -2:], th.tensor([1., 1.25]))
+                context = expert.context_frames(th.tensor([[0, other]]), 5)
+                th.testing.assert_close(context[0, -1, -2:], stored[0, -1, -2:])
+                empty, ages = expert.context_frames(th.empty(0, 2, dtype=th.long), 5,
+                                                    return_age=True)
+                self.assertEqual(empty.shape, (0, 5, team_discriminator_scene_size(size)))
+                self.assertEqual(ages.shape, (0,))
+                self.assertEqual(expert.internal_states.shape[-2:], (2 * size, 19))
+                self.assertEqual(expert.sample(2, "cpu").shape,
+                                 (2, 4, team_discriminator_scene_size(size)))
+
+                for factorize, transformer in ((False, False), (True, False),
+                                               (True, True)):
+                    model = build_discriminator(argparse.Namespace(
+                        team_size=size, factorize=factorize,
+                        flip_state_features=True, recurrent_global=False,
+                        transformer_global=transformer,
+                        discriminator_context_length=8,
+                        discriminator_hidden=16, frame_embedding=8,
+                        temporal_hidden=8,
+                    ))
+                    logits = model(stored)
+                    self.assertEqual(logits.shape, (1, 3) if factorize else (1,))
+
+                n_cars = team_car_count(size)
+                observation = th.zeros(n_cars, team_live_observation_size(size) + 1)
+                observation[:, internal_start:internal_start + 2] = th.tensor([1., 1.25])
+                next_obs = observation.clone()
+                next_obs[:, internal_start:internal_start + 2] = th.tensor([0., 0.])
+                capture = SceneWindowCapture(3, n_cars, flip_state_features=True)
+                capture.reset(n_cars)
+                result = capture._capture(SimpleNamespace(
+                    observation=observation,
+                    env_step=SimpleNamespace(
+                        next_obs=next_obs, done=th.zeros(n_cars, dtype=th.bool),
+                    ),
+                ))
+                self.assertEqual(result["scene_window"].shape,
+                                 (n_cars, 3, team_discriminator_scene_size(size)))
+                th.testing.assert_close(result["scene_window"][0, 0, -2:],
+                                        th.tensor([1., 1.25]))
+                th.testing.assert_close(result["scene_window"][0, -1, -2:],
+                                        th.tensor([0., 0.]))
+
     def test_invalid_car_rotations_are_excluded_from_resets_but_not_expert_scenes(self):
         for size in (2, 3):
             with self.subTest(team_size=size), tempfile.TemporaryDirectory(
@@ -255,6 +326,11 @@ class TeamSizeUnitTests(unittest.TestCase):
                 changed, _ = parse_args()
             with self.assertRaisesRegex(ValueError, "--team-size must match"):
                 validate_resume_args(changed, payload)
+            with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
+                                            "--flip-state-features", "false"]):
+                changed, _ = parse_args()
+            with self.assertRaisesRegex(ValueError, "--flip-state-features must match"):
+                validate_resume_args(changed, payload)
 
     def test_inspector_renders_and_scores_all_cars_in_team_povs(self):
         for size in (2, 3):
@@ -345,8 +421,9 @@ class TeamSizeTrainingSmoke(unittest.TestCase):
             self.assertEqual(payload["step"], 8 * 2 * n_cars * 2)
             self.assertEqual(payload["config"]["team_size"], size)
             self.assertTrue(payload["config"]["expired_dodge_mask"])
+            self.assertTrue(payload["config"]["flip_state_features"])
             self.assertEqual(payload["policy"]["foot.model.0.weight"].shape[1],
-                             team_observation_size(size) + 1)
+                             team_live_observation_size(size) + 1)
             self.assertTrue(payload["discriminator_optimizer"]["state"])
             return payload
 

@@ -22,8 +22,9 @@ from gaifo import (
 from dodge_window import DodgeWindowActionCodec
 from replay_layout import team_observation_size
 from watch_checkpoints import (
-    CheckpointRegistry, SpectatorState, load_match, load_policy_checkpoint, make_handler,
-    parse_args, policy_environment, policy_observation, render_frame,
+    CheckpointRegistry, SpectatorState, checkpoint_policy_environment, load_match,
+    load_policy_checkpoint, make_handler, parse_args, policy_environment,
+    policy_observation, render_frame,
 )
 
 
@@ -35,6 +36,37 @@ class FakeEnv:
 
 
 class WatchGAIFOCheckpointsTests(unittest.TestCase):
+    def test_new_carl_observations_preserve_old_checkpoint_goal_and_age_fields(self):
+        class Env(FakeEnv):
+            raw_observation_size = 139
+            dodge_window_features = True
+            action_codec = DodgeWindowActionCodec(139)
+            single_observation_space = Box(-np.inf, np.inf, (140,), np.float32)
+            single_action_space = MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
+
+        env = Env()
+        observation = th.zeros(2, 140)
+        observation[:, 136] = 0.42  # Last legacy goal feature.
+        observation[:, 137:139] = th.tensor([1., 1.25])
+        observation[:, 139] = 0.75  # Legacy jump-age checkpoint must keep this.
+        for width, aged in ((137, False), (138, True),
+                            (139, False), (140, True)):
+            with self.subTest(width=width):
+                view = checkpoint_policy_environment(
+                    env, {"foot.model.0.weight": th.zeros(16, width)},
+                    Path("saved.pt"), {"expired_dodge_mask": aged},
+                )
+                policy = build_policy(
+                    view, argparse.Namespace(policy_hidden=16, policy_layers=1, gru=False),
+                )
+                projected = policy_observation(policy, observation)
+                self.assertEqual(projected.shape[-1], width)
+                self.assertEqual(projected[0, 136].item(), observation[0, 136].item())
+                if aged:
+                    self.assertEqual(projected[0, -1].item(), 0.75)
+                elif width == 139:
+                    th.testing.assert_close(projected[0, -2:], observation[0, 137:139])
+
     def test_reset_type_api_offers_loaded_pools_and_rejects_unavailable_choices(self):
         state = SpectatorState()
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

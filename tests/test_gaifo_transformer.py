@@ -75,7 +75,8 @@ class GAIFOTransformerTests(unittest.TestCase):
             model = build_discriminator(args)
             global_model = model.global_discriminator if factorize else model
             self.assertIsInstance(global_model, CausalSceneTransformer)
-            self.assertEqual(model(th.zeros(2, 8, 51)).shape,
+            self.assertTrue(args.flip_state_features)
+            self.assertEqual(model(th.zeros(2, 8, model.scene_size)).shape,
                              (2, 3) if factorize else (2,))
             if factorize:
                 self.assertIsInstance(model, FactorizedSceneDiscriminator)
@@ -249,7 +250,10 @@ class GAIFOTransformerTests(unittest.TestCase):
             inspected, _, _ = load_discriminator(checkpoint, th.device("cpu"))
             self.assertIsInstance(inspected, CausalSceneTransformer)
             th.testing.assert_close(inspected.state_dict(), model.state_dict())
-            expert = ExpertSceneDataset(folder, trajectory_length=8, heldout_size=4)
+            expert = ExpertSceneDataset(
+                folder, trajectory_length=8, heldout_size=4,
+                flip_state_features=args.flip_state_features,
+            )
             start = int(expert.train_window_starts[0])
             record = ExpertSequence(
                 id=0, skill="driving", split="train", source="test", actor=0,

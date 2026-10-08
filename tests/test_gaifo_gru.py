@@ -79,6 +79,7 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertEqual((parsed.policy_hidden, parsed.critic_hidden), (320, 320))
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (2, 2))
                 self.assertTrue(parsed.expired_dodge_mask)
+                self.assertTrue(parsed.flip_state_features)
                 self.assertFalse(parsed.recurrent_global)
                 self.assertEqual(parsed.discriminator_context_length, 16)
                 self.assertEqual(parsed.discriminator_context_stride, 4)
@@ -94,12 +95,14 @@ class GAIFOGruTests(unittest.TestCase):
     def test_feature_flags_require_full_names_and_accept_explicit_false(self):
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",
-            "--expired-dodge-mask", "false", "--curated-skill-sampling", "false",
+            "--expired-dodge-mask", "false", "--flip-state-features", "false",
+            "--curated-skill-sampling", "false",
             "--exp-log-odds-reward", "true", "--recency-replay", "false",
             "--aerial-touch-reward-weight", "1.0",
         ]):
             parsed, _ = parse_args()
         self.assertFalse(parsed.expired_dodge_mask)
+        self.assertFalse(parsed.flip_state_features)
         self.assertFalse(parsed.curated_skill_sampling)
         self.assertTrue(parsed.exp_log_odds_reward)
         self.assertFalse(parsed.recency_replay)

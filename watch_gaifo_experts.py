@@ -83,6 +83,7 @@ def load_discriminator(path: Path, device: th.device):
     args = argparse.Namespace(
         team_size=int(config.get("team_size", 1)),
         factorize=bool(config.get("factorize", False)),
+        flip_state_features=bool(config.get("flip_state_features", False)),
         recurrent_global=bool(config.get("recurrent_global", False)),
         transformer_global=bool(config.get("transformer_global", False)),
         discriminator_context_length=int(config.get("discriminator_context_length", 16)),
@@ -523,6 +524,7 @@ class InspectionService:
                 driving_fraction=float(config.get("general_driving_fraction", 0.05)),
                 kickoff_fraction=float(config.get("kickoff_fraction", 0.0)),
                 team_size=int(config.get("team_size", 1)),
+                flip_state_features=bool(config.get("flip_state_features", False)),
             )
             records = collect_sequences(
                 expert, directory, seed, limit, self.max_driving,

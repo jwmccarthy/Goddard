@@ -23,7 +23,7 @@ from gymnasium.spaces import Box
 from jarl.envs import DatasetResetSampler
 
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
-from dodge_window import DodgeAwareCARLTorchVectorEnv
+from dodge_window import DodgeAwareCARLTorchVectorEnv, DodgeWindowActionCodec
 from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
@@ -397,21 +397,42 @@ def checkpoint_policy_environment(
         raise ValueError(f"checkpoint has no supported policy encoder: {path}")
     raw_size = getattr(env, "raw_observation_size", env.single_observation_space.shape[0])
     input_size = foot.shape[1]
-    if input_size not in (raw_size, raw_size + 1):
+    native = raw_size in (139, 193, 247)
+    supported = (raw_size - 2, raw_size - 1, raw_size, raw_size + 1) if native else (
+        raw_size, raw_size + 1,
+    )
+    if input_size not in supported:
         raise ValueError(
             f"checkpoint policy needs {input_size} observation features; "
-            f"viewer supports {raw_size} or {raw_size + 1}: {path}"
+            f"viewer supports {', '.join(str(size) for size in supported)}: {path}"
         )
-    dodge_window = input_size == raw_size + 1
+    dodge_window = input_size in ((raw_size - 1, raw_size + 1) if native else (raw_size + 1,))
     if ("expired_dodge_mask" in config
             and bool(config["expired_dodge_mask"]) != dodge_window):
         raise ValueError(f"checkpoint dodge-window setting does not match weights: {path}")
+    if native and input_size <= raw_size:
+        if input_size == raw_size - 1 and not getattr(env, "dodge_window_features", False):
+            raise ValueError("checkpoint requires tracked jump age")
+        codec = (
+            CARLActionCodec() if input_size == raw_size - 2 else
+            DodgeWindowActionCodec(raw_size - 2) if input_size == raw_size - 1 else
+            DodgeWindowActionCodec(raw_size, append_age=False)
+        )
+        return SimpleNamespace(
+            device=env.device,
+            action_codec=codec.to(env.device),
+            single_observation_space=Box(-np.inf, np.inf, (input_size,), np.float32),
+            single_action_space=env.single_action_space,
+        )
     return policy_environment(env, dodge_window)
 
 
 def policy_observation(policy, observation: th.Tensor) -> th.Tensor:
-    """New policies see the jump age; older policies retain their saved width."""
-    return observation[..., :policy.foot.model[0].in_features]
+    """Drop native flip fields only for old networks, preserving their jump age."""
+    width = policy.foot.model[0].in_features
+    if observation.shape[-1] in (140, 194, 248) and width == observation.shape[-1] - 2:
+        return th.cat((observation[..., :width - 1], observation[..., -1:]), dim=-1)
+    return observation[..., :width]
 
 
 def load_match(

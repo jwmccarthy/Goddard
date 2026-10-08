@@ -51,13 +51,13 @@ from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
-from dodge_window import DodgeAwareCARLTorchVectorEnv
+from dodge_window import DodgeAwareCARLTorchVectorEnv, flip_state_from_internal
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
 )
 from replay_layout import (
-    TEAM_SIZES, team_car_count, team_observation_size, team_replay_row_size,
-    team_scene_size,
+    FLIP_STATE_SIZE, TEAM_SIZES, team_car_count, team_discriminator_scene_size,
+    team_observation_size, team_replay_row_size, team_scene_size,
 )
 from replay_safety import (
     GOAL_EXCLUSION_SECONDS, TICKS_PER_SECOND,
@@ -78,6 +78,7 @@ DOUBLES_N_CARS = 4
 DOUBLES_SCENE_SIZE = BALL_SIZE + DOUBLES_N_CARS * CAR_SIZE
 STANDARD_N_CARS = 6
 SCENE_SIZES = tuple(team_scene_size(size) for size in TEAM_SIZES)
+FLIP_SCENE_SIZES = tuple(team_discriminator_scene_size(size) for size in TEAM_SIZES)
 BLUE_START = 9
 ORANGE_START = 30
 CAR_BOOL_START = 16
@@ -137,19 +138,28 @@ RESET_MINING_MIN_CONFIDENCE = 0.6
 
 
 def scene_car_count(scenes: th.Tensor) -> int:
-    if scenes.shape[-1] not in SCENE_SIZES:
+    width = scenes.shape[-1]
+    if width not in (*SCENE_SIZES, *FLIP_SCENE_SIZES):
         raise ValueError("physical scenes must contain two, four, or six cars")
-    return (scenes.shape[-1] - BALL_SIZE) // CAR_SIZE
+    return (width - BALL_SIZE - (FLIP_STATE_SIZE if width in FLIP_SCENE_SIZES else 0)) // CAR_SIZE
 
 
-def noise_mask(device: str | th.device = "cpu", n_cars: int = N_CARS) -> th.Tensor:
+def noise_mask(
+    device: str | th.device = "cpu", n_cars: int = N_CARS,
+    flip_state_features: bool = False,
+) -> th.Tensor:
     """Boolean mask that is True for continuous scene features and False for car booleans."""
     if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
         raise ValueError("noise mask needs two, four, or six cars")
-    mask = th.ones(BALL_SIZE + n_cars * CAR_SIZE, dtype=th.bool, device=device)
+    mask = th.ones(
+        BALL_SIZE + n_cars * CAR_SIZE + (FLIP_STATE_SIZE if flip_state_features else 0),
+        dtype=th.bool, device=device,
+    )
     for car in range(n_cars):
         start = BALL_SIZE + car * CAR_SIZE
         mask[start + CAR_BOOL_START : start + CAR_BOOL_END] = False
+    if flip_state_features:
+        mask[-FLIP_STATE_SIZE] = False
     return mask
 
 
@@ -160,7 +170,9 @@ def add_scene_noise(windows: th.Tensor, std: float) -> th.Tensor:
     n_cars = scene_car_count(windows)
     if std <= 0.0:
         return windows
-    mask = noise_mask(windows.device, n_cars).view(
+    mask = noise_mask(
+        windows.device, n_cars, windows.shape[-1] in FLIP_SCENE_SIZES,
+    ).view(
         *((1,) * (windows.ndim - 1)), windows.shape[-1]
     )
     noise = th.randn_like(windows) * std * mask
@@ -545,6 +557,8 @@ def ground_maneuvers(
 def actor_view(scenes: th.Tensor, actor_index: int) -> th.Tensor:
     """Make one actor the ego, followed by teammates and then opponents."""
     n_cars = scene_car_count(scenes)
+    if scenes.shape[-1] != BALL_SIZE + n_cars * CAR_SIZE:
+        raise ValueError("switching ego requires the other actor's recorded flip state")
     if not 0 <= actor_index < n_cars:
         raise ValueError("actor index must identify a car in the scene")
     team_size = n_cars // 2
@@ -668,14 +682,21 @@ def resample_internal_state(
 def extract_scene_observations(
     observation: th.Tensor,
     n_cars: int = N_CARS,
+    flip_state_features: bool = False,
 ) -> th.Tensor:
-    """Return each actor's canonical ball-and-cars physical scene prefix."""
+    """Return the physical scene and, optionally, the focal native dodge state."""
     if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
         raise ValueError("observations need two, four, or six cars")
     width = BALL_SIZE + n_cars * CAR_SIZE
     if observation.shape[-1] < width:
         raise ValueError(f"actor observations require at least {width} features")
-    return observation[..., :width].contiguous()
+    scene = observation[..., :width].contiguous()
+    if not flip_state_features:
+        return scene
+    flip_start = team_observation_size(n_cars // 2)
+    if observation.shape[-1] < flip_start + FLIP_STATE_SIZE:
+        raise ValueError("actor observations need native or tracked flip state")
+    return th.cat((scene, observation[..., flip_start:flip_start + FLIP_STATE_SIZE]), dim=-1)
 
 
 def _unsafe_replay_reset_frames(
@@ -901,14 +922,19 @@ class EgoBallTouchCapture(CaptureBase):
 class SceneWindowCapture(CaptureBase):
     """Capture short scene windows across rollout boundaries, resetting on done."""
 
-    def __init__(self, trajectory_length: int, n_cars: int = N_CARS) -> None:
+    def __init__(
+        self, trajectory_length: int, n_cars: int = N_CARS,
+        flip_state_features: bool = False,
+    ) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
         if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
             raise ValueError("scene capture needs two, four, or six cars")
         self.trajectory_length = trajectory_length
         self.n_cars = n_cars
-        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.flip_state_features = flip_state_features
+        self.scene_size = (BALL_SIZE + n_cars * CAR_SIZE
+                           + (FLIP_STATE_SIZE if flip_state_features else 0))
         self.distances = np.arange(trajectory_length - 1, -1, -1)
 
         self.n_envs = 0
@@ -934,8 +960,12 @@ class SceneWindowCapture(CaptureBase):
         if len(observation) != self.n_envs:
             raise ValueError("scene capture batch changed after reset")
 
-        current_scene = extract_scene_observations(observation, self.n_cars)
-        next_scene = extract_scene_observations(next_obs, self.n_cars)
+        current_scene = extract_scene_observations(
+            observation, self.n_cars, self.flip_state_features,
+        )
+        next_scene = extract_scene_observations(
+            next_obs, self.n_cars, self.flip_state_features,
+        )
         n_envs = len(current_scene)
         capacity = self.trajectory_length - 1
 
@@ -1053,10 +1083,15 @@ class ExpertSceneDataset:
         driving_fraction: float = 0.10,
         kickoff_fraction: float = 0.05,
         team_size: int = 1,
+        flip_state_features: bool = False,
     ) -> None:
         self.n_cars = team_car_count(team_size)
         self.team_size = team_size
         self.scene_size = team_scene_size(team_size)
+        self.flip_state_features = flip_state_features
+        self.discriminator_scene_size = (
+            self.scene_size + (FLIP_STATE_SIZE if flip_state_features else 0)
+        )
         self.internal_start = team_observation_size(team_size)
         self.touch_index = self.internal_start + INTERNAL_STATE_SIZE
         if trajectory_length < 2:
@@ -1581,8 +1616,14 @@ class ExpertSceneDataset:
         return self._windows_for_povs(chosen)
 
     def _windows_for_povs(self, chosen: th.Tensor) -> th.Tensor:
-        windows = self.frames[chosen[:, 0, None] + self.window_offsets]
-        return self._orient_actor_windows(windows, chosen[:, 1])
+        indices = chosen[:, 0, None] + self.window_offsets
+        windows = self._orient_actor_windows(self.frames[indices], chosen[:, 1])
+        if self.flip_state_features:
+            flip = flip_state_from_internal(
+                self.internal_states[indices, chosen[:, 1, None]],
+            )
+            windows = th.cat((windows, flip), dim=-1)
+        return windows
 
     def sample_povs(self, n: int, *, heldout: bool = False) -> th.Tensor:
         """Choose expert window starts and their stored focal viewpoint."""
@@ -1620,7 +1661,7 @@ class ExpertSceneDataset:
         if pairs.ndim != 2 or pairs.shape[1] != 2 or length < 1:
             raise ValueError("expert context needs window/actor pairs and a positive length")
         if not len(pairs):
-            empty = self.frames.new_empty((0, length, self.frames.shape[-1]))
+            empty = self.frames.new_empty((0, length, self.discriminator_scene_size))
             return (empty, pairs.new_empty(0)) if return_age else empty
         starts = self.heldout_window_starts if heldout else self.train_window_starts
         if heldout not in self._context_run_starts:
@@ -1639,8 +1680,13 @@ class ExpertSceneDataset:
         ages = (pairs[:, 0] - run_start + 1).clamp(max=length)
         offsets = th.arange(length - 1, -1, -1, device=pairs.device)
         indices = th.maximum(pairs[:, :1] - offsets, run_start[:, None])
-        scenes = self.frames[indices + self.partition_span]
+        frame_indices = indices + self.partition_span
+        scenes = self.frames[frame_indices]
         scenes = self._orient_actor_windows(scenes, pairs[:, 1])
+        if self.flip_state_features:
+            scenes = th.cat((scenes, flip_state_from_internal(
+                self.internal_states[frame_indices, pairs[:, 1, None]],
+            )), dim=-1)
         return (scenes, ages) if return_age else scenes
 
     def situation_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
@@ -2040,7 +2086,7 @@ class HistoricalReplayBuffer:
             raise ValueError("history capacity must be non-negative")
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
-        if scene_size not in SCENE_SIZES:
+        if scene_size not in (*SCENE_SIZES, *FLIP_SCENE_SIZES):
             raise ValueError("historical scenes must contain two, four, or six cars")
         self.capacity = capacity
         self.trajectory_length = trajectory_length
@@ -2209,6 +2255,7 @@ class SceneDiscriminator(nn.Module):
         temporal_hidden: int,
         hidden_size: int = 128,
         *, n_cars: int = N_CARS, recurrent_global: bool = False,
+        flip_state_features: bool = False,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
@@ -2216,7 +2263,10 @@ class SceneDiscriminator(nn.Module):
         if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
             raise ValueError("scene discriminator needs two, four, or six cars")
         self.n_cars = n_cars
-        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.flip_state_features = flip_state_features
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE + (
+            FLIP_STATE_SIZE if flip_state_features else 0
+        )
         self.recurrent_global = recurrent_global
         self.ball_encoder = nn.Sequential(
             nn.Linear(BALL_SIZE, hidden_size),
@@ -2225,7 +2275,7 @@ class SceneDiscriminator(nn.Module):
             nn.ReLU(),
         )
         self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + 1, hidden_size),
+            nn.Linear(CAR_SIZE + 1 + (FLIP_STATE_SIZE if flip_state_features else 0), hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding),
             nn.ReLU(),
@@ -2238,11 +2288,17 @@ class SceneDiscriminator(nn.Module):
     def _encode(self, scenes: th.Tensor) -> th.Tensor:
         B, T, _ = scenes.shape
         ball = scenes[..., :BALL_SIZE]
-        cars = scenes[..., BALL_SIZE:].reshape(B, T, self.n_cars, CAR_SIZE)
+        cars = scenes[..., BALL_SIZE:BALL_SIZE + self.n_cars * CAR_SIZE].reshape(
+            B, T, self.n_cars, CAR_SIZE,
+        )
         sign = scenes.new_tensor(
             [1.0] * (self.n_cars // 2) + [-1.0] * (self.n_cars // 2)
         ).view(1, 1, self.n_cars, 1)
         car_in = th.cat((cars, sign.expand(B, T, -1, -1)), dim=-1)
+        if self.flip_state_features:
+            car_flip = cars.new_zeros((B, T, self.n_cars, FLIP_STATE_SIZE))
+            car_flip[:, :, 0] = scenes[..., -FLIP_STATE_SIZE:]
+            car_in = th.cat((car_in, car_flip), dim=-1)
         ball_emb = self.ball_encoder(ball)
         car_emb = self.car_encoder(car_in).flatten(-2)
         return th.cat((ball_emb, car_emb), dim=-1)
@@ -2344,6 +2400,7 @@ class CausalSceneTransformer(nn.Module):
     def __init__(
         self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
         *, max_context: int = 128, layers: int = 2, n_cars: int = N_CARS,
+        flip_state_features: bool = False,
     ) -> None:
         super().__init__()
         if (min(frame_embedding, temporal_hidden, hidden_size, max_context, layers) < 1
@@ -2352,14 +2409,18 @@ class CausalSceneTransformer(nn.Module):
         if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
             raise ValueError("Transformer needs two, four, or six cars")
         self.n_cars = n_cars
-        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.flip_state_features = flip_state_features
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE + (
+            FLIP_STATE_SIZE if flip_state_features else 0
+        )
         self.max_context = max_context
         self.ball_encoder = nn.Sequential(
             nn.Linear(BALL_SIZE, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + n_cars, hidden_size), nn.ReLU(),
+            nn.Linear(CAR_SIZE + n_cars + (FLIP_STATE_SIZE if flip_state_features else 0),
+                      hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.frame_projection = nn.Linear(frame_embedding * (n_cars + 1), temporal_hidden)
@@ -2375,10 +2436,17 @@ class CausalSceneTransformer(nn.Module):
 
     def _encode(self, scenes: th.Tensor) -> th.Tensor:
         count, steps = scenes.shape[:2]
-        cars = scenes[..., BALL_SIZE:].reshape(count, steps, self.n_cars, CAR_SIZE)
+        cars = scenes[..., BALL_SIZE:BALL_SIZE + self.n_cars * CAR_SIZE].reshape(
+            count, steps, self.n_cars, CAR_SIZE,
+        )
         roles = th.eye(self.n_cars, device=scenes.device, dtype=scenes.dtype)
         roles = roles.view(1, 1, self.n_cars, self.n_cars).expand(count, steps, -1, -1)
-        encoded = self.car_encoder(th.cat((cars, roles), dim=-1))
+        car_in = th.cat((cars, roles), dim=-1)
+        if self.flip_state_features:
+            car_flip = cars.new_zeros((count, steps, self.n_cars, FLIP_STATE_SIZE))
+            car_flip[:, :, 0] = scenes[..., -FLIP_STATE_SIZE:]
+            car_in = th.cat((car_in, car_flip), dim=-1)
+        encoded = self.car_encoder(car_in)
         combined = th.cat((
             self.ball_encoder(scenes[..., :BALL_SIZE]),
             encoded.flatten(-2),
@@ -2422,10 +2490,16 @@ class CausalSceneTransformer(nn.Module):
 class EgoBallSceneDiscriminator(nn.Module):
     """Judge the joint ego-car and ball trajectory without opponent shortcuts."""
 
-    def __init__(self, frame_embedding: int, temporal_hidden: int, hidden_size: int):
+    def __init__(
+        self, frame_embedding: int, temporal_hidden: int, hidden_size: int,
+        *, flip_state_features: bool = False,
+    ):
         super().__init__()
+        self.flip_state_features = flip_state_features
         self.encoder = nn.Sequential(
-            nn.Linear(BALL_SIZE + CAR_SIZE + 6, hidden_size), nn.ReLU(),
+            nn.Linear(BALL_SIZE + CAR_SIZE + 6 + (
+                FLIP_STATE_SIZE if flip_state_features else 0
+            ), hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.gru = nn.GRU(frame_embedding, temporal_hidden, batch_first=True)
@@ -2440,6 +2514,8 @@ class EgoBallSceneDiscriminator(nn.Module):
         relative_position = ball[..., :3] - ego[..., :3]
         relative_velocity = ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
         inputs = th.cat((ball, ego, relative_position, relative_velocity), dim=-1)
+        if self.flip_state_features:
+            inputs = th.cat((inputs, windows[..., -FLIP_STATE_SIZE:]), dim=-1)
         features, _ = self.gru(self.encoder(inputs))
         return self.head(features[:, -1]).squeeze(-1)
 
@@ -2458,6 +2534,7 @@ class FactorizedSceneDiscriminator(nn.Module):
         *, n_cars: int = N_CARS, _legacy_two_heads: bool = False,
         _legacy_opponent_context: bool = False, recurrent_global: bool = False,
         transformer_global: bool = False, context_length: int = 128,
+        flip_state_features: bool = False,
     ) -> None:
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
@@ -2466,17 +2543,24 @@ class FactorizedSceneDiscriminator(nn.Module):
             raise ValueError("factorized discriminator needs two, four, or six cars")
         if _legacy_opponent_context and not _legacy_two_heads:
             raise ValueError("opponent context is only supported for legacy checkpoints")
+        if _legacy_two_heads and flip_state_features:
+            raise ValueError("legacy factorized checkpoints do not contain flip state")
         if transformer_global and (recurrent_global or _legacy_two_heads):
             raise ValueError("Transformer requires a non-recurrent global head")
         self.n_cars = n_cars
-        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
+        self.flip_state_features = flip_state_features
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE + (
+            FLIP_STATE_SIZE if flip_state_features else 0
+        )
         self.recurrent_global = recurrent_global
         self.transformer_global = transformer_global
         self.other_context_size = (
             (n_cars - 1) * (CAR_SIZE + 6) if _legacy_opponent_context else 0
         )
         self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + 6 + self.other_context_size, hidden_size), nn.ReLU(),
+            nn.Linear(CAR_SIZE + 6 + self.other_context_size + (
+                FLIP_STATE_SIZE if flip_state_features else 0
+            ), hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         if _legacy_two_heads:
@@ -2493,15 +2577,16 @@ class FactorizedSceneDiscriminator(nn.Module):
         self.near_discriminator = (
             None if _legacy_two_heads else EgoBallSceneDiscriminator(
                 frame_embedding, temporal_hidden, hidden_size,
+                flip_state_features=flip_state_features,
             )
         )
         self.global_discriminator = (
             None if _legacy_two_heads else CausalSceneTransformer(
                 frame_embedding, temporal_hidden, hidden_size, max_context=context_length,
-                n_cars=n_cars,
+                n_cars=n_cars, flip_state_features=flip_state_features,
             ) if transformer_global else SceneDiscriminator(
                 frame_embedding, temporal_hidden, hidden_size, n_cars=n_cars,
-                recurrent_global=recurrent_global,
+                recurrent_global=recurrent_global, flip_state_features=flip_state_features,
             )
         )
 
@@ -2519,8 +2604,10 @@ class FactorizedSceneDiscriminator(nn.Module):
         car_input = th.cat((
             ego, initial_context[:, None].expand(-1, windows.shape[1], -1),
         ), dim=-1)
+        if self.flip_state_features:
+            car_input = th.cat((car_input, windows[..., -FLIP_STATE_SIZE:]), dim=-1)
         if self.near_discriminator is None and self.other_context_size:
-            others = windows[:, 0, BLUE_START + CAR_SIZE:].reshape(
+            others = windows[:, 0, BLUE_START + CAR_SIZE:BALL_SIZE + self.n_cars * CAR_SIZE].reshape(
                 -1, self.n_cars - 1, CAR_SIZE,
             )
             relative_others = others[..., :6] - ego[:, 0, None, :6]
@@ -4090,9 +4177,11 @@ class SceneDiscriminatorReward:
             raise ValueError("reward gamma must be in (0, 1]")
         self.discriminator = discriminator
         self.scene_size = getattr(discriminator, "scene_size", SCENE_SIZE)
-        self.n_cars = (self.scene_size - BALL_SIZE) // CAR_SIZE
-        if self.scene_size not in SCENE_SIZES:
+        if self.scene_size not in (*SCENE_SIZES, *FLIP_SCENE_SIZES):
             raise ValueError("discriminator reward needs two-, four-, or six-car scenes")
+        self.n_cars = (self.scene_size - BALL_SIZE - (
+            FLIP_STATE_SIZE if self.scene_size in FLIP_SCENE_SIZES else 0
+        )) // CAR_SIZE
         self.factorize = getattr(discriminator, "factorized", False)
         self.recurrent_global = getattr(discriminator, "recurrent_global", False)
         self.transformer_global = getattr(discriminator, "transformer_global", False)
@@ -4553,7 +4642,7 @@ class AdaptiveDiscriminatorUpdate:
             raise RuntimeError("no valid generated scene windows in rollout")
 
         flat_windows = windows.reshape(
-            -1, self.expert.trajectory_length, self.expert.scene_size
+            -1, self.expert.trajectory_length, self.expert.discriminator_scene_size
         )
         train_indices, heldout_indices = self._split_generated(valid)
         terminal = batch.get("terminated")
@@ -4567,7 +4656,9 @@ class AdaptiveDiscriminatorUpdate:
         context_timeline = None
         if self.transformer_global:
             if (self._recent_context_frames is not None and
-                    self._recent_context_frames.shape[1:] != (valid.shape[1], self.expert.scene_size)):
+                    self._recent_context_frames.shape[1:] != (
+                        valid.shape[1], self.expert.discriminator_scene_size,
+                    )):
                 self._recent_context_frames = self._recent_context_ends = None
             context_timeline = GeneratedContextTimeline(
                 flat_windows, valid.shape[1], terminal,
@@ -5157,6 +5248,8 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         )
     if args.factorize != config.get("factorize", False):
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
+    if getattr(args, "flip_state_features", False) != config.get("flip_state_features", False):
+        raise ValueError("--flip-state-features must match the checkpoint when resuming")
     if getattr(args, "team_size", 1) != config.get("team_size", 1):
         raise ValueError("--team-size must match the checkpoint when resuming")
     if getattr(args, "expired_dodge_mask", config.get("expired_dodge_mask", False)) != (
@@ -5279,6 +5372,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     add_feature_option(
         parser, "--expired-dodge-mask", default=True,
         help="track CARL's dodge window in policy observations and mask expired airborne jumps",
+    )
+    add_feature_option(
+        parser, "--flip-state-features", default=True,
+        help="give the policy and discriminator focal flip availability and remaining dodge time",
     )
     parser.add_argument("--max-ticks", type=int, default=1_000_000)
     parser.add_argument("--no-touch-timeout", type=float, default=30.0)
@@ -5446,6 +5543,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("policy_layers", 1)
         inherited.setdefault("critic_layers", 1)
         inherited.setdefault("expired_dodge_mask", False)
+        inherited.setdefault("flip_state_features", False)
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
         parser.set_defaults(**inherited)
@@ -5659,9 +5757,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
     team_size = getattr(args, "team_size", 1)
-    env_type = (DodgeAwareCARLTorchVectorEnv if getattr(args, "expired_dodge_mask", True)
-                else CARLTorchVectorEnv)
-    return env_type(
+    return DodgeAwareCARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=team_size,
         n_orange=team_size,
@@ -5671,6 +5767,8 @@ def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
         no_touch_timeout_seconds=args.no_touch_timeout,
         normalize=True,
         discrete_actions=True,
+        flip_state_features=getattr(args, "flip_state_features", False),
+        append_age=getattr(args, "expired_dodge_mask", True),
     )
 
 
@@ -5709,11 +5807,13 @@ def build_discriminator(
     args: argparse.Namespace,
 ) -> SceneDiscriminator | CausalSceneTransformer | FactorizedSceneDiscriminator:
     n_cars = team_car_count(getattr(args, "team_size", 1))
+    flip_state_features = getattr(args, "flip_state_features", False)
     if getattr(args, "transformer_global", False) and not args.factorize:
         return CausalSceneTransformer(
             args.frame_embedding, args.temporal_hidden, args.discriminator_hidden,
             max_context=args.discriminator_context_length,
             n_cars=n_cars,
+            flip_state_features=flip_state_features,
         )
     model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
     options = dict(
@@ -5722,6 +5822,7 @@ def build_discriminator(
         hidden_size=args.discriminator_hidden,
         n_cars=n_cars,
         recurrent_global=getattr(args, "recurrent_global", False),
+        flip_state_features=flip_state_features,
     )
     if args.factorize:
         options.update(
@@ -5746,6 +5847,7 @@ def build_runner(
             captures.append(EgoBallTouchCapture(gameplay))
     captures.append(SceneWindowCapture(
         args.trajectory_length, team_car_count(getattr(args, "team_size", 1)),
+        flip_state_features=getattr(args, "flip_state_features", False),
     ))
     return Runner(env, policy, buffer, captures=captures)
 
@@ -5834,6 +5936,7 @@ def main() -> None:
         driving_fraction=args.general_driving_fraction,
         kickoff_fraction=args.kickoff_fraction,
         team_size=args.team_size,
+        flip_state_features=args.flip_state_features,
     )
     if expert.train_total < 1:
         raise ValueError("expert dataset contains no training windows")
@@ -5867,7 +5970,7 @@ def main() -> None:
 
     history_options = dict(
         capacity=args.history_capacity, trajectory_length=args.trajectory_length,
-        device=env.device, seed=args.seed, scene_size=expert.scene_size,
+        device=env.device, seed=args.seed, scene_size=expert.discriminator_scene_size,
     )
     history = (
         RecencyReplayBuffer(
@@ -5884,7 +5987,7 @@ def main() -> None:
                       / args.discriminator_context_length),
             ),
             trajectory_length=args.discriminator_context_length,
-            device=env.device, seed=args.seed, scene_size=expert.scene_size,
+            device=env.device, seed=args.seed, scene_size=expert.discriminator_scene_size,
         )
         context_history = (
             RecencyReplayBuffer(

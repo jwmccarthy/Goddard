@@ -223,11 +223,11 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                     start_args.no_touch_timeout = 30
                     start_args.reward_scale = 1
                     start_args.normalize = True
-                    with patch("basic.CARLTorchVectorEnv", return_value=env) as legacy, \
-                            patch("basic.DodgeAwareCARLTorchVectorEnv", return_value=env) as dodge:
+                    with patch("basic.DodgeAwareCARLTorchVectorEnv", return_value=env) as dodge:
                         built = build_training_environment(start_args, None)
-                        (dodge if width == 138 else legacy).assert_called_once()
-                        (legacy if width == 138 else dodge).assert_not_called()
+                        dodge.assert_called_once()
+                        self.assertFalse(dodge.call_args.kwargs["flip_state_features"])
+                        self.assertEqual(dodge.call_args.kwargs["append_age"], width == 138)
                     initialized, initialized_critic = build_policy_and_critic(
                         built, start_args, start_args.policy_architecture,
                     )
@@ -300,7 +300,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                 env = build_training_environment(arguments, None)
                 try:
                     observation = env.reset()
-                    self.assertEqual(tuple(observation.shape), (2, 138))
+                    self.assertEqual(tuple(observation.shape), (2, 140))
                     policy, _ = build_policy_and_critic(
                         env, arguments, arguments.policy_architecture,
                     )

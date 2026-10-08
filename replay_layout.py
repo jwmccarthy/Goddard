@@ -5,6 +5,7 @@ BALL_SIZE = 9
 CAR_SIZE = 21
 INTERNAL_SIZE = 19
 EVENT_SIZE = 4  # Touch, other-player touch, bump, and replay correction.
+FLIP_STATE_SIZE = 2  # Focal hasFlipOrJump and seconds left in its dodge window.
 
 
 def team_car_count(team_size: int) -> int:
@@ -21,6 +22,15 @@ def team_observation_size(team_size: int) -> int:
     cars = team_car_count(team_size)
     # Ball, cars, 34 pad flags/distances, relative ball/other cars, two goals.
     return team_scene_size(team_size) + 68 + 6 * cars + 6
+
+
+def team_live_observation_size(team_size: int) -> int:
+    """CARL appends the focal car's native flip state after the goal vectors."""
+    return team_observation_size(team_size) + FLIP_STATE_SIZE
+
+
+def team_discriminator_scene_size(team_size: int) -> int:
+    return team_scene_size(team_size) + FLIP_STATE_SIZE
 
 
 def team_replay_row_size(team_size: int) -> int:
