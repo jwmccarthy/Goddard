@@ -16,12 +16,14 @@ from http.server import ThreadingHTTPServer
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic
 from gaifo import (
     GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+    GAIFO_TEAM_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE,
     build_policy,
 )
 from dodge_window import DodgeWindowActionCodec
+from replay_layout import team_observation_size
 from watch_checkpoints import (
     CheckpointRegistry, SpectatorState, load_match, load_policy_checkpoint, make_handler,
-    parse_args, policy_environment, policy_observation,
+    parse_args, policy_environment, policy_observation, render_frame,
 )
 
 
@@ -97,6 +99,50 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
         with patch.object(sys, "argv", ["watch_checkpoints.py"]):
             args = parse_args()
         self.assertEqual(args.replay_dir.name, "pro_1v1_fs4")
+        with patch.object(sys, "argv", ["watch_checkpoints.py", "--team-size", "3"]):
+            self.assertEqual(parse_args().replay_dir.name, "pro_3v3_fs4")
+
+    def test_multiplayer_policy_loading_and_viewer_frames(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            for size, gru in ((2, False), (3, True)):
+                with self.subTest(team_size=size, gru=gru):
+                    class ModeEnv(FakeEnv):
+                        n_cars = 2 * size
+                        single_observation_space = Box(
+                            -1.0, 1.0, shape=(team_observation_size(size),),
+                            dtype=np.float32,
+                        )
+
+                    env = ModeEnv()
+                    reference = build_policy(
+                        env, argparse.Namespace(policy_hidden=16, gru=gru),
+                    )
+                    path = folder / f"gaifo_{size:012d}.pt"
+                    th.save({
+                        "config": {
+                            "architecture": (GAIFO_TEAM_GRU_ARCHITECTURE if gru else
+                                             GAIFO_TEAM_ARCHITECTURE),
+                            "team_size": size, "frameskip": 4,
+                            "policy_hidden": 16, "gru": gru,
+                        },
+                        "policy": reference.state_dict(),
+                    }, path)
+                    loaded, signature = load_policy_checkpoint(path, env, 4, None)
+                    self.assertEqual(signature[-1], size)
+                    observation = th.randn(size, team_observation_size(size))
+                    with th.no_grad():
+                        result = loaded.act(observation, loaded.initial_state(size))
+                    self.assertEqual(result.action.shape[0], size)
+                    with self.assertRaisesRegex(ValueError, "team size does not match"):
+                        load_policy_checkpoint(path, FakeEnv(), 4, None)
+
+                    raw = th.zeros(1, 9 + 22 * 2 * size + 34)
+                    frame = render_frame(raw, folder, path, path, 0, 0, 1, 4, size)
+                    self.assertEqual([car["team"] for car in frame["cars"]],
+                                     [0] * size + [1] * size)
+                    self.assertEqual([car["player"] for car in frame["cars"]],
+                                     list(range(1, size + 1)) * 2)
 
     def test_load_and_play_mlp_and_gru(self):
         th.manual_seed(0)

@@ -55,6 +55,10 @@ from dodge_window import DodgeAwareCARLTorchVectorEnv
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
 )
+from replay_layout import (
+    TEAM_SIZES, team_car_count, team_observation_size, team_replay_row_size,
+    team_scene_size,
+)
 from replay_safety import (
     GOAL_EXCLUSION_SECONDS, TICKS_PER_SECOND,
     infer_unsafe_start_mask, pre_goal_start_mask,
@@ -65,11 +69,15 @@ from reward_spec import CEILING_Z
 SCENE_SIZE = 51
 GAIFO_ARCHITECTURE = "scene-marl-gaifo-1v1-v3"
 GAIFO_GRU_ARCHITECTURE = "scene-marl-gaifo-1v1-v3-gru"
+GAIFO_TEAM_ARCHITECTURE = "scene-marl-gaifo-teams-v1"
+GAIFO_TEAM_GRU_ARCHITECTURE = "scene-marl-gaifo-teams-v1-gru"
 BALL_SIZE = 9
 CAR_SIZE = 21
 N_CARS = 2
 DOUBLES_N_CARS = 4
 DOUBLES_SCENE_SIZE = BALL_SIZE + DOUBLES_N_CARS * CAR_SIZE
+STANDARD_N_CARS = 6
+SCENE_SIZES = tuple(team_scene_size(size) for size in TEAM_SIZES)
 BLUE_START = 9
 ORANGE_START = 30
 CAR_BOOL_START = 16
@@ -129,15 +137,15 @@ RESET_MINING_MIN_CONFIDENCE = 0.6
 
 
 def scene_car_count(scenes: th.Tensor) -> int:
-    if scenes.shape[-1] not in (SCENE_SIZE, DOUBLES_SCENE_SIZE):
-        raise ValueError("physical scenes must contain two or four cars")
+    if scenes.shape[-1] not in SCENE_SIZES:
+        raise ValueError("physical scenes must contain two, four, or six cars")
     return (scenes.shape[-1] - BALL_SIZE) // CAR_SIZE
 
 
 def noise_mask(device: str | th.device = "cpu", n_cars: int = N_CARS) -> th.Tensor:
     """Boolean mask that is True for continuous scene features and False for car booleans."""
-    if n_cars not in (N_CARS, DOUBLES_N_CARS):
-        raise ValueError("noise mask needs two or four cars")
+    if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
+        raise ValueError("noise mask needs two, four, or six cars")
     mask = th.ones(BALL_SIZE + n_cars * CAR_SIZE, dtype=th.bool, device=device)
     for car in range(n_cars):
         start = BALL_SIZE + car * CAR_SIZE
@@ -173,16 +181,17 @@ def _ball_distances(windows: th.Tensor, car_start: int) -> th.Tensor:
 
 
 def scene_situation_ids(windows: th.Tensor, car_start: int = BLUE_START) -> th.Tensor:
-    """Distance and ego-car situation at the closest approach in each 1v1 window.
+    """Distance and focal-car situation at the closest approach in each window.
 
     Six car situations are crossed with close (<350), approach (<1500), and
     far (>=1500) ball-distance bands. Near-roof airborne play counts as ceiling;
     a car with its wheels on a vertical surface counts as wall instead.
     """
-    if windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE:
-        raise ValueError("situation labels need [batch, frames, 1v1 scene] windows")
-    if car_start not in (BLUE_START, ORANGE_START):
-        raise ValueError("situation car must be one of the stored 1v1 actors")
+    if windows.ndim != 3:
+        raise ValueError("situation labels need [batch, frames, scene] windows")
+    n_cars = scene_car_count(windows)
+    if car_start not in range(BALL_SIZE, BALL_SIZE + n_cars * CAR_SIZE, CAR_SIZE):
+        raise ValueError("situation car must be an actor in the scene")
     distance = _ball_distances(windows, car_start)
     closest = distance.argmin(dim=1)
     rows = th.arange(len(windows), device=windows.device)
@@ -562,9 +571,9 @@ def opponent_view(scenes: th.Tensor) -> th.Tensor:
 
 
 def teammate_view(scenes: th.Tensor) -> th.Tensor:
-    """Use the other player on the ego's team as the ego in a 2v2 scene."""
-    if scene_car_count(scenes) != DOUBLES_N_CARS:
-        raise ValueError("teammate view needs a four-car scene")
+    """Use the first teammate as the ego in a team scene."""
+    if scene_car_count(scenes) == N_CARS:
+        raise ValueError("teammate view needs a team scene")
     return actor_view(scenes, 1)
 
 
@@ -609,6 +618,8 @@ def resample_scene(
     target_frame_skip: int,
 ) -> np.ndarray:
     """Resample normalized physical scenes onto the simulator's time cadence."""
+    if scene.shape[-1] not in SCENE_SIZES:
+        raise ValueError("replay scenes must contain two, four, or six cars")
     if len(scene) < 2 or source_frame_skip == target_frame_skip:
         return np.asarray(scene, dtype=np.float32)
     left, right, alpha = _resample_coordinates(
@@ -620,7 +631,7 @@ def resample_scene(
     ).astype(np.float32)
 
     nearest = np.where(alpha < 0.5, left, right)
-    for car_start in (BLUE_START, ORANGE_START):
+    for car_start in range(BALL_SIZE, scene.shape[-1], CAR_SIZE):
         bool_slice = slice(
             car_start + CAR_BOOL_START,
             car_start + CAR_BOOL_END,
@@ -656,11 +667,15 @@ def resample_internal_state(
 
 def extract_scene_observations(
     observation: th.Tensor,
+    n_cars: int = N_CARS,
 ) -> th.Tensor:
-    """Return every actor's own canonical 51-feature physical scene prefix."""
-    if observation.shape[-1] < SCENE_SIZE:
-        raise ValueError(f"actor observations require at least {SCENE_SIZE} features")
-    return observation[..., :SCENE_SIZE].contiguous()
+    """Return each actor's canonical ball-and-cars physical scene prefix."""
+    if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
+        raise ValueError("observations need two, four, or six cars")
+    width = BALL_SIZE + n_cars * CAR_SIZE
+    if observation.shape[-1] < width:
+        raise ValueError(f"actor observations require at least {width} features")
+    return observation[..., :width].contiguous()
 
 
 def _unsafe_replay_reset_frames(
@@ -749,13 +764,20 @@ def advanced_touch_events(
 class GameplayDiagnostics:
     """Record physical events and goal-only episode rewards before CARL auto-resets."""
 
-    def __init__(self, n_sim: int, device: th.device, no_touch_timeout_steps: int) -> None:
+    def __init__(
+        self, n_sim: int, device: th.device, no_touch_timeout_steps: int,
+        n_cars: int = N_CARS,
+    ) -> None:
+        if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
+            raise ValueError("gameplay needs two, four, or six cars")
+        self.n_cars = n_cars
+        self.team_size = n_cars // 2
         self.no_touch_timeout_steps = no_touch_timeout_steps
         self.touch_steps = th.zeros(n_sim, dtype=th.long, device=device)
-        self.last_aerial_touch_score = th.zeros(n_sim * N_CARS, device=device)
-        self.last_flip_reset = th.zeros(n_sim * N_CARS, device=device)
-        self.last_ego_ball_touch = th.zeros(n_sim * N_CARS, dtype=th.bool, device=device)
-        self.last_opponent_ball_touch = th.zeros(n_sim * N_CARS, dtype=th.bool, device=device)
+        self.last_aerial_touch_score = th.zeros(n_sim * n_cars, device=device)
+        self.last_flip_reset = th.zeros(n_sim * n_cars, device=device)
+        self.last_ego_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
+        self.last_opponent_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
         self.counts = {
             name: th.zeros((), dtype=th.float32, device=device)
             for name in (
@@ -770,20 +792,24 @@ class GameplayDiagnostics:
             )
         }
 
+    def _team_difference(self, events: th.Tensor) -> th.Tensor:
+        # Each player's event contributes its full bonus to their entire team.
+        scores = events.reshape(-1, 2, self.team_size).sum(dim=-1, keepdim=True)
+        return (scores - scores.flip(dims=(1,))).expand(-1, -1, self.team_size).reshape(-1)
+
     @th.no_grad()
     def __call__(self, context: RewardContext) -> th.Tensor:
         touches = context.current.car_ball_touches
         self.last_ego_ball_touch = touches.reshape(-1)
-        self.last_opponent_ball_touch = touches.flip(dims=(-1,)).reshape(-1)
+        opposing = touches.reshape(-1, 2, self.team_size).any(dim=-1, keepdim=True)
+        self.last_opponent_ball_touch = opposing.flip(dims=(1,)).expand(
+            -1, -1, self.team_size,
+        ).reshape(-1)
         score_for_actor = context.events.score_delta[:, None] * context.current.team_sign
         aerial_score, aerial, flip_reset = advanced_touch_events(context)
-        self.last_aerial_touch_score = (
-            aerial_score - aerial_score.flip(dims=(-1,))
-        ).reshape(-1)
+        self.last_aerial_touch_score = self._team_difference(aerial_score)
         flip_reset_score = flip_reset.to(aerial_score.dtype)
-        self.last_flip_reset = (
-            flip_reset_score - flip_reset_score.flip(dims=(-1,))
-        ).reshape(-1)
+        self.last_flip_reset = self._team_difference(flip_reset_score)
 
         self.touch_steps += 1
         self.touch_steps[touches.any(dim=-1)] = 0
@@ -798,8 +824,8 @@ class GameplayDiagnostics:
         self.counts["flip_resets"] += flip_reset.sum()
         self.counts["goals_for"] += (score_for_actor > 0).sum()
         self.counts["goals_against"] += (score_for_actor < 0).sum()
-        self.counts["episodes"] += context.events.done.sum() * N_CARS
-        self.counts["timeouts"] += timeout.sum() * N_CARS
+        self.counts["episodes"] += context.events.done.sum() * self.n_cars
+        self.counts["timeouts"] += timeout.sum() * self.n_cars
 
         # GAIFO's imitation reward is computed separately; preserve CARL's
         # default goal-only reward for episode statistics and rollout records.
@@ -860,10 +886,14 @@ class EgoBallTouchCapture(CaptureBase):
 class SceneWindowCapture(CaptureBase):
     """Capture short scene windows across rollout boundaries, resetting on done."""
 
-    def __init__(self, trajectory_length: int) -> None:
+    def __init__(self, trajectory_length: int, n_cars: int = N_CARS) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
+        if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
+            raise ValueError("scene capture needs two, four, or six cars")
         self.trajectory_length = trajectory_length
+        self.n_cars = n_cars
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.distances = np.arange(trajectory_length - 1, -1, -1)
 
         self.n_envs = 0
@@ -872,8 +902,8 @@ class SceneWindowCapture(CaptureBase):
         self.history_pos: th.Tensor | None = None
 
     def reset(self, batch_size: int) -> None:
-        if batch_size % N_CARS:
-            raise ValueError("1v1 collection requires two actors per simulation")
+        if batch_size % self.n_cars:
+            raise ValueError("scene collection needs a complete team per simulation")
         self.n_envs = batch_size
         self.history = None
         self.history_age = None
@@ -889,8 +919,8 @@ class SceneWindowCapture(CaptureBase):
         if len(observation) != self.n_envs:
             raise ValueError("scene capture batch changed after reset")
 
-        current_scene = extract_scene_observations(observation)
-        next_scene = extract_scene_observations(next_obs)
+        current_scene = extract_scene_observations(observation, self.n_cars)
+        next_scene = extract_scene_observations(next_obs, self.n_cars)
         n_envs = len(current_scene)
         capacity = self.trajectory_length - 1
 
@@ -898,7 +928,7 @@ class SceneWindowCapture(CaptureBase):
             self.history = th.zeros(
                 n_envs,
                 capacity,
-                SCENE_SIZE,
+                self.scene_size,
                 dtype=observation.dtype,
                 device=observation.device,
             )
@@ -939,9 +969,9 @@ class SceneWindowCapture(CaptureBase):
             dtype=th.bool,
             device=observation.device,
         )
-        n_sim = n_envs // N_CARS
-        simulation_done = done.view(n_sim, N_CARS).any(dim=1)
-        env_done = simulation_done.repeat_interleave(N_CARS)
+        n_sim = n_envs // self.n_cars
+        simulation_done = done.view(n_sim, self.n_cars).any(dim=1)
+        env_done = simulation_done.repeat_interleave(self.n_cars)
         self.history[env_done] = 0
         self.history_age[env_done] = 0
         self.history_pos[env_done] = 0
@@ -953,7 +983,7 @@ class SceneWindowCapture(CaptureBase):
         current_scene: th.Tensor,
         next_scene: th.Tensor,
     ) -> th.Tensor:
-        """Build [n_envs, trajectory_length, SCENE_SIZE] windows from circular history.
+        """Build [n_envs, trajectory_length, scene_size] windows from circular history.
 
         Distances are chronological offsets from ``next_scene`` (0 = newest),
         ordered oldest-to-newest so the window ends with the scored transition's
@@ -967,7 +997,7 @@ class SceneWindowCapture(CaptureBase):
         window = th.empty(
             n_envs,
             samples,
-            SCENE_SIZE,
+            self.scene_size,
             dtype=current_scene.dtype,
             device=current_scene.device,
         )
@@ -992,7 +1022,7 @@ class SceneWindowCapture(CaptureBase):
 
 
 class ExpertSceneDataset:
-    """Expert windows from stored 1v1 POVs, never from an unstored opponent."""
+    """Expert windows from recorded player POVs, never synthetic expert actors."""
 
     def __init__(
         self,
@@ -1007,7 +1037,13 @@ class ExpertSceneDataset:
         skill_sampling: bool = False,
         driving_fraction: float = 0.10,
         kickoff_fraction: float = 0.05,
+        team_size: int = 1,
     ) -> None:
+        self.n_cars = team_car_count(team_size)
+        self.team_size = team_size
+        self.scene_size = team_scene_size(team_size)
+        self.internal_start = team_observation_size(team_size)
+        self.touch_index = self.internal_start + INTERNAL_STATE_SIZE
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
         if limit is not None and limit < trajectory_length:
@@ -1041,21 +1077,21 @@ class ExpertSceneDataset:
         groups: dict[tuple[str, ...], list[Path]] = {}
         for path in paths:
             source = np.load(path, mmap_mode="r")
-            if source.ndim != 2 or source.shape[1] != 161:
+            if source.ndim != 2 or source.shape[1] != team_replay_row_size(team_size):
                 continue
             key = self._dedup_key(path)
             groups.setdefault(key, []).append(path)
 
         selected = [sorted(groups[key]) for key in sorted(groups)]
         if not selected:
-            raise ValueError(f"no 1v1 replay files found in {replay_dir}")
+            raise ValueError(f"no {team_size}v{team_size} replay files found in {replay_dir}")
 
         if limit is not None:
             rng.shuffle(selected)
 
         frames: list[th.Tensor] = []
         internal_states: list[th.Tensor] = []
-        opponent_povs: list[th.Tensor] = []
+        available_povs: list[th.Tensor] = []
         invalid_frames: list[th.Tensor] = []
         contact_frames: list[th.Tensor] = []
         ego_touches: list[th.Tensor] = []
@@ -1077,8 +1113,8 @@ class ExpertSceneDataset:
             if skill_sampling:
                 source_skip = stored_frame_skip if frame_skip is not None else 4
                 unsafe_reset = _unsafe_replay_reset_frames(path, stored, source_skip)
-                touches = np.zeros((len(stored), N_CARS), dtype=bool)
-                touches[:, 0] = stored[:, 156] > 0.5
+                touches = np.zeros((len(stored), self.n_cars), dtype=bool)
+                touches[:, 0] = stored[:, self.touch_index] > 0.5
             if reject_discontinuities:
                 # The final two columns flag parser corrections and implausible
                 # physics jumps. The preceding columns are real touch/bump
@@ -1086,59 +1122,51 @@ class ExpertSceneDataset:
                 invalid = np.asarray(stored[:, -2:], dtype=bool).any(axis=-1)
                 contact = np.asarray(stored[:, -5:-2], dtype=bool).any(axis=-1)
             source = np.array(
-                stored[:, :SCENE_SIZE], dtype=np.float32, copy=True
+                stored[:, :self.scene_size], dtype=np.float32, copy=True
             )
             ego_internal = np.array(
                 stored[
-                    :, INTERNAL_STATE_START:INTERNAL_STATE_START + INTERNAL_STATE_SIZE
+                    :, self.internal_start:self.internal_start + INTERNAL_STATE_SIZE
                 ],
                 dtype=np.float32,
                 copy=True,
             )
-            opponent_internal = np.zeros_like(ego_internal)
-            if len(group) > 1:
-                opponent_path = group[1]
-                opponent = np.load(opponent_path, mmap_mode="r")
-                if len(opponent) != len(stored):
+            internal = np.zeros((len(source), self.n_cars, INTERNAL_STATE_SIZE), dtype=np.float32)
+            for actor in range(self.n_cars):
+                car = source[:, BALL_SIZE + actor * CAR_SIZE:BALL_SIZE + (actor + 1) * CAR_SIZE]
+                for scene_field, internal_field in ((16, 0), (19, 7), (18, 8), (20, 17)):
+                    internal[:, actor, internal_field] = car[:, scene_field]
+            internal[:, 0] = ego_internal
+            available = np.zeros(self.n_cars, dtype=bool)
+            available[0] = True
+            for other_path in group[1:]:
+                other = np.load(other_path, mmap_mode="r")
+                if other.shape != stored.shape:
                     raise ValueError(f"paired POV rows differ for {path.name}")
+                actor = self._stored_actor(source, other)
+                if available[actor]:
+                    raise ValueError(f"duplicate stored actor for {path.name}")
+                available[actor] = True
                 if skill_sampling:
                     unsafe_reset |= _unsafe_replay_reset_frames(
-                        opponent_path, opponent, source_skip,
+                        other_path, other, source_skip,
                     )
-                    touches[:, 1] = opponent[:, 156] > 0.5
+                    touches[:, actor] = other[:, self.touch_index] > 0.5
                 if reject_discontinuities:
-                    invalid |= np.asarray(opponent[:, -2:], dtype=bool).any(axis=-1)
-                    contact |= np.asarray(opponent[:, -5:-2], dtype=bool).any(axis=-1)
-                opponent_internal = np.array(
-                    opponent[
-                        :,
-                        INTERNAL_STATE_START:INTERNAL_STATE_START + INTERNAL_STATE_SIZE,
-                    ],
-                    dtype=np.float32,
-                    copy=True,
-                )
+                    invalid |= np.asarray(other[:, -2:], dtype=bool).any(axis=-1)
+                    contact |= np.asarray(other[:, -5:-2], dtype=bool).any(axis=-1)
+                internal[:, actor] = other[
+                    :, self.internal_start:self.internal_start + INTERNAL_STATE_SIZE,
+                ]
                 if frame_skip is not None:
-                    opponent_metadata_path = opponent_path.with_suffix(
-                        ".unsafe-starts.npz"
-                    )
-                    if opponent_metadata_path.is_file():
-                        with np.load(opponent_metadata_path) as metadata:
-                            opponent_frame_skip = int(metadata.get("frame_skip", -1))
+                    other_metadata = other_path.with_suffix(".unsafe-starts.npz")
+                    if other_metadata.is_file():
+                        with np.load(other_metadata) as metadata:
+                            other_frame_skip = int(metadata.get("frame_skip", -1))
                     else:
-                        opponent_frame_skip = _sampled_frame_skip(
-                            opponent_path, frame_skip
-                        )
-                    if opponent_frame_skip != stored_frame_skip:
+                        other_frame_skip = _sampled_frame_skip(other_path, frame_skip)
+                    if other_frame_skip != stored_frame_skip:
                         raise ValueError(f"paired POV cadence differs for {path.name}")
-            else:
-                # CARL uses the internal state, rather than the scene flags, to
-                # determine grounded/flip availability on a replay reset.
-                for scene_field, internal_field in (
-                    (16, 0), (19, 7), (18, 8), (20, 17),
-                ):
-                    opponent_internal[:, internal_field] = source[
-                        :, ORANGE_START + scene_field
-                    ]
             if reject_discontinuities and frame_skip is not None and stored_frame_skip != frame_skip:
                 left, right, _ = _resample_coordinates(
                     len(stored), stored_frame_skip, frame_skip
@@ -1155,13 +1183,10 @@ class ExpertSceneDataset:
                 touches = touches[left] | touches[right]
             if frame_skip is not None:
                 source = resample_scene(source, stored_frame_skip, frame_skip)
-                ego_internal = resample_internal_state(
-                    ego_internal, stored_frame_skip, frame_skip
-                )
-                opponent_internal = resample_internal_state(
-                    opponent_internal, stored_frame_skip, frame_skip
-                )
-            internal = np.stack((ego_internal, opponent_internal), axis=1)
+                internal = np.stack([
+                    resample_internal_state(internal[:, actor], stored_frame_skip, frame_skip)
+                    for actor in range(self.n_cars)
+                ], axis=1)
             full_length = len(source)
             if limit is not None and total + len(source) > limit:
                 keep = max(0, limit - total)
@@ -1190,11 +1215,13 @@ class ExpertSceneDataset:
                     np.ones(pad, dtype=bool), unsafe_reset,
                 ))
                 touches = np.concatenate((
-                    np.zeros((pad, N_CARS), dtype=bool), touches,
+                    np.zeros((pad, self.n_cars), dtype=bool), touches,
                 ))
             frames.append(th.from_numpy(source))
             internal_states.append(th.from_numpy(internal))
-            opponent_povs.append(th.full((len(source),), len(group) > 1, dtype=th.bool))
+            available_povs.append(th.from_numpy(
+                np.broadcast_to(available, (len(source), self.n_cars)).copy(),
+            ))
             if reject_discontinuities:
                 invalid_frames.append(th.from_numpy(invalid.copy()))
                 contact_frames.append(th.from_numpy(contact.copy()))
@@ -1212,7 +1239,9 @@ class ExpertSceneDataset:
 
         self.frames = th.cat(frames).to(device)
         self.internal_states = th.cat(internal_states).to(device)
-        self.opponent_pov_available = th.cat(opponent_povs).to(device)
+        self.pov_available = th.cat(available_povs).to(device)
+        # Retain the 1v1 API used by existing analyses and checkpoints.
+        self.opponent_pov_available = self.pov_available[:, self.team_size]
         self.contact_frames = (
             th.cat(contact_frames).to(device) if reject_discontinuities else None
         )
@@ -1360,6 +1389,24 @@ class ExpertSceneDataset:
             return (parts[1], parts[2])
         return (path.stem,)
 
+    def _stored_actor(self, primary: np.ndarray, other: np.ndarray) -> int:
+        """Identify a second recorded focal car by its physical ball and ego state."""
+        if self.n_cars == N_CARS:
+            return 1
+        indices = np.unique([0, len(primary) // 2, len(primary) - 1])
+        source = th.from_numpy(np.asarray(primary[indices], dtype=np.float32))
+        focal = other[indices, :BALL_SIZE + CAR_SIZE]
+        matched = [
+            actor for actor in range(1, self.n_cars)
+            if np.allclose(
+                actor_view(source, actor).numpy()[:, :BALL_SIZE + CAR_SIZE], focal,
+                rtol=1e-4, atol=1e-4,
+            )
+        ]
+        if len(matched) != 1:
+            raise ValueError("stored POV does not identify a unique car in the replay")
+        return matched[0]
+
     def _sample_windows(
         self,
         starts: th.Tensor,
@@ -1384,12 +1431,22 @@ class ExpertSceneDataset:
             generator=generator,
         )
         chosen_starts = starts[selected]
-        windows = self.frames[chosen_starts[:, None] + self.window_offsets]
-        paired = self.opponent_pov_available[chosen_starts]
-        if paired.any():
-            opponent = paired & (th.rand(n, device=self.frames.device, generator=generator) < 0.5)
-            if opponent.any():
-                windows[opponent] = opponent_view(windows[opponent])
+        actors = self._sample_stored_actors(chosen_starts, generator)
+        return self._windows_for_povs(th.stack((chosen_starts, actors), dim=-1))
+
+    def _sample_stored_actors(
+        self, starts: th.Tensor, generator: th.Generator,
+    ) -> th.Tensor:
+        return th.multinomial(
+            self.pov_available[starts].float(), 1, replacement=True, generator=generator,
+        ).squeeze(-1)
+
+    @staticmethod
+    def _orient_actor_windows(windows: th.Tensor, actors: th.Tensor) -> th.Tensor:
+        for actor in actors.unique().tolist():
+            if actor:
+                chosen = actors == actor
+                windows[chosen] = actor_view(windows[chosen], actor)
         return windows
 
     def _sample_curated(
@@ -1413,8 +1470,8 @@ class ExpertSceneDataset:
     def sample(self, n: int, device: str | th.device) -> th.Tensor:
         """Sample ``n`` training scene windows without crossing file boundaries.
 
-        A second ego viewpoint is eligible only if that replay segment has a
-        second stored expert POV. Physical scenes are shared between paired POVs.
+        Every eligible ego viewpoint has its own stored expert POV. Physical
+        scenes are shared between the recorded POVs of one replay period.
         """
         if self.skill_sampling:
             return self._sample_curated(n, device)
@@ -1450,17 +1507,16 @@ class ExpertSceneDataset:
                 self._train_near_pairs = pairs
             return pairs
         if self._near_frames is None:
-            cars = th.stack((
-                self.frames[:, BLUE_START:BLUE_START + 3],
-                self.frames[:, ORANGE_START:ORANGE_START + 3],
-            ), dim=1)
+            cars = self.frames[:, BALL_SIZE:self.scene_size].reshape(
+                -1, self.n_cars, CAR_SIZE,
+            )[..., :3]
             distance = (self.frames[:, None, :3] - cars) * self.frames.new_tensor(POSITION_SCALE)
             self._near_frames = distance.square().sum(dim=-1) <= BALL_NEAR_DISTANCE ** 2
         starts = self.heldout_window_starts if heldout else self.train_window_starts
         found = []
         for chunk in starts.split(32_768):
             near = self._near_frames[chunk[:, None] + self.window_offsets].any(dim=1)
-            near[:, 1] &= self.opponent_pov_available[chunk]
+            near &= self.pov_available[chunk]
             choices = near.nonzero(as_tuple=False)
             if len(choices):
                 found.append(th.stack((chunk[choices[:, 0]], choices[:, 1]), dim=-1))
@@ -1494,10 +1550,7 @@ class ExpertSceneDataset:
 
     def _windows_for_povs(self, chosen: th.Tensor) -> th.Tensor:
         windows = self.frames[chosen[:, 0, None] + self.window_offsets]
-        opponent = chosen[:, 1].bool()
-        if opponent.any():
-            windows[opponent] = opponent_view(windows[opponent])
-        return windows
+        return self._orient_actor_windows(windows, chosen[:, 1])
 
     def sample_povs(self, n: int, *, heldout: bool = False) -> th.Tensor:
         """Choose expert window starts and their stored focal viewpoint."""
@@ -1524,9 +1577,7 @@ class ExpertSceneDataset:
         chosen = starts[th.randint(
             len(starts), (n,), device=self.frames.device, generator=generator,
         )]
-        opponent = (self.opponent_pov_available[chosen]
-                    & (th.rand(n, device=self.frames.device, generator=generator) < 0.5))
-        return th.stack((chosen, opponent.long()), dim=-1)
+        return th.stack((chosen, self._sample_stored_actors(chosen, generator)), dim=-1)
 
     def context_frames(
         self, pairs: th.Tensor, length: int, *, heldout: bool = False,
@@ -1557,9 +1608,7 @@ class ExpertSceneDataset:
         offsets = th.arange(length - 1, -1, -1, device=pairs.device)
         indices = th.maximum(pairs[:, :1] - offsets, run_start[:, None])
         scenes = self.frames[indices + self.partition_span]
-        opponent = pairs[:, 1].bool()
-        if opponent.any():
-            scenes[opponent] = opponent_view(scenes[opponent])
+        scenes = self._orient_actor_windows(scenes, pairs[:, 1])
         return (scenes, ages) if return_age else scenes
 
     def situation_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
@@ -1571,15 +1620,13 @@ class ExpertSceneDataset:
         groups: list[list[th.Tensor]] = [[] for _ in range(N_SITUATIONS)]
         for chunk in starts.split(8_192):
             scenes = self.frames[chunk[:, None] + self.window_offsets]
-            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START)):
-                focal_starts = chunk
-                focal_scenes = scenes
-                if actor:
-                    available = self.opponent_pov_available[chunk]
-                    if not available.any():
-                        continue
-                    focal_starts = chunk[available]
-                    focal_scenes = scenes[available]
+            for actor in range(self.n_cars):
+                car_start = BALL_SIZE + actor * CAR_SIZE
+                available = self.pov_available[chunk, actor]
+                if not available.any():
+                    continue
+                focal_starts = chunk[available]
+                focal_scenes = scenes[available]
                 labels = scene_situation_ids(focal_scenes, car_start)
                 on_surface = focal_scenes[:, -1, car_start + CAR_BOOL_START] > 0.5
                 for label in labels.unique().tolist():
@@ -1624,14 +1671,15 @@ class ExpertSceneDataset:
         if self._train_grounded_choices is None:
             starts = self.train_window_starts
             scored = starts + self.trajectory_length - 1
-            blue = ((self.frames[scored, BLUE_START + CAR_BOOL_START] > 0.5)
-                    & (self.frames[scored, BLUE_START + 14] > 0.65))
-            orange = ((self.frames[scored, ORANGE_START + CAR_BOOL_START] > 0.5)
-                      & (self.frames[scored, ORANGE_START + 14] > 0.65)
-                      & self.opponent_pov_available[starts])
-            eligible = blue | orange
+            available = th.stack([
+                ((self.frames[scored, BALL_SIZE + actor * CAR_SIZE + CAR_BOOL_START] > 0.5)
+                 & (self.frames[scored, BALL_SIZE + actor * CAR_SIZE + 14] > 0.65)
+                 & self.pov_available[starts, actor])
+                for actor in range(self.n_cars)
+            ], dim=-1)
+            eligible = available.any(dim=-1)
             self._train_grounded_choices = (
-                starts[eligible], th.stack((blue[eligible], orange[eligible]), dim=-1),
+                starts[eligible], available[eligible],
             )
         return self._train_grounded_choices
 
@@ -1644,12 +1692,10 @@ class ExpertSceneDataset:
             len(starts), (n,), device=starts.device, generator=self._train_generator,
         )
         choices = available[selected]
-        actor = (~choices[:, 0]) | (
-            choices[:, 1] & (th.rand(
-                n, device=starts.device, generator=self._train_generator,
-            ) < 0.5)
-        )
-        return th.stack((starts[selected], actor.long()), dim=-1)
+        actor = th.multinomial(
+            choices.float(), 1, replacement=True, generator=self._train_generator,
+        ).squeeze(-1)
+        return th.stack((starts[selected], actor), dim=-1)
 
     def maneuver_pools(self, *, heldout: bool = False) -> tuple[list[SceneManeuver], ...]:
         """Complete aerial, dribble, and flick sequences from stored POVs."""
@@ -1659,24 +1705,27 @@ class ExpertSceneDataset:
         allowed = np.zeros(len(self.frames), dtype=bool)
         starts = self.heldout_window_starts if heldout else self.train_window_starts
         allowed[starts.cpu().numpy()] = True
-        stored_opponent = self.opponent_pov_available.cpu().numpy()
+        stored_povs = self.pov_available.cpu().numpy()
+        actors = [actor for actor in range(self.n_cars) if stored_povs[:, actor].any()]
         frame_distance = {
-            actor: _ball_distances(self.frames, car_start).cpu().numpy()
-            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+            actor: _ball_distances(self.frames, BALL_SIZE + actor * CAR_SIZE).cpu().numpy()
+            for actor in actors
         }
         frame_pose = {
             actor: (
                 np.pad(recovery_surface_contact(
-                    self.frames[1:], self.frames[:-1], car_start,
+                    self.frames[1:], self.frames[:-1], BALL_SIZE + actor * CAR_SIZE,
                 ).cpu().numpy(), (1, 0)),
-                self.frames[:, car_start + 2].cpu().numpy() * POSITION_SCALE[2],
-                self.frames[:, car_start + 14].cpu().numpy(),
+                self.frames[:, BALL_SIZE + actor * CAR_SIZE + 2].cpu().numpy() * POSITION_SCALE[2],
+                self.frames[:, BALL_SIZE + actor * CAR_SIZE + 14].cpu().numpy(),
             )
-            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+            for actor in actors
         }
         control_features = {
-            actor: self.frames[:, list(ground_feature_indices(car_start))].cpu().numpy()
-            for actor, car_start in ((0, BLUE_START), (1, ORANGE_START))
+            actor: self.frames[:, list(ground_feature_indices(
+                BALL_SIZE + actor * CAR_SIZE,
+            ))].cpu().numpy()
+            for actor in actors
         }
         touches = self.ego_touches.cpu().numpy() if self.ego_touches is not None else None
         contacts = (self.contact_frames.cpu().numpy()
@@ -1687,10 +1736,9 @@ class ExpertSceneDataset:
         for length, goal_actor in zip(self.lengths, self.segment_goal_actors):
             count = max(0, length - self.trajectory_length + 1)
             if count and allowed[offset:offset + count].any():
-                actors = (0, 1) if stored_opponent[offset] else (0,)
-                for actor in actors:
+                for actor in np.flatnonzero(stored_povs[offset]).tolist():
                     goal_ends = np.zeros(count, dtype=bool)
-                    goal_ends[-1] = actor == goal_actor
+                    goal_ends[-1] = actor // self.team_size == goal_actor
                     surface, height, up_z = frame_pose[actor]
                     scored = slice(offset + self.trajectory_length - 1, offset + length)
                     frame_dist = frame_distance[actor][offset:offset + length]
@@ -1765,10 +1813,11 @@ class ExpertSceneDataset:
             first = offset + self.partition_span
             at_center = np.linalg.norm(scene[:2] * POSITION_SCALE[:2]) < 2 * BALL_RADIUS
             stationary = np.linalg.norm(scene[3:6] * BALL_MAX_SPEED) < 250
+            opponent_start = BALL_SIZE + self.team_size * CAR_SIZE
             spawn = (scene[BLUE_START + 1] * POSITION_SCALE[1] < -2_000
-                     and scene[ORANGE_START + 1] * POSITION_SCALE[1] > 2_000
+                     and scene[opponent_start + 1] * POSITION_SCALE[1] > 2_000
                      and scene[BLUE_START + 2] * POSITION_SCALE[2] < 120
-                     and scene[ORANGE_START + 2] * POSITION_SCALE[2] < 120)
+                     and scene[opponent_start + 2] * POSITION_SCALE[2] < 120)
             height = scene[2] * POSITION_SCALE[2]
             if at_center and stationary and spawn and BALL_RADIUS - 20 < height < 150:
                 flight = ball_position[first:first + count]
@@ -1801,16 +1850,16 @@ class ExpertSceneDataset:
         starts = self.heldout_window_starts if heldout else self.train_window_starts
         pools: list[list[th.Tensor]] = [[] for _ in SKILL_CATEGORIES]
         kept_clips: list[list[SceneManeuver]] = [[] for _ in range(N_SITUATIONS)]
-        used = np.zeros((len(self.frames), N_CARS), dtype=bool)
+        used = np.zeros((len(self.frames), self.n_cars), dtype=bool)
         touches = self.ego_touches.cpu().numpy()
         ball_position = self.frames[:, :3].cpu().numpy()
         distances = {
-            actor: _ball_distances(self.frames, car).cpu().numpy()
-            for actor, car in enumerate((BLUE_START, ORANGE_START))
+            actor: _ball_distances(self.frames, BALL_SIZE + actor * CAR_SIZE).cpu().numpy()
+            for actor in range(self.n_cars) if self.pov_available[:, actor].any()
         }
         heights = {
-            actor: self.frames[:, car + 2].cpu().numpy() * POSITION_SCALE[2]
-            for actor, car in enumerate((BLUE_START, ORANGE_START))
+            actor: self.frames[:, BALL_SIZE + actor * CAR_SIZE + 2].cpu().numpy() * POSITION_SCALE[2]
+            for actor in distances
         }
         for label, clips in enumerate(self.maneuver_pools(heldout=heldout)):
             for clip in clips:
@@ -1850,10 +1899,9 @@ class ExpertSceneDataset:
             self._kickoff_window_mask(ball_position) if self.kickoff_fraction
             else th.zeros(len(self.frames), dtype=th.bool, device=self.frames.device)
         )
-        for actor, car in enumerate((BLUE_START, ORANGE_START)):
-            eligible = starts
-            if actor:
-                eligible = eligible[self.opponent_pov_available[eligible]]
+        for actor in range(self.n_cars):
+            car = BALL_SIZE + actor * CAR_SIZE
+            eligible = starts[self.pov_available[starts, actor]]
             scored = eligible + self.partition_span
             unused = ~th.from_numpy(used[:, actor]).to(eligible.device)[eligible]
             kickoff = eligible[kickoff_starts[eligible] & unused]
@@ -1904,10 +1952,12 @@ class ExpertSceneDataset:
             groups: list[list[th.Tensor]] = [[] for _ in range(GROUND_MANEUVER_START)]
             for chunk in pairs.split(8_192):
                 windows = self.frames[chunk[:, 0, None] + self.window_offsets]
-                labels = scene_situation_ids(windows)
-                opposite = chunk[:, 1].bool()
-                if opposite.any():
-                    labels[opposite] = scene_situation_ids(windows[opposite], ORANGE_START)
+                labels = th.empty(len(chunk), dtype=th.long, device=chunk.device)
+                for actor in chunk[:, 1].unique().tolist():
+                    selected = chunk[:, 1] == actor
+                    labels[selected] = scene_situation_ids(
+                        windows[selected], BALL_SIZE + actor * CAR_SIZE,
+                    )
                 for label in labels.unique().tolist():
                     groups[label].append(chunk[labels == label])
             categories.append(tuple(
@@ -1952,13 +2002,17 @@ class HistoricalReplayBuffer:
         trajectory_length: int,
         device: str | th.device,
         seed: int = 0,
+        scene_size: int = SCENE_SIZE,
     ) -> None:
         if capacity < 0:
             raise ValueError("history capacity must be non-negative")
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
+        if scene_size not in SCENE_SIZES:
+            raise ValueError("historical scenes must contain two, four, or six cars")
         self.capacity = capacity
         self.trajectory_length = trajectory_length
+        self.scene_size = scene_size
         self.device = th.device(device)
         self.buffer: th.Tensor | None = None
         self.size = 0
@@ -1969,7 +2023,7 @@ class HistoricalReplayBuffer:
         """Store a bounded random subset of ``windows`` (detached)."""
         if add_size <= 0 or len(windows) == 0 or self.capacity == 0:
             return
-        if windows.shape[1:] != (self.trajectory_length, SCENE_SIZE):
+        if windows.shape[1:] != (self.trajectory_length, self.scene_size):
             raise ValueError("historical windows have the wrong shape")
         windows = windows.detach().to(self.device, non_blocking=False)
         if len(windows) > add_size:
@@ -1982,7 +2036,7 @@ class HistoricalReplayBuffer:
             self.buffer = th.empty(
                 self.capacity,
                 self.trajectory_length,
-                SCENE_SIZE,
+                self.scene_size,
                 dtype=windows.dtype,
                 device=self.device,
             )
@@ -2008,7 +2062,7 @@ class HistoricalReplayBuffer:
             return th.empty(
                 0,
                 self.trajectory_length,
-                SCENE_SIZE,
+                self.scene_size,
                 device=device,
             )
         n = min(n, self.size)
@@ -2027,6 +2081,7 @@ class RecencyReplayBuffer:
         device: str | th.device,
         seed: int = 0,
         reservoir_fraction: float = 0.25,
+        scene_size: int = SCENE_SIZE,
     ) -> None:
         if capacity < 2:
             raise ValueError("recency replay capacity must be at least two")
@@ -2036,8 +2091,10 @@ class RecencyReplayBuffer:
         self.reservoir_capacity = max(1, round(capacity * reservoir_fraction))
         self.recent = HistoricalReplayBuffer(
             capacity - self.reservoir_capacity, trajectory_length, device, seed,
+            scene_size=scene_size,
         )
         self.trajectory_length = trajectory_length
+        self.scene_size = scene_size
         self.device = th.device(device)
         self.reservoir: th.Tensor | None = None
         self.reservoir_size = 0
@@ -2051,7 +2108,7 @@ class RecencyReplayBuffer:
     def add(self, windows: th.Tensor, add_size: int) -> None:
         if add_size <= 0 or len(windows) == 0:
             return
-        if windows.shape[1:] != (self.trajectory_length, SCENE_SIZE):
+        if windows.shape[1:] != (self.trajectory_length, self.scene_size):
             raise ValueError("historical windows have the wrong shape")
         windows = windows.detach().to(self.device, non_blocking=False)
         if len(windows) > add_size:
@@ -2061,7 +2118,7 @@ class RecencyReplayBuffer:
         self.recent.add(windows, len(windows))
         if self.reservoir is None:
             self.reservoir = windows.new_empty(
-                (self.reservoir_capacity, self.trajectory_length, SCENE_SIZE)
+                (self.reservoir_capacity, self.trajectory_length, self.scene_size)
             )
         filling = min(self.reservoir_capacity - self.reservoir_size, len(windows))
         if filling:
@@ -2093,7 +2150,7 @@ class RecencyReplayBuffer:
 
     def sample(self, n: int, device: str | th.device) -> th.Tensor:
         if self.size == 0:
-            return th.empty(0, self.trajectory_length, SCENE_SIZE, device=device)
+            return th.empty(0, self.trajectory_length, self.scene_size, device=device)
         n = min(n, self.size)
         n_old = min(int(n * self.reservoir_fraction), self.reservoir_size)
         if n > 1 and self.reservoir_size:
@@ -2124,8 +2181,8 @@ class SceneDiscriminator(nn.Module):
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
             raise ValueError("discriminator dimensions must be positive")
-        if n_cars not in (N_CARS, DOUBLES_N_CARS):
-            raise ValueError("scene discriminator needs two or four cars")
+        if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
+            raise ValueError("scene discriminator needs two, four, or six cars")
         self.n_cars = n_cars
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.recurrent_global = recurrent_global
@@ -2160,7 +2217,7 @@ class SceneDiscriminator(nn.Module):
 
     def forward(self, windows: th.Tensor) -> th.Tensor:
         if windows.ndim != 3 or windows.shape[-1] != self.scene_size:
-            raise ValueError("scene discriminator requires two- or four-car scene windows")
+            raise ValueError("scene discriminator requires matching scene windows")
         gru_out, _ = self.gru(self._encode(windows))
         return self.head(gru_out[:, -1]).squeeze(-1)
 
@@ -2245,7 +2302,7 @@ class SceneDiscriminator(nn.Module):
 
 
 class CausalSceneTransformer(nn.Module):
-    """Judge bounded, causal histories of the ball and both 1v1 cars."""
+    """Judge bounded, causal histories of the ball and both teams."""
 
     transformer_global = True
     recurrent_global = False
@@ -2254,22 +2311,26 @@ class CausalSceneTransformer(nn.Module):
 
     def __init__(
         self, frame_embedding: int, temporal_hidden: int, hidden_size: int = 128,
-        *, max_context: int = 128, layers: int = 2,
+        *, max_context: int = 128, layers: int = 2, n_cars: int = N_CARS,
     ) -> None:
         super().__init__()
         if (min(frame_embedding, temporal_hidden, hidden_size, max_context, layers) < 1
-                or temporal_hidden % 4):
+                 or temporal_hidden % 4):
             raise ValueError("Transformer dimensions must be positive and divisible by four")
+        if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
+            raise ValueError("Transformer needs two, four, or six cars")
+        self.n_cars = n_cars
+        self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.max_context = max_context
         self.ball_encoder = nn.Sequential(
             nn.Linear(BALL_SIZE, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
         self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + 2, hidden_size), nn.ReLU(),
+            nn.Linear(CAR_SIZE + n_cars, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding), nn.ReLU(),
         )
-        self.frame_projection = nn.Linear(frame_embedding * 3, temporal_hidden)
+        self.frame_projection = nn.Linear(frame_embedding * (n_cars + 1), temporal_hidden)
         self.position = nn.Embedding(max_context, temporal_hidden)
         self.temporal = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -2282,13 +2343,13 @@ class CausalSceneTransformer(nn.Module):
 
     def _encode(self, scenes: th.Tensor) -> th.Tensor:
         count, steps = scenes.shape[:2]
-        cars = scenes[..., BALL_SIZE:].reshape(count, steps, N_CARS, CAR_SIZE)
-        roles = th.eye(N_CARS, device=scenes.device, dtype=scenes.dtype)
-        roles = roles.view(1, 1, N_CARS, N_CARS).expand(count, steps, -1, -1)
+        cars = scenes[..., BALL_SIZE:].reshape(count, steps, self.n_cars, CAR_SIZE)
+        roles = th.eye(self.n_cars, device=scenes.device, dtype=scenes.dtype)
+        roles = roles.view(1, 1, self.n_cars, self.n_cars).expand(count, steps, -1, -1)
         encoded = self.car_encoder(th.cat((cars, roles), dim=-1))
         combined = th.cat((
             self.ball_encoder(scenes[..., :BALL_SIZE]),
-            encoded[:, :, 0], encoded[:, :, 1],
+            encoded.flatten(-2),
         ), dim=-1)
         return self.frame_projection(combined)
 
@@ -2296,10 +2357,10 @@ class CausalSceneTransformer(nn.Module):
         self, scenes: th.Tensor, ages: th.Tensor, *, return_previous: bool = False,
     ) -> th.Tensor | tuple[th.Tensor, th.Tensor]:
         """Score a real prefix, optionally including the score before its final frame."""
-        if (scenes.ndim != 3 or scenes.shape[-1] != SCENE_SIZE
+        if (scenes.ndim != 3 or scenes.shape[-1] != self.scene_size
                 or ages.shape != (len(scenes),) or not 1 <= scenes.shape[1] <= self.max_context
                 or (ages < 1).any() or (ages > scenes.shape[1]).any()):
-            raise ValueError("Transformer context needs valid 1v1 scenes and lengths")
+            raise ValueError("Transformer context needs valid scenes and lengths")
         # Align real left-padded scenes at the start before applying the causal mask.
         scenes = scenes[:, -int(ages.max()):]
         length = scenes.shape[1]
@@ -2369,12 +2430,12 @@ class FactorizedSceneDiscriminator(nn.Module):
         super().__init__()
         if min(frame_embedding, temporal_hidden, hidden_size) < 1:
             raise ValueError("discriminator dimensions must be positive")
-        if n_cars not in (N_CARS, DOUBLES_N_CARS):
-            raise ValueError("factorized discriminator needs two or four cars")
+        if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
+            raise ValueError("factorized discriminator needs two, four, or six cars")
         if _legacy_opponent_context and not _legacy_two_heads:
             raise ValueError("opponent context is only supported for legacy checkpoints")
-        if transformer_global and (n_cars != N_CARS or recurrent_global or _legacy_two_heads):
-            raise ValueError("1v1 Transformer requires a non-recurrent global head")
+        if transformer_global and (recurrent_global or _legacy_two_heads):
+            raise ValueError("Transformer requires a non-recurrent global head")
         self.n_cars = n_cars
         self.scene_size = BALL_SIZE + n_cars * CAR_SIZE
         self.recurrent_global = recurrent_global
@@ -2405,6 +2466,7 @@ class FactorizedSceneDiscriminator(nn.Module):
         self.global_discriminator = (
             None if _legacy_two_heads else CausalSceneTransformer(
                 frame_embedding, temporal_hidden, hidden_size, max_context=context_length,
+                n_cars=n_cars,
             ) if transformer_global else SceneDiscriminator(
                 frame_embedding, temporal_hidden, hidden_size, n_cars=n_cars,
                 recurrent_global=recurrent_global,
@@ -2652,32 +2714,26 @@ class ConfidentExpertResetTransform:
             self.discriminator.eval()
             try:
                 for chunk in starts.split(self.microbatch_size):
-                    windows = self.expert.frames[chunk[:, None] + self.expert.window_offsets]
                     contextual = (getattr(self.discriminator, "recurrent_global", False)
                                   or getattr(self.discriminator, "transformer_global", False))
-                    if contextual:
-                        context, ages = self.expert.context_frames(
-                            th.stack((chunk, th.zeros_like(chunk)), dim=-1),
-                            self.context_length, return_age=True,
-                        )
-                    else:
-                        context = ages = None
-                    confidence = self._confidence(windows, context, ages)
-                    paired = self.expert.opponent_pov_available[chunk]
-                    if paired.any():
+                    confidence = self.expert.frames.new_full((len(chunk),), -float("inf"))
+                    for actor in range(self.expert.n_cars):
+                        available = self.expert.pov_available[chunk, actor]
+                        if not available.any():
+                            continue
+                        pairs = th.stack((
+                            chunk[available], th.full_like(chunk[available], actor),
+                        ), dim=-1)
+                        windows = self.expert._windows_for_povs(pairs)
                         if contextual:
-                            opponent_context, opponent_ages = self.expert.context_frames(
-                                th.stack((chunk[paired], th.ones_like(chunk[paired])), dim=-1),
+                            context, ages = self.expert.context_frames(
+                                pairs,
                                 self.context_length, return_age=True,
                             )
                         else:
-                            opponent_context = opponent_ages = None
-                        confidence[paired] = th.maximum(
-                            confidence[paired],
-                            self._confidence(
-                                opponent_view(windows[paired]),
-                                opponent_context, opponent_ages,
-                            ),
+                            context = ages = None
+                        confidence[available] = th.maximum(
+                            confidence[available], self._confidence(windows, context, ages),
                         )
                     scores.append(confidence)
             finally:
@@ -3269,37 +3325,43 @@ class GeneratedManeuverTracker:
             )
 
 
-def simulation_episode_ends(episode_end: th.Tensor) -> th.Tensor:
-    """A 1v1 simulation resets both focal viewpoints when either actor is done."""
-    if episode_end.ndim != 2 or episode_end.shape[1] % N_CARS:
-        raise ValueError("1v1 episode ends need two actors per simulation")
+def simulation_episode_ends(
+    episode_end: th.Tensor, n_cars: int = N_CARS,
+) -> th.Tensor:
+    """A simulation resets all its actor viewpoints when any actor is done."""
+    if (n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS)
+            or episode_end.ndim != 2 or episode_end.shape[1] % n_cars):
+        raise ValueError("episode ends need complete simulations")
     return episode_end.bool().reshape(
-        len(episode_end), -1, N_CARS,
-    ).any(dim=-1).repeat_interleave(N_CARS, dim=-1)
+        len(episode_end), -1, n_cars,
+    ).any(dim=-1).repeat_interleave(n_cars, dim=-1)
 
 
 class GeneratedContextTimeline:
-    """Causal 1v1 actor histories, including a bounded prefix from the last rollout."""
+    """Causal actor histories, including a bounded prefix from the last rollout."""
 
     def __init__(
         self, windows: th.Tensor, n_envs: int, episode_end: th.Tensor | None,
         prefix_frames: th.Tensor | None = None, prefix_ends: th.Tensor | None = None,
     ) -> None:
-        if (windows.ndim != 3 or windows.shape[-1] != SCENE_SIZE or n_envs < 1
-                or n_envs % N_CARS or len(windows) % n_envs):
-            raise ValueError("generated context needs time-major 1v1 scene windows")
+        if windows.ndim != 3:
+            raise ValueError("generated context needs time-major scene windows")
+        n_cars = scene_car_count(windows)
+        if n_envs < 1 or n_envs % n_cars or len(windows) % n_envs:
+            raise ValueError("generated context needs complete simulation scenes")
         self.n_envs = n_envs
+        self.scene_size = windows.shape[-1]
         self.steps = len(windows) // n_envs
         if episode_end is not None and episode_end.shape != (self.steps, n_envs):
             raise ValueError("generated context episode ends must match actors")
         if (prefix_frames is None) != (prefix_ends is None):
             raise ValueError("generated context needs both previous frames and episode ends")
-        current = windows.reshape(self.steps, n_envs, windows.shape[1], SCENE_SIZE)[:, :, -1]
-        endings = (simulation_episode_ends(episode_end) if episode_end is not None else
+        current = windows.reshape(self.steps, n_envs, windows.shape[1], self.scene_size)[:, :, -1]
+        endings = (simulation_episode_ends(episode_end, n_cars) if episode_end is not None else
                    th.zeros((self.steps, n_envs), dtype=th.bool, device=windows.device))
         self.offset = 0
         if prefix_frames is not None:
-            if (prefix_frames.ndim != 3 or prefix_frames.shape[1:] != (n_envs, SCENE_SIZE)
+            if (prefix_frames.ndim != 3 or prefix_frames.shape[1:] != (n_envs, self.scene_size)
                     or prefix_ends.shape != prefix_frames.shape[:2]
                     or prefix_frames.device != windows.device
                     or prefix_ends.device != windows.device):
@@ -3319,7 +3381,7 @@ class GeneratedContextTimeline:
         if length < 1:
             raise ValueError("generated context length must be positive")
         if not len(indices):
-            return self.frames.new_empty((0, length, SCENE_SIZE)), indices.new_empty(0)
+            return self.frames.new_empty((0, length, self.scene_size)), indices.new_empty(0)
         if (indices < 0).any() or (indices >= self.steps * self.n_envs).any():
             raise ValueError("generated context indices must be in the rollout")
         time, actor = indices // self.n_envs + self.offset, indices % self.n_envs
@@ -3961,8 +4023,8 @@ class SceneDiscriminatorReward:
     mode rewards the change in expert log-odds or discount-adjusted capped
     expert odds as a scene frame is added. The Transformer global head always
     compares before and after that frame, including in exponential mode.
-    Physical bonuses are zero-sum in 1v1; goal and touch transitions remain
-    learnable before imitation windows are valid.
+    Physical bonuses are zero-sum between teams; goal and touch transitions
+    remain learnable before imitation windows are valid.
     """
 
     def __init__(
@@ -3995,6 +4057,10 @@ class SceneDiscriminatorReward:
         if not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
             raise ValueError("reward gamma must be in (0, 1]")
         self.discriminator = discriminator
+        self.scene_size = getattr(discriminator, "scene_size", SCENE_SIZE)
+        self.n_cars = (self.scene_size - BALL_SIZE) // CAR_SIZE
+        if self.scene_size not in SCENE_SIZES:
+            raise ValueError("discriminator reward needs two-, four-, or six-car scenes")
         self.factorize = getattr(discriminator, "factorized", False)
         self.recurrent_global = getattr(discriminator, "recurrent_global", False)
         self.transformer_global = getattr(discriminator, "transformer_global", False)
@@ -4049,7 +4115,7 @@ class SceneDiscriminatorReward:
         current_frames = windows[:, :, -1]
         # A window can be unscored while its scene still belongs to this episode.
         # Only a real termination clears recurrent memory.
-        current_ends = simulation_episode_ends(episode_end)
+        current_ends = simulation_episode_ends(episode_end, self.n_cars)
         have_history = (self._recent_frames is not None
                         and self._recent_frames.shape[1:] == current_frames.shape[1:])
         version = getattr(self.discriminator, "context_version", 0)
@@ -4122,9 +4188,9 @@ class SceneDiscriminatorReward:
         n_envs = valid.shape[1]
         previous = self._recent_frames
         previous_ends = self._recent_ends
-        if previous is not None and previous.shape[1:] != (n_envs, SCENE_SIZE):
+        if previous is not None and previous.shape[1:] != (n_envs, self.scene_size):
             previous = previous_ends = None
-        flat = windows.reshape(-1, self.trajectory_length, SCENE_SIZE)
+        flat = windows.reshape(-1, self.trajectory_length, self.scene_size)
         timeline = GeneratedContextTimeline(
             flat, n_envs, episode_end, previous, previous_ends,
         )
@@ -4143,8 +4209,8 @@ class SceneDiscriminatorReward:
                 add_scene_noise(context, self.noise_std), ages,
                 return_previous=True,
             )
-            # Both logits use the identical capped window. An old frame expiring
-            # from the context cannot earn reward just by disappearing.
+            # Compare logits from the same capped context so an old frame
+            # expiring cannot earn reward just by disappearing.
             result[chunk] = self._score_change(current, previous).clamp(
                 -self.max_magnitude, self.max_magnitude,
             )
@@ -4173,7 +4239,7 @@ class SceneDiscriminatorReward:
             scores.flatten()[valid.flatten()] = global_scores[valid.flatten()]
             return scores
 
-        flat_windows = windows.reshape(-1, self.trajectory_length, SCENE_SIZE)
+        flat_windows = windows.reshape(-1, self.trajectory_length, self.scene_size)
         flat_scores = scores.reshape(-1, 3) if self.factorize else scores.flatten()
         indices = th.nonzero(valid.flatten(), as_tuple=False).squeeze(-1)
         near = (nearest_ball_distance(flat_windows[indices]) <= BALL_NEAR_DISTANCE
@@ -4239,8 +4305,8 @@ class SceneDiscriminatorReward:
                 selected_scores[start:stop, 2] = global_scores[indices[start:stop]]
 
         if self.factorize:
-            # Normalize the specialist scores within their own proximity bands.
-            # The global score is normalized across every valid window.
+            # Normalize plain log-odds within specialist proximity bands; the
+            # non-Transformer global head uses all valid windows.
             gated = th.zeros_like(selected_scores)
             for head, active in enumerate((~near, near, th.ones_like(near))):
                 values = selected_scores[active, head]
@@ -4272,7 +4338,7 @@ class SceneDiscriminatorReward:
         windows = batch["scene_window"]
         valid = batch["scene_window_valid"].bool()
         if windows.shape[:2] != valid.shape or windows.shape[-2:] != (
-            self.trajectory_length, SCENE_SIZE
+            self.trajectory_length, self.scene_size
         ):
             raise ValueError("scene windows have the wrong shape")
 
@@ -4455,7 +4521,7 @@ class AdaptiveDiscriminatorUpdate:
             raise RuntimeError("no valid generated scene windows in rollout")
 
         flat_windows = windows.reshape(
-            -1, self.expert.trajectory_length, SCENE_SIZE
+            -1, self.expert.trajectory_length, self.expert.scene_size
         )
         train_indices, heldout_indices = self._split_generated(valid)
         terminal = batch.get("terminated")
@@ -4465,11 +4531,11 @@ class AdaptiveDiscriminatorUpdate:
         if self.transformer_global and terminal is None:
             raise ValueError("Transformer training needs episode ends")
         if terminal is not None and self.contextual_global:
-            terminal = simulation_episode_ends(terminal)
+            terminal = simulation_episode_ends(terminal, self.expert.n_cars)
         context_timeline = None
         if self.transformer_global:
             if (self._recent_context_frames is not None and
-                    self._recent_context_frames.shape[1:] != (valid.shape[1], SCENE_SIZE)):
+                    self._recent_context_frames.shape[1:] != (valid.shape[1], self.expert.scene_size)):
                 self._recent_context_frames = self._recent_context_ends = None
             context_timeline = GeneratedContextTimeline(
                 flat_windows, valid.shape[1], terminal,
@@ -4667,10 +4733,11 @@ class AdaptiveDiscriminatorUpdate:
     def _split_generated(
         self, valid: th.Tensor
     ) -> tuple[th.Tensor, th.Tensor]:
-        if valid.ndim != 2 or valid.shape[1] % N_CARS:
-            raise ValueError("generated validity must be [time, 1v1 actors]")
+        n_cars = self.expert.n_cars
+        if valid.ndim != 2 or valid.shape[1] % n_cars:
+            raise ValueError("generated validity must be [time, complete simulations]")
         T, n_envs = valid.shape
-        n_sim = n_envs // N_CARS
+        n_sim = n_envs // n_cars
         flat_valid = valid.flatten()
         valid_indices = th.nonzero(flat_valid, as_tuple=False).squeeze(-1)
         if self.heldout_size == 0 or n_sim < 2:
@@ -4679,7 +4746,7 @@ class AdaptiveDiscriminatorUpdate:
         if self._heldout_sim is not None:
             heldout_mask = (
                 self._heldout_sim.view(1, n_sim, 1)
-                .expand(T, n_sim, N_CARS)
+                .expand(T, n_sim, n_cars)
                 .reshape(T, n_envs)
                 & valid
             ).flatten()
@@ -4688,7 +4755,7 @@ class AdaptiveDiscriminatorUpdate:
                 th.nonzero(heldout_mask, as_tuple=False).squeeze(-1),
             )
 
-        per_sim = valid.view(T, n_sim, N_CARS).sum(dim=(0, 2))
+        per_sim = valid.view(T, n_sim, n_cars).sum(dim=(0, 2))
         candidates = th.nonzero(per_sim > 0, as_tuple=False).squeeze(-1)
         if len(candidates) < 2:
             return valid_indices, valid_indices[:0]
@@ -4708,7 +4775,7 @@ class AdaptiveDiscriminatorUpdate:
         self._heldout_sim = heldout_sim
         heldout_mask = (
             heldout_sim.view(1, n_sim, 1)
-            .expand(T, n_sim, N_CARS)
+            .expand(T, n_sim, n_cars)
             .reshape(T, n_envs)
             & valid
         ).flatten()
@@ -4964,7 +5031,11 @@ class GAIFOCheckpoints:
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
             "config": {
-                "architecture": GAIFO_GRU_ARCHITECTURE if self.args.gru else GAIFO_ARCHITECTURE,
+                "architecture": (
+                    GAIFO_GRU_ARCHITECTURE if self.args.gru else GAIFO_ARCHITECTURE
+                ) if getattr(self.args, "team_size", 1) == 1 else (
+                    GAIFO_TEAM_GRU_ARCHITECTURE if self.args.gru else GAIFO_TEAM_ARCHITECTURE
+                ),
                 **{
                     name: str(value) if isinstance(value, Path) else value
                     for name, value in vars(self.args).items()
@@ -4995,9 +5066,20 @@ def load_resume_checkpoint(path: Path) -> dict:
         raise ValueError(f"invalid GAIFO checkpoint: {path}")
     config = payload["config"]
     architecture = config.get("architecture")
-    if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+    legacy = (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE)
+    teams = (GAIFO_TEAM_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE)
+    if architecture not in (*legacy, *teams):
         raise ValueError(f"incompatible GAIFO architecture in {path}")
-    if config.get("gru", False) != (architecture == GAIFO_GRU_ARCHITECTURE):
+    team_size = config.get("team_size", 1)
+    try:
+        n_cars = team_car_count(team_size)
+    except ValueError as error:
+        raise ValueError(f"checkpoint has an invalid team size: {path}") from error
+    if (architecture in legacy) != (team_size == 1):
+        raise ValueError(f"checkpoint team size does not match architecture in {path}")
+    if config.get("gru", False) != (
+        architecture in (GAIFO_GRU_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE)
+    ):
         raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
     step = payload.get("step")
     if type(step) is not int or step < 0:
@@ -5005,7 +5087,7 @@ def load_resume_checkpoint(path: Path) -> dict:
     for name in ("n_sim", "rollout"):
         if type(config.get(name)) is not int or config[name] < 1:
             raise ValueError(f"checkpoint has an invalid {name}: {path}")
-    if step % (config["n_sim"] * N_CARS):
+    if step % (config["n_sim"] * n_cars):
         raise ValueError(f"checkpoint step is not a complete vector step: {path}")
     required = (
         "policy", "critic", "discriminator", "policy_optimizer",
@@ -5043,6 +5125,8 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         )
     if args.factorize != config.get("factorize", False):
         raise ValueError("--factorize must match the checkpoint discriminator when resuming")
+    if getattr(args, "team_size", 1) != config.get("team_size", 1):
+        raise ValueError("--team-size must match the checkpoint when resuming")
     if getattr(args, "expired_dodge_mask", config.get("expired_dodge_mask", False)) != (
         config.get("expired_dodge_mask", False)
     ):
@@ -5101,7 +5185,9 @@ def restore_training_checkpoint(
     if "clock" in payload:
         return Clock(**payload["clock"])
     config = payload["config"]
-    vector_steps = payload["step"] // (config["n_sim"] * N_CARS)
+    vector_steps = payload["step"] // (
+        config["n_sim"] * team_car_count(config.get("team_size", 1))
+    )
     return Clock(
         vector_steps=vector_steps,
         env_steps=payload["step"],
@@ -5140,7 +5226,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
 
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
-        description="GAIfO imitation learning for 1v1 Rocket League via CARL and JARL."
+        description="GAIfO imitation learning for 1v1, 2v2, or 3v3 Rocket League."
     )
     parser.add_argument(
         "--resume-checkpoint", type=Path,
@@ -5150,11 +5236,12 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--replay-dir",
         type=Path,
         required=resume is None,
-        help="1v1 replay folder or its parent containing pro_1v1_fs4",
+        help="parsed replay folder or its parent containing pro_<mode>_fs4",
     )
+    parser.add_argument("--team-size", type=int, choices=TEAM_SIZES, default=1)
     parser.add_argument(
         "--n-sim", type=int, default=None,
-        help="parallel simulations (default: 16384 for GRU, 256 for Transformer)",
+        help="parallel simulations (default scales with team size and discriminator)",
     )
     parser.add_argument("--frameskip", type=int, default=4)
     add_feature_option(
@@ -5174,7 +5261,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     add_feature_option(
         parser, "--transformer", "--transformer-global", dest="transformer_global",
-        help="use a capped causal Transformer for the 1v1 global discriminator (default: GRU)",
+        help="use a capped causal Transformer for the global discriminator (default: GRU)",
     )
     parser.add_argument(
         "--discriminator-context-length", type=int, default=None,
@@ -5323,6 +5410,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
             )
         }
         # Checkpoints predating configurable depth used one hidden layer.
+        inherited.setdefault("team_size", 1)
         inherited.setdefault("policy_layers", 1)
         inherited.setdefault("critic_layers", 1)
         inherited.setdefault("expired_dodge_mask", False)
@@ -5331,11 +5419,14 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         parser.set_defaults(**inherited)
     args = parser.parse_args()
     if args.n_sim is None:
-        args.n_sim = 256 if args.transformer_global else 16_384
+        args.n_sim = (256 // args.team_size if args.transformer_global else
+                      {1: 16_384, 2: 4_096, 3: 2_048}[args.team_size])
     if args.discriminator_batch is None:
-        args.discriminator_batch = 2_048 if args.transformer_global else 16_384
+        args.discriminator_batch = (2_048 if args.transformer_global else
+                                    {1: 16_384, 2: 4_096, 3: 2_048}[args.team_size])
     if args.discriminator_heldout_size is None:
-        args.discriminator_heldout_size = 512 if args.transformer_global else 16_384
+        args.discriminator_heldout_size = (512 if args.transformer_global else
+                                           {1: 16_384, 2: 2_048, 3: 1_024}[args.team_size])
     if args.discriminator_context_length is None:
         args.discriminator_context_length = 128 if args.transformer_global else 16
     if args.discriminator_context_stride is None:
@@ -5352,27 +5443,30 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    n_cars = team_car_count(getattr(args, "team_size", 1))
+    team_size = n_cars // 2
     if not args.replay_dir.is_dir():
         raise FileNotFoundError(args.replay_dir)
 
     replay_dir = args.replay_dir
     if not next(replay_dir.glob("*.npy"), None):
-        for name in (f"pro_1v1_fs{args.frameskip}", "pro_1v1_fs4"):
+        for name in (f"pro_{team_size}v{team_size}_fs{args.frameskip}",
+                     f"pro_{team_size}v{team_size}_fs4"):
             candidate = replay_dir / name
             if candidate.is_dir():
                 replay_dir = candidate
                 break
 
-    found_1v1 = False
+    found_mode = False
     for path in replay_dir.glob("*.npy"):
         source = np.load(path, mmap_mode="r")
-        if source.ndim == 2 and source.shape[1] == 161:
-            found_1v1 = True
+        if source.ndim == 2 and source.shape[1] == team_replay_row_size(team_size):
+            found_mode = True
             break
-    if not found_1v1:
-        raise FileNotFoundError(f"no 1v1 replay files in {args.replay_dir}")
+    if not found_mode:
+        raise FileNotFoundError(f"no {team_size}v{team_size} replay files in {args.replay_dir}")
     if replay_dir != args.replay_dir:
-        print(f"Using 1v1 replays from {replay_dir}")
+        print(f"Using {team_size}v{team_size} replays from {replay_dir}")
         args.replay_dir = replay_dir
 
     if args.transformer_global and args.recurrent_global:
@@ -5514,14 +5608,14 @@ def validate_args(args: argparse.Namespace) -> None:
 
     generated_windows = max(
         0, args.rollout - (args.trajectory_length - 2)
-    ) * args.n_sim * N_CARS
+    ) * args.n_sim * n_cars
     if generated_windows < args.discriminator_batch:
         raise ValueError(
             f"rollout is too short to produce a discriminator batch: "
             f"{generated_windows} generated windows, batch size {args.discriminator_batch}"
         )
 
-    n_envs = args.n_sim * 2
+    n_envs = args.n_sim * n_cars
     if args.ppo_batch > args.rollout * n_envs:
         raise ValueError("--ppo-batch must fit the rollout size")
     if args.gru:
@@ -5532,12 +5626,13 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
+    team_size = getattr(args, "team_size", 1)
     env_type = (DodgeAwareCARLTorchVectorEnv if getattr(args, "expired_dodge_mask", True)
                 else CARLTorchVectorEnv)
     return env_type(
         n_sim=args.n_sim,
-        n_blue=1,
-        n_orange=1,
+        n_blue=team_size,
+        n_orange=team_size,
         seed=args.seed,
         frameskip=args.frameskip,
         max_ticks=args.max_ticks,
@@ -5581,16 +5676,19 @@ def build_critic(env, args: argparse.Namespace) -> Critic:
 def build_discriminator(
     args: argparse.Namespace,
 ) -> SceneDiscriminator | CausalSceneTransformer | FactorizedSceneDiscriminator:
+    n_cars = team_car_count(getattr(args, "team_size", 1))
     if getattr(args, "transformer_global", False) and not args.factorize:
         return CausalSceneTransformer(
             args.frame_embedding, args.temporal_hidden, args.discriminator_hidden,
             max_context=args.discriminator_context_length,
+            n_cars=n_cars,
         )
     model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
     options = dict(
         frame_embedding=args.frame_embedding,
         temporal_hidden=args.temporal_hidden,
         hidden_size=args.discriminator_hidden,
+        n_cars=n_cars,
         recurrent_global=getattr(args, "recurrent_global", False),
     )
     if args.factorize:
@@ -5614,7 +5712,9 @@ def build_runner(
         captures.append(AdvancedTouchCapture(gameplay))
         if getattr(args, "factorize", False):
             captures.append(EgoBallTouchCapture(gameplay))
-    captures.append(SceneWindowCapture(args.trajectory_length))
+    captures.append(SceneWindowCapture(
+        args.trajectory_length, team_car_count(getattr(args, "team_size", 1)),
+    ))
     return Runner(env, policy, buffer, captures=captures)
 
 
@@ -5683,6 +5783,7 @@ def main() -> None:
         env.n_sim,
         env.device,
         math.ceil(args.no_touch_timeout * 120.0 / args.frameskip),
+        n_cars=team_car_count(args.team_size),
     ))
     policy = build_policy(env, args)
     critic = build_critic(env, args)
@@ -5700,6 +5801,7 @@ def main() -> None:
         skill_sampling=args.curated_skill_sampling,
         driving_fraction=args.general_driving_fraction,
         kickoff_fraction=args.kickoff_fraction,
+        team_size=args.team_size,
     )
     if expert.train_total < 1:
         raise ValueError("expert dataset contains no training windows")
@@ -5733,7 +5835,7 @@ def main() -> None:
 
     history_options = dict(
         capacity=args.history_capacity, trajectory_length=args.trajectory_length,
-        device=env.device, seed=args.seed,
+        device=env.device, seed=args.seed, scene_size=expert.scene_size,
     )
     history = (
         RecencyReplayBuffer(
@@ -5750,7 +5852,7 @@ def main() -> None:
                       / args.discriminator_context_length),
             ),
             trajectory_length=args.discriminator_context_length,
-            device=env.device, seed=args.seed,
+            device=env.device, seed=args.seed, scene_size=expert.scene_size,
         )
         context_history = (
             RecencyReplayBuffer(

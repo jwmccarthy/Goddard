@@ -1,4 +1,4 @@
-"""Select recent ranked duels by verified player ID, then download/parse only new games."""
+"""Select ranked 1v1, 2v2, or 3v3 by verified player ID and parse new games."""
 
 import argparse
 import hashlib
@@ -9,6 +9,8 @@ import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from replay_layout import TEAM_SIZES
 
 try:
     from ballchasing_replays.ballchasing_api import BallchasingClient
@@ -22,6 +24,7 @@ UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$", re.I)
 DEFAULT_ROSTER = Path(__file__).resolve().parent.parent / "mechanical_duels_roster.json"
 DEFAULT_REPLAYS = Path(__file__).resolve().parent / "mechanical_duels" / "replays"
 DEFAULT_PARSED = Path(__file__).resolve().parent.parent / "parsed_replays" / "pro_1v1_fs4"
+PLAYLISTS = {1: "ranked-duels", 2: "ranked-doubles", 3: "ranked-standard"}
 
 
 def month_offset(day: datetime, months: int) -> datetime:
@@ -39,10 +42,10 @@ def replay_datetime(value: str) -> datetime:
     return date.replace(tzinfo=timezone.utc) if date.tzinfo is None else date.astimezone(timezone.utc)
 
 
-def replay_player_ids(replay: dict) -> tuple[str, ...] | None:
+def replay_player_ids(replay: dict, team_size: int = 1) -> tuple[str, ...] | None:
     blue = replay.get("blue", {}).get("players", ())
     orange = replay.get("orange", {}).get("players", ())
-    if len(blue) != 1 or len(orange) != 1:
+    if len(blue) != team_size or len(orange) != team_size:
         return None
     result = []
     for player in (*blue, *orange):
@@ -53,10 +56,12 @@ def replay_player_ids(replay: dict) -> tuple[str, ...] | None:
     return tuple(result)
 
 
-def accepted_replay(replay: dict, player_id: str, after: datetime, before: datetime) -> bool:
-    players = replay_player_ids(replay)
+def accepted_replay(
+    replay: dict, player_id: str, after: datetime, before: datetime, team_size: int = 1,
+) -> bool:
+    players = replay_player_ids(replay, team_size)
     return bool(
-        replay.get("playlist_id") == "ranked-duels"
+        replay.get("playlist_id") == PLAYLISTS[team_size]
         and players is not None and player_id in players
         and replay.get("duration", 0) >= 60
         and after <= replay_datetime(replay["date"]) < before
@@ -77,7 +82,7 @@ def verified_players(roster: dict) -> dict[str, str]:
 
 def select_replays(
     client: BallchasingClient, roster: dict, after: datetime, before: datetime,
-    *, max_per_player: int = 200, max_pages: int = 4,
+    *, max_per_player: int = 200, max_pages: int = 4, team_size: int = 1,
 ) -> tuple[dict[str, dict], dict[str, dict]]:
     """Spread each player's capped selection across roughly three-month intervals."""
     if max_per_player < 1 or max_pages < 1 or after >= before:
@@ -108,7 +113,7 @@ def select_replays(
             if quota:
                 for platform_id in player["platform_ids"]:
                     pages = client.iter_replay_pages(
-                        playlist="ranked-duels", player_id=platform_id,
+                        playlist=PLAYLISTS[team_size], player_id=platform_id,
                         replay_date_after=start.isoformat(),
                         replay_date_before=end.isoformat(),
                         count=200, sort_by="replay-date", sort_dir="desc",
@@ -118,10 +123,11 @@ def select_replays(
                             replay_id = replay.get("id", "").lower()
                             if (
                                 found >= quota
-                                or not accepted_replay(replay, platform_id.lower(), start, end)
+                                or not accepted_replay(replay, platform_id.lower(), start, end,
+                                                       team_size)
                             ):
                                 continue
-                            present = replay_player_ids(replay)
+                            present = replay_player_ids(replay, team_size)
                             match_key = (
                                 str(replay.get("rocket_league_id") or replay_id).lower(),
                                 tuple(sorted(present)),
@@ -222,8 +228,9 @@ def choose_focal_povs(replays: dict[str, dict], roster_names: list[str]) -> None
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
-    parser.add_argument("--replay-dir", type=Path, default=DEFAULT_REPLAYS)
-    parser.add_argument("--parsed-dir", type=Path, default=DEFAULT_PARSED)
+    parser.add_argument("--team-size", type=int, choices=TEAM_SIZES, default=1)
+    parser.add_argument("--replay-dir", type=Path)
+    parser.add_argument("--parsed-dir", type=Path)
     parser.add_argument("--max-per-player", type=int, default=200)
     parser.add_argument("--max-downloads", type=int, default=600)
     parser.add_argument("--max-pages-per-period", type=int, default=4)
@@ -233,6 +240,12 @@ def main() -> None:
     parser.add_argument("--parse", action="store_true")
     parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args()
+    if args.replay_dir is None:
+        args.replay_dir = (DEFAULT_REPLAYS if args.team_size == 1 else
+                           DEFAULT_REPLAYS.parent.parent / f"mechanical_{args.team_size}v{args.team_size}" / "replays")
+    if args.parsed_dir is None:
+        args.parsed_dir = (DEFAULT_PARSED if args.team_size == 1 else
+                           DEFAULT_PARSED.parent / f"pro_{args.team_size}v{args.team_size}_fs4")
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     after = replay_datetime(args.since) if args.since else month_offset(today, -24)
     before = replay_datetime(args.until) if args.until else today + timedelta(days=1)
@@ -247,12 +260,14 @@ def main() -> None:
     selected, counts = select_replays(
         client, roster, after, before,
         max_per_player=args.max_per_player, max_pages=args.max_pages_per_period,
+        team_size=args.team_size,
     )
-    skip = existing_replay_ids([
-        args.parsed_dir, args.parsed_dir.parent / "pro_1v1_fs4",
-        args.parsed_dir.parent / "mechanical_1v1_fs4",
-        args.parsed_dir.parent / "ranked",
-    ])
+    mode = f"{args.team_size}v{args.team_size}"
+    parsed_dirs = [args.parsed_dir, args.parsed_dir.parent / f"pro_{mode}_fs4",
+                   args.parsed_dir.parent / f"mechanical_{mode}_fs4"]
+    if args.team_size == 1:
+        parsed_dirs.append(args.parsed_dir.parent / "ranked")
+    skip = existing_replay_ids(parsed_dirs)
     raw = downloaded_replay_ids(args.replay_dir)
     new = {replay_id: replay for replay_id, replay in selected.items()
            if replay_id not in skip and replay_id not in raw}
@@ -260,7 +275,7 @@ def main() -> None:
         new, [player["name"] for player in roster["players"]], args.max_downloads,
     )
     print(f"{after.date()} to {before.date()} (exclusive): "
-          f"{len(selected)} ranked duels selected under per-player quotas, "
+          f"{len(selected)} {PLAYLISTS[args.team_size]} selected under per-player quotas, "
           f"{len(set(selected) & skip)} already parsed, "
           f"{len((set(selected) & raw) - skip)} already downloaded, "
           f"{len(fresh)} selected for download")
@@ -271,13 +286,15 @@ def main() -> None:
     selection_path = args.replay_dir / "ranked_selection.json"
     pov_path = args.replay_dir / "pov_players.json"
     previous = json.loads(selection_path.read_text()) if selection_path.exists() else {}
+    if previous and previous.get("playlist") != PLAYLISTS[args.team_size]:
+        raise ValueError(f"existing selection in {args.replay_dir} belongs to another playlist")
     history = previous.get("selected", {})
     history.update({replay_id: replay for replay_id, replay in selected.items()
                     if replay_id in raw and replay_id not in skip})
     history.update({replay_id: selected[replay_id] for replay_id in fresh})
     choose_focal_povs(history, [player["name"] for player in roster["players"]])
     selection = {
-        "playlist": "ranked-duels", "after": after.isoformat(),
+        "playlist": PLAYLISTS[args.team_size], "after": after.isoformat(),
         "before": before.isoformat(), "per_player": counts, "selected": history,
     }
     selection_path.write_text(
@@ -292,9 +309,10 @@ def main() -> None:
         client.download_replays(fresh, args.replay_dir)
         if args.parse:
             parse(str(args.replay_dir), str(args.parsed_dir), frame_skip=4,
-                   workers=args.workers,
-                   pov_manifest=str(pov_path), replay_ids=set(history),
-                   require_pov_manifest=True, fail_on_errors=True)
+                    workers=args.workers,
+                    pov_manifest=str(pov_path), replay_ids=set(history),
+                    require_pov_manifest=True, fail_on_errors=True,
+                    team_size=args.team_size)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch Basic or GAIFO 1v1 checkpoints play in the browser."""
+"""Watch Basic or GAIFO checkpoints play in the browser."""
 
 import argparse
 import json
@@ -27,6 +27,8 @@ from dodge_window import DodgeAwareCARLTorchVectorEnv
 from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
+    GAIFO_TEAM_ARCHITECTURE,
+    GAIFO_TEAM_GRU_ARCHITECTURE,
     SKILL_CATEGORIES,
     CuratedReplayResetTransform,
     ExpertSceneDataset,
@@ -35,6 +37,7 @@ from gaifo import (
 from replay_resets import (
     ReplayResetProvider, reset_index_dataset,
 )
+from replay_layout import TEAM_SIZES
 
 
 ROOT = Path(__file__).resolve().parent
@@ -254,12 +257,13 @@ def load_curated_reset_provider(
     state_limit: int,
     corpus_limit: int | None,
     seed: int,
+    team_size: int = 1,
 ) -> CuratedViewerResetProvider:
     """Classify complete replay periods, then retain a bounded GPU reset cache."""
     expert = ExpertSceneDataset(
         replay_dir, trajectory_length=8, limit=corpus_limit, seed=seed,
         frame_skip=frame_skip, device="cpu", reject_discontinuities=True,
-        skill_sampling=True,
+        skill_sampling=True, team_size=team_size,
     )
     transform = CuratedReplayResetTransform(expert)
     weights = transform.weights.cpu().numpy()
@@ -314,11 +318,15 @@ def load_policy_checkpoint(
     kind = checkpoint_kind(path)
     if kind == "gaifo":
         architecture = config.get("architecture")
-        if architecture not in (GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE):
+        if architecture not in (
+            GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+            GAIFO_TEAM_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE,
+        ):
             raise ValueError(f"unsupported GAIFO architecture in {path}")
-        if config.get("team_size", 1) != 1:
-            raise ValueError(f"checkpoint team size is not 1v1: {path}")
-        gru = architecture == GAIFO_GRU_ARCHITECTURE
+        team_size = config.get("team_size", 1)
+        if 2 * team_size != getattr(env, "n_cars", 2):
+            raise ValueError(f"checkpoint team size does not match the viewer: {path}")
+        gru = architecture in (GAIFO_GRU_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE)
         if config.get("gru", False) != gru:
             raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
         hidden = int(config["policy_hidden"])
@@ -357,6 +365,8 @@ def load_policy_checkpoint(
         (kind, hidden, architecture, layers) if architecture is not None else
         (kind, hidden, architecture)
     )
+    if kind == "gaifo" and team_size > 1:
+        signature = (*signature, team_size)
     return policy.eval().requires_grad_(False), signature
 
 
@@ -439,9 +449,10 @@ def render_frame(
     orange_score: int,
     round_number: int,
     tick: int,
+    team_size: int = 1,
 ) -> dict:
     raw = raw[0].cpu()
-    cars = raw[9:53].view(2, 22)
+    cars = raw[9:9 + 44 * team_size].view(2 * team_size, 22)
     rendered = []
     for index, car in enumerate(cars):
         forward = car[9:12]
@@ -454,8 +465,8 @@ def render_frame(
             + up * CAR_OFFSET[2]
         )
         rendered.append({
-            "team": index,
-            "player": 1,
+            "team": index // team_size,
+            "player": index % team_size + 1,
             "pos": vector(center),
             "fwd": vector(forward),
             "rgt": vector(right),
@@ -506,12 +517,13 @@ def simulate(
         reset_provider = load_curated_reset_provider(
             args.replay_dir, "cuda:0", args.frameskip, args.reset_state_limit,
             args.reset_corpus_limit or None, args.seed,
+            team_size=args.team_size,
         )
         state.configure_reset_types(tuple(reset_provider.providers))
         base = DodgeAwareCARLTorchVectorEnv(
             n_sim=1,
-            n_blue=1,
-            n_orange=1,
+            n_blue=args.team_size,
+            n_orange=args.team_size,
             seed=args.seed,
             frameskip=args.frameskip,
             max_ticks=args.max_ticks,
@@ -524,8 +536,8 @@ def simulate(
             blue_path, orange_path, base, args.frameskip, args.hidden_size,
         )
         observation = env.reset()
-        blue_state = blue.initial_state(1)
-        orange_state = orange.initial_state(1)
+        blue_state = blue.initial_state(args.team_size)
+        orange_state = orange.initial_state(args.team_size)
         blue_score = orange_score = 0
         round_number = 1
         tick = 0
@@ -545,8 +557,8 @@ def simulate(
                     blue_path, orange_path = pending
                     env = next_env
                     blue, orange = next_blue, next_orange
-                    blue_state = blue.initial_state(1)
-                    orange_state = orange.initial_state(1)
+                    blue_state = blue.initial_state(args.team_size)
+                    orange_state = orange.initial_state(args.team_size)
                     state.request_reset()
 
             request = state.take_reset_request()
@@ -554,19 +566,19 @@ def simulate(
                 kickoff, reset_type = request
                 reset_provider.select(reset_type)
                 observation = reset_observation(env, kickoff)
-                blue_state = blue.initial_state(1)
-                orange_state = orange.initial_state(1)
+                blue_state = blue.initial_state(args.team_size)
+                orange_state = orange.initial_state(args.team_size)
                 blue_score = orange_score = 0
                 round_number = 1
                 tick = 0
 
             with th.inference_mode():
                 blue_output = blue.act(
-                    policy_observation(blue, observation[:1]), blue_state,
+                    policy_observation(blue, observation[:args.team_size]), blue_state,
                     deterministic=not args.sample,
                 )
                 orange_output = orange.act(
-                    policy_observation(orange, observation[1:]), orange_state,
+                    policy_observation(orange, observation[args.team_size:]), orange_state,
                     deterministic=not args.sample,
                 )
                 blue_state = blue_output.next_state
@@ -579,8 +591,8 @@ def simulate(
             blue_score += max(goal, 0)
             orange_score += max(-goal, 0)
             if (terminated | truncated).any():
-                blue_state = blue.initial_state(1)
-                orange_state = orange.initial_state(1)
+                blue_state = blue.initial_state(args.team_size)
+                orange_state = orange.initial_state(args.team_size)
                 round_number += 1
                 tick = 0
 
@@ -593,6 +605,7 @@ def simulate(
                 orange_score,
                 round_number,
                 tick,
+                args.team_size,
             ))
             next_step += args.frameskip / 120.0
             delay = next_step - time.perf_counter()
@@ -718,9 +731,10 @@ def make_handler(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "checkpoints")
+    parser.add_argument("--team-size", type=int, choices=TEAM_SIZES, default=1)
     parser.add_argument(
         "--replay-dir", type=Path,
-        help="parsed POV directory (default: pro_1v1_fs4)",
+        help="parsed POV directory (default: pro_<team-size>v<team-size>_fs4)",
     )
     parser.add_argument("--blue")
     parser.add_argument("--orange")
@@ -742,7 +756,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
     if args.replay_dir is None:
-        args.replay_dir = ROOT / "parsed_replays/pro_1v1_fs4"
+        args.replay_dir = (ROOT / "parsed_replays" /
+                           f"pro_{args.team_size}v{args.team_size}_fs4")
     if (args.blue is None) != (args.orange is None):
         parser.error("--blue and --orange must be provided together")
     if args.frameskip < 1 or args.max_ticks < 1 or args.reset_state_limit < 1:

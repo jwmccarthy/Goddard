@@ -92,7 +92,11 @@ function makeCar(color) {
   return { group, material };
 }
 
-const cars = [makeCar(0x5e9dfb), makeCar(0xff955b)];
+const cars = [];
+const carColors = [
+  [0x5e9dfb, 0x9bc6ff, 0x3056a3],
+  [0xff955b, 0xffc080, 0xb75939],
+];
 const ball = new THREE.Mesh(
   new THREE.SphereGeometry(91.25, 24, 16),
   new THREE.MeshStandardMaterial({ color: 0xf8f4e9, emissive: 0x275451, roughness: .28 }),
@@ -106,8 +110,10 @@ const forward = new THREE.Vector3();
 const right = new THREE.Vector3();
 const up = new THREE.Vector3();
 
-function setCar(index, state) {
+function setCar(index, state, color) {
   const car = cars[index];
+  car.material.color.setHex(color);
+  car.material.emissive.setHex(color);
   car.group.visible = !state.demoed;
   car.group.position.fromArray(state.pos);
   forward.fromArray(state.fwd);
@@ -392,7 +398,8 @@ async function selectSequence(id) {
     }
     $('clipTitle').textContent = `${clip.skill.replaceAll('_', ' ')} / #${clip.id}`;
     $('clipSource').textContent = clip.source;
-    $('clipActor').textContent = clip.actor === 0 ? 'Blue' : 'Orange';
+    const team = clip.actor < clip.team_size ? 'Blue' : 'Orange';
+    $('clipActor').textContent = clip.team_size === 1 ? team : `${team} P${clip.actor % clip.team_size + 1}`;
     $('clipSplit').textContent = clip.split === 'heldout' ? 'Held-out' : 'Training';
     $('clipRows').textContent = `${clip.source_start.toLocaleString()} – ${clip.source_stop.toLocaleString()}`;
     $('clipDuration').textContent = `${(clip.frames.length * clip.frame_skip / 120).toFixed(2)} s`;
@@ -435,7 +442,15 @@ function showFrame(index) {
   frameIndex = Math.max(0, Math.min(clip.frames.length - 1, Math.round(index)));
   const state = clip.frames[frameIndex];
   ball.position.fromArray(state.ball);
-  state.cars.forEach((car, idx) => setCar(idx, car));
+  state.cars.forEach((car, idx) => {
+    const teamSize = state.cars.length / 2;
+    const color = carColors[Math.floor(idx / teamSize)][idx % teamSize % 3];
+    if (!cars[idx]) {
+      cars[idx] = makeCar(color);
+    }
+    setCar(idx, car, color);
+  });
+  for (const car of cars.slice(state.cars.length)) car.group.visible = false;
   $('frameSlider').value = frameIndex;
   $('frameTime').textContent = `${(frameIndex * clip.frame_skip / 120).toFixed(2)} s`;
   $('frameLabel').textContent = `row ${clip.source_start + frameIndex} / ${clip.source_stop}${state.touch ? ' · EGO TOUCH' : ''}${clip.goal_terminal && frameIndex === clip.frames.length - 1 ? ' · GOAL' : ''}`;

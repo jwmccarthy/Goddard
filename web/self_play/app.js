@@ -130,7 +130,11 @@ function makeCar(color) {
   return { group, material };
 }
 
-const cars = [makeCar(0x145bd7), makeCar(0xe65b35)];
+const cars = [];
+const carColors = [
+  [0x145bd7, 0x4895f5, 0x0b3479],
+  [0xe65b35, 0xffa365, 0xa54125],
+];
 const ball = new THREE.Mesh(
   new THREE.SphereGeometry(91.25, 28, 20),
   new THREE.MeshStandardMaterial({ color: 0xf8fbfc, roughness: 0.3, metalness: 0.04 }),
@@ -167,17 +171,21 @@ source.onmessage = ({ data }) => {
     connection.classList.remove('live');
     return;
   }
-  setCar(0, frame.cars[0]);
-  setCar(1, frame.cars[1]);
+  for (const [index, car] of frame.cars.entries()) {
+    if (!cars[index]) cars[index] = makeCar(carColors[car.team][(car.player - 1) % 3]);
+    setCar(index, car);
+  }
+  for (const car of cars.slice(frame.cars.length)) car.group.visible = false;
+  const orangeIndex = frame.cars.length / 2;
   ball.position.fromArray(frame.ball.pos);
   blueLabel.textContent = frame.blue.checkpoint;
   orangeLabel.textContent = frame.orange.checkpoint;
   goals.textContent = `${frame.blue.score} - ${frame.orange.score}`;
   roundLabel.textContent = `round ${frame.round} | tick ${frame.tick}`;
   blueBoost.textContent = frame.cars[0].boost.toFixed(0);
-  orangeBoost.textContent = frame.cars[1].boost.toFixed(0);
+  orangeBoost.textContent = frame.cars[orangeIndex].boost.toFixed(0);
   blueBoostFill.style.width = `${frame.cars[0].boost}%`;
-  orangeBoostFill.style.width = `${frame.cars[1].boost}%`;
+  orangeBoostFill.style.width = `${frame.cars[orangeIndex].boost}%`;
   if (!initialSelection) {
     blueCheckpoint.value = frame.blue.path;
     orangeCheckpoint.value = frame.orange.path;

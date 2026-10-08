@@ -26,14 +26,16 @@ import torch as th
 from gaifo import (
     BALL_NEAR_DISTANCE, BALL_RADIUS, BLUE_START, CAR_SIZE,
     GLOBAL_DISCRIMINATOR_WEIGHT, SPECIALIST_DISCRIMINATOR_WEIGHT, GAIFO_ARCHITECTURE,
-    GAIFO_GRU_ARCHITECTURE, GROUND_MANEUVERS,
+    GAIFO_GRU_ARCHITECTURE, GAIFO_TEAM_ARCHITECTURE,
+    GAIFO_TEAM_GRU_ARCHITECTURE, GROUND_MANEUVERS,
     GROUND_MANEUVER_START, DRIVING_SKILL, KICKOFF_SKILL,
-    ORANGE_START, POSITION_SCALE,
+    POSITION_SCALE,
     SKILL_CATEGORIES,
     ExpertSceneDataset, FactorizedSceneDiscriminator, build_discriminator,
     bounded_context_batch_size, load_discriminator_state, nearest_ball_distance,
-    opponent_view,
+    actor_view,
 )
+from replay_layout import team_replay_row_size
 from watch_checkpoints import CheckpointRegistry
 
 
@@ -75,9 +77,11 @@ def load_discriminator(path: Path, device: th.device):
     config = payload["config"]
     if config.get("architecture") not in (
         GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+        GAIFO_TEAM_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE,
     ) or "discriminator" not in payload:
-        raise ValueError(f"checkpoint has no supported 1v1 discriminator: {path}")
+        raise ValueError(f"checkpoint has no supported discriminator: {path}")
     args = argparse.Namespace(
+        team_size=int(config.get("team_size", 1)),
         factorize=bool(config.get("factorize", False)),
         recurrent_global=bool(config.get("recurrent_global", False)),
         transformer_global=bool(config.get("transformer_global", False)),
@@ -87,7 +91,8 @@ def load_discriminator(path: Path, device: th.device):
         temporal_hidden=int(config["temporal_hidden"]),
     )
     state = payload["discriminator"]
-    if args.factorize and not any(key.startswith("global_discriminator.") for key in state):
+    if (args.team_size == 1 and args.factorize
+            and not any(key.startswith("global_discriminator.") for key in state)):
         width = state["car_encoder.0.weight"].shape[1]
         if width not in (CAR_SIZE + 6, 2 * (CAR_SIZE + 6)):
             raise ValueError("legacy factorized discriminator has incompatible car inputs")
@@ -103,17 +108,19 @@ def load_discriminator(path: Path, device: th.device):
 
 
 def replay_directory(config: dict, explicit: Path | None) -> Path:
+    team_size = int(config.get("team_size", 1))
+    mode = f"{team_size}v{team_size}"
     if explicit is not None:
         path = explicit
     else:
         recorded = Path(config.get("replay_dir") or "")
-        path = recorded if recorded.is_dir() else ROOT / "parsed_replays" / "pro_1v1_fs4"
+        path = recorded if recorded.is_dir() else ROOT / "parsed_replays" / f"pro_{mode}_fs4"
     if not next(path.glob("*.npy"), None):
-        candidate = path / f"pro_1v1_fs{int(config['frameskip'])}"
+        candidate = path / f"pro_{mode}_fs{int(config['frameskip'])}"
         if candidate.is_dir():
             path = candidate
     if not next(path.glob("*.npy"), None):
-        raise FileNotFoundError(f"no parsed 1v1 replay files in {path}; pass --replay-dir")
+        raise FileNotFoundError(f"no parsed {mode} replay files in {path}; pass --replay-dir")
     return path.resolve()
 
 
@@ -124,7 +131,7 @@ def replay_sources(
     grouped: dict[tuple[str, ...], list[Path]] = {}
     for path in sorted(directory.glob("*.npy")):
         scene = np.load(path, mmap_mode="r")
-        if scene.ndim == 2 and scene.shape[1] == 161:
+        if scene.ndim == 2 and scene.shape[1] == team_replay_row_size(expert.team_size):
             grouped.setdefault(expert._dedup_key(path), []).append(path)
     selected = [sorted(grouped[key]) for key in sorted(grouped)]
     if limit is not None:
@@ -178,14 +185,15 @@ def driving_spans(
     """Group consecutive eligible windows without bridging invalid rows."""
     spans = []
     indices = pairs.cpu().numpy()
-    for actor in (0, 1):
+    for actor in np.unique(indices[:, 1]):
         starts = indices[indices[:, 1] == actor, 0]
         boundaries = np.r_[0, np.flatnonzero(np.diff(starts) != 1) + 1, len(starts)]
         for left, right in zip(boundaries[:-1], boundaries[1:]):
             for first in range(int(left), int(right), max_span):
                 last = min(first + max_span, int(right))
                 if last - first >= minimum:
-                    spans.append((int(starts[first]), int(starts[last - 1]) + 1, actor))
+                    spans.append((int(starts[first]), int(starts[last - 1]) + 1,
+                                  int(actor)))
     return spans
 
 
@@ -206,7 +214,7 @@ def collect_sequences(
             action_stop=action_stop, stop=stop,
             source_start=start - offsets[segment],
             probabilities=np.empty((stop - start, 0), dtype=np.float32),
-            goal_terminal=(expert.segment_goal_actors[segment] == actor
+            goal_terminal=(expert.segment_goal_actors[segment] == actor // expert.team_size
                            and stop == offsets[segment + 1] - expert.partition_span),
         ))
 
@@ -235,7 +243,7 @@ def collect_sequences(
                 other_candidates = []
                 for index, (start, stop, actor) in enumerate(candidates):
                     segment = bisect_right(offsets, start) - 1
-                    is_goal = (expert.segment_goal_actors[segment] == actor
+                    is_goal = (expert.segment_goal_actors[segment] == actor // expert.team_size
                                and stop == offsets[segment + 1] - expert.partition_span)
                     (goal_candidates if is_goal else other_candidates).append(index)
                 random = np.random.default_rng(seed + int(heldout))
@@ -351,14 +359,14 @@ def sequence_frames(expert: ExpertSceneDataset, record: ExpertSequence) -> list[
     first = record.start + expert.partition_span
     scenes = expert.frames[first:first + record.length]
     if record.actor:
-        scenes = opponent_view(scenes)
+        scenes = actor_view(scenes, record.actor)
     scenes = scenes.cpu().numpy()
     touches = expert.ego_touches[first:first + record.length, record.actor].cpu().numpy()
     scale = np.asarray(POSITION_SCALE, dtype=np.float32)
     output = []
     for scene, touch in zip(scenes, touches):
         rendered = []
-        for start in (BLUE_START, ORANGE_START):
+        for start in range(BLUE_START, expert.scene_size, CAR_SIZE):
             car = scene[start:start + CAR_SIZE]
             forward = car[9:12]
             up = car[12:15]
@@ -449,6 +457,7 @@ class Inspection:
             "action_start": record.action_start - record.start,
             "action_stop": record.action_stop - record.start,
             "frame_skip": self.frame_skip,
+            "team_size": self.expert.team_size,
             "scores": {
                 name: record.probabilities[:, column].tolist()
                 for column, name in enumerate(self.heads)
@@ -513,6 +522,7 @@ class InspectionService:
                 device="cpu", reject_discontinuities=True, skill_sampling=True,
                 driving_fraction=float(config.get("general_driving_fraction", 0.05)),
                 kickoff_fraction=float(config.get("kickoff_fraction", 0.0)),
+                team_size=int(config.get("team_size", 1)),
             )
             records = collect_sequences(
                 expert, directory, seed, limit, self.max_driving,
@@ -631,7 +641,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-dir", type=Path, default=ROOT / "checkpoints")
     parser.add_argument("--checkpoint", help="gaifo_*.pt path (default: latest in --checkpoint-dir)")
-    parser.add_argument("--replay-dir", type=Path, help="parsed 1v1 replay directory")
+    parser.add_argument("--replay-dir", type=Path, help="parsed replay directory for the checkpoint mode")
     parser.add_argument("--device", choices=("cpu", "cuda"), default=(
         "cuda" if th.cuda.is_available() else "cpu"
     ))

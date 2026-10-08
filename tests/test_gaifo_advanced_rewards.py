@@ -23,6 +23,7 @@ from gaifo import (
 )
 from jarl.data import TensorBatch
 from jarl.transform import PrepareContext
+from replay_layout import team_scene_size
 from reward_spec import BALL_RADIUS, CEILING_Z, GOAL_HEIGHT
 
 
@@ -94,6 +95,44 @@ def touch_context() -> RewardContext:
 
 
 class AdvancedGAIFORewardTests(unittest.TestCase):
+    def test_differential_short_window_rewards_improvement_not_expiring_history(self):
+        windows = th.zeros(2, 6, 3, team_scene_size(3))
+        windows[0, :, 0, 0] = -100
+        windows[1, :, 0, 0] = 100  # A new game cannot change the prefix's baseline.
+        windows[0, :, 1, 0] = 1
+        windows[0, :, 2, 0] = th.tensor([0., 2., 3., 1., 0., 2.])
+        windows[1, :, 1, 0] = 5
+        windows[1, :, 2, 0] = th.tensor([4., 6., 5., 3., 7., 5.])
+        valid = th.ones(2, 6, dtype=th.bool)
+        valid[0, 5] = False
+        ended = th.zeros_like(valid)
+        ended[0, 2] = True
+
+        class TeamPositionJudge(PositionDiscriminator):
+            scene_size = team_scene_size(3)
+
+        reward = SceneDiscriminatorReward(
+            TeamPositionJudge(), noise_std=0, trajectory_length=3,
+            differential=True, max_magnitude=1,
+        )
+        th.testing.assert_close(reward._score_windows(windows, valid, ended), th.tensor([
+            [1., -1., -1., 0., 1., 0.],
+            [1., -1., 0., 1., -1., 0.],
+        ]))
+
+        class FirstFrameJudge(th.nn.Module):
+            scene_size = team_scene_size(3)
+
+            def forward(self, scenes):
+                return scenes[:, 0, 0]
+
+        constant = SceneDiscriminatorReward(
+            FirstFrameJudge(), noise_std=0.5, trajectory_length=3, differential=True,
+        )
+        th.testing.assert_close(
+            constant._score_windows(windows, valid, ended), th.zeros(2, 6),
+        )
+
     def test_physical_events_feed_zero_sum_ppo_rewards(self):
         context = touch_context()
         gameplay = GameplayDiagnostics(4, th.device("cpu"), 900)

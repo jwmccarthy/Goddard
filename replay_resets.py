@@ -10,17 +10,17 @@ from carl.gymnasium import CARLBall, CARLCars, CARLResetState
 from jarl.data import TensorBatch, TensorDataset
 from jarl.envs import DatasetResetSampler
 
+from replay_layout import INTERNAL_SIZE, TEAM_SIZES, team_car_count, team_scene_size
 from replay_safety import infer_unsafe_start_mask, pre_goal_start_mask
 
 
 BALL_MAX_SPEED = 6000.0
 
 
-# parse_replays.py's 1v1 layout: ball(9), two cars(2 * 21), pads(68),
-# relative ball/car(12), goals(6), then the ego's 19 CARL internal fields.
+# The standalone demonstration loader below retains its original 1v1 layout.
+# ReplayResetProvider accepts every team size through six cars.
 SCENE_SIZE = 51
 INTERNAL_START = 137
-INTERNAL_SIZE = 19
 
 
 def reset_index_dataset(indices: th.Tensor) -> TensorDataset:
@@ -37,9 +37,15 @@ class ReplayResetProvider:
         frames: th.Tensor,
         internal_states: th.Tensor,
     ) -> None:
+        n_cars = next((team_car_count(size) for size in TEAM_SIZES
+                       if frames.ndim == 2 and frames.shape[-1] == team_scene_size(size)), None)
+        if n_cars is None or internal_states.shape != (len(frames), n_cars, INTERNAL_SIZE):
+            raise ValueError("replay reset scenes and car internal states must match")
         self.sampler = sampler
         self.frames = frames
         self.internal_states = internal_states
+        self.n_cars = n_cars
+        self.scene_size = frames.shape[-1]
 
     def __call__(self, reset_mask: th.Tensor) -> CARLResetState | None:
         sample = self.sampler(reset_mask)
@@ -50,7 +56,9 @@ class ReplayResetProvider:
         return CARLResetState(
             simulation_indices=sample["simulation_indices"],
             ball=CARLBall.from_tensor(scenes[:, :9]),
-            cars=CARLCars.from_tensor(scenes[:, 9:SCENE_SIZE].view(-1, 2, 21), 2),
+            cars=CARLCars.from_tensor(
+                scenes[:, 9:self.scene_size].reshape(-1, self.n_cars, 21), self.n_cars,
+            ),
             car_internal_state=self.internal_states[indices],
             normalized=True,
         )
