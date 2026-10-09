@@ -9,6 +9,7 @@ import torch as th
 
 from basic import SyntheticMatchResetProvider
 from carl.gymnasium import CARLMatchReset, CARLResetState, REGULATION_TICKS
+from carl.gymnasium.torch import _forward_up_to_quat
 from jarl.envs import DatasetResetSampler
 from replay_resets import (
     ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
@@ -81,6 +82,33 @@ class ReplayResetTests(unittest.TestCase):
             th.testing.assert_close(ball.velocity[:, 0], th.full((3,), 600.0))
             th.testing.assert_close(cars.boost, th.full((3, 2), 50.0))
             th.testing.assert_close(request.cars.boost, th.full((3, 2), 0.5))
+
+    def test_invalid_car_rotations_are_excluded_before_reset_sampling(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            rows = write_replay(folder)
+            rows[0, 9 + 9:9 + 15] = 0  # Demoed ego without axes.
+            rows[0, 9 + 17] = 1
+            rows[1, 30 + 12:30 + 15] = rows[1, 30 + 9:30 + 12]  # Parallel opponent axes.
+            rows[4, 9 + 9] = 1e-5  # Too short to define a forward direction.
+            rows[5, 30 + 12] = np.nan
+            rows[6, 9 + 12:9 + 15] = [1, 1e-5, 0]  # Almost parallel to forward.
+            np.save(folder / "replay.npy", rows)
+
+            frames, _ = load_demonstration_reset_frames(folder, "cpu")
+            th.testing.assert_close(frames, th.from_numpy(rows[7:, :51]))
+
+            limited_frames, limited_internal = load_demonstration_reset_frames(
+                folder, "cpu", limit=8, seed=0,
+            )
+            self.assertEqual(len(limited_frames), 8)
+            request = ReplayResetProvider(
+                DatasetResetSampler(
+                    reset_index_dataset(th.arange(len(limited_frames))), seed=0,
+                ), limited_frames, limited_internal,
+            )(th.ones(1_024, dtype=th.bool))
+            _, cars = request.physical()
+            self.assertEqual(_forward_up_to_quat(cars.forward, cars.up).shape, (1_024, 2, 4))
 
     def test_synthetic_match_state_and_kickoff_fallback(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

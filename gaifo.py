@@ -53,7 +53,8 @@ from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
 from replay_resets import (
-    ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
+    ReplayResetProvider, _invalid_reset_rotations, _sampled_frame_skip,
+    reset_index_dataset,
 )
 from replay_layout import (
     FLIP_STATE_SIZE, TEAM_SIZES, team_car_count, team_discriminator_scene_size,
@@ -742,21 +743,6 @@ def _unsafe_replay_reset_frames(
     # The first touch column is the ego's contact. An opponent's contact is
     # immediately available from the paired POV; neither is a safe reset tick.
     return unsafe | pre_goal | np.asarray(stored[:, -5:], dtype=bool).any(axis=-1)
-
-
-def _invalid_reset_rotations(scenes: np.ndarray, n_cars: int) -> np.ndarray:
-    """Find frames whose car axes CARL cannot convert to reset rotations."""
-    cars = scenes[:, BALL_SIZE:].reshape(-1, n_cars, CAR_SIZE)
-    forward = cars[:, :, 9:12]
-    up = cars[:, :, 12:15]
-    right = np.cross(up, forward)
-    valid = (
-        np.isfinite(forward).all(axis=(1, 2))
-        & np.isfinite(up).all(axis=(1, 2))
-        & (np.square(forward).sum(axis=-1) >= 1e-8).all(axis=1)
-        & (np.square(right).sum(axis=-1) >= 1e-8).all(axis=1)
-    )
-    return ~valid
 
 
 def _replay_goal_scorer(path: Path, stored: np.ndarray) -> int | None:

@@ -10,7 +10,10 @@ from carl.gymnasium import CARLBall, CARLCars, CARLResetState
 from jarl.data import TensorBatch, TensorDataset
 from jarl.envs import DatasetResetSampler
 
-from replay_layout import INTERNAL_SIZE, TEAM_SIZES, team_car_count, team_scene_size
+from replay_layout import (
+    BALL_SIZE, CAR_SIZE, INTERNAL_SIZE, TEAM_SIZES, team_car_count,
+    team_scene_size,
+)
 from replay_safety import infer_unsafe_start_mask, pre_goal_start_mask
 
 
@@ -21,6 +24,21 @@ BALL_MAX_SPEED = 6000.0
 # ReplayResetProvider accepts every team size through six cars.
 SCENE_SIZE = 51
 INTERNAL_START = 137
+
+
+def _invalid_reset_rotations(scenes: np.ndarray, n_cars: int) -> np.ndarray:
+    """Find frames whose car axes CARL cannot convert to reset rotations."""
+    cars = scenes[:, BALL_SIZE:].reshape(-1, n_cars, CAR_SIZE)
+    forward = cars[:, :, 9:12]
+    up = cars[:, :, 12:15]
+    right = np.cross(up, forward)
+    valid = (
+        np.isfinite(forward).all(axis=(1, 2))
+        & np.isfinite(up).all(axis=(1, 2))
+        & (np.square(forward).sum(axis=-1) >= 1e-8).all(axis=1)
+        & (np.square(right).sum(axis=-1) >= 1e-8).all(axis=1)
+    )
+    return ~valid
 
 
 def reset_index_dataset(indices: th.Tensor) -> TensorDataset:
@@ -207,6 +225,10 @@ def load_demonstration_reset_frames(
         invalid = source[:, -4:].astype(bool).any(axis=-1)
         # Retain aerial, boost, and flip states while excluding unsafe frames.
         eligible = np.flatnonzero(~unsafe & ~invalid & ~pre_goal)
+        if len(eligible):
+            # Demoed cars can have undefined axes even on otherwise safe frames.
+            scene = np.asarray(source[eligible, :SCENE_SIZE], dtype=np.float32)
+            eligible = eligible[~_invalid_reset_rotations(scene, 2)]
         if len(eligible):
             if quota is not None and len(eligible) > quota:
                 eligible = random.choice(eligible, size=quota, replace=False)
