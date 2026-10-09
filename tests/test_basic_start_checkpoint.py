@@ -8,10 +8,11 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+from carl.gymnasium import CARLTorchVectorEnv
 from gymnasium.spaces import Box, MultiDiscrete
 
 from basic import (
@@ -29,7 +30,6 @@ from basic import (
     parse_arguments,
     validate_arguments,
 )
-from dodge_window import DodgeAwareCARLTorchVectorEnv
 from gaifo import (
     GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
     build_policy as build_gaifo_policy,
@@ -380,11 +380,12 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                         else:
                             configure_starting_checkpoint(checkpoint_args(resume=tampered))
 
-    def test_start_and_resume_preserve_gaifo_dodge_window_observation_width(self):
+    def test_start_and_resume_require_native_carl_observation_width(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             for width, architecture in (
+                (139, GAIFO_ARCHITECTURE), (139, GAIFO_GRU_ARCHITECTURE),
                 (137, GAIFO_ARCHITECTURE), (138, GAIFO_ARCHITECTURE),
-                (138, GAIFO_GRU_ARCHITECTURE),
+                (140, GAIFO_ARCHITECTURE),
             ):
                 with self.subTest(width=width, architecture=architecture):
                     env = FakeEnv()
@@ -401,14 +402,12 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                         "config": {
                             "architecture": architecture, "policy_hidden": 16,
                             "gru": architecture == GAIFO_GRU_ARCHITECTURE,
-                            "expired_dodge_mask": width == 138,
                         },
                     }, gaifo_path)
 
                     start_args = checkpoint_args(start=gaifo_path)
                     starting, _ = configure_starting_checkpoint(start_args)
                     self.assertEqual(start_args.checkpoint_observation_size, width)
-                    self.assertEqual(start_args.expired_dodge_mask, width == 138)
                     start_args.num_simulations = 2
                     start_args.seed = 0
                     start_args.frameskip = 4
@@ -416,11 +415,20 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                     start_args.no_touch_timeout = 30
                     start_args.reward_scale = 1
                     start_args.normalize = True
-                    with patch("basic.DodgeAwareCARLTorchVectorEnv", return_value=env) as dodge:
+                    native = FakeEnv()
+                    native.single_observation_space = Box(
+                        -1, 1, shape=(139,), dtype=np.float32,
+                    )
+                    native.close = Mock()
+                    with patch("basic.CARLTorchVectorEnv", return_value=native) as carl:
+                        if width != 139:
+                            with self.assertRaisesRegex(ValueError, "CARL provides 139"):
+                                build_training_environment(start_args, None)
+                            native.close.assert_called_once()
+                            continue
                         built = build_training_environment(start_args, None)
-                        dodge.assert_called_once()
-                        self.assertFalse(dodge.call_args.kwargs["flip_state_features"])
-                        self.assertEqual(dodge.call_args.kwargs["append_age"], width == 138)
+                        carl.assert_called_once()
+                        self.assertTrue(carl.call_args.kwargs["discrete_actions"])
                     initialized, initialized_critic = build_policy_and_critic(
                         built, start_args, start_args.policy_architecture,
                     )
@@ -429,17 +437,16 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                         initialized.foot.model[0].weight, reference.foot.model[0].weight,
                     )
 
-                    if width == 138 and architecture == GAIFO_ARCHITECTURE:
+                    if architecture == GAIFO_ARCHITECTURE:
                         training_path = Path(directory) / "training_latest.pt"
                         training_args = ppo_args(architecture)
                         training_args.start_kl_coef = 0
-                        training_args.expired_dodge_mask = start_args.expired_dodge_mask
                         training_objects = build_ppo(
                             env, initialized, initialized_critic,
                             DiagnosticRewardSpec(normalize=False), training_args,
                             Path(directory) / "snapshot-pool",
                         )[-1]
-                        self.assertTrue(training_objects["config"]["expired_dodge_mask"])
+                        self.assertNotIn("expired_dodge_mask", training_objects["config"])
                         checkpointer = TrainingCheckpointer(
                             training_path, **training_objects,
                         )
@@ -449,8 +456,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                         resume_args = checkpoint_args(resume=training_path)
                         resumed, _ = configure_starting_checkpoint(resume_args)
                         self.assertIsNone(resumed)
-                        self.assertTrue(resume_args.expired_dodge_mask)
-                        self.assertEqual(resume_args.checkpoint_observation_size, 138)
+                        self.assertEqual(resume_args.checkpoint_observation_size, 139)
                         resumed_policy, resumed_critic = build_policy_and_critic(
                             env, resume_args, resume_args.policy_architecture,
                         )
@@ -463,9 +469,9 @@ class BasicStartingCheckpointTests(unittest.TestCase):
         os.environ.get("GODDARD_GPU_SMOKE") == "1" and torch.cuda.is_available(),
         "opt-in CARL/CUDA Basic checkpoint integration",
     )
-    def test_real_carl_basic_warm_start_from_dodge_aware_gaifo(self):
+    def test_real_carl_basic_warm_start_from_native_gaifo(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            source = DodgeAwareCARLTorchVectorEnv(
+            source = CARLTorchVectorEnv(
                 n_sim=1, n_blue=1, n_orange=1, frameskip=4,
                 normalize=True, discrete_actions=True,
             )
@@ -478,7 +484,6 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                     "policy": reference.state_dict(),
                     "config": {
                         "architecture": GAIFO_ARCHITECTURE, "policy_hidden": 16,
-                        "expired_dodge_mask": True,
                     },
                 }, path)
                 arguments = checkpoint_args(start=path)
@@ -493,7 +498,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                 env = build_training_environment(arguments, None)
                 try:
                     observation = env.reset()
-                    self.assertEqual(tuple(observation.shape), (2, 140))
+                    self.assertEqual(tuple(observation.shape), (2, 139))
                     policy, _ = build_policy_and_critic(
                         env, arguments, arguments.policy_architecture,
                     )
@@ -512,7 +517,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
     )
     def test_real_carl_multilayer_basic_gru_ppo_update(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            env = DodgeAwareCARLTorchVectorEnv(
+            env = CARLTorchVectorEnv(
                 n_sim=1, n_blue=1, n_orange=1, frameskip=4,
                 normalize=True, discrete_actions=True,
             )

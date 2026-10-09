@@ -52,7 +52,6 @@ from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
-from dodge_window import DodgeAwareCARLTorchVectorEnv
 from reward_spec import RewardSpec
 from replay_resets import (
     ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
@@ -221,7 +220,6 @@ def configure_starting_checkpoint(
     starting = None
     resumed_reference = False
     arguments.checkpoint_observation_size = None
-    arguments.expired_dodge_mask = False
     source = arguments.start_checkpoint or arguments.resume_checkpoint
     if source is not None:
         checkpoint, payload = load_policy_checkpoint(source)
@@ -267,9 +265,6 @@ def configure_starting_checkpoint(
                     )
                 setattr(arguments, name, saved)
         arguments.checkpoint_observation_size = checkpoint.observation_size
-        # Legacy policies used 137/138 features; new ones include CARL's two
-        # focal flip features before the optional tracked jump age.
-        arguments.expired_dodge_mask = checkpoint.observation_size in (138, 140)
 
         if arguments.start_kl_coef is None and resumed_reference:
             arguments.start_kl_coef = payload.get("config", {}).get(
@@ -1138,7 +1133,6 @@ def build_ppo(
         "config": {
             "policy_architecture": arguments.policy_architecture,
             "hidden_size": arguments.hidden_size,
-            "expired_dodge_mask": getattr(arguments, "expired_dodge_mask", False),
             "policy_layers": policy_layers,
             "critic_layers": critic_layers,
             "policy_gru_layers": policy_gru_layers,
@@ -1154,7 +1148,7 @@ def build_training_environment(
     reset_provider: SyntheticMatchResetProvider,
 ) -> CARLTorchVectorEnv:
     saved_size = getattr(arguments, "checkpoint_observation_size", None)
-    environment = DodgeAwareCARLTorchVectorEnv(
+    environment = CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=1,
         n_orange=1,
@@ -1167,8 +1161,6 @@ def build_training_environment(
         reset_state_provider=reset_provider,
         normalize=arguments.normalize,
         discrete_actions=True,
-        flip_state_features=saved_size not in (137, 138),
-        append_age=getattr(arguments, "expired_dodge_mask", False),
     )
     actual_size = environment.single_observation_space.shape[0]
     if saved_size is not None and saved_size != actual_size:

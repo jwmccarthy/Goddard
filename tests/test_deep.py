@@ -10,14 +10,13 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-from carl.gymnasium.action import ACTION_NVECS
+from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 
 from deep import (
     ContrastiveBatch, ContrastiveLearner, ResidualNetwork, TrajectoryReplay,
     achieved_goal, contrastive_minibatches, goal_size, load_checkpoint, load_replay_prior, main,
     parse_arguments, save_checkpoint, transition_observation, validate_arguments,
 )
-from dodge_window import DodgeWindowActionCodec
 
 
 def small_arguments(*extra: str):
@@ -186,7 +185,7 @@ class DeepCRLTests(unittest.TestCase):
 
     def test_goal_projection_masked_actor_and_critic_update(self):
         args = small_arguments("--entropy-target-fraction", "0")
-        codec = DodgeWindowActionCodec(139, append_age=False)
+        codec = CARLActionCodec()
         learner = ContrastiveLearner(139, codec, args, torch.device("cpu"))
         observation = torch.randn(4, 139) * 0.05
         observation[:, 24] = 0  # No boost.
@@ -226,7 +225,7 @@ class DeepCRLTests(unittest.TestCase):
 
     def test_checkpoint_restores_policy_and_optimizers(self):
         args = small_arguments("--goal-kind", "both")
-        codec = DodgeWindowActionCodec(139, append_age=False)
+        codec = CARLActionCodec()
         learner = ContrastiveLearner(139, codec, args, torch.device("cpu"))
         observation = torch.randn(4, 139) * 0.1
         goal = achieved_goal(observation, "both") + torch.randn(4, 6) * 0.1
@@ -292,7 +291,7 @@ class DeepCARLSmokeTests(unittest.TestCase):
             "--actor-depth", "64", "--critic-depth", "64",
         )
         learner = ContrastiveLearner(
-            139, DodgeWindowActionCodec(139, append_age=False).cuda(),
+            139, CARLActionCodec().cuda(),
             args, torch.device("cuda:0"),
         )
         self.assertTrue(learner.actor.network.checkpoint_activations)

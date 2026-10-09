@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-carl = { git = "https://github.com/jwmccarthy/CARL.git", rev = "fa9e5a6e460e5c08d4d6dbb21ae745f318c25641" }
+carl = { git = "https://github.com/jwmccarthy/CARL.git", rev = "654cb6b64396ccf8d9adc655b2e33fa5cf4acbeb" }
 jarl = { git = "https://github.com/jwmccarthy/JARL.git", rev = "0275061d0d6657c77638a7bd47db64ae6a14c440" }
 torch = { index = "pytorch-cu128" }
 

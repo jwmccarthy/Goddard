@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch as th
-from carl.gymnasium.action import ACTION_NVECS
+from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 from gymnasium.spaces import Box, MultiDiscrete
 from http.server import ThreadingHTTPServer
 
@@ -24,12 +24,11 @@ from gaifo import (
     GAIFO_TEAM_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE,
     build_policy,
 )
-from dodge_window import DodgeWindowActionCodec
-from replay_layout import team_observation_size
+from replay_layout import team_live_observation_size
 from watch_checkpoints import (
     CheckpointRegistry, SpectatorState, checkpoint_policy_environment, load_match,
     deep_watch_goal, load_policy_checkpoint, make_handler, parse_args,
-    policy_environment, policy_observation, render_frame,
+    render_frame,
 )
 
 
@@ -44,10 +43,8 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
     def test_deep_checkpoints_and_mixed_1v1_matches_are_watchable(self):
         class DeepEnv(FakeEnv):
             n_cars = 2
-            dodge_window_features = True
-            raw_observation_size = 139
-            action_codec = DodgeWindowActionCodec(139)
-            single_observation_space = Box(-np.inf, np.inf, (140,), np.float32)
+            action_codec = CARLActionCodec()
+            single_observation_space = Box(-np.inf, np.inf, (139,), np.float32)
             single_action_space = MultiDiscrete(ACTION_NVECS)
 
         env = DeepEnv()
@@ -58,10 +55,10 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             "--embedding-size", "8",
         ])
         learner = ContrastiveLearner(
-            139, DodgeWindowActionCodec(139, append_age=False),
+            139, CARLActionCodec(),
             arguments, th.device("cpu"),
         )
-        observation = th.zeros(1, 140)
+        observation = th.zeros(1, 139)
         observation[0, :3] = th.tensor([0.2, 0.1, 0.04])
         observation[0, 9:12] = th.tensor([-0.2, -0.5, 0.01])
         observation[0, 25] = 1
@@ -76,20 +73,18 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
 
             loaded, signature = load_policy_checkpoint(deep_path, env, 4, None)
             self.assertEqual(signature, ("deep", 139, "both", 16, 4))
-            projected = policy_observation(loaded, observation)
-            self.assertEqual(tuple(projected.shape), (1, 139))
-            target = deep_watch_goal(projected, "both")
+            target = deep_watch_goal(observation, "both")
             th.testing.assert_close(target[0, :3], th.tensor([
                 0.0, 5120 / 6000, 321.3875 / 2076,
             ]))
             th.testing.assert_close(target[0, 3:], observation[0, :3])
             with th.inference_mode():
-                actual = loaded.act(projected, loaded.initial_state(1), deterministic=True)
-                expected = learner.act(projected, target, deterministic=True)
+                actual = loaded.act(observation, loaded.initial_state(1), deterministic=True)
+                expected = learner.act(observation, target, deterministic=True)
             th.testing.assert_close(actual.action, expected)
             self.assertIsNone(actual.next_state)
-            th.testing.assert_close(deep_watch_goal(projected, "car"), projected[:, :3])
-            th.testing.assert_close(deep_watch_goal(projected, "ball"), target[:, :3])
+            th.testing.assert_close(deep_watch_goal(observation, "car"), observation[:, :3])
+            th.testing.assert_close(deep_watch_goal(observation, "ball"), target[:, :3])
 
             gaifo = build_policy(
                 env, argparse.Namespace(policy_hidden=16, gru=False),
@@ -104,7 +99,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             }, gaifo_path)
             _, deep, gaifo = load_match(deep_path, gaifo_path, env, 4, None)
             self.assertEqual(deep.goal_kind, "both")
-            self.assertEqual(gaifo.foot.model[0].in_features, 140)
+            self.assertEqual(gaifo.foot.model[0].in_features, 139)
 
             with self.assertRaisesRegex(ValueError, "trained at frameskip 4"):
                 load_policy_checkpoint(deep_path, env, 8, None)
@@ -113,46 +108,28 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "1v1 viewer"):
                 load_policy_checkpoint(deep_path, TeamEnv(), 4, None)
 
-            # Older deep checkpoints lacked a config-level frameskip.
-            legacy = th.load(deep_path, weights_only=True)
-            legacy["config"].pop("frameskip")
-            legacy_path = folder / "deep_000000000032.pt"
-            th.save(legacy, legacy_path)
-            restored, _ = load_policy_checkpoint(legacy_path, env, 4, None)
-            th.testing.assert_close(
-                restored.act(projected, deterministic=True).action, expected,
-            )
-
-    def test_new_carl_observations_preserve_old_checkpoint_goal_and_age_fields(self):
+    def test_checkpoint_policies_require_native_carl_observation_width(self):
         class Env(FakeEnv):
-            raw_observation_size = 139
-            dodge_window_features = True
-            action_codec = DodgeWindowActionCodec(139)
-            single_observation_space = Box(-np.inf, np.inf, (140,), np.float32)
+            action_codec = CARLActionCodec()
+            single_observation_space = Box(-np.inf, np.inf, (139,), np.float32)
             single_action_space = MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
 
         env = Env()
-        observation = th.zeros(2, 140)
-        observation[:, 136] = 0.42  # Last legacy goal feature.
-        observation[:, 137:139] = th.tensor([1., 1.25])
-        observation[:, 139] = 0.75  # Legacy jump-age checkpoint must keep this.
-        for width, aged in ((137, False), (138, True),
-                            (139, False), (140, True)):
+        observation = th.zeros(2, 139)
+        observation[0, -2:] = th.tensor([1., 1.25])
+        self.assertEqual(env.action_codec.mask(observation)[:, 17].tolist(), [True, False])
+        for width in (137, 138, 139, 140):
             with self.subTest(width=width):
-                view = checkpoint_policy_environment(
-                    env, {"foot.model.0.weight": th.zeros(16, width)},
-                    Path("saved.pt"), {"expired_dodge_mask": aged},
-                )
+                state = {"foot.model.0.weight": th.zeros(16, width)}
+                if width != 139:
+                    with self.assertRaisesRegex(ValueError, "viewer provides 139"):
+                        checkpoint_policy_environment(env, state, Path("saved.pt"))
+                    continue
+                self.assertIs(checkpoint_policy_environment(env, state, Path("saved.pt")), env)
                 policy = build_policy(
-                    view, argparse.Namespace(policy_hidden=16, policy_layers=1, gru=False),
+                    env, argparse.Namespace(policy_hidden=16, policy_layers=1, gru=False),
                 )
-                projected = policy_observation(policy, observation)
-                self.assertEqual(projected.shape[-1], width)
-                self.assertEqual(projected[0, 136].item(), observation[0, 136].item())
-                if aged:
-                    self.assertEqual(projected[0, -1].item(), 0.75)
-                elif width == 139:
-                    th.testing.assert_close(projected[0, -2:], observation[0, 137:139])
+                self.assertEqual(policy.foot.model[0].in_features, 139)
 
     def test_reset_type_api_offers_loaded_pools_and_rejects_unavailable_choices(self):
         state = SpectatorState()
@@ -228,8 +205,10 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                 with self.subTest(team_size=size, gru=gru):
                     class ModeEnv(FakeEnv):
                         n_cars = 2 * size
+                        action_codec = CARLActionCodec()
+                        single_action_space = MultiDiscrete(ACTION_NVECS)
                         single_observation_space = Box(
-                            -1.0, 1.0, shape=(team_observation_size(size),),
+                            -1.0, 1.0, shape=(team_live_observation_size(size),),
                             dtype=np.float32,
                         )
 
@@ -249,7 +228,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                     }, path)
                     loaded, signature = load_policy_checkpoint(path, env, 4, None)
                     self.assertEqual(signature[-1], size)
-                    observation = th.randn(size, team_observation_size(size))
+                    observation = th.randn(size, team_live_observation_size(size))
                     with th.no_grad():
                         result = loaded.act(observation, loaded.initial_state(size))
                     self.assertEqual(result.action.shape[0], size)
@@ -326,72 +305,55 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
 
         self.assertNotEqual(signatures[0], signatures[1])
 
-    def test_viewer_can_pair_legacy_and_dodge_aware_gaifo_policies(self):
-        class DodgeAwareEnv(FakeEnv):
-            dodge_window_features = True
-            raw_observation_size = 137
+    def test_viewer_only_pairs_native_gaifo_policies(self):
+        class NativeEnv(FakeEnv):
             n_cars = 2
-            action_codec = DodgeWindowActionCodec(137)
+            action_codec = CARLActionCodec()
             single_observation_space = Box(
-                -np.inf, np.inf, (138,), dtype=np.float32,
+                -np.inf, np.inf, (139,), dtype=np.float32,
             )
             single_action_space = MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
 
-        env = DodgeAwareEnv()
+        env = NativeEnv()
         args = argparse.Namespace(policy_hidden=16, policy_layers=1, gru=False)
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             paths = []
-            for enabled in (False, True):
-                reference = build_policy(
-                    policy_environment(env, enabled), args,
-                )
-                with th.no_grad():
-                    reference.head.model[-1].weight.zero_()
-                    reference.head.model[-1].bias.zero_()
-                    reference.head.model[-1].bias[17] = 10
-                path = Path(directory) / f"gaifo_{int(enabled):012d}.pt"
+            for index in range(2):
+                reference = build_policy(env, args)
+                path = Path(directory) / f"gaifo_{index:012d}.pt"
                 th.save({
                     "config": {
                         "architecture": GAIFO_ARCHITECTURE,
                         "policy_hidden": 16, "policy_layers": 1,
-                        "frameskip": 4, "expired_dodge_mask": enabled,
+                        "frameskip": 4,
                     },
                     "policy": reference.state_dict(),
                 }, path)
                 paths.append(path)
 
-            _, legacy, enhanced = load_match(paths[0], paths[1], env, 4, None)
-            observation = th.zeros(2, 138)
-            observation[:, -1] = 1.25
-            self.assertEqual(policy_observation(legacy, observation).shape[-1], 137)
-            self.assertEqual(policy_observation(enhanced, observation).shape[-1], 138)
-            self.assertEqual(
-                legacy.act(policy_observation(legacy, observation), deterministic=True)
-                .action[:, 6].tolist(), [1, 1],
-            )
-            self.assertEqual(
-                enhanced.act(policy_observation(enhanced, observation), deterministic=True)
-                .action[:, 6].tolist(), [0, 0],
-            )
-            without_flag = th.load(paths[1], weights_only=True)
-            del without_flag["config"]["expired_dodge_mask"]
-            implicit = Path(directory) / "gaifo_000000000002.pt"
-            th.save(without_flag, implicit)
-            loaded, _ = load_policy_checkpoint(implicit, env, 4, None)
-            self.assertEqual(loaded.foot.model[0].in_features, 138)
-            with self.assertRaisesRegex(ValueError, "checkpoint policy needs 138 observation features"):
-                load_policy_checkpoint(paths[1], FakeEnv(), 4, None)
+            _, blue, orange = load_match(paths[0], paths[1], env, 4, None)
+            observation = th.zeros(2, 139)
+            for policy in (blue, orange):
+                self.assertEqual(policy.foot.model[0].in_features, 139)
+                self.assertEqual(tuple(policy.act(observation, deterministic=True).action.shape),
+                                 (2, 7))
+            for width in (137, 138, 140):
+                with self.subTest(width=width):
+                    incompatible = th.load(paths[0], weights_only=True)
+                    incompatible["policy"]["foot.model.0.weight"] = th.zeros(16, width)
+                    path = Path(directory) / f"gaifo_{width:012d}.pt"
+                    th.save(incompatible, path)
+                    with self.assertRaisesRegex(ValueError, "viewer provides 139"):
+                        load_policy_checkpoint(path, env, 4, None)
 
-    def test_basic_checkpoints_and_snapshots_infer_dodge_window_from_weights(self):
-        class DodgeAwareEnv(FakeEnv):
-            dodge_window_features = True
-            raw_observation_size = 137
+    def test_basic_checkpoints_and_snapshots_require_native_width(self):
+        class NativeEnv(FakeEnv):
             n_cars = 2
-            action_codec = DodgeWindowActionCodec(137)
-            single_observation_space = Box(-np.inf, np.inf, (138,), np.float32)
+            action_codec = CARLActionCodec()
+            single_observation_space = Box(-np.inf, np.inf, (139,), np.float32)
             single_action_space = MultiDiscrete([3, 3, 3, 2, 2, 3, 2])
 
-        env = DodgeAwareEnv()
+        env = NativeEnv()
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             for architecture in (GAIFO_ARCHITECTURE, BASIC_POLICY_ARCHITECTURE):
                 with self.subTest(architecture=architecture):
@@ -411,7 +373,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                     th.save(reference.state_dict(), snapshot)
                     for path in (training, snapshot):
                         loaded, _ = load_policy_checkpoint(path, env, 4, None)
-                        self.assertEqual(loaded.foot.model[0].in_features, 138)
+                        self.assertEqual(loaded.foot.model[0].in_features, 139)
                         th.testing.assert_close(
                             loaded.foot.model[0].weight, reference.foot.model[0].weight,
                         )

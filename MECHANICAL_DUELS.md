@@ -155,11 +155,10 @@ the no-touch timeout in seconds.
 Transformer defaults to a 128-frame context, 256 simulations, a 2,048-window
 discriminator batch and 512 held-out windows in 1v1; all remain configurable.
 Without `--transformer`, the original 1v1 simulation, replay-sampling,
-and discriminator defaults remain; the dodge-window mask below is new for
-fresh runs. Team-mode simulation and discriminator batch defaults scale down
-with scene size. Both learning rates stay constant unless an end value is
-supplied; schedules resume from checkpoint settings and the restored training
-step.
+and discriminator defaults remain. Team-mode simulation and discriminator
+batch defaults scale down with scene size. Both learning rates stay constant
+unless an end value is supplied; schedules resume from checkpoint settings and
+the restored training step.
 
 Replay resets draw all cars and available internal control states from the
 selected mode's parsed data; curated skill categories choose *when* to reset,
@@ -169,13 +168,12 @@ opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
 `--aerial-touch-reward-weight` (default `0.5`).
 
-New GAIFO runs also include CARL's jump age in each policy observation. The
-tracker starts from the replay's internal jump timer, advances with the
-simulator's jump-hold rules, and resets on landings and flip restores. An
-airborne jump is masked after CARL's 1.25-second dodge window; the same saved
-observation supplies the mask during PPO updates. Resuming an older checkpoint
-retains its original observation width and action mask. The checkpoint viewer
-accepts both observation versions, including matches between them.
+GAIFO, BASIC, deep training, and the checkpoint viewer use CARL's native
+observation and action codec. Its final two observation fields report whether
+the focal car can jump or flip and how much dodge time remains. The codec masks
+expired airborne dodges from these fields, including during PPO updates.
+Checkpoints must use the matching native observation width (139/193/247 for
+1v1/2v2/3v3); jump-age-extended policies are not supported.
 
 `watch_checkpoints.py --team-size 2` (or `3`) views team checkpoints with the
 corresponding replay resets; `watch_gaifo_experts.py` reads the team size from

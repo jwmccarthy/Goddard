@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium.action import ACTION_NVECS
 from jarl.collect import GoalConditionedRunner, ReplayGoalSampler
 from jarl.envs import DatasetResetSampler
@@ -27,7 +28,6 @@ from jarl.modules.contrastive import (
 from jarl.runtime import OffPolicySchedule, Trainer
 from jarl.store import ContrastiveBatch, FutureGoalReplayBuffer
 
-from dodge_window import DodgeAwareCARLTorchVectorEnv
 from replay_resets import (
     ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
 )
@@ -338,12 +338,12 @@ def main(argv: list[str] | None = None) -> None:
     run_name = args.run_name or datetime.now().strftime("deep-%Y%m%d-%H%M%S")
     device = torch.device("cuda:0")
     reset_provider, expert_goals = load_replay_prior(args, device)
-    environment = DodgeAwareCARLTorchVectorEnv(
+    environment = CARLTorchVectorEnv(
         n_sim=args.n_sim, n_blue=1, n_orange=1, seed=args.seed,
         frameskip=args.frameskip, max_ticks=args.max_ticks,
         no_touch_timeout_seconds=args.no_touch_timeout,
         reset_state_provider=reset_provider, synchronize=False,
-        normalize=True, discrete_actions=True, append_age=False,
+        normalize=True, discrete_actions=True,
     )
     try:
         if tuple(environment.single_action_space.nvec) != ACTION_NVECS:

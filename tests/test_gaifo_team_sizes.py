@@ -132,7 +132,7 @@ class TeamSizeUnitTests(unittest.TestCase):
                     self.assertEqual(logits.shape, (1, 3) if factorize else (1,))
 
                 n_cars = team_car_count(size)
-                observation = th.zeros(n_cars, team_live_observation_size(size) + 1)
+                observation = th.zeros(n_cars, team_live_observation_size(size))
                 observation[:, internal_start:internal_start + 2] = th.tensor([1., 1.25])
                 next_obs = observation.clone()
                 next_obs[:, internal_start:internal_start + 2] = th.tensor([0., 0.])
@@ -420,10 +420,9 @@ class TeamSizeTrainingSmoke(unittest.TestCase):
             payload = load_resume_checkpoint(max(checkpoints))
             self.assertEqual(payload["step"], 8 * 2 * n_cars * 2)
             self.assertEqual(payload["config"]["team_size"], size)
-            self.assertTrue(payload["config"]["expired_dodge_mask"])
             self.assertTrue(payload["config"]["flip_state_features"])
             self.assertEqual(payload["policy"]["foot.model.0.weight"].shape[1],
-                             team_live_observation_size(size) + 1)
+                             team_live_observation_size(size))
             self.assertTrue(payload["discriminator_optimizer"]["state"])
             return payload
 

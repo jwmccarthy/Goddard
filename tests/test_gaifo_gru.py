@@ -61,6 +61,7 @@ class GAIFOGruTests(unittest.TestCase):
     def args(gru):
         return argparse.Namespace(
             gru=gru, policy_hidden=16, critic_hidden=16,
+            flip_state_features=False,
             trajectory_length=2, sequence_length=4, rollout=4,
             ppo_batch=8, ppo_epochs=1,
         )
@@ -78,7 +79,6 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertEqual(parsed.sequence_length, 8)
                 self.assertEqual((parsed.policy_hidden, parsed.critic_hidden), (320, 320))
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (2, 2))
-                self.assertTrue(parsed.expired_dodge_mask)
                 self.assertTrue(parsed.flip_state_features)
                 self.assertFalse(parsed.recurrent_global)
                 self.assertEqual(parsed.discriminator_context_length, 16)
@@ -95,13 +95,12 @@ class GAIFOGruTests(unittest.TestCase):
     def test_feature_flags_require_full_names_and_accept_explicit_false(self):
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",
-            "--expired-dodge-mask", "false", "--flip-state-features", "false",
+            "--flip-state-features", "false",
             "--curated-skill-sampling", "false",
             "--exp-log-odds-reward", "true", "--recency-replay", "false",
             "--aerial-touch-reward-weight", "1.0",
         ]):
             parsed, _ = parse_args()
-        self.assertFalse(parsed.expired_dodge_mask)
         self.assertFalse(parsed.flip_state_features)
         self.assertFalse(parsed.curated_skill_sampling)
         self.assertTrue(parsed.exp_log_odds_reward)
@@ -318,7 +317,6 @@ class GAIFOGruTests(unittest.TestCase):
                     parsed, resumed = parse_args()
                 self.assertIsNotNone(resumed)
                 self.assertEqual(parsed.gru, gru)
-                self.assertFalse(parsed.expired_dodge_mask)
                 self.assertEqual(parsed.entropy_end, args.entropy_end)
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (layers, layers))
                 self.assertEqual(parsed.recurrent_global, layers == 2)
@@ -328,10 +326,6 @@ class GAIFOGruTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "--recurrent-global must match"):
                     validate_resume_args(parsed, resumed)
                 parsed.recurrent_global = layers == 2
-                parsed.expired_dodge_mask = True
-                with self.assertRaisesRegex(ValueError, "--expired-dodge-mask must match"):
-                    validate_resume_args(parsed, resumed)
-                parsed.expired_dodge_mask = False
                 if parsed.recurrent_global:
                     parsed.discriminator_context_length += 1
                     with self.assertRaisesRegex(ValueError, "--discriminator-context-length must match"):

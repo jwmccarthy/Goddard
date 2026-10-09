@@ -12,22 +12,19 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 
 import carl
 import numpy as np
 import torch as th
 import torch.nn as nn
 from carl.gymnasium import CARLTorchVectorEnv
-from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
-from gymnasium.spaces import Box
+from carl.gymnasium.action import ACTION_NVECS
 from jarl.data.records import PolicyOutput
 from jarl.envs import DatasetResetSampler
 from jarl.modules import GoalActor
 
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
 from deep import ARCHITECTURE as DEEP_ARCHITECTURE, GOAL_SLICES, goal_size
-from dodge_window import DodgeAwareCARLTorchVectorEnv, DodgeWindowActionCodec
 from gaifo import (
     GAIFO_ARCHITECTURE,
     GAIFO_GRU_ARCHITECTURE,
@@ -363,21 +360,19 @@ def load_deep_policy(path: Path, payload: dict, env: CARLTorchVectorEnv):
     if tuple(config.get("action_nvec", ())) != tuple(env.single_action_space.nvec):
         raise ValueError(f"deep checkpoint action space differs from the viewer: {path}")
     observation_size = int(config["observation_size"])
-    raw_size = getattr(env, "raw_observation_size", env.single_observation_space.shape[0])
-    if (observation_size != raw_size
-            or not getattr(env, "dodge_window_features", False)):
+    raw_size = env.single_observation_space.shape[0]
+    if observation_size != raw_size:
         raise ValueError(
-            f"checkpoint policy needs {observation_size} dodge-window observation "
+            f"checkpoint policy needs {observation_size} native observation "
             f"features; viewer provides {raw_size}: {path}"
         )
     if state.get("network.stem.0.weight") is None or (
         state["network.stem.0.weight"].shape[1] != observation_size + goal_size(kind)
     ):
         raise ValueError(f"deep checkpoint goal and observation sizes do not match weights: {path}")
-    codec = DodgeWindowActionCodec(observation_size, append_age=False).to(env.device)
     actor = GoalActor(
         observation_size, goal_size(kind), int(config["actor_width"]),
-        int(config["actor_depth"]), ACTION_NVECS, codec,
+        int(config["actor_depth"]), ACTION_NVECS, env.action_codec,
     ).to(env.device)
     actor.load_state_dict(state)
     return WatchedDeepPolicy(actor, kind).eval().requires_grad_(False), (
@@ -423,7 +418,7 @@ def load_policy_checkpoint(
         layers = int(config.get("policy_layers", 1))
         policy_state = payload["policy"]
         policy = build_gaifo_policy(
-            checkpoint_policy_environment(env, policy_state, path, config),
+            checkpoint_policy_environment(env, policy_state, path),
             argparse.Namespace(policy_hidden=hidden, policy_layers=layers, gru=gru),
         )
     else:
@@ -435,7 +430,7 @@ def load_policy_checkpoint(
             None if checkpoint.architecture == BASIC_POLICY_ARCHITECTURE
             else checkpoint.architecture
         )
-        policy_env = checkpoint_policy_environment(env, policy_state, path, config)
+        policy_env = checkpoint_policy_environment(env, policy_state, path)
         if architecture is None:
             policy, _ = build_policy_and_critic(
                 policy_env, argparse.Namespace(
@@ -462,70 +457,21 @@ def load_policy_checkpoint(
     return policy.eval().requires_grad_(False), signature
 
 
-def policy_environment(env: CARLTorchVectorEnv, dodge_window: bool):
-    """Build legacy networks against CARL's original observation and codec."""
-    if dodge_window:
-        if not getattr(env, "dodge_window_features", False):
-            raise ValueError("checkpoint requires dodge-window observations")
-        return env
-    if not getattr(env, "dodge_window_features", False):
-        return env
-    return SimpleNamespace(
-        device=env.device,
-        action_codec=CARLActionCodec().to(env.device),
-        single_observation_space=Box(
-            -np.inf, np.inf, (env.raw_observation_size,), np.float32,
-        ),
-        single_action_space=env.single_action_space,
-    )
-
-
 def checkpoint_policy_environment(
-    env: CARLTorchVectorEnv, state: dict, path: Path, config: dict,
+    env: CARLTorchVectorEnv, state: dict, path: Path,
 ):
-    """Match the network's saved input width to CARL or its jump-age extension."""
+    """Require the network's saved input width to match native CARL."""
     foot = state.get("foot.model.0.weight")
     if not isinstance(foot, th.Tensor) or foot.ndim != 2:
         raise ValueError(f"checkpoint has no supported policy encoder: {path}")
-    raw_size = getattr(env, "raw_observation_size", env.single_observation_space.shape[0])
+    raw_size = env.single_observation_space.shape[0]
     input_size = foot.shape[1]
-    native = raw_size in (139, 193, 247)
-    supported = (raw_size - 2, raw_size - 1, raw_size, raw_size + 1) if native else (
-        raw_size, raw_size + 1,
-    )
-    if input_size not in supported:
+    if input_size != raw_size:
         raise ValueError(
             f"checkpoint policy needs {input_size} observation features; "
-            f"viewer supports {', '.join(str(size) for size in supported)}: {path}"
+            f"viewer provides {raw_size}: {path}"
         )
-    dodge_window = input_size in ((raw_size - 1, raw_size + 1) if native else (raw_size + 1,))
-    if ("expired_dodge_mask" in config
-            and bool(config["expired_dodge_mask"]) != dodge_window):
-        raise ValueError(f"checkpoint dodge-window setting does not match weights: {path}")
-    if native and input_size <= raw_size:
-        if input_size == raw_size - 1 and not getattr(env, "dodge_window_features", False):
-            raise ValueError("checkpoint requires tracked jump age")
-        codec = (
-            CARLActionCodec() if input_size == raw_size - 2 else
-            DodgeWindowActionCodec(raw_size - 2) if input_size == raw_size - 1 else
-            DodgeWindowActionCodec(raw_size, append_age=False)
-        )
-        return SimpleNamespace(
-            device=env.device,
-            action_codec=codec.to(env.device),
-            single_observation_space=Box(-np.inf, np.inf, (input_size,), np.float32),
-            single_action_space=env.single_action_space,
-        )
-    return policy_environment(env, dodge_window)
-
-
-def policy_observation(policy, observation: th.Tensor) -> th.Tensor:
-    """Drop native flip fields only for old networks, preserving their jump age."""
-    width = (policy.observation_size if isinstance(policy, WatchedDeepPolicy)
-             else policy.foot.model[0].in_features)
-    if observation.shape[-1] in (140, 194, 248) and width == observation.shape[-1] - 2:
-        return th.cat((observation[..., :width - 1], observation[..., -1:]), dim=-1)
-    return observation[..., :width]
+    return env
 
 
 def load_match(
@@ -635,7 +581,7 @@ def simulate(
             team_size=args.team_size,
         )
         state.configure_reset_types(tuple(reset_provider.providers))
-        base = DodgeAwareCARLTorchVectorEnv(
+        base = CARLTorchVectorEnv(
             n_sim=1,
             n_blue=args.team_size,
             n_orange=args.team_size,
@@ -689,11 +635,11 @@ def simulate(
 
             with th.inference_mode():
                 blue_output = blue.act(
-                    policy_observation(blue, observation[:args.team_size]), blue_state,
+                    observation[:args.team_size], blue_state,
                     deterministic=not args.sample,
                 )
                 orange_output = orange.act(
-                    policy_observation(orange, observation[args.team_size:]), orange_state,
+                    observation[args.team_size:], orange_state,
                     deterministic=not args.sample,
                 )
                 blue_state = blue_output.next_state

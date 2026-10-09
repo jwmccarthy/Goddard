@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
+import carl
 from carl.gymnasium import CARLTorchVectorEnv
 from carl.gymnasium.state import RewardContext
 from jarl.collect import (
@@ -51,7 +52,6 @@ from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
-from dodge_window import DodgeAwareCARLTorchVectorEnv, flip_state_from_internal
 from replay_resets import (
     ReplayResetProvider, _sampled_frame_skip, reset_index_dataset,
 )
@@ -706,6 +706,17 @@ def extract_scene_observations(
     if observation.shape[-1] < flip_start + FLIP_STATE_SIZE:
         raise ValueError("actor observations need native or tracked flip state")
     return th.cat((scene, observation[..., flip_start:flip_start + FLIP_STATE_SIZE]), dim=-1)
+
+
+def flip_state_from_internal(internal: th.Tensor) -> th.Tensor:
+    """Reconstruct CARL's native focal flip state from recorded car internals."""
+    if internal.shape[-1] != INTERNAL_STATE_SIZE:
+        raise ValueError("flip state needs all 19 replay internal fields")
+    window = carl.DOUBLEJUMP_MAX_DELAY
+    available = (~internal[..., 7].bool() & ~internal[..., 8].bool()
+                 & (internal[..., 1] < window))
+    remaining = (window - internal[..., 1]).clamp(min=0, max=window)
+    return th.stack((available.to(internal.dtype), remaining * available), dim=-1)
 
 
 def _unsafe_replay_reset_frames(
@@ -5279,10 +5290,6 @@ def validate_resume_args(args: argparse.Namespace, payload: dict | None) -> None
         raise ValueError("--discriminator-relative-positions must match the checkpoint when resuming")
     if getattr(args, "team_size", 1) != config.get("team_size", 1):
         raise ValueError("--team-size must match the checkpoint when resuming")
-    if getattr(args, "expired_dodge_mask", config.get("expired_dodge_mask", False)) != (
-        config.get("expired_dodge_mask", False)
-    ):
-        raise ValueError("--expired-dodge-mask must match the checkpoint when resuming")
     if args.transformer_global != config.get("transformer_global", False):
         raise ValueError("--transformer must match the checkpoint discriminator when resuming")
     if args.recurrent_global != config.get("recurrent_global", False):
@@ -5397,12 +5404,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument("--frameskip", type=int, default=4)
     add_feature_option(
-        parser, "--expired-dodge-mask", default=True,
-        help="track CARL's dodge window in policy observations and mask expired airborne jumps",
-    )
-    add_feature_option(
         parser, "--flip-state-features", default=True,
-        help="give the policy and discriminator focal flip availability and remaining dodge time",
+        help="include focal flip availability and remaining dodge time in discriminator scenes",
     )
     add_feature_option(
         parser, "--discriminator-relative-positions", default=True,
@@ -5573,8 +5576,6 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("team_size", 1)
         inherited.setdefault("policy_layers", 1)
         inherited.setdefault("critic_layers", 1)
-        inherited.setdefault("expired_dodge_mask", False)
-        inherited.setdefault("flip_state_features", False)
         inherited.setdefault("discriminator_relative_positions", False)
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
@@ -5789,7 +5790,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
     team_size = getattr(args, "team_size", 1)
-    return DodgeAwareCARLTorchVectorEnv(
+    return CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=team_size,
         n_orange=team_size,
@@ -5799,8 +5800,6 @@ def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
         no_touch_timeout_seconds=args.no_touch_timeout,
         normalize=True,
         discrete_actions=True,
-        flip_state_features=getattr(args, "flip_state_features", False),
-        append_age=getattr(args, "expired_dodge_mask", True),
     )
 
 
