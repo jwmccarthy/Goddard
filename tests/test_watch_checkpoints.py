@@ -368,6 +368,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                         "modules": {"policy": reference.state_dict()},
                         "config": {
                             "policy_architecture": architecture, "hidden_size": 16,
+                            "frameskip": 4,
                         },
                     }, training)
                     th.save(reference.state_dict(), snapshot)
@@ -377,6 +378,13 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                         th.testing.assert_close(
                             loaded.foot.model[0].weight, reference.foot.model[0].weight,
                         )
+                    if architecture == BASIC_POLICY_ARCHITECTURE:
+                        legacy = th.load(training, weights_only=True)
+                        del legacy["config"]["frameskip"]
+                        th.save(legacy, training)
+                        with self.assertRaisesRegex(ValueError, "trained at frameskip 8"):
+                            load_policy_checkpoint(training, env, 4, None)
+                        load_policy_checkpoint(training, env, 8, None)
 
     def test_deeper_basic_snapshots_and_training_checkpoints_are_watchable(self):
         env = FakeEnv()
@@ -401,6 +409,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                             "hidden_size": 16,
                             "policy_layers": layers,
                             "policy_gru_layers": gru_layers,
+                            "frameskip": 4,
                         },
                     }, paths[0])
                     th.save(reference.state_dict(), paths[1])
@@ -471,6 +480,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                             "policy_architecture": architecture,
                             "hidden_size": 16,
                             "policy_layers": layers,
+                            "frameskip": 4,
                         },
                     }, basic_path)
                     for kind, path in (("gaifo", gaifo_path), ("basic", basic_path)):
@@ -521,6 +531,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                         "config": {
                             "policy_architecture": architecture,
                             "hidden_size": 16,
+                            "frameskip": 4,
                         },
                     }, path)
                     loaded, signature = load_policy_checkpoint(path, env, 4, None)

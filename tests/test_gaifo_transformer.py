@@ -10,7 +10,7 @@ import numpy as np
 import torch as th
 
 from gaifo import (
-    BLUE_START, GAIFO_ARCHITECTURE, ORANGE_START, POSITION_SCALE,
+    BLUE_START, GAIFO_GRU_ARCHITECTURE, ORANGE_START, POSITION_SCALE,
     AdaptiveDiscriminatorUpdate, CausalSceneTransformer, ExpertSceneDataset,
     FactorizedSceneDiscriminator, SceneDiscriminator, SceneDiscriminatorLoss,
     SceneDiscriminatorReward, build_discriminator, parse_args,
@@ -53,6 +53,7 @@ class GAIFOTransformerTests(unittest.TestCase):
             standard, _ = parse_args()
         self.assertFalse(standard.transformer_global)
         self.assertFalse(standard.differential)
+        self.assertTrue(standard.gru)
         self.assertEqual(standard.n_sim, 16_384)
         self.assertEqual(standard.discriminator_batch, 16_384)
         self.assertEqual(standard.discriminator_heldout_size, 16_384)
@@ -117,7 +118,7 @@ class GAIFOTransformerTests(unittest.TestCase):
             checkpoint = folder / "gaifo_000000000000.pt"
             th.save({
                 "step": 0,
-                "config": {"architecture": GAIFO_ARCHITECTURE, **{
+                "config": {"architecture": GAIFO_GRU_ARCHITECTURE, **{
                     name: str(value) if isinstance(value, Path) else value
                     for name, value in vars(args).items()
                 }},
@@ -203,6 +204,16 @@ class GAIFOTransformerTests(unittest.TestCase):
                 optimizer=optimizer, loss=SceneDiscriminatorLoss(model),
                 context_length=6, context_stride=2, microbatch_size=2,
             )
+            empty = TensorBatch({
+                **batch,
+                "scene_window_valid": th.zeros_like(batch["scene_window_valid"]),
+            })
+            _, skipped = update.run(empty)
+            self.assertEqual(skipped["Discriminator"]["minibatches"], 0)
+            self.assertEqual(skipped["Discriminator"]["heldout_accuracy"], 0)
+            self.assertFalse(optimizer.state)
+            th.testing.assert_close(update._recent_context_frames[-1, :, 0],
+                                    windows[-1, :, -1, 0])
             _, first = update.run(batch)
             self.assertGreater(first["Discriminator"]["minibatches"], 0)
             self.assertTrue(optimizer.state)
@@ -221,7 +232,7 @@ class GAIFOTransformerTests(unittest.TestCase):
                      "--frame-embedding", "8", "--temporal-hidden", "8",
                      "--discriminator-hidden", "16", "--discriminator-batch", "4",
                      "--ppo-batch", "8", "--history-capacity", "8",
-                     "--history-add-size", "4"]
+                     "--history-add-size", "4", "--sequence-length", "4"]
             with patch.object(sys, "argv", flags):
                 args, _ = parse_args()
             validate_args(args)
@@ -229,7 +240,7 @@ class GAIFOTransformerTests(unittest.TestCase):
             checkpoint = folder / "gaifo_000000000000.pt"
             th.save({
                 "step": 0,
-                "config": {"architecture": GAIFO_ARCHITECTURE, **{
+                "config": {"architecture": GAIFO_GRU_ARCHITECTURE, **{
                     name: str(value) if isinstance(value, Path) else value
                     for name, value in vars(args).items()
                 }},

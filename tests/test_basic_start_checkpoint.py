@@ -98,6 +98,42 @@ class BasicStartingCheckpointTests(unittest.TestCase):
         torch.manual_seed(0)
         self.env = FakeEnv()
 
+    def test_frameskip_default_and_checkpoint_resume_inherit_control_cadence(self):
+        policy, critic = build_policy_and_critic(
+            self.env, argparse.Namespace(hidden_size=16),
+        )
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            path = Path(directory) / "training_latest.pt"
+            payload = {
+                "modules": {"policy": policy.state_dict(), "critic": critic.state_dict()},
+                "optimizers": {}, "config": {"frameskip": 4},
+            }
+            torch.save(payload, path)
+
+            def resumed(*flags):
+                with patch.object(sys, "argv", [
+                    "basic.py", "--resume-checkpoint", str(path), *flags,
+                ]):
+                    return parse_arguments()
+
+            new = resumed()
+            self.assertIsNone(new.frameskip)
+            configure_starting_checkpoint(new)
+            self.assertEqual(new.frameskip, 4)
+
+            mismatched = resumed("--frameskip", "2")
+            with self.assertRaisesRegex(ValueError, "--frameskip must match"):
+                configure_starting_checkpoint(mismatched)
+
+            payload["config"] = {}  # Historical BASIC training default.
+            torch.save(payload, path)
+            old = resumed()
+            configure_starting_checkpoint(old)
+            self.assertEqual(old.frameskip, 8)
+            explicit = resumed("--frameskip", "2")
+            configure_starting_checkpoint(explicit)
+            self.assertEqual(explicit.frameskip, 2)
+
     def test_cosine_learning_rate_updates_both_optimizers_and_resumes(self):
         args = ppo_args(BASIC_POLICY_ARCHITECTURE)
         args.start_kl_coef = 0.0
@@ -111,6 +147,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                 self.env, policy, critic, DiagnosticRewardSpec(), args,
                 Path(directory) / "snapshots",
             )
+            self.assertEqual(objects["config"]["frameskip"], 4)
             optimizers = objects["optimizers"]
 
             scheduler.start(100)
@@ -630,6 +667,7 @@ class BasicStartingCheckpointTests(unittest.TestCase):
             (2, 2, 1, 1),
         )
         self.assertEqual(defaults.entropy_coef_end, 0.005)
+        self.assertEqual(defaults.frameskip, 4)
         self.assertEqual(defaults.learning_rate_end_factor, 0.5)
         self.assertEqual(defaults.replay_reset_probability, 0.7)
 

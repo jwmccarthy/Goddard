@@ -24,6 +24,10 @@ BALL_MAX_SPEED = 6000.0
 # ReplayResetProvider accepts every team size through six cars.
 SCENE_SIZE = 51
 INTERNAL_START = 137
+# CARL's jump grace is 0.025 + 0.025 seconds; flip torque and pitch lock
+# last 0.65 + 0.3 seconds (RLConstants.cuh). Neither phase is observable.
+JUMP_GRACE_SECONDS = 0.05
+FLIP_PITCH_LOCK_SECONDS = 0.95
 
 
 def _invalid_reset_rotations(scenes: np.ndarray, n_cars: int) -> np.ndarray:
@@ -39,6 +43,42 @@ def _invalid_reset_rotations(scenes: np.ndarray, n_cars: int) -> np.ndarray:
         & (np.square(right).sum(axis=-1) >= 1e-8).all(axis=1)
     )
     return ~valid
+
+
+def observable_replay_reset_mask(
+    scenes: th.Tensor,
+    internal_states: th.Tensor,
+    known_internal: th.Tensor,
+) -> th.Tensor:
+    """Keep resets whose unobserved jump/flip phases cannot change the next action.
+
+    A missing player POV supplies only visible car flags. Its canonical zero
+    control state is safe at a settled ground start, not in an aerial with an
+    unknown jump latch, dodge timer, or active flip torque.
+    """
+    n_frames, n_cars, width = internal_states.shape
+    if (width != INTERNAL_SIZE or scenes.shape != (n_frames, BALL_SIZE + n_cars * CAR_SIZE)
+            or known_internal.shape != (n_frames, n_cars)):
+        raise ValueError("replay reset scenes, internals, and recorded POVs must match")
+
+    cars = scenes[:, BALL_SIZE:].reshape(n_frames, n_cars, CAR_SIZE)
+    grounded = cars[..., 16].bool()
+    # Active jump, held jump, dodge torque/autoflip, and pitch lock depend on
+    # phases absent from CARL's actor observation (which exposes only the
+    # available dodge and its remaining window).
+    safe_recorded = (
+        th.isfinite(internal_states).all(dim=-1)
+        & ~internal_states[..., 4].bool()  # is_jumping
+        & ~internal_states[..., 5].bool()  # previous jump input (edge latch)
+        & ~internal_states[..., 9].bool()  # is_flipping
+        & ~internal_states[..., 11].bool()  # is_autoflipping
+        & ~(internal_states[..., 3].bool()
+            & (internal_states[..., 6] < JUMP_GRACE_SECONDS))
+        & ~(internal_states[..., 8].bool()
+            & (internal_states[..., 10] < FLIP_PITCH_LOCK_SECONDS))
+    )
+    safe_unrecorded = grounded & ~cars[..., 18].bool() & ~cars[..., 19].bool()
+    return th.where(known_internal.bool(), safe_recorded, safe_unrecorded).all(dim=-1)
 
 
 def reset_index_dataset(indices: th.Tensor) -> TensorDataset:
@@ -169,10 +209,9 @@ def load_demonstration_reset_frames(
     """Sample safe replay frames with both cars' available CARL control state.
 
     Return normalized scenes and raw internal states on the requested device.
-    Unpaired opponent POVs contain only ground/flip/double-jump/boosting flags;
-    their unknown jump, flip, and boost timers remain zero. This can give an
-    airborne, unspent opponent a fresh dodge window. CARL resets boost pads to
-    active: its reset API cannot restore the replay's pad cooldowns.
+    Unpaired opponents must be grounded with an unused flip and jump; their
+    unknown jump, flip, and boost timers are initialized to zero. CARL resets
+    boost pads to active: its reset API cannot restore replay pad cooldowns.
     """
     random = np.random.default_rng(seed)
     rows = []
@@ -223,15 +262,13 @@ def load_demonstration_reset_frames(
             raise ValueError(f"pre-goal mask for {path.name} has wrong shape")
 
         invalid = source[:, -4:].astype(bool).any(axis=-1)
-        # Retain aerial, boost, and flip states while excluding unsafe frames.
+        # Retain safe aerial and boost states while excluding unsafe frames.
         eligible = np.flatnonzero(~unsafe & ~invalid & ~pre_goal)
         if len(eligible):
             # Demoed cars can have undefined axes even on otherwise safe frames.
             scene = np.asarray(source[eligible, :SCENE_SIZE], dtype=np.float32)
             eligible = eligible[~_invalid_reset_rotations(scene, 2)]
         if len(eligible):
-            if quota is not None and len(eligible) > quota:
-                eligible = random.choice(eligible, size=quota, replace=False)
             scene = np.asarray(source[eligible, :SCENE_SIZE], dtype=np.float32)
             ego_internal = np.asarray(
                 source[eligible, INTERNAL_START:INTERNAL_START + INTERNAL_SIZE],
@@ -250,8 +287,19 @@ def load_demonstration_reset_frames(
             )
             if paired_internal is not None:
                 opponent_internal = paired_internal
+            internal = np.stack((ego_internal, opponent_internal), axis=1)
+            known = th.ones((len(eligible), 2), dtype=th.bool)
+            known[:, 1] = paired_internal is not None
+            safe = observable_replay_reset_mask(
+                th.from_numpy(scene), th.from_numpy(internal), known,
+            ).numpy()
+            if not safe.any():
+                continue
+            selected = np.flatnonzero(safe)
+            if quota is not None and len(selected) > quota:
+                selected = random.choice(selected, size=quota, replace=False)
             rows.append(np.concatenate(
-                (scene, ego_internal, opponent_internal), axis=1
+                (scene[selected], internal[selected, 0], internal[selected, 1]), axis=1,
             ))
 
     if not rows:
@@ -266,5 +314,6 @@ def load_demonstration_reset_frames(
 
 
 __all__ = [
-    "ReplayResetProvider", "load_demonstration_reset_frames", "reset_index_dataset",
+    "ReplayResetProvider", "load_demonstration_reset_frames",
+    "observable_replay_reset_mask", "reset_index_dataset",
 ]

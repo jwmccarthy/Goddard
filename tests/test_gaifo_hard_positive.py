@@ -55,6 +55,7 @@ def make_expert(folder: Path, *, heldout_size: int = 8) -> ExpertSceneDataset:
             rows[:, car + 2] = 17 / POSITION_SCALE[2]
             rows[:, car + 9] = 1
             rows[:, car + 14] = 1
+            rows[:, car + 16] = 1
         np.save(folder / f"segment{segment}.npy", rows)
     return ExpertSceneDataset(folder, trajectory_length=8, heldout_size=heldout_size)
 

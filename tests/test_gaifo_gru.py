@@ -67,7 +67,7 @@ class GAIFOGruTests(unittest.TestCase):
         )
 
     def test_gru_flag(self):
-        for flags, expected in (((), False), (("--gru",), True),
+        for flags, expected in (((), True), (("--gru",), True),
                                 (("--gru", "false"), False)):
             with self.subTest(flags=flags), patch.object(sys, "argv", [
                 "gaifo.py", "--replay-dir", "parsed_replays", *flags,

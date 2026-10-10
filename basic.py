@@ -52,6 +52,7 @@ from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
 from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
+from action_codec import enable_grounded_aerial_controls
 from reward_spec import RewardSpec
 from replay_resets import (
     ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
@@ -279,6 +280,16 @@ def configure_starting_checkpoint(
                 setattr(arguments, name, saved)
         arguments.checkpoint_observation_size = checkpoint.observation_size
 
+        if arguments.resume_checkpoint is not None:
+            saved_frameskip = payload.get("config", {}).get("frameskip")
+            if getattr(arguments, "frameskip", None) is None:
+                # Older BASIC checkpoints did not save their default of 8.
+                arguments.frameskip = 8 if saved_frameskip is None else saved_frameskip
+            elif saved_frameskip is not None and arguments.frameskip != saved_frameskip:
+                raise ValueError(
+                    f"--frameskip must match the checkpoint ({saved_frameskip}) when resuming"
+                )
+
         if arguments.start_kl_coef is None and resumed_reference:
             arguments.start_kl_coef = payload.get("config", {}).get(
                 "start_kl_coef", DEFAULT_START_KL_COEF
@@ -286,6 +297,8 @@ def configure_starting_checkpoint(
 
     if arguments.hidden_size is None:
         arguments.hidden_size = 256
+    if getattr(arguments, "frameskip", None) is None:
+        arguments.frameskip = 4
     if source is None:
         arguments.policy_architecture = BASIC_POLICY_ARCHITECTURE
     (
@@ -480,7 +493,10 @@ def parse_arguments() -> argparse.Namespace:
         "--n-sim", "--num-simulations", dest="num_simulations",
         type=int, default=1024, metavar="N_SIM",
     )
-    parser.add_argument("--frameskip",                  type=int,   default=8)
+    parser.add_argument(
+        "--frameskip", type=int, default=None,
+        help="physics ticks per policy action (default: 4; inherited on resume)",
+    )
     parser.add_argument("--max-ticks",                  type=int,   default=36_000)
     parser.add_argument(
         "--no-touch-timeout",
@@ -607,6 +623,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--seed",                       type=int,   default=0)
     arguments = parser.parse_args()
+    if arguments.frameskip is None and arguments.resume_checkpoint is None:
+        arguments.frameskip = 4
     if (
         arguments.hidden_size is None
         and arguments.start_checkpoint is None
@@ -1159,6 +1177,7 @@ def build_ppo(
             "policy_gru_layers": policy_gru_layers,
             "critic_gru_layers": critic_gru_layers,
             "start_kl_coef": arguments.start_kl_coef,
+            "frameskip": arguments.frameskip,
             "sparse": arguments.sparse,
         },
     }
@@ -1169,7 +1188,7 @@ def build_training_environment(
     reset_provider: SyntheticMatchResetProvider,
 ) -> CARLTorchVectorEnv:
     saved_size = getattr(arguments, "checkpoint_observation_size", None)
-    environment = CARLTorchVectorEnv(
+    environment = enable_grounded_aerial_controls(CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
         n_blue=1,
         n_orange=1,
@@ -1182,7 +1201,7 @@ def build_training_environment(
         reset_state_provider=reset_provider,
         normalize=arguments.normalize,
         discrete_actions=True,
-    )
+    ))
     actual_size = environment.single_observation_space.shape[0]
     if saved_size is not None and saved_size != actual_size:
         environment.close()

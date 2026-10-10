@@ -23,6 +23,7 @@ from jarl.data.records import PolicyOutput
 from jarl.envs import DatasetResetSampler
 from jarl.modules import GoalActor
 
+from action_codec import enable_grounded_aerial_controls
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
 from deep import ARCHITECTURE as DEEP_ARCHITECTURE, GOAL_SLICES, goal_size
 from gaifo import (
@@ -389,16 +390,20 @@ def load_policy_checkpoint(
 ):
     payload = th.load(path, map_location="cpu", weights_only=True)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
+    kind = checkpoint_kind(path)
     saved_frameskip = config.get("frameskip")
-    if checkpoint_kind(path) == "deep" and saved_frameskip is None:
+    if kind == "deep" and saved_frameskip is None:
         saved_frameskip = payload.get("arguments", {}).get("frameskip")
+    elif kind == "basic" and saved_frameskip is None and config:
+        # Structured BASIC checkpoints predating cadence metadata trained at 8.
+        # Bare policy weights have no reliable way to identify their cadence.
+        saved_frameskip = 8
     if saved_frameskip is not None and int(saved_frameskip) != frameskip:
         raise ValueError(
             f"checkpoint was trained at frameskip {saved_frameskip}, "
             f"watching at {frameskip}; pass --frameskip {saved_frameskip}"
         )
 
-    kind = checkpoint_kind(path)
     if kind == "deep":
         return load_deep_policy(path, payload, env)
     if kind == "gaifo":
@@ -581,7 +586,7 @@ def simulate(
             team_size=args.team_size,
         )
         state.configure_reset_types(tuple(reset_provider.providers))
-        base = CARLTorchVectorEnv(
+        base = enable_grounded_aerial_controls(CARLTorchVectorEnv(
             n_sim=1,
             n_blue=args.team_size,
             n_orange=args.team_size,
@@ -592,7 +597,7 @@ def simulate(
             synchronize=True,
             reset_state_provider=reset_provider,
             discrete_actions=True,
-        )
+        ))
         env, blue, orange = load_match(
             blue_path, orange_path, base, args.frameskip, args.hidden_size,
         )

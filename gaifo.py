@@ -52,9 +52,10 @@ from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
+from action_codec import enable_grounded_aerial_controls
 from replay_resets import (
     ReplayResetProvider, _invalid_reset_rotations, _sampled_frame_skip,
-    reset_index_dataset,
+    observable_replay_reset_mask, reset_index_dataset,
 )
 from replay_layout import (
     FLIP_STATE_SIZE, TEAM_SIZES, team_car_count, team_discriminator_scene_size,
@@ -926,7 +927,7 @@ class EgoBallTouchCapture(CaptureBase):
 
 
 class SceneWindowCapture(CaptureBase):
-    """Capture short scene windows across rollout boundaries, resetting on done."""
+    """Capture causal windows; mark incomplete episode history unscorable."""
 
     def __init__(
         self, trajectory_length: int, n_cars: int = N_CARS,
@@ -996,13 +997,11 @@ class SceneWindowCapture(CaptureBase):
         assert self.history_age is not None
         assert self.history_pos is not None
 
-        # A new episode begins at its kickoff state. Left-pad causal context
-        # with that state so its first actions can receive imitation reward.
+        # Keep incomplete windows well-formed for storage, but mark them invalid
+        # until every historical scene came from an actual environment step.
         fresh = self.history_age == 0
         if fresh.any():
             self.history[fresh] = current_scene[fresh, None].expand(-1, capacity, -1)
-            self.history_pos[fresh] = 0
-            self.history_age[fresh] = capacity - 1
 
         env_indices = th.arange(n_envs, device=observation.device)
         self.history[env_indices, self.history_pos] = current_scene
@@ -1268,9 +1267,9 @@ class ExpertSceneDataset:
                 invalid_rotation_frames.append(th.from_numpy(np.pad(
                     bad_rotations, (self.partition_span, 0), constant_values=True,
                 )))
-            # Every kickoff belongs to a causal window, including the first
-            # frame of each replay period. Repeating its initial state provides
-            # history without borrowing frames from another segment or the future.
+            # A replay period begins at its kickoff state. Its repeated prefix
+            # provides the skill classifier with setup context; generated
+            # windows, by contrast, are invalid until real history is complete.
             pad = trajectory_length - 1
             source = np.concatenate((np.repeat(source[:1], pad, axis=0), source))
             internal = np.concatenate((np.repeat(internal[:1], pad, axis=0), internal))
@@ -1366,6 +1365,14 @@ class ExpertSceneDataset:
             self.reset_indices = self.reset_indices[
                 ~invalid_rotations[self.reset_indices]
             ]
+        # Keep skill clips as discriminator examples, but do not reset an
+        # unobserved active jump/flip or an unrecorded airborne opponent.
+        safe = observable_replay_reset_mask(
+            self.frames[self.reset_indices],
+            self.internal_states[self.reset_indices],
+            self.pov_available[self.reset_indices],
+        )
+        self.reset_indices = self.reset_indices[safe]
         self._near_frames: th.Tensor | None = None
         self._train_near_pairs: th.Tensor | None = None
         self._heldout_near_pairs: th.Tensor | None = None
@@ -4525,15 +4532,11 @@ class SceneDiscriminatorReward:
                 imitation_reward + goal_reward + aerial_touch_reward + flip_reset_reward
             ),
         )
-        learner_mask = (
-            valid | goal_reward.ne(0) | aerial_touch_reward.ne(0)
-            | flip_reset_reward.ne(0)
-        )
         if "learner_mask" in result:
-            return result.replace_fields(
-                learner_mask=result["learner_mask"].bool() & learner_mask
-            )
-        return result.with_fields(learner_mask=learner_mask)
+            return result.replace_fields(learner_mask=result["learner_mask"].bool())
+        # Incomplete imitation context does not invalidate the policy action:
+        # PPO still needs early steps to credit later goals and touches.
+        return result.with_fields(learner_mask=th.ones_like(valid))
 
 
 class SelectPPOFields:
@@ -4658,8 +4661,6 @@ class AdaptiveDiscriminatorUpdate:
         )
         windows = batch["scene_window"]
         valid = batch["scene_window_valid"].bool()
-        if not valid.any():
-            raise RuntimeError("no valid generated scene windows in rollout")
 
         flat_windows = windows.reshape(
             -1, self.expert.trajectory_length, self.expert.discriminator_scene_size
@@ -5504,8 +5505,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument("--ppo-batch", type=int, default=16_384)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     add_feature_option(
-        parser, "--gru",
-        help="use GRU policy and critic with recurrent PPO (default: MLP)",
+        parser, "--gru", default=True,
+        help="use GRU policy and critic with recurrent PPO (default: enabled; --gru false for MLP)",
     )
     parser.add_argument(
         "--sequence-length", type=int, default=16,
@@ -5562,6 +5563,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("team_size", 1)
         inherited.setdefault("policy_layers", 1)
         inherited.setdefault("critic_layers", 1)
+        inherited.setdefault("gru", resume["config"].get("gru", False))
         inherited.setdefault("discriminator_relative_positions", False)
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
@@ -5776,7 +5778,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
     team_size = getattr(args, "team_size", 1)
-    return CARLTorchVectorEnv(
+    return enable_grounded_aerial_controls(CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=team_size,
         n_orange=team_size,
@@ -5786,7 +5788,7 @@ def build_env(args: argparse.Namespace) -> CARLTorchVectorEnv:
         no_touch_timeout_seconds=args.no_touch_timeout,
         normalize=True,
         discrete_actions=True,
-    )
+    ))
 
 
 def build_policy(env, args: argparse.Namespace) -> MultiCategoricalPolicy:

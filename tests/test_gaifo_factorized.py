@@ -86,7 +86,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 "gaifo.py", "--replay-dir", directory, "--factorize",
                 "--discriminator-relative-positions", "false", "--n-sim", "1",
                 "--rollout", "4", "--discriminator-hidden", "16",
-                "--frame-embedding", "8", "--temporal-hidden", "8",
+                "--frame-embedding", "8", "--temporal-hidden", "8", "--gru", "false",
             ]):
                 args, _ = parse_args()
             original = build_discriminator(args)
@@ -103,6 +103,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 for name, value in vars(args).items()
             }
             config["architecture"] = GAIFO_ARCHITECTURE
+            config.pop("gru")  # Original MLP checkpoints did not record this flag.
             config.pop("discriminator_relative_positions")
             checkpoint = Path(directory) / "gaifo_000000000000.pt"
             th.save({

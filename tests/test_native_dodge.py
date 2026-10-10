@@ -11,6 +11,7 @@ from carl.gymnasium.action import CARLActionCodec
 from gymnasium.spaces import Box, MultiDiscrete
 from jarl.envs import DatasetResetSampler
 
+from action_codec import GroundAerialActionCodec, enable_grounded_aerial_controls
 from gaifo import build_policy, flip_state_from_internal
 from replay_resets import ReplayResetProvider, reset_index_dataset
 
@@ -35,6 +36,26 @@ class NativeDodgeTests(unittest.TestCase):
         observation[3, 25] = 1  # A grounded first jump remains available.
         self.assertEqual(CARLActionCodec().mask(observation)[:, 17].tolist(),
                          [True, False, False, True])
+
+    def test_project_mask_keeps_grounded_aerial_controls_and_native_jump_rules(self):
+        observation = th.zeros(2, 139)
+        observation[0, 25] = 1  # Grounded, with no boost.
+        observation[1, -2:] = th.tensor([1., 0.5])  # Airborne dodge available.
+        codec = GroundAerialActionCodec()
+        mask = codec.mask(observation)
+        for index in (4, 5, 14, 15):
+            self.assertTrue(mask[:, index].all(), f"pitch/roll logit {index} was masked")
+        self.assertEqual(mask[:, 10].tolist(), [True, False])  # Powerslide.
+        self.assertFalse(mask[:, 12].any())  # No boost.
+        self.assertTrue(mask[:, 17].all())  # Jump/dodge remain legal.
+
+        class Env:
+            device = th.device("cpu")
+            action_codec = CARLActionCodec()
+
+        env = Env()
+        self.assertIs(enable_grounded_aerial_controls(env), env)
+        self.assertIsInstance(env.action_codec, GroundAerialActionCodec)
 
     def test_saved_native_state_controls_policy_and_ppo_action_masks(self):
         class Env:

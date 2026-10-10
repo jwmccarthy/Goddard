@@ -160,7 +160,7 @@ class KickoffRetentionTests(unittest.TestCase):
                 window = heldout.frames[selected[0] + heldout.window_offsets]
                 self.assertTrue((window[:, 3] == window[0, 3]).all())
 
-    def test_generated_first_action_uses_its_own_kickoff_context_after_reset(self):
+    def test_generated_windows_wait_for_real_history_and_keep_terminal_scenes(self):
         capture = SceneWindowCapture(4)
         capture.reset(batch_size=2)
 
@@ -178,16 +178,27 @@ class KickoffRetentionTests(unittest.TestCase):
             ))
 
         first = capture_step(0, 1)
-        self.assertTrue(first["scene_window_valid"].all())
+        self.assertFalse(first["scene_window_valid"].any())
         th.testing.assert_close(first["scene_window"][:, :, 3],
                                 th.tensor([[0., 0., 0., 1.]]).expand(2, -1))
         second = capture_step(1, 2, done=True)
+        self.assertFalse(second["scene_window_valid"].any())
         th.testing.assert_close(second["scene_window"][:, :, 3],
                                 th.tensor([[0., 0., 1., 2.]]).expand(2, -1))
         after_reset = capture_step(10, 11)
-        self.assertTrue(after_reset["scene_window_valid"].all())
+        self.assertFalse(after_reset["scene_window_valid"].any())
         th.testing.assert_close(after_reset["scene_window"][:, :, 3],
                                 th.tensor([[10., 10., 10., 11.]]).expand(2, -1))
+        self.assertFalse(capture_step(11, 12)["scene_window_valid"].any())
+        full = capture_step(12, 13)
+        self.assertTrue(full["scene_window_valid"].all())
+        th.testing.assert_close(full["scene_window"][:, :, 3],
+                                th.tensor([[10., 11., 12., 13.]]).expand(2, -1))
+        terminal = capture_step(13, 14, done=True)
+        self.assertTrue(terminal["scene_window_valid"].all())
+        th.testing.assert_close(terminal["scene_window"][:, :, 3],
+                                th.tensor([[11., 12., 13., 14.]]).expand(2, -1))
+        self.assertFalse(capture_step(-50, -49)["scene_window_valid"].any())
 
 
 if __name__ == "__main__":

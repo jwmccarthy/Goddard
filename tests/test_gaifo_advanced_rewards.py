@@ -188,10 +188,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         th.testing.assert_close(
             result["training_reward"].view(4, 2).sum(-1), th.zeros(4)
         )
-        th.testing.assert_close(
-            result["learner_mask"].view(4, 2).any(-1),
-            th.tensor([True, False, True, True]),
-        )
+        self.assertTrue(result["learner_mask"].all())
 
         metrics = gameplay.diagnostic_metrics()["Gameplay"]
         self.assertEqual(metrics["aerial_touches_per_1000_steps"], 375.0)
@@ -220,9 +217,14 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         th.testing.assert_close(
             reward["training_reward"], th.tensor([[1.0, 0.0, -1.0, 2.0]])
         )
-        th.testing.assert_close(
-            reward["learner_mask"], th.tensor([[True, False, True, True]])
-        )
+        self.assertTrue(reward["learner_mask"].all())
+        # Self-play still excludes non-learner actors, regardless of D context.
+        masked = batch.with_fields(learner_mask=th.tensor([[True, False, True, False]]))
+        replayed = SceneDiscriminatorReward(
+            PositionDiscriminator(), noise_std=0.0, trajectory_length=2,
+            batch_size=1,
+        )(masked, PrepareContext())
+        th.testing.assert_close(replayed["learner_mask"], masked["learner_mask"])
         self.assertNotIn("long_imitation_reward", reward)
 
     def test_exp_log_odds_reward_is_bounded_without_batch_centering(self):

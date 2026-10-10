@@ -38,9 +38,9 @@ def _period(folder: Path, kind: str, index: int) -> None:
     if kind in ("aerial", "aerial_touch"):
         rows[8:25, BLUE_START + 16] = 0
         rows[8:25, BLUE_START + 2] = 650 / POSITION_SCALE[2]
-        rows[8:25, ORANGE_START + 16] = 0
-        rows[8:25, ORANGE_START + 18] = 1
-        rows[8:25, ORANGE_START + 2] = 650 / POSITION_SCALE[2]
+        rows[8:12, ORANGE_START + 16] = 0
+        rows[8:12, ORANGE_START + 18] = 1
+        rows[8:12, ORANGE_START + 2] = 650 / POSITION_SCALE[2]
         rows[8:25, 2] = 750 / POSITION_SCALE[2]
         rows[8:25, 0] = 100 / POSITION_SCALE[0]
         if kind == "aerial":
@@ -70,6 +70,8 @@ def _period(folder: Path, kind: str, index: int) -> None:
         rows[:, ORANGE_START + 1] = 2_560 / POSITION_SCALE[1]
         rows[20:, 0] = (np.arange(20, 48) - 19) * 30 / POSITION_SCALE[0]
         rows[20:, 3] = 900 / 6_000  # Kickoff challenge at step 20.
+
+    rows[:, 137] = rows[:, BLUE_START + 16]
 
     unsafe = np.zeros(len(rows), dtype=bool)
     pre_goal = np.zeros(len(rows), dtype=bool)
@@ -253,7 +255,7 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                 ))
 
     @unittest.skipUnless(th.cuda.is_available(), "CARL reset integration requires CUDA")
-    def test_carl_resets_preserve_unpaired_opponent_controls(self):
+    def test_carl_resets_avoid_unrecorded_airborne_opponent_controls(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             for index, kind in enumerate(("aerial", "aerial_touch", "dribble", "flick", "driving")):
                 _period(Path(directory), kind, index)
@@ -262,7 +264,10 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                 reject_discontinuities=True, skill_sampling=True,
             )
             aerial = expert._curated_reset_pools[AERIAL_MANEUVER_SKILL]
-            flip = aerial[expert.frames[aerial, ORANGE_START + 18] > .5][0]
+            self.assertTrue(len(aerial))
+            self.assertFalse((expert.frames[aerial, ORANGE_START + 18] > .5).any())
+            airborne = aerial[expert.frames[aerial, BLUE_START + 16] < .5]
+            self.assertTrue(len(airborne))
             ground = expert._curated_reset_pools[DRIVING_SKILL][
                 expert.frames[expert._curated_reset_pools[DRIVING_SKILL], ORANGE_START + 16] > .5
             ][0]
@@ -277,7 +282,7 @@ class CuratedSkillSamplingTests(unittest.TestCase):
                         "simulation_indices": th.zeros(1, dtype=th.long, device=mask.device),
                     })
 
-            fixed = FixedStart(flip)
+            fixed = FixedStart(airborne[0])
             env = CARLTorchVectorEnv(
                 n_sim=1, n_blue=1, n_orange=1, frameskip=4,
                 normalize=True, discrete_actions=True,
@@ -287,8 +292,9 @@ class CuratedSkillSamplingTests(unittest.TestCase):
             )
             try:
                 observations = env.reset()
-                self.assertTrue(bool(observations[0, ORANGE_START + 18]))
-                self.assertFalse(bool(env.action_mask(observations)[1, 17]))
+                self.assertFalse(bool(observations[0, BLUE_START + 16]))
+                self.assertTrue(bool(observations[0, ORANGE_START + 16]))
+                self.assertTrue(bool(env.action_mask(observations)[1, 17]))
                 fixed.index = ground
                 observations = env.reset()
                 self.assertTrue(bool(observations[0, ORANGE_START + 16]))

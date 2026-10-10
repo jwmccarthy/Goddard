@@ -131,7 +131,9 @@ by default, using the existing parsed files without reparsing. Checkpoint
 resumes retain their saved discriminator inputs.
 `--factorize --transformer` also trains the existing near-ball and far-car
 specialists. `--gru` independently controls the policy and critic; it does not
-select the discriminator. `--transformer` cannot be combined with
+select the discriminator. New runs use a GRU policy and critic by default;
+`--gru false` selects an MLP, and resumes preserve the saved architecture.
+`--transformer` cannot be combined with
 `--recurrent-global`.
 
 ```bash
@@ -162,16 +164,21 @@ the restored training step.
 
 Replay resets draw all cars and available internal control states from the
 selected mode's parsed data; curated skill categories choose *when* to reset,
-and `--replay-reset-fraction` controls the share versus fresh kickoffs. Goal
+and `--replay-reset-fraction` controls the share versus fresh kickoffs. Resets
+skip hidden active jump/flip phases and unrecorded airborne opponents. GAIFO
+does not score imitation until it has a full window of real episode history;
+PPO can still credit those early actions for later rewards. Goal
 rewards and the default aerial-touch bonus are shared across teammates and
 opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
 `--aerial-touch-reward-weight` (default `0.5`).
 
 GAIFO, BASIC, deep training, and the checkpoint viewer use CARL's native
-observation and action codec. Its final two observation fields report whether
-the focal car can jump or flip and how much dodge time remains. The codec masks
-expired airborne dodges from these fields, including during PPO updates.
+observation and a shared project action mask. Its final two observation fields
+report whether the focal car can jump or flip and how much dodge time remains.
+The mask permits grounded pitch and air roll, while still masking expired
+airborne dodges, including during PPO updates. New BASIC runs use frameskip 4;
+checkpoint resumes inherit their saved cadence (8 for older BASIC checkpoints).
 Checkpoints must use the matching native observation width (139/193/247 for
 1v1/2v2/3v3); jump-age-extended policies are not supported.
 

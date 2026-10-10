@@ -62,14 +62,14 @@ def write_team_povs(
         rows[29, other_car + 12:other_car + 15] = rows[29, other_car + 9:other_car + 12]
     internal = team_observation_size(team_size)
     rows[:, internal] = 1
-    rows[:, internal + 5] = 0.1
+    rows[0, internal + 5] = 0.1  # A held jump is restored, but not a reset target.
     for actor in (0, *extra):
         recorded = rows.copy()
         if actor:
             recorded[:, :team_scene_size(team_size)] = actor_view(
                 th.from_numpy(rows[:, :team_scene_size(team_size)]), actor,
             ).numpy()
-        recorded[:, internal + 5] = 0.1 + 0.05 * actor
+        recorded[0, internal + 5] = 0.1 + 0.05 * actor
         recorded[12 + actor, internal + 19] = 1
         path = folder / f"{100 + actor}-0-match.npy"
         np.save(path, recorded)
@@ -306,6 +306,7 @@ class TeamSizeUnitTests(unittest.TestCase):
                 original, _ = parse_args()
             config = {name: str(value) if isinstance(value, Path) else value
                       for name, value in vars(original).items()}
+            config["gru"] = False  # Exercise a pre-GRU-default MLP checkpoint.
             config["architecture"] = GAIFO_TEAM_ARCHITECTURE
             path = Path(directory) / "gaifo_000000000012.pt"
             th.save({
@@ -320,6 +321,7 @@ class TeamSizeUnitTests(unittest.TestCase):
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)]):
                 resumed, payload = parse_args()
             self.assertEqual(resumed.team_size, 3)
+            self.assertFalse(resumed.gru)
             validate_resume_args(resumed, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
                                             "--team-size", "2"]):
@@ -400,6 +402,7 @@ class TeamSizeTrainingSmoke(unittest.TestCase):
             flags = [
                 "gaifo.py", "--team-size", str(size), "--replay-dir", str(replay_dir),
                 "--replay-reset-fraction", "1", "--n-sim", "2", "--rollout", "8",
+                "--sequence-length", "4",
                 "--trajectory-length", "4", "--timesteps", str(8 * 2 * n_cars * 2),
                 "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",

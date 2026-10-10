@@ -45,6 +45,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 rows[:, car + 9] = 1
                 rows[:, car + 14] = 1
                 rows[:, car + 16] = 1
+            # Random policies jump before their first full eight-frame window;
+            # include a low-aerial expert situation for a matched discriminator.
+            rows[16:40, BLUE_START + 2] = 100 / POSITION_SCALE[2]
+            rows[16:40, BLUE_START + 16] = 0
             rows[:, 137] = 1
             if invalid_rotations:
                 rows[12:32, ORANGE_START + 9:ORANGE_START + 15] = 0
@@ -66,8 +70,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             flags = [
                 "gaifo.py", "--replay-dir", str(replays),
                 "--replay-reset-fraction", "1",
+                "--curated-skill-sampling", "false",  # Synthetic replays have no touch metadata.
                 "--n-sim", "2",
                 "--rollout", "8", "--trajectory-length", str(trajectory_length),
+                "--gru", "false",  # Exercise legacy MLP checkpoints explicitly.
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
                 "--discriminator-hidden", "16", "--frame-embedding", "8",
