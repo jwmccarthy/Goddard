@@ -10,7 +10,7 @@ from carl.gymnasium.state import (
     CarlState,
     RewardContext,
 )
-from reward_spec import BALL_RADIUS, RewardSpec, RewardWeights
+from reward_spec import BALL_RADIUS, GOAL_HEIGHT, RewardSpec, RewardWeights
 
 
 def raw_state(n_sim: int) -> torch.Tensor:
@@ -66,6 +66,85 @@ def mechanic_weights(**enabled: float) -> RewardWeights:
 
 
 class BasicMechanicsRewardTests(unittest.TestCase):
+    def test_aerial_shot_rewards_goalward_redirection_not_repeated_contact(self):
+        current = raw_state(6)
+        current[:, 2] = 700.0
+        cars = current[:, 9:53].view(6, 2, 22)
+        cars[:, 0, 2] = 560.0
+        cars[:, 0, 16] = 0.0
+        cars[:, 0, 21] = 1.0
+        cars[1, 1, 2] = 560.0
+        cars[1, 1, 16] = 0.0
+        cars[1, 1, 21] = 1.0
+        cars[1, 0, 21] = 0.0
+        cars[5, 0, 21] = 0.0
+        current[:, 4] = torch.tensor([1500., -1500., 1000., -1500., 1500., 1500.])
+        current[:, 5] = torch.tensor([-100., -100., -100., 0., -100., -100.])
+
+        previous = current.clone()
+        previous[:, 3:6] = 0.0
+        previous[2, 3:5] = torch.tensor([1200.0, 800.0])  # Fast, but badly aimed.
+        previous[3, 4:6] = torch.tensor([1500.0, -100.0])
+        previous[4, 1] = -100.0
+        previous[4, 4:6] = current[4, 4:6]  # Travel, but no change in shot aim.
+        previous[:, 9:53].view(6, 2, 22)[:, :, 21] = 0.0
+
+        weights = mechanic_weights(aerial_shot=1.0)
+        reward_spec = RewardSpec(normalize=False, weights=weights)
+        context = reward_context(current, previous)
+        reward = reward_spec(context)
+
+        self.assertEqual(RewardSpec().weights.aerial_shot, 1.0)
+        self.assertGreater(reward[0, 0].item(), 0.0)
+        self.assertAlmostEqual(reward[1, 1].item(), reward[0, 0].item())
+        self.assertGreater(reward[2, 0].item(), 0.0)  # Aim improved as speed fell.
+        self.assertLess(reward[3, 0].item(), 0.0)  # A touch spoils a good shot.
+        torch.testing.assert_close(reward[4:], torch.zeros(2, 2))
+        torch.testing.assert_close(
+            reward_spec(reward_context(current, current)), torch.zeros(6, 2),
+        )
+        torch.testing.assert_close(reward.sum(dim=-1), torch.zeros(6))
+
+    def test_aerial_shot_needs_height_and_goalward_aim(self):
+        current = raw_state(7)
+        current[:, 2] = 700.0
+        current[:, 4] = 1500.0
+        current[:, 5] = -100.0
+        cars = current[:, 9:53].view(7, 2, 22)
+        cars[:, 0, 2] = 560.0
+        cars[:, 0, 16] = 0.0
+        cars[:, 0, 21] = 1.0
+        previous = current.clone()
+        previous[:, 3:6] = 0.0
+        old_cars = previous[:, 9:53].view(7, 2, 22)
+        old_cars[:, 0, 21] = 0.0
+
+        current[0, 2] = previous[0, 2] = GOAL_HEIGHT
+        cars[1, 0, 2] = old_cars[1, 0, 2] = 17.0  # A ground touch.
+        cars[1, 0, 16] = old_cars[1, 0, 16] = 1.0
+        current[2, 0] = previous[2, 0] = 3900.0
+        cars[2, 0, :2] = old_cars[2, 0, :2] = torch.tensor([4050.0, 0.0])
+        cars[2, 0, 2] = old_cars[2, 0, 2] = 700.0
+        cars[2, 0, 12:15] = old_cars[2, 0, 12:15] = torch.tensor([1., 0., 0.])
+        cars[2, 0, 16] = old_cars[2, 0, 16] = 1.0  # On the wall.
+        current[2, 3:6] = torch.tensor([-1200.0, 1600.0, -100.0])
+
+        current[4:6, 1] = previous[4:6, 1] = 4800.0
+        cars[4:6, 0, 1] = old_cars[4:6, 0, 1] = 4700.0
+        current[4, 5] = 0.0  # A horizontal ball would clear the crossbar.
+        current[5, 5] = -1700.0  # This touch directs it down into the goal.
+        current[6, 0] = 2000.0  # A discontinuous replay transition.
+        cars[6, 0, 0] = old_cars[6, 0, 0] = 2000.0
+        done = torch.zeros(7, dtype=torch.bool)
+        done[3] = True
+
+        reward = RewardSpec(
+            normalize=False, weights=mechanic_weights(aerial_shot=1.0),
+        )(reward_context(current, previous, done=done))
+        torch.testing.assert_close(reward[[0, 1, 2, 3, 4, 6]], torch.zeros(6, 2))
+        self.assertGreater(reward[5, 0].item(), 0.0)
+        self.assertAlmostEqual(reward[5].sum().item(), 0.0)
+
     def test_soft_lifts_reward_gentle_pops_more_at_height_but_not_hard_hits(self):
         current = raw_state(7)
         cars = current[:, 9:53].view(7, 2, 22)

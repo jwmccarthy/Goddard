@@ -129,7 +129,7 @@ class SparseRewardTests(unittest.TestCase):
             "goal_scored", "shot", "air_dribble_setup", "car_velocity",
             "aerial_touch", "demo", "aerial_carry_progress",
             "aerial_speed_progress", "speed_progress", "boost_free_speed_progress",
-            "soft_lift", "flip_reset",
+            "soft_lift", "flip_reset", "aerial_shot",
         })
         self.assertGreater(result.info["reward_spec/component/shot"][2 * 2], 0)
         self.assertGreater(result.info["reward_spec/component/aerial_touch"][3 * 2 + 1], 0)

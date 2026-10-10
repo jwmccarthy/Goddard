@@ -55,6 +55,7 @@ class RewardWeights:
     speed_progress:       float = 0.1
     boost_free_speed_progress: float = 0.2
     soft_lift:            float = 0.4
+    aerial_shot:          float = 1.0
 
     @classmethod
     def sparse(cls) -> "RewardWeights":
@@ -486,6 +487,22 @@ class RewardSpec:
             & ~wall_contact
         )
 
+        opponent_goal = torch.zeros_like(current.car_position)
+        opponent_goal[..., 1] = team_sign * GOAL_Y
+        opponent_goal[..., 2] = GOAL_HEIGHT / 2.0
+        toward_goal = self._unit(opponent_goal - ball_position)
+        # Compare velocities at the same ball position, so travel alone cannot
+        # earn a shot. A poor aerial touch that spoils a shot is charged too.
+        aerial_shot = (
+            current.car_ball_touches
+            & ball_position[..., 2].gt(GOAL_HEIGHT)
+            & current.car_position[..., 2].gt(2.0 * BALL_RADIUS)
+            & ~wall_contact
+        ) * (
+            self._aerial_shot_quality(current.ball_velocity, toward_goal)
+            - self._aerial_shot_quality(previous.ball_velocity, toward_goal)
+        )
+
         weights = self.weights
         return {
             "aerial_carry_progress": weights.aerial_carry_progress * valid * (
@@ -500,7 +517,21 @@ class RewardSpec:
             ),
             "soft_lift": weights.soft_lift * valid * soft_lift,
             "flip_reset": weights.flip_reset * valid * flip_reset,
+            "aerial_shot": weights.aerial_shot * valid * aerial_shot,
         }
+
+    @classmethod
+    def _aerial_shot_quality(
+        cls, ball_velocity: torch.Tensor, toward_goal: torch.Tensor,
+    ) -> torch.Tensor:
+        velocity = ball_velocity[:, None, :]
+        goalward_speed = (velocity * toward_goal).sum(dim=-1)
+        alignment = cls._cosine(velocity, toward_goal)
+        # Low-speed or off-target contact pays nothing; quality is capped at one.
+        return (
+            ((goalward_speed - 400.0) / 1200.0).clamp(0.0, 1.0)
+            * ((alignment - 0.8) / 0.2).clamp(0.0, 1.0)
+        )
 
     @classmethod
     def _aerial_potentials(cls, state: CarlState) -> tuple[torch.Tensor, torch.Tensor]:

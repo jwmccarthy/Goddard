@@ -795,6 +795,7 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         "reward_spec/component/player_ball_progress",
         "reward_spec/component/touch_acceleration",
         "reward_spec/component/aerial_touch",
+        "reward_spec/component/aerial_shot",
         "reward_spec/component/shot",
         "reward_spec/component/air_dribble_setup",
         "reward_spec/component/car_velocity",
