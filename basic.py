@@ -545,7 +545,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--goal-score-weight-end",      type=float, default=10.0)
     add_feature_option(
         parser, "--sparse", default=None,
-        help="focus rewards on goals, shots, air dribble setups, fast aerial approaches, high aerial touches and demos (inherited on resume)",
+        help="focus rewards on goals, shots, aerial mechanics, boost-free speed and demos (inherited on resume)",
     )
     add_feature_option(
         parser, "--normalize-rewards", default=True,
@@ -798,6 +798,12 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         "reward_spec/component/shot",
         "reward_spec/component/air_dribble_setup",
         "reward_spec/component/car_velocity",
+        "reward_spec/component/aerial_carry_progress",
+        "reward_spec/component/aerial_speed_progress",
+        "reward_spec/component/speed_progress",
+        "reward_spec/component/boost_free_speed_progress",
+        "reward_spec/component/soft_lift",
+        "reward_spec/component/flip_reset",
         "reward_spec/component/demo",
     )
 
@@ -1207,6 +1213,7 @@ def main() -> None:
             normalize=arguments.normalize_rewards,
             log_diagnostics=True,
             sparse=arguments.sparse,
+            frameskip=arguments.frameskip,
         )
     )
     try:

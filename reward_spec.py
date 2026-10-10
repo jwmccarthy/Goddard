@@ -2,7 +2,7 @@ from dataclasses import dataclass, fields, replace
 
 import torch
 
-from carl.gymnasium.state import RewardContext, RewardResult
+from carl.gymnasium.state import CarlState, RewardContext, RewardResult
 
 
 BALL_RADIUS = 91.25
@@ -44,16 +44,21 @@ class RewardWeights:
     touch_acceleration:   float = 0.25
     aerial_touch:         float = 1.0
     angular_velocity:     float = 0.01
-    flip_reset:           float = 10.0
+    flip_reset:           float = 3.0
     touch_grass:          float = 0.005
     win_probability:      float = 10.0
     shot:                 float = 0.0
     air_dribble_setup:    float = 0.0
     car_velocity:         float = 0.0
+    aerial_carry_progress: float = 0.75
+    aerial_speed_progress: float = 0.5
+    speed_progress:       float = 0.1
+    boost_free_speed_progress: float = 0.2
+    soft_lift:            float = 0.4
 
     @classmethod
     def sparse(cls) -> "RewardWeights":
-        """Keep only goals, demos, and deliberate airborne/shot-making behavior."""
+        """Focus on goals, demos, shots, and bounded mechanic-focused shaping."""
         values = {field.name: 0.0 for field in fields(cls)}
         values.update(
             goal_scored=10.0,
@@ -61,6 +66,12 @@ class RewardWeights:
             air_dribble_setup=1.0,
             car_velocity=0.05,
             aerial_touch=1.0,
+            aerial_carry_progress=0.75,
+            aerial_speed_progress=0.5,
+            speed_progress=0.1,
+            boost_free_speed_progress=0.2,
+            soft_lift=0.4,
+            flip_reset=3.0,
             demo=5.0,
         )
         return cls(**values)
@@ -75,6 +86,7 @@ class RewardSpec:
         log_diagnostics: bool = False,
         weights: RewardWeights | None = None,
         sparse: bool = False,
+        frameskip: int = 8,
     ) -> None:
         self.normalize = normalize
         self.log_diagnostics = log_diagnostics
@@ -82,6 +94,9 @@ class RewardSpec:
         self.weights = weights if weights is not None else (
             RewardWeights.sparse() if sparse else RewardWeights()
         )
+        if frameskip < 1:
+            raise ValueError("frameskip must be positive")
+        self.frameskip = frameskip
         self._last_touch = None
         self._count = 0
         self._mean = None
@@ -237,20 +252,6 @@ class RewardSpec:
             ball_position[..., 2] / AERIAL_TOUCH_HEIGHT_SCALE
         ).clamp_min(0.0)
         angular_velocity = current.car_angular_velocity.norm(dim=-1) / 5.5
-        previously_spent_flip = (
-            previous.car_has_flipped | previous.car_has_double_jumped
-        )
-        flip_available = ~(
-            current.car_has_flipped | current.car_has_double_jumped
-        )
-        flip_reset = (
-            touches
-            & previously_spent_flip
-            & flip_available
-            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
-            & (ball_position - current.car_position).norm(dim=-1).lt(2.0 * BALL_RADIUS)
-            & self._cosine(ball_position - current.car_position, -current.car_up).gt(0.9)
-        ).float()
         touch_grass = (
             current.car_on_ground
             & current.car_position[..., 2].lt(BALL_RADIUS)
@@ -314,10 +315,10 @@ class RewardSpec:
             "touch_acceleration":   weights.touch_acceleration * touch_acceleration,
             "aerial_touch":         weights.aerial_touch * aerial_touch,
             "angular_velocity":     weights.angular_velocity * angular_velocity,
-            "flip_reset":           weights.flip_reset * flip_reset,
             "touch_grass":         -weights.touch_grass * touch_grass,
             "win_probability":      weights.win_probability * win_probability_progress,
         }
+        components.update(self._mechanics_components(context))
 
         return self._finish_reward(context, components)
 
@@ -393,7 +394,7 @@ class RewardSpec:
             self._opponent_team_mean(newly_demoed.float()) - newly_demoed.float()
         )
         weights = self.weights
-        return {
+        components = {
             "goal_scored": weights.goal_scored * (
                 context.events.score_delta[:, None] * team_sign
             ).clamp_min(0.0),
@@ -405,6 +406,151 @@ class RewardSpec:
             "aerial_touch": weights.aerial_touch * aerial_touch * goalward_impulse,
             "demo": weights.demo * demo,
         }
+        components.update(self._mechanics_components(context))
+        return components
+
+    def _mechanics_components(self, context: RewardContext) -> dict[str, torch.Tensor]:
+        current, previous = context.current, context.previous
+        ball_position = current.ball_position[:, None, :]
+        car_to_ball = ball_position - current.car_position
+        team_sign = current.team_sign[None, :]
+
+        # CARL supplies pre-autoreset transition states. Ignore terminal, demo and
+        # implausibly discontinuous samples (e.g. a replay reset or a respawn).
+        valid = (
+            ~context.events.done[:, None]
+            & ~current.car_demoed & ~previous.car_demoed
+            & (current.car_position - previous.car_position).norm(dim=-1).le(
+                CAR_MAX_SPEED * self.frameskip / 120.0 + 150.0
+            )
+            & (current.ball_position - previous.ball_position).norm(dim=-1)[:, None].le(
+                BALL_MAX_SPEED * self.frameskip / 120.0 + 2.0 * BALL_RADIUS
+            )
+        )
+        speed = (current.car_velocity.norm(dim=-1) / CAR_MAX_SPEED).clamp(0.0, 1.0)
+        previous_speed = (
+            previous.car_velocity.norm(dim=-1) / CAR_MAX_SPEED
+        ).clamp(0.0, 1.0)
+        speed_change = speed - previous_speed
+
+        # CARL's action factor at index 4 is boost. Debit speed
+        # losses even after boosting, so alternating acceleration and braking
+        # cannot repeatedly earn the nonboost acceleration bonus.
+        boost_action = context.actions.reshape(current.raw.shape[0], current.n_cars, -1)[
+            ..., 4
+        ].gt(0)
+        no_boost = (
+            ~boost_action & ~current.car_is_boosting & ~previous.car_is_boosting
+            & (current.car_boost - previous.car_boost).abs().lt(0.01)
+        )
+        boost_free_speed = torch.where(
+            no_boost, speed_change, speed_change.clamp_max(0.0)
+        )
+
+        carry, flight_speed = self._aerial_potentials(current)
+        previous_carry, previous_flight_speed = self._aerial_potentials(previous)
+
+        ball_velocity_change = current.ball_velocity - previous.ball_velocity
+        upward_impulse = (ball_velocity_change[:, None, 2] / 400.0).clamp(0.0, 1.0)
+        softness = (
+            (1200.0 - ball_velocity_change.norm(dim=-1, keepdim=True)) / 800.0
+        ).clamp(0.0, 1.0)
+        height = (
+            (ball_position[..., 2] - BALL_RADIUS) / (CEILING_Z - BALL_RADIUS)
+        ).clamp(0.0, 1.0)
+        goal_side = (team_sign * car_to_ball[..., 1]).gt(-BALL_RADIUS)
+        rising = current.ball_velocity[:, None, 2].gt(0.0)
+        not_backwards = (team_sign * current.ball_velocity[:, None, 1]).gt(-200.0)
+        wall_contact = self._wall_contact(current)
+        # Ground pops can start at rest; airborne lifts should advance the ball
+        # rather than pay indefinitely for keeping it aloft in one spot.
+        ground_pop = current.car_on_ground & current.car_position[..., 2].lt(
+            2.0 * BALL_RADIUS
+        )
+        goalward_motion = (
+            team_sign * current.ball_velocity[:, None, 1] / 400.0
+        ).clamp(0.0, 1.0)
+        soft_lift = (
+            (current.car_ball_touches & goal_side & rising & not_backwards & ~wall_contact)
+            * upward_impulse * softness * (0.25 + 0.75 * height)
+            * torch.where(ground_pop, 1.0, goalward_motion)
+        )
+
+        flip_reset = (
+            current.car_ball_touches
+            & (previous.car_has_flipped | previous.car_has_double_jumped)
+            & ~(current.car_has_flipped | current.car_has_double_jumped)
+            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
+            & car_to_ball.square().sum(dim=-1).lt((2.0 * BALL_RADIUS) ** 2)
+            & self._cosine(car_to_ball, -current.car_up).gt(0.9)
+            & ~wall_contact
+        )
+
+        weights = self.weights
+        return {
+            "aerial_carry_progress": weights.aerial_carry_progress * valid * (
+                carry - previous_carry
+            ),
+            "aerial_speed_progress": weights.aerial_speed_progress * valid * (
+                flight_speed - previous_flight_speed
+            ),
+            "speed_progress": weights.speed_progress * valid * speed_change,
+            "boost_free_speed_progress": (
+                weights.boost_free_speed_progress * valid * boost_free_speed
+            ),
+            "soft_lift": weights.soft_lift * valid * soft_lift,
+            "flip_reset": weights.flip_reset * valid * flip_reset,
+        }
+
+    @classmethod
+    def _aerial_potentials(cls, state: CarlState) -> tuple[torch.Tensor, torch.Tensor]:
+        ball_position = state.ball_position[:, None, :]
+        car_to_ball = ball_position - state.car_position
+        height = torch.minimum(
+            state.car_position[..., 2], ball_position[..., 2]
+        )
+        air = (
+            (height - 2.0 * BALL_RADIUS) / (GOAL_HEIGHT - 2.0 * BALL_RADIUS)
+        ).clamp(0.0, 1.0)
+        ahead = (state.team_sign[None, :] * car_to_ball[..., 1]).gt(-BALL_RADIUS)
+        airborne = (~state.car_on_ground & ahead) * air
+        distance = car_to_ball.norm(dim=-1)
+        goalward_speed = (
+            state.team_sign[None, :] * state.car_velocity[..., 1] / CAR_MAX_SPEED
+        ).clamp(0.0, 1.0)
+        flight_speed = (
+            airborne * (1.0 - distance / 1000.0).clamp(0.0, 1.0)
+            * goalward_speed
+        )
+
+        # Direction alone would reward a near-stationary ball as a carry.
+        ball_goalward = (
+            state.team_sign[None, :] * state.ball_velocity[:, None, 1] / 1000.0
+        ).clamp(0.0, 1.0)
+        matching_velocity = cls._cosine(
+            state.car_velocity, state.ball_velocity[:, None, :]
+        ).clamp(0.0, 1.0)
+        # A steady carry still makes progress as the ball travels downfield;
+        # making this a bounded potential charges a reversal or lost possession.
+        field_progress = (
+            state.team_sign[None, :] * ball_position[..., 1] / GOAL_Y
+        ).clamp(-1.0, 1.0)
+        carry = (
+            airborne * (1.0 - distance / 550.0).clamp(0.0, 1.0)
+            * ball_goalward * matching_velocity
+            * (0.75 + 0.25 * field_progress)
+        )
+        return carry, flight_speed
+
+    @staticmethod
+    def _wall_contact(state: CarlState) -> torch.Tensor:
+        position = state.car_position
+        x, y, z = position[..., 0].abs(), position[..., 1].abs(), position[..., 2]
+        near_wall = (x > 3900.0) | (y > 4900.0) | ((x > 3000.0) & (y > 4300.0))
+        return (
+            state.car_on_ground & z.lt(1700.0)
+            & state.car_up[..., 2].abs().lt(0.5) & near_wall
+        )
 
     def _finish_reward(
         self, context: RewardContext, components: dict[str, torch.Tensor]
