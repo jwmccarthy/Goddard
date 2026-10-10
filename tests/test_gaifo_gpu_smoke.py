@@ -12,12 +12,18 @@ from unittest.mock import patch
 import numpy as np
 import torch as th
 
+from carl.gymnasium import CARLTorchVectorEnv
 from gaifo import (
     BLUE_START, ConfidentExpertResetTransform, ExpertSceneDataset,
-    ORANGE_START, POSITION_SCALE,
-    load_resume_checkpoint, main,
+    ORANGE_START, POSITION_SCALE, SceneWindowCapture, actor_view,
+    extract_scene_observations, load_resume_checkpoint, main,
 )
+from jarl.collect import Runner
+from jarl.data import TensorBatch
+from jarl.data.records import PolicyOutput
+from jarl.store import RolloutBuffer
 from replay_layout import team_live_observation_size
+from replay_resets import ReplayResetProvider
 
 
 @unittest.skipUnless(
@@ -25,6 +31,97 @@ from replay_layout import team_live_observation_size
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
+    def test_one_step_carl_resets_keep_terminal_scenes_and_previous_replay_history(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            rows = np.zeros((48, 161), np.float32)
+            rows[:, 0] = .1 + np.arange(len(rows)) / 1_000
+            rows[:, 2] = 91.25 / POSITION_SCALE[2]
+            for car, y in ((BLUE_START, -1_200), (ORANGE_START, 1_200)):
+                rows[:, car + 1] = y / POSITION_SCALE[1]
+                rows[:, car + 2] = 17 / POSITION_SCALE[2]
+                rows[:, car + 9] = rows[:, car + 14] = rows[:, car + 16] = 1
+            rows[:, 137] = 1
+            np.save(folder / "100-0-match.npy", rows)
+            other = rows.copy()
+            other[:, :51] = actor_view(th.from_numpy(rows[:, :51]), 1).numpy()
+            np.save(folder / "200-0-match.npy", other)
+            expert = ExpertSceneDataset(
+                folder, 4, device="cuda:0", flip_state_features=True,
+            )
+            indices = expert.segment_frame_indices[0][th.tensor([10, 20, 30], device="cuda:0")]
+
+            class CyclingSampler:
+                calls = 0
+
+                def __call__(self, reset_mask):
+                    sim = reset_mask.nonzero().flatten()
+                    if not len(sim):
+                        return None
+                    sampled = indices[min(self.calls, 2)].expand(len(sim))
+                    self.calls += 1
+                    return TensorBatch({
+                        "simulation_indices": sim,
+                        "frame_index": sampled,
+                    })
+
+            class NeutralPolicy:
+                device = th.device("cuda:0")
+
+                def initial_state(self, n_envs):
+                    return None
+
+                def act(self, observation, state):
+                    action = th.tensor([1, 1, 1, 0, 0, 1, 0], device=self.device)
+                    return PolicyOutput(action=action.expand(len(observation), -1))
+
+            provider = ReplayResetProvider(
+                CyclingSampler(), expert.frames, expert.internal_states,
+            )
+            env = CARLTorchVectorEnv(
+                n_sim=1, n_blue=1, n_orange=1, frameskip=4,
+                no_touch_timeout_ticks=4, normalize=True, discrete_actions=True,
+                reset_state_provider=provider,
+            )
+            try:
+                capture = SceneWindowCapture(
+                    4, flip_state_features=True,
+                    replay_expert=expert, reset_provider=provider,
+                )
+                buffer = RolloutBuffer(2, env.n_envs, env.device)
+                runner = Runner(env, NeutralPolicy(), buffer, captures=(capture,))
+                runner.reset()
+                self.assertEqual(int(capture.episode_reset_indices[0]), int(indices[0]))
+                for old, replacement in zip(indices[:2], indices[1:]):
+                    step = runner.step()
+                    self.assertTrue(step.done.all())
+                    self.assertEqual(int(provider.last_reset_indices[0]), int(replacement))
+                    self.assertEqual(int(capture.episode_reset_indices[0]), int(replacement))
+                    th.testing.assert_close(step.observation[0, 0], expert.frames[replacement, 0])
+                    self.assertNotAlmostEqual(
+                        float(step.next_obs[0, 0]), float(step.observation[0, 0]),
+                        places=4,
+                    )
+                rollout = buffer.finish().steps
+                self.assertTrue(rollout["scene_window_valid"].all())
+                th.testing.assert_close(
+                    rollout["scene_window_agent_fraction"], th.full((2, 2), .25,
+                                                                    device="cuda:0"),
+                )
+                for step_index, old in enumerate(indices[:2]):
+                    index = int(old)
+                    expected = actor_view(expert.frames[index - 2:index + 1], 0)
+                    th.testing.assert_close(
+                        rollout["scene_window"][step_index, 0, :3, :51], expected,
+                        atol=1e-5, rtol=1e-5,
+                    )
+                    th.testing.assert_close(
+                        rollout["scene_window"][step_index, :, -1],
+                        extract_scene_observations(rollout["next_obs"][step_index], 2, True),
+                    )
+            finally:
+                env.close()
+
     def _short_window_training(
         self, factorize: bool, hard_positive_mining: bool = False,
         exp_log_odds_reward: bool = False, recency_replay: bool = False,
@@ -32,6 +129,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         gamma: float | None = None,
         invalid_rotations: bool = False, recurrent_global: bool = True,
         trajectory_length: int = 8,
+        frameskip: int = 4,
     ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -69,6 +167,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertGreater(len(expert.reset_indices), 0)
             flags = [
                 "gaifo.py", "--replay-dir", str(replays),
+                "--frameskip", str(frameskip),
                 "--replay-reset-fraction", "1",
                 "--curated-skill-sampling", "false",  # Synthetic replays have no touch metadata.
                 "--n-sim", "2",
@@ -158,6 +257,16 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         self.assertIn("D far accuracy", output)
         self.assertIn("D near accuracy", output)
         self.assertIn("D global accuracy", output)
+
+    def test_smaller_frame_skip_trains_with_resampled_replay_states(self):
+        saved, output, _ = self._short_window_training(
+            False, recurrent_global=False, trajectory_length=4, frameskip=2,
+            exp_log_odds_reward=True, gamma=.81,
+        )
+        self.assertEqual(saved["step"], 64)
+        self.assertEqual(saved["config"]["frameskip"], 2)
+        self.assertEqual(saved["config"]["gamma"], .81)
+        self.assertIn("D heldout accuracy", output)
 
     def test_factorized_1v1_training_skips_invalid_opponent_rotations(self):
         saved, output, _ = self._short_window_training(

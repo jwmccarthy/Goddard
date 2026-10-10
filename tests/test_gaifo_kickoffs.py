@@ -10,9 +10,13 @@ import torch as th
 
 from gaifo import (
     BLUE_START, DRIVING_SKILL, KICKOFF_SKILL, ORANGE_START, POSITION_SCALE,
-    ConfidentExpertResetTransform,
-    ExpertSceneDataset, SceneWindowCapture, opponent_view,
+    ConfidentExpertResetTransform, ExpertSceneDataset, SceneGAIFOMinibatches,
+    SceneWindowCapture,
+    actor_view, flip_state_from_internal, opponent_view,
 )
+from jarl.data import TensorBatch
+from replay_layout import team_live_observation_size
+from replay_resets import ReplayResetProvider
 
 
 def save_period(folder: Path, name: str, marker: int, paired: bool = False) -> None:
@@ -21,11 +25,45 @@ def save_period(folder: Path, name: str, marker: int, paired: bool = False) -> N
     rows[:, BLUE_START + 9] = rows[:, ORANGE_START + 9] = 1
     rows[:, BLUE_START + 14] = rows[:, ORANGE_START + 14] = 1
     rows[:, BLUE_START + 16] = rows[:, ORANGE_START + 16] = 1
+    rows[:, 137] = 1
     np.save(folder / f"100-0-{name}.npy", rows)
     if paired:
         opponent = rows.copy()
         opponent[:, :51] = opponent_view(th.from_numpy(rows[:, :51])).numpy()
         np.save(folder / f"200-0-{name}.npy", opponent)
+
+
+class SelectedResetSampler:
+    def __init__(self, indices: dict[int, int]):
+        self.indices = indices
+
+    def __call__(self, reset_mask: th.Tensor) -> TensorBatch | None:
+        selected = [int(sim) for sim in reset_mask.nonzero().flatten().tolist()
+                    if int(sim) in self.indices]
+        if not selected:
+            return None
+        return TensorBatch({
+            "simulation_indices": th.tensor(selected, device=reset_mask.device),
+            "frame_index": th.tensor(
+                [self.indices[sim] for sim in selected], device=reset_mask.device,
+            ),
+        })
+
+
+def actor_observations(
+    expert: ExpertSceneDataset, indices: list[int], velocity_offset: float = 0,
+) -> th.Tensor:
+    frames = expert.frames[indices].clone()
+    frames[:, 3] += velocity_offset
+    observations = frames.new_zeros(
+        len(indices), expert.n_cars, team_live_observation_size(expert.team_size),
+    )
+    for actor in range(expert.n_cars):
+        observations[:, actor, :expert.scene_size] = actor_view(frames, actor)
+        observations[:, actor, expert.internal_start:expert.internal_start + 2] = (
+            flip_state_from_internal(expert.internal_states[indices, actor])
+        )
+    return observations.flatten(0, 1)
 
 
 class KickoffRetentionTests(unittest.TestCase):
@@ -199,6 +237,201 @@ class KickoffRetentionTests(unittest.TestCase):
         th.testing.assert_close(terminal["scene_window"][:, :, 3],
                                 th.tensor([[11., 12., 13., 14.]]).expand(2, -1))
         self.assertFalse(capture_step(-50, -49)["scene_window_valid"].any())
+
+    def test_replay_reset_backfills_recorded_povs_and_tracks_consecutive_resets(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            save_period(folder, "single", 10)
+            save_period(folder, "paired", 100, paired=True)
+            opposite = folder / "200-0-paired.npy"
+            paired = np.load(opposite)
+            paired[:, 138] = np.arange(8) / 10  # A recorded, non-constant flip timer.
+            paired[2, -2] = 1  # Corrections from either POV interrupt borrowed history.
+            np.save(opposite, paired)
+            expert = ExpertSceneDataset(folder, 4, flip_state_features=True)
+            single = next(indices for indices in expert.segment_frame_indices
+                          if expert.frames[indices[0], 3] == 10)
+            paired_frames = next(indices for indices in expert.segment_frame_indices
+                                 if expert.frames[indices[0], 3] == 100)
+            first, second = int(single[2]), int(paired_frames[5])
+            next_reset = int(single[4])
+            self.assertEqual(int(expert.replay_history_start[paired_frames[3]]),
+                             int(paired_frames[3]))
+
+            sampler = SelectedResetSampler({0: first, 1: second})
+            provider = ReplayResetProvider(sampler, expert.frames, expert.internal_states)
+            provider(th.ones(2, dtype=th.bool))
+            capture = SceneWindowCapture(
+                4, flip_state_features=True,
+                replay_expert=expert, reset_provider=provider,
+            )
+            capture.reset(4)
+            initial = actor_observations(expert, [first, second])
+            terminal = actor_observations(expert, [first, second], 500)
+
+            # CARL samples the following reset before Jarl records this terminal
+            # transition. Its window must still use the previous reset index.
+            sampler.indices = {0: next_reset}
+            provider(th.tensor([True, False]))
+            first_step = capture._capture(SimpleNamespace(
+                observation=initial,
+                env_step=SimpleNamespace(
+                    next_obs=terminal, done=th.tensor([True, False, False, False]),
+                ),
+            ))
+            self.assertEqual(first_step["scene_window_valid"].tolist(),
+                             [True, False, True, True])
+            th.testing.assert_close(first_step["scene_window_agent_fraction"],
+                                    th.full((4,), .25))
+            th.testing.assert_close(first_step["scene_window"][0, :, 3],
+                                    th.tensor([10., 11., 12., 512.]))
+            th.testing.assert_close(first_step["scene_window"][3, :, 3],
+                                    th.tensor([-103., -104., -105., -605.]))
+            th.testing.assert_close(
+                first_step["scene_window"][3, :3, -2:],
+                flip_state_from_internal(expert.internal_states[paired_frames[3:6], 1]),
+            )
+            train_indices = first_step["scene_window_valid"].nonzero().flatten()
+            training = next(SceneGAIFOMinibatches(
+                expert, batch_size=4, epochs=1, noise_std=0,
+            ).sample_windows(first_step["scene_window"], train_indices))
+            self.assertEqual(set(training["window"][:3, -1, 3].tolist()),
+                             {512., 605., -605.})
+            self.assertTrue(training["is_agent"][:3].all())
+            self.assertEqual(capture.episode_reset_indices.tolist(),
+                             [next_reset, second])
+
+            continuing = actor_observations(expert, [next_reset, second])
+            continuing[2:] = terminal[2:]
+            following = actor_observations(expert, [next_reset, second], 600)
+            next_step = capture._capture(SimpleNamespace(
+                observation=continuing,
+                env_step=SimpleNamespace(next_obs=following, done=th.zeros(4, dtype=th.bool)),
+            ))
+            self.assertEqual(next_step["scene_window_valid"].tolist(),
+                             [True, False, True, True])
+            th.testing.assert_close(next_step["scene_window_agent_fraction"],
+                                    th.tensor([.25, .25, .5, .5]))
+            th.testing.assert_close(next_step["scene_window"][0, :, 3],
+                                    th.tensor([12., 13., 14., 614.]))
+            th.testing.assert_close(next_step["scene_window"][2, :, 3],
+                                    th.tensor([104., 105., 605., 705.]))
+
+            # A fresh kickoff is not assigned the previous episode's index.
+            sampler.indices = {}
+            provider(th.tensor([True, False]))
+            capture._capture(SimpleNamespace(
+                observation=following,
+                env_step=SimpleNamespace(
+                    next_obs=following, done=th.tensor([True, False, False, False]),
+                ),
+            ))
+            kickoff = th.zeros_like(initial)
+            kickoff[:, 3] = -50
+            kickoff_next = kickoff.clone()
+            kickoff_next[:, 3] = -49
+            fresh = capture._capture(SimpleNamespace(
+                observation=kickoff,
+                env_step=SimpleNamespace(
+                    next_obs=kickoff_next, done=th.zeros(4, dtype=th.bool),
+                ),
+            ))
+            self.assertEqual(capture.episode_reset_indices.tolist(), [-1, second])
+            self.assertFalse(fresh["scene_window_valid"][:2].any())
+            th.testing.assert_close(fresh["scene_window_agent_fraction"][:2], th.ones(2))
+
+    def test_replay_backfill_stops_at_parser_gaps_and_period_boundaries(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            save_period(folder, "gap", 10)
+            save_period(folder, "next", 100)
+            path = folder / "100-0-gap.npy"
+            rows = np.load(path)
+            rows[2, -2] = 1
+            np.save(path, rows)
+            expert = ExpertSceneDataset(folder, 4, reject_discontinuities=True)
+            gap = next(indices for indices in expert.segment_frame_indices
+                       if expert.frames[indices[0], 3] == 10)
+            next_period = next(indices for indices in expert.segment_frame_indices
+                               if expert.frames[indices[0], 3] == 100)
+            reset_indices = [int(gap[4]), int(next_period[0])]
+            self.assertEqual(int(expert.replay_history_start[gap[4]]), int(gap[3]))
+            self.assertEqual(int(expert.replay_history_start[gap[2]]), -1)
+            self.assertEqual(int(expert.replay_history_start[next_period[0]]),
+                             int(next_period[0]))
+
+            sampler = SelectedResetSampler(dict(enumerate(reset_indices)))
+            provider = ReplayResetProvider(sampler, expert.frames, expert.internal_states)
+            provider(th.ones(2, dtype=th.bool))
+            capture = SceneWindowCapture(4, replay_expert=expert, reset_provider=provider)
+            capture.reset(4)
+            results = []
+            for current_offset, next_offset in ((0, 500), (500, 600), (600, 700)):
+                results.append(capture._capture(SimpleNamespace(
+                    observation=actor_observations(expert, reset_indices, current_offset),
+                    env_step=SimpleNamespace(
+                        next_obs=actor_observations(expert, reset_indices, next_offset),
+                        done=th.zeros(4, dtype=th.bool),
+                    ),
+                )))
+            self.assertEqual([item["scene_window_valid"].tolist() for item in results], [
+                [False, False, False, False],
+                [True, True, False, False],
+                [True, True, True, True],
+            ])
+            th.testing.assert_close(results[1]["scene_window"][0, :, 3],
+                                    th.tensor([13., 14., 514., 614.]))
+            th.testing.assert_close(results[1]["scene_window_agent_fraction"],
+                                    th.full((4,), .5))
+            th.testing.assert_close(results[2]["scene_window_agent_fraction"],
+                                    th.full((4,), .75))
+
+            # Interpolated frames adjacent to a correction must also break the
+            # prefix; source and target sample indices have different lengths.
+            for name in ("gap", "next"):
+                np.savez_compressed(
+                    (folder / f"100-0-{name}.npy").with_suffix(".unsafe-starts.npz"),
+                    unsafe=np.zeros(8, dtype=bool), pre_goal=np.zeros(8, dtype=bool),
+                    frame_skip=4,
+                )
+            next_path = folder / "100-0-next.npy"
+            rotation_gap = np.load(next_path)
+            rotation_gap[2, BLUE_START + 9] = 0
+            np.save(next_path, rotation_gap)
+            resampled = ExpertSceneDataset(
+                folder, 4, frame_skip=2, reject_discontinuities=True,
+            )
+            gap = next(indices for indices in resampled.segment_frame_indices
+                       if resampled.frames[indices[0], 3] == 10)
+            next_period = next(indices for indices in resampled.segment_frame_indices
+                               if resampled.frames[indices[0], 3] == 100)
+            self.assertEqual(int(resampled.replay_history_start[gap[8]]), int(gap[7]))
+            self.assertEqual(int(resampled.replay_history_start[gap[9]]), int(gap[7]))
+            self.assertEqual(int(resampled.replay_history_start[next_period[8]]),
+                             int(next_period[7]))
+
+    def test_two_frame_replay_window_credits_only_the_generated_scene(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            save_period(folder, "short", 10)
+            expert = ExpertSceneDataset(folder, 2)
+            reset_index = int(expert.segment_frame_indices[0][0])
+            sampler = SelectedResetSampler({0: reset_index})
+            provider = ReplayResetProvider(sampler, expert.frames, expert.internal_states)
+            provider(th.ones(1, dtype=th.bool))
+            capture = SceneWindowCapture(2, replay_expert=expert, reset_provider=provider)
+            capture.reset(2)
+            for current_offset, next_offset, fraction in ((0, 500, .5), (500, 600, 1.)):
+                result = capture._capture(SimpleNamespace(
+                    observation=actor_observations(expert, [reset_index], current_offset),
+                    env_step=SimpleNamespace(
+                        next_obs=actor_observations(expert, [reset_index], next_offset),
+                        done=th.zeros(2, dtype=th.bool),
+                    ),
+                ))
+                self.assertTrue(result["scene_window_valid"].all())
+                th.testing.assert_close(result["scene_window_agent_fraction"],
+                                        th.full((2,), fraction))
 
 
 if __name__ == "__main__":

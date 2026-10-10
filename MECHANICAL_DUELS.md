@@ -122,6 +122,13 @@ usual proximity gate. The Transformer global head always compares before/after
 scores; `--differential` discounts its previous capped odds when exponential
 rewards are enabled. A recurrent global GRU carries its previous score across
 rollouts and clears it at game boundaries.
+`--gamma` and `--lambda` are specified per four physics ticks: with
+`--frameskip N`, GAIFO uses `gamma^(N/4)` and `lambda^(N/4)` for PPO and the
+effective gamma for differential odds. Per-step state imitation rewards scale
+by `N/4` after clipping and replay-history attribution, keeping their reward
+per second steady. Goals, touches and flip resets remain one-off event rewards;
+differential and Transformer global before/after rewards are already changes
+and are not multiplied by the frame-skip ratio.
 The global GRU and Transformer frame encoders receive explicit normalized
 ball-to-car and car-to-focal positions for every car, computed identically from
 expert and live scenes. The factorized near-ball head already receives the
@@ -166,8 +173,12 @@ Replay resets draw all cars and available internal control states from the
 selected mode's parsed data; curated skill categories choose *when* to reset,
 and `--replay-reset-fraction` controls the share versus fresh kickoffs. Resets
 skip hidden active jump/flip phases and unrecorded airborne opponents. GAIFO
-does not score imitation until it has a full window of real episode history;
-PPO can still credit those early actions for later rewards. Goal
+fills short-window history from contiguous physical replay frames when a reset
+has them; fresh kickoffs and replay gaps wait for real episode history. Early
+mixed windows train the short-window discriminator; rewards from heads that
+use that borrowed context are scaled by the fraction of frames produced by
+the policy. Contextual global heads use generated episode frames. PPO can
+still credit all early actions for later rewards. Goal
 rewards and the default aerial-touch bonus are shared across teammates and
 opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured

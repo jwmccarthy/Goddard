@@ -23,15 +23,16 @@ from gaifo import (
     ExpertSceneDataset, FactorizedSceneDiscriminator,
     GAIFO_TEAM_ARCHITECTURE,
     GameplayDiagnostics, GeneratedContextTimeline, SceneDiscriminator,
-    SceneWindowCapture, actor_view, advanced_touch_events, build_discriminator, load_resume_checkpoint,
-    main, parse_args, simulation_episode_ends, validate_resume_args,
+    SceneWindowCapture, actor_view, advanced_touch_events, build_discriminator,
+    flip_state_from_internal, load_resume_checkpoint, main, parse_args,
+    simulation_episode_ends, validate_resume_args,
 )
 from jarl.envs import DatasetResetSampler
 from replay_layout import (
     team_car_count, team_discriminator_scene_size, team_live_observation_size,
     team_observation_size, team_replay_row_size, team_scene_size,
 )
-from replay_resets import ReplayResetProvider
+from replay_resets import ReplayResetProvider, reset_index_dataset
 from watch_gaifo_experts import (
     Inspection, collect_sequences, load_discriminator, score_sequences,
 )
@@ -150,6 +151,59 @@ class TeamSizeUnitTests(unittest.TestCase):
                                         th.tensor([1., 1.25]))
                 th.testing.assert_close(result["scene_window"][0, -1, -2:],
                                         th.tensor([0., 0.]))
+
+    def test_team_replay_backfill_only_uses_recorded_flip_states(self):
+        for size in (2, 3):
+            with self.subTest(team_size=size), tempfile.TemporaryDirectory(
+                dir="/tmp/opencode",
+            ) as directory:
+                folder = Path(directory)
+                n_cars = team_car_count(size)
+                last_actor = n_cars - 1
+                write_team_povs(folder, size, (last_actor,))
+                expert = ExpertSceneDataset(
+                    folder, 4, team_size=size, flip_state_features=True,
+                )
+                frame_index = int(expert.segment_frame_indices[0][5])
+                provider = ReplayResetProvider(
+                    DatasetResetSampler(reset_index_dataset(th.tensor([frame_index]))),
+                    expert.frames, expert.internal_states,
+                )
+                provider(th.ones(1, dtype=th.bool))
+                capture = SceneWindowCapture(
+                    4, n_cars, flip_state_features=True,
+                    replay_expert=expert, reset_provider=provider,
+                )
+                capture.reset(n_cars)
+                original = expert.frames[frame_index:frame_index + 1]
+                generated = original.clone()
+                generated[:, 3] += .5
+                observation = th.zeros(n_cars, team_live_observation_size(size))
+                next_obs = observation.clone()
+                for actor in range(n_cars):
+                    observation[actor, :expert.scene_size] = actor_view(original, actor)[0]
+                    next_obs[actor, :expert.scene_size] = actor_view(generated, actor)[0]
+                    flip = flip_state_from_internal(expert.internal_states[frame_index, actor])
+                    observation[actor, -2:] = next_obs[actor, -2:] = flip
+                result = capture._capture(SimpleNamespace(
+                    observation=observation,
+                    env_step=SimpleNamespace(
+                        next_obs=next_obs, done=th.zeros(n_cars, dtype=th.bool),
+                    ),
+                ))
+                self.assertEqual(result["scene_window_valid"].tolist(), [
+                    actor in (0, last_actor) for actor in range(n_cars)
+                ])
+                th.testing.assert_close(result["scene_window_agent_fraction"],
+                                        th.full((n_cars,), .25))
+                for actor in (0, last_actor):
+                    expected = th.cat((
+                        actor_view(expert.frames[frame_index - 2:frame_index + 1], actor),
+                        flip_state_from_internal(expert.internal_states[
+                            frame_index - 2:frame_index + 1, actor,
+                        ]),
+                    ), dim=-1)
+                    th.testing.assert_close(result["scene_window"][actor, :3], expected)
 
     def test_invalid_car_rotations_are_excluded_from_resets_but_not_expert_scenes(self):
         for size in (1, 2, 3):

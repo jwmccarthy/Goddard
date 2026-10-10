@@ -18,8 +18,7 @@ from gaifo import (
     EgoBallTouchCapture,
     GameplayDiagnostics,
     SceneDiscriminatorReward,
-    advanced_touch_events,
-    parse_args,
+    advanced_touch_events, build_ppo_transforms, parse_args,
 )
 from jarl.data import TensorBatch
 from jarl.transform import PrepareContext
@@ -249,6 +248,200 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             result["training_reward"], th.tensor([[1.0, 0.5, 2.0, 10.0, 2.0]]),
         )
         self.assertTrue(result["learner_mask"].all())
+
+    def test_replay_window_credit_scales_only_heads_with_borrowed_context(self):
+        windows = th.zeros(1, 4, 2, 51)
+        windows[0, :, -1, 0] = th.tensor([0., math.log(2), 0., 0.])
+        batch = TensorBatch({
+            "observation": th.zeros(1, 4, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.tensor([[True, True, False, False]]),
+            "scene_window_agent_fraction": th.tensor([[.25, 1., .25, 1.]]),
+            "terminated": th.zeros(1, 4, dtype=th.bool),
+            "reward": th.tensor([[0., 0., 2., 0.]]),
+        })
+        short = SceneDiscriminatorReward(
+            PositionDiscriminator(), noise_std=0, trajectory_length=2,
+            exp_log_odds_reward=True,
+        )(batch, PrepareContext())
+        th.testing.assert_close(short["imitation_reward"], th.tensor([[.25, .5, 0., 0.]]))
+        th.testing.assert_close(short["training_reward"], th.tensor([[.25, .5, 2., 0.]]))
+
+        class ConstantRecurrent(th.nn.Module):
+            recurrent_global = True
+
+            def score_sequence(self, scenes, reset, initial_state=None):
+                return (scenes.new_zeros(scenes.shape[:2]),
+                        scenes.new_zeros((1, scenes.shape[1], 1)))
+
+        class FactorizedRecurrent(th.nn.Module):
+            factorized = True
+            recurrent_global = True
+
+            def __init__(self):
+                super().__init__()
+                self.global_discriminator = ConstantRecurrent()
+
+            def specialist_logits(self, scenes):
+                return scenes.new_zeros((len(scenes), 2))
+
+        global_only = SceneDiscriminatorReward(
+            ConstantRecurrent(), noise_std=0, trajectory_length=2,
+            exp_log_odds_reward=True,
+        )(batch, PrepareContext())
+        th.testing.assert_close(global_only["imitation_reward"], th.tensor([[1., 1., 0., 0.]]))
+
+        combined = SceneDiscriminatorReward(
+            FactorizedRecurrent(), noise_std=0, trajectory_length=2,
+            exp_log_odds_reward=True,
+        )(batch, PrepareContext())
+        th.testing.assert_close(combined["near_imitation_reward"],
+                                th.tensor([[.125, .5, 0., 0.]]))
+        th.testing.assert_close(combined["global_imitation_reward"],
+                                th.tensor([[.5, .5, 0., 0.]]))
+        th.testing.assert_close(combined["training_reward"],
+                                th.tensor([[.625, 1., 2., 0.]]))
+
+        class ConstantTransformer(th.nn.Module):
+            transformer_global = True
+
+            def score_context(self, scenes, ages, *, return_previous=False):
+                current = scenes.new_ones(len(scenes))
+                return (current, current.new_zeros(len(scenes))) if return_previous else current
+
+        transformer = SceneDiscriminatorReward(
+            ConstantTransformer(), noise_std=0, trajectory_length=2,
+        )(batch, PrepareContext())
+        th.testing.assert_close(transformer["imitation_reward"],
+                                th.tensor([[-1., -1., 0., 0.]]))
+
+        with self.assertRaisesRegex(ValueError, "fraction must match"):
+            SceneDiscriminatorReward(
+                PositionDiscriminator(), noise_std=0, trajectory_length=2,
+            )(TensorBatch({**batch, "scene_window_agent_fraction": th.ones(1, 2)}),
+              PrepareContext())
+
+    def test_state_rewards_scale_with_elapsed_ticks_but_events_and_changes_do_not(self):
+        windows = th.zeros(1, 2, 2, 51)
+        windows[0, 1, -1, 0] = math.log(2)
+        batch = TensorBatch({
+            "observation": th.zeros(1, 2, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+            "scene_window_agent_fraction": th.tensor([[.25, 1.]]),
+            "reward": th.tensor([[0., 2.]]),
+            "aerial_touch_score": th.tensor([[0., .8]]),
+            "flip_reset_event": th.tensor([[0., 1.]]),
+        })
+        for frameskip in (2, 4, 8):
+            with self.subTest(frameskip=frameskip):
+                scale = frameskip / 4
+                result = SceneDiscriminatorReward(
+                    PositionDiscriminator(), noise_std=0, trajectory_length=2,
+                    exp_log_odds_reward=True, frameskip=frameskip,
+                    goal_reward_weight=3, aerial_touch_reward_weight=.5,
+                    flip_reset_reward_weight=1,
+                )(batch, PrepareContext())
+                th.testing.assert_close(result["imitation_reward"],
+                                        th.tensor([[.25 * scale, .5 * scale]]))
+                th.testing.assert_close(result["goal_reward"], th.tensor([[0., 6.]]))
+                th.testing.assert_close(result["aerial_touch_reward"],
+                                        th.tensor([[0., .4]]))
+                th.testing.assert_close(result["flip_reset_reward"],
+                                        th.tensor([[0., 1.]]))
+                th.testing.assert_close(result["training_reward"],
+                                        th.tensor([[.25 * scale, 7.4 + .5 * scale]]))
+
+                changed = windows.clone()
+                changed[0, 0, 0, 0] = math.log(2)
+                changed[0, 0, 1, 0] = 0
+                changed_batch = TensorBatch({
+                    "observation": th.zeros(1, 2, 51),
+                    "scene_window": changed,
+                    "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+                    "reward": th.zeros(1, 2),
+                })
+                delta = SceneDiscriminatorReward(
+                    PositionDiscriminator(), noise_std=0, trajectory_length=2,
+                    exp_log_odds_reward=True, differential=True,
+                    gamma=.9, frameskip=frameskip,
+                )(changed_batch, PrepareContext())
+                self.assertAlmostEqual(
+                    float(delta["imitation_reward"][0, 0]),
+                    1 - .5 * .9 ** scale, places=6,
+                )
+
+        with self.assertRaisesRegex(ValueError, "frame skip must be positive"):
+            SceneDiscriminatorReward(
+                PositionDiscriminator(), noise_std=0, trajectory_length=2, frameskip=0,
+            )
+
+    def test_transformer_global_change_stays_unscaled_while_specialists_are_state_rewards(self):
+        class ConstantTransformer(th.nn.Module):
+            def score_context(self, scenes, ages, *, return_previous=False):
+                current = scenes.new_full((len(scenes),), math.log(2))
+                return (current, current.new_zeros(len(scenes))) if return_previous else current
+
+        class FactorizedTransformer(th.nn.Module):
+            factorized = True
+            transformer_global = True
+
+            def __init__(self):
+                super().__init__()
+                self.global_discriminator = ConstantTransformer()
+
+            def specialist_logits(self, windows):
+                return windows.new_zeros((len(windows), 2))
+
+        batch = TensorBatch({
+            "observation": th.zeros(1, 2, 51),
+            "scene_window": th.zeros(1, 2, 2, 51),
+            "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+            "terminated": th.zeros(1, 2, dtype=th.bool),
+            "reward": th.zeros(1, 2),
+        })
+        for frameskip in (2, 8):
+            with self.subTest(frameskip=frameskip):
+                output = SceneDiscriminatorReward(
+                    FactorizedTransformer(), noise_std=0, trajectory_length=2,
+                    exp_log_odds_reward=True, frameskip=frameskip,
+                )(batch, PrepareContext())
+                th.testing.assert_close(output["near_imitation_reward"],
+                                        th.full((1, 2), .5 * frameskip / 4))
+                th.testing.assert_close(output["global_imitation_reward"],
+                                        th.full((1, 2), -.25))
+
+    def test_ppo_discounts_and_differential_odds_share_frame_skip_timing(self):
+        for frameskip in (2, 4, 8):
+            with self.subTest(frameskip=frameskip), patch.object(sys, "argv", [
+                "gaifo.py", "--replay-dir", "parsed_replays",
+                "--frameskip", str(frameskip), "--gamma", "0.81", "--lambda", "0.64",
+                "--differential", "--exp-log-odds-reward",
+            ]):
+                args, _ = parse_args()
+                imitation, gae, _ = build_ppo_transforms(args, PositionDiscriminator())
+                expected_gamma = .81 ** (frameskip / 4)
+                expected_lambda = .64 ** (frameskip / 4)
+                self.assertAlmostEqual(imitation.gamma, expected_gamma)
+                self.assertAlmostEqual(gae.gamma, expected_gamma)
+                self.assertAlmostEqual(gae.lambda_, expected_lambda)
+                self.assertEqual(gae.reward_field, "training_reward")
+                self.assertAlmostEqual(imitation.state_reward_scale, frameskip / 4)
+                self.assertAlmostEqual(
+                    float(imitation._score_change(th.zeros(1), th.zeros(1))[0]),
+                    1 - expected_gamma,
+                )
+                transitions = TensorBatch({
+                    "baseline_value": th.zeros(2, 2),
+                    "baseline_next_value": th.zeros(2, 2),
+                    "training_reward": th.tensor([[0., 0.], [1., 1.]]),
+                    "terminated": th.zeros(2, 2, dtype=th.bool),
+                    "truncated": th.zeros(2, 2, dtype=th.bool),
+                })
+                advantages = gae(transitions, PrepareContext())["advantage"]
+                th.testing.assert_close(
+                    advantages[0], th.full((2,), expected_gamma * expected_lambda),
+                )
 
     def test_aerial_bonus_increases_with_height_without_goalward_acceleration(self):
         context = touch_context()

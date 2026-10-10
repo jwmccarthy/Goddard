@@ -134,9 +134,16 @@ DRIBBLE_MAX_RELATIVE_SPEED = 1_200.0
 FLICK_MIN_VELOCITY_CHANGE = 500.0
 GLOBAL_DISCRIMINATOR_WEIGHT = 0.5
 SPECIALIST_DISCRIMINATOR_WEIGHT = 0.5
+REFERENCE_FRAMESKIP = 4  # Existing reward and discount settings are per four physics ticks.
 RESET_MINING_CANDIDATES = 8
 RESET_MINING_FRACTION = 0.5
 RESET_MINING_MIN_CONFIDENCE = 0.6
+
+
+def frameskip_ratio(frameskip: int) -> float:
+    if frameskip < 1:
+        raise ValueError("frame skip must be positive")
+    return frameskip / REFERENCE_FRAMESKIP
 
 
 def scene_car_count(scenes: th.Tensor) -> int:
@@ -927,19 +934,32 @@ class EgoBallTouchCapture(CaptureBase):
 
 
 class SceneWindowCapture(CaptureBase):
-    """Capture causal windows; mark incomplete episode history unscorable."""
+    """Capture causal windows, borrowing safe replay history for replay resets."""
 
     def __init__(
         self, trajectory_length: int, n_cars: int = N_CARS,
         flip_state_features: bool = False,
+        replay_expert: "ExpertSceneDataset | None" = None,
+        reset_provider: ReplayResetProvider | None = None,
     ) -> None:
         if trajectory_length < 2:
             raise ValueError("trajectory length must be at least 2")
         if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
             raise ValueError("scene capture needs two, four, or six cars")
+        if (replay_expert is None) != (reset_provider is None):
+            raise ValueError("replay history needs both expert scenes and a reset provider")
+        if replay_expert is not None and (
+            replay_expert.n_cars != n_cars
+            or replay_expert.trajectory_length != trajectory_length
+            or replay_expert.flip_state_features != flip_state_features
+            or reset_provider.frames is not replay_expert.frames
+        ):
+            raise ValueError("replay history must match the captured scenes")
         self.trajectory_length = trajectory_length
         self.n_cars = n_cars
         self.flip_state_features = flip_state_features
+        self.replay_expert = replay_expert
+        self.reset_provider = reset_provider
         self.scene_size = (BALL_SIZE + n_cars * CAR_SIZE
                            + (FLIP_STATE_SIZE if flip_state_features else 0))
         self.distances = np.arange(trajectory_length - 1, -1, -1)
@@ -948,6 +968,8 @@ class SceneWindowCapture(CaptureBase):
         self.history: th.Tensor | None = None
         self.history_age: th.Tensor | None = None
         self.history_pos: th.Tensor | None = None
+        self.replay_action_steps: th.Tensor | None = None
+        self.episode_reset_indices: th.Tensor | None = None
 
     def reset(self, batch_size: int) -> None:
         if batch_size % self.n_cars:
@@ -956,6 +978,73 @@ class SceneWindowCapture(CaptureBase):
         self.history = None
         self.history_age = None
         self.history_pos = None
+        self.replay_action_steps = None
+        self.episode_reset_indices = None
+        if self.reset_provider is not None:
+            sampled = self.reset_provider.last_reset_indices
+            if sampled is not None and sampled.shape != (batch_size // self.n_cars,):
+                raise ValueError("replay reset indices must match the simulations")
+            self.episode_reset_indices = (
+                sampled.clone() if sampled is not None else
+                self.reset_provider.frames.new_full(
+                    (batch_size // self.n_cars,), -1, dtype=th.long,
+                )
+            )
+
+    def _seed_replay_history(self, fresh: th.Tensor) -> None:
+        """Use only contiguous physical replay frames preceding each reset."""
+        expert = self.replay_expert
+        sampled = self.episode_reset_indices
+        if expert is None or sampled is None:
+            return
+        assert self.history is not None
+        assert self.history_age is not None
+        assert self.history_pos is not None
+        assert self.replay_action_steps is not None
+        eligible = fresh.view(-1, self.n_cars).all(dim=1) & (sampled >= 0)
+        if not eligible.any():
+            return
+        simulations = eligible.nonzero(as_tuple=True)[0]
+        # Even without an earlier frame, the reset scene itself is borrowed
+        # context until it leaves the scored window.
+        self.replay_action_steps[simulations[:, None] * self.n_cars
+                                 + th.arange(self.n_cars, device=sampled.device)] = 0
+        if self.trajectory_length < 3:
+            return
+        indices = sampled[simulations]
+        earliest = expert.replay_history_start[indices]
+        count = th.where(
+            earliest >= 0,
+            (indices - earliest).clamp(min=0, max=self.trajectory_length - 2),
+            0,
+        )
+        if not count.any():
+            return
+        offsets = th.arange(self.trajectory_length - 2, device=indices.device)
+        prefix_indices = th.where(
+            offsets[None, :] < count[:, None],
+            indices[:, None] - count[:, None] + offsets[None, :],
+            indices[:, None],
+        )
+        scenes = expert.frames[prefix_indices]
+        for actor in range(self.n_cars):
+            actor_count = count
+            if self.flip_state_features:
+                # An unrecorded POV has no reliable historical flip timer.
+                recorded = expert.pov_available[prefix_indices, actor].all(dim=1)
+                actor_count = th.where(recorded, count, 0)
+            actor_indices = simulations * self.n_cars + actor
+            view = actor_view(scenes, actor)
+            if self.flip_state_features:
+                view = th.cat((view, flip_state_from_internal(
+                    expert.internal_states[prefix_indices, actor],
+                )), dim=-1)
+            existing = self.history[actor_indices[:, None], offsets[None, :]]
+            self.history[actor_indices[:, None], offsets[None, :]] = th.where(
+                (offsets[None, :] < actor_count[:, None])[..., None], view, existing,
+            )
+            self.history_pos[actor_indices] = actor_count
+            self.history_age[actor_indices] = actor_count
 
     def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
         observation = context.observation
@@ -994,14 +1083,18 @@ class SceneWindowCapture(CaptureBase):
                 dtype=th.long,
                 device=observation.device,
             )
+            self.replay_action_steps = th.full(
+                (n_envs,), -1, dtype=th.long, device=observation.device,
+            )
         assert self.history_age is not None
         assert self.history_pos is not None
 
-        # Keep incomplete windows well-formed for storage, but mark them invalid
-        # until every historical scene came from an actual environment step.
+        # Keep incomplete windows well-formed for storage; only replay resets
+        # with enough contiguous physical history become valid early.
         fresh = self.history_age == 0
         if fresh.any():
             self.history[fresh] = current_scene[fresh, None].expand(-1, capacity, -1)
+            self._seed_replay_history(fresh)
 
         env_indices = th.arange(n_envs, device=observation.device)
         self.history[env_indices, self.history_pos] = current_scene
@@ -1009,9 +1102,18 @@ class SceneWindowCapture(CaptureBase):
         self.history_age = self.history_age + 1
 
         valid = self.history_age >= capacity
+        assert self.replay_action_steps is not None
+        replayed = self.replay_action_steps >= 0
+        self.replay_action_steps[replayed] += 1
+        agent_fraction = th.where(
+            replayed,
+            (self.replay_action_steps.float() / self.trajectory_length).clamp(max=1),
+            1.0,
+        ).to(current_scene.dtype)
         result: dict[str, th.Tensor] = {
             "scene_window": self._gather_window(current_scene, next_scene),
             "scene_window_valid": valid,
+            "scene_window_agent_fraction": agent_fraction,
         }
 
         done = th.as_tensor(
@@ -1025,6 +1127,13 @@ class SceneWindowCapture(CaptureBase):
         self.history[env_done] = 0
         self.history_age[env_done] = 0
         self.history_pos[env_done] = 0
+        self.replay_action_steps[env_done] = -1
+        if self.episode_reset_indices is not None:
+            updated = self.reset_provider.last_reset_indices
+            if updated is None or updated.shape != self.episode_reset_indices.shape:
+                self.episode_reset_indices[simulation_done] = -1
+            else:
+                self.episode_reset_indices[simulation_done] = updated[simulation_done]
 
         return result
 
@@ -1152,9 +1261,11 @@ class ExpertSceneDataset:
         ego_touches: list[th.Tensor] = []
         unsafe_reset_frames: list[th.Tensor] = []
         invalid_rotation_frames: list[th.Tensor] = []
+        replay_history_starts: list[th.Tensor] = []
         lengths: list[int] = []
         goal_actors: list[int | None] = []
         total = 0
+        padded_total = 0
         for group in selected:
             path = group[0]
             if frame_skip is not None:
@@ -1166,6 +1277,9 @@ class ExpertSceneDataset:
                     stored_frame_skip = _sampled_frame_skip(path, frame_skip)
             stored = np.load(path, mmap_mode="r")
             goal_actor = _replay_goal_scorer(path, stored)
+            # Even when expert scenes may contain parser corrections, never
+            # borrow such frames as the learner's reset history.
+            history_invalid = np.asarray(stored[:, -2:], dtype=bool).any(axis=-1)
             if skill_sampling:
                 source_skip = stored_frame_skip if frame_skip is not None else 4
                 unsafe_reset = _unsafe_replay_reset_frames(path, stored, source_skip)
@@ -1175,7 +1289,7 @@ class ExpertSceneDataset:
                 # The final two columns flag parser corrections and implausible
                 # physics jumps. The preceding columns are real touch/bump
                 # events and must remain in the motion prior's training data.
-                invalid = np.asarray(stored[:, -2:], dtype=bool).any(axis=-1)
+                invalid = history_invalid.copy()
                 contact = np.asarray(stored[:, -5:-2], dtype=bool).any(axis=-1)
             source = np.array(
                 stored[:, :self.scene_size], dtype=np.float32, copy=True
@@ -1211,6 +1325,7 @@ class ExpertSceneDataset:
                 if reject_discontinuities:
                     invalid |= np.asarray(other[:, -2:], dtype=bool).any(axis=-1)
                     contact |= np.asarray(other[:, -5:-2], dtype=bool).any(axis=-1)
+                history_invalid |= np.asarray(other[:, -2:], dtype=bool).any(axis=-1)
                 internal[:, actor] = other[
                     :, self.internal_start:self.internal_start + INTERNAL_STATE_SIZE,
                 ]
@@ -1223,20 +1338,22 @@ class ExpertSceneDataset:
                         other_frame_skip = _sampled_frame_skip(other_path, frame_skip)
                     if other_frame_skip != stored_frame_skip:
                         raise ValueError(f"paired POV cadence differs for {path.name}")
-            if reject_discontinuities and frame_skip is not None and stored_frame_skip != frame_skip:
+            if frame_skip is not None and stored_frame_skip != frame_skip:
+                # Interpolation can hide an invalid source orientation. Never
+                # borrow scenes that straddle it, even if the result has axes.
+                history_invalid |= _invalid_reset_rotations(source, self.n_cars)
                 left, right, _ = _resample_coordinates(
                     len(stored), stored_frame_skip, frame_skip
                 )
-                invalid = invalid[left] | invalid[right]
-                event_prefix = np.pad(contact.astype(np.int64).cumsum(0), (1, 0))
-                previous_right = np.concatenate(([-1], right[:-1]))
-                contact = (event_prefix[right + 1] - event_prefix[previous_right + 1]) > 0
-            if skill_sampling and frame_skip is not None and stored_frame_skip != frame_skip:
-                left, right, _ = _resample_coordinates(
-                    len(stored), stored_frame_skip, frame_skip,
-                )
-                unsafe_reset = unsafe_reset[left] | unsafe_reset[right]
-                touches = touches[left] | touches[right]
+                history_invalid = history_invalid[left] | history_invalid[right]
+                if reject_discontinuities:
+                    invalid = invalid[left] | invalid[right]
+                    event_prefix = np.pad(contact.astype(np.int64).cumsum(0), (1, 0))
+                    previous_right = np.concatenate(([-1], right[:-1]))
+                    contact = (event_prefix[right + 1] - event_prefix[previous_right + 1]) > 0
+                if skill_sampling:
+                    unsafe_reset = unsafe_reset[left] | unsafe_reset[right]
+                    touches = touches[left] | touches[right]
             if frame_skip is not None:
                 source = resample_scene(source, stored_frame_skip, frame_skip)
                 internal = np.stack([
@@ -1250,6 +1367,7 @@ class ExpertSceneDataset:
                     break
                 source = source[:keep]
                 internal = internal[:keep]
+                history_invalid = history_invalid[:keep]
                 if reject_discontinuities:
                     invalid = invalid[:keep]
                     contact = contact[:keep]
@@ -1261,6 +1379,7 @@ class ExpertSceneDataset:
             # axes when demoed. Keep the scene for imitation, but never reset
             # CARL from a frame whose axes cannot define a rotation.
             bad_rotations = _invalid_reset_rotations(source, self.n_cars)
+            history_invalid |= bad_rotations
             if skill_sampling:
                 unsafe_reset |= bad_rotations
             else:
@@ -1269,10 +1388,17 @@ class ExpertSceneDataset:
                 )))
             # A replay period begins at its kickoff state. Its repeated prefix
             # provides the skill classifier with setup context; generated
-            # windows, by contrast, are invalid until real history is complete.
+            # windows instead borrow only contiguous physical replay frames.
             pad = trajectory_length - 1
             source = np.concatenate((np.repeat(source[:1], pad, axis=0), source))
             internal = np.concatenate((np.repeat(internal[:1], pad, axis=0), internal))
+            history_invalid = np.pad(history_invalid, (pad, 0), constant_values=True)
+            run_start = np.maximum.accumulate(np.where(
+                history_invalid, np.arange(len(source)) + 1, pad,
+            ))
+            replay_history_starts.append(th.from_numpy(np.where(
+                history_invalid, -1, padded_total + run_start,
+            ).astype(np.int64)))
             if reject_discontinuities:
                 invalid = np.concatenate((np.repeat(invalid[:1], pad), invalid))
                 contact = np.concatenate((np.repeat(contact[:1], pad), contact))
@@ -1297,6 +1423,7 @@ class ExpertSceneDataset:
             lengths.append(len(source))
             goal_actors.append(goal_actor if real_length == full_length else None)
             total += real_length
+            padded_total += len(source)
             if limit is not None and total >= limit:
                 break
 
@@ -1306,6 +1433,7 @@ class ExpertSceneDataset:
         self.frames = th.cat(frames).to(device)
         self.internal_states = th.cat(internal_states).to(device)
         self.pov_available = th.cat(available_povs).to(device)
+        self.replay_history_start = th.cat(replay_history_starts).to(device)
         # Retain the 1v1 API used by existing analyses and checkpoints.
         self.opponent_pov_available = self.pov_available[:, self.team_size]
         self.contact_frames = (
@@ -4170,7 +4298,9 @@ class SceneDiscriminatorReward:
     expert odds as a scene frame is added. The Transformer global head always
     compares before and after that frame, including in exponential mode.
     Physical bonuses are zero-sum between teams; goal and touch transitions
-    remain learnable before imitation windows are valid.
+    remain learnable before imitation windows are valid. Per-state imitation
+    scores scale with the physics ticks per action; changes and one-off events
+    already represent transitions and keep their original magnitudes.
     """
 
     def __init__(
@@ -4187,6 +4317,7 @@ class SceneDiscriminatorReward:
         context_length: int = 16,
         differential: bool = False,
         gamma: float = 0.99,
+        frameskip: int = REFERENCE_FRAMESKIP,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -4221,7 +4352,8 @@ class SceneDiscriminatorReward:
         self.max_magnitude = max_magnitude
         self.exp_log_odds_reward = exp_log_odds_reward
         self.differential = differential
-        self.gamma = gamma
+        self.state_reward_scale = frameskip_ratio(frameskip)
+        self.gamma = gamma ** self.state_reward_scale
         self.context_length = context_length
         self._recent_frames: th.Tensor | None = None
         self._recent_ends: th.Tensor | None = None
@@ -4496,6 +4628,29 @@ class SceneDiscriminatorReward:
         if truncated is not None:
             terminal = truncated.bool() if terminal is None else terminal.bool() | truncated.bool()
         scores = self._score_windows(windows, valid, terminal).to(dtype)
+        agent_fraction = batch.get("scene_window_agent_fraction")
+        if agent_fraction is not None:
+            if agent_fraction.shape != valid.shape:
+                raise ValueError("generated scene fraction must match the actor rollout")
+            # A replay-backed window initially contains mostly expert frames.
+            # Pay only for the portion produced by the learner. Recurrent and
+            # Transformer global heads instead see generated episode frames,
+            # so their scores contain no borrowed short-window history.
+            weight = agent_fraction.to(dtype)
+            if self.factorize:
+                if self.recurrent_global or self.transformer_global:
+                    scores[..., :2] *= weight[..., None]
+                else:
+                    scores *= weight[..., None]
+            elif not (self.recurrent_global or self.transformer_global):
+                scores *= weight
+        if not self.differential:
+            # Short-window and recurrent-global state scores repeat each
+            # action. Transformer globals always pay a before/after change.
+            if self.factorize and self.transformer_global:
+                scores[..., :2] *= self.state_reward_scale
+            elif not self.transformer_global:
+                scores *= self.state_reward_scale
         components = {}
         if self.factorize:
             far_reward = SPECIALIST_DISCRIMINATOR_WEIGHT * scores[..., 0]
@@ -5500,7 +5655,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--reward-max-magnitude", type=float, default=10.0,
-        help="clip standardized imitation rewards or cap exponential rewards",
+        help="clip standardized imitation rewards or cap exponential rewards before per-step time scaling",
     )
     parser.add_argument("--ppo-batch", type=int, default=16_384)
     parser.add_argument("--ppo-epochs", type=int, default=4)
@@ -5520,9 +5675,13 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     parser.add_argument("--ppo-clip", type=float, default=0.2)
     parser.add_argument("--value-clip", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
-    parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument(
-        "--lambda", type=float, default=0.95, dest="lambda_", metavar="LAMBDA"
+        "--gamma", type=float, default=0.99,
+        help="four-tick reference discount; adjusted for --frameskip",
+    )
+    parser.add_argument(
+        "--lambda", type=float, default=0.95, dest="lambda_", metavar="LAMBDA",
+        help="four-tick reference GAE trace decay; adjusted for --frameskip",
     )
     parser.add_argument("--entropy", type=float, default=0.01)
     parser.add_argument(
@@ -5857,6 +6016,7 @@ def build_discriminator(
 def build_runner(
     env, policy, critic, buffer, args,
     gameplay: GameplayDiagnostics | None = None,
+    expert: ExpertSceneDataset | None = None,
 ) -> Runner:
     captures = [LogProbCapture()]
     if args.gru:
@@ -5867,9 +6027,13 @@ def build_runner(
         captures.append(AdvancedTouchCapture(gameplay))
         if getattr(args, "factorize", False):
             captures.append(EgoBallTouchCapture(gameplay))
+    provider = getattr(env, "reset_state_provider", None) if expert is not None else None
+    if expert is not None and not isinstance(provider, ReplayResetProvider):
+        raise ValueError("expert history needs the active replay reset provider")
     captures.append(SceneWindowCapture(
         args.trajectory_length, team_car_count(getattr(args, "team_size", 1)),
         flip_state_features=getattr(args, "flip_state_features", False),
+        replay_expert=expert, reset_provider=provider,
     ))
     return Runner(env, policy, buffer, captures=captures)
 
@@ -5882,6 +6046,38 @@ def build_ppo_sampler(args):
             epochs=args.ppo_epochs,
         )
     return RolloutMinibatches(args.ppo_batch, args.ppo_epochs)
+
+
+def build_ppo_transforms(
+    args: argparse.Namespace, discriminator: nn.Module,
+) -> tuple[SceneDiscriminatorReward, GAE, SelectPPOFields]:
+    # CLI and checkpoint discounts are specified per four-tick action. Keep
+    # both the return horizon and GAE trace horizon constant in physics time.
+    exponent = frameskip_ratio(args.frameskip)
+    gamma = args.gamma ** exponent
+    return (
+        SceneDiscriminatorReward(
+            discriminator=discriminator,
+            noise_std=args.discriminator_noise,
+            trajectory_length=args.trajectory_length,
+            goal_reward_weight=args.goal_reward_weight,
+            aerial_touch_reward_weight=args.aerial_touch_reward_weight,
+            flip_reset_reward_weight=args.flip_reset_reward_weight,
+            batch_size=args.discriminator_microbatch,
+            max_magnitude=args.reward_max_magnitude,
+            exp_log_odds_reward=args.exp_log_odds_reward,
+            context_length=args.discriminator_context_length,
+            differential=args.differential,
+            gamma=args.gamma,
+            frameskip=args.frameskip,
+        ),
+        GAE(
+            gamma=gamma,
+            lambda_=args.lambda_ ** exponent,
+            reward_field="training_reward",
+        ),
+        SelectPPOFields(recurrent=args.gru),
+    )
 
 
 def build_entropy_scheduler(
@@ -6040,7 +6236,7 @@ def main() -> None:
     buffer = RolloutBuffer(
         args.rollout, env.n_envs, env.device, copy_on_finish=False
     )
-    runner = build_runner(env, policy, critic, buffer, args, gameplay)
+    runner = build_runner(env, policy, critic, buffer, args, gameplay, expert=expert)
 
     discriminator_update = AdaptiveDiscriminatorUpdate(
         expert=expert,
@@ -6077,28 +6273,7 @@ def main() -> None:
         OptimizerStep(critic, critic_optimizer, max_grad_norm=args.max_grad_norm),
     )
     ppo_update = Update(
-        transforms=(
-            SceneDiscriminatorReward(
-                discriminator=discriminator,
-                noise_std=args.discriminator_noise,
-                trajectory_length=args.trajectory_length,
-                goal_reward_weight=args.goal_reward_weight,
-                aerial_touch_reward_weight=args.aerial_touch_reward_weight,
-                flip_reset_reward_weight=args.flip_reset_reward_weight,
-                batch_size=args.discriminator_microbatch,
-                max_magnitude=args.reward_max_magnitude,
-                exp_log_odds_reward=args.exp_log_odds_reward,
-                context_length=args.discriminator_context_length,
-                differential=args.differential,
-                gamma=args.gamma,
-            ),
-            GAE(
-                gamma=args.gamma,
-                lambda_=args.lambda_,
-                reward_field="training_reward",
-            ),
-            SelectPPOFields(recurrent=args.gru),
-        ),
+        transforms=build_ppo_transforms(args, discriminator),
         sampler=build_ppo_sampler(args),
         loss=ppo_loss,
         optimizer_step=IndependentOptimizerSteps(*ppo_optimizer_steps),

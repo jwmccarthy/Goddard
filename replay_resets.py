@@ -104,12 +104,23 @@ class ReplayResetProvider:
         self.internal_states = internal_states
         self.n_cars = n_cars
         self.scene_size = frames.shape[-1]
+        # Per-simulation source frame for the current reset. GAIFO snapshots
+        # this before stepping because CARL may sample the next reset during
+        # the same step that finishes the previous episode.
+        self.last_reset_indices: th.Tensor | None = None
 
     def __call__(self, reset_mask: th.Tensor) -> CARLResetState | None:
+        if (self.last_reset_indices is None
+                or self.last_reset_indices.shape != reset_mask.shape
+                or self.last_reset_indices.device != reset_mask.device):
+            self.last_reset_indices = th.full_like(reset_mask, -1, dtype=th.long)
+        else:
+            self.last_reset_indices[reset_mask] = -1
         sample = self.sampler(reset_mask)
         if sample is None:
             return None
         indices = sample["frame_index"]
+        self.last_reset_indices[sample["simulation_indices"]] = indices
         scenes = self.frames[indices]
         return CARLResetState(
             simulation_indices=sample["simulation_indices"],
