@@ -98,6 +98,51 @@ class BasicStartingCheckpointTests(unittest.TestCase):
         torch.manual_seed(0)
         self.env = FakeEnv()
 
+    def test_cosine_learning_rate_updates_both_optimizers_and_resumes(self):
+        args = ppo_args(BASIC_POLICY_ARCHITECTURE)
+        args.start_kl_coef = 0.0
+        args.learning_rate = 0.001
+        args.learning_rate_end_factor = 0.2
+        args.entropy_coef = 0.02
+        args.entropy_coef_end = 0.005
+        policy, critic = build_policy_and_critic(self.env, args)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            _, _, _, scheduler, objects = build_ppo(
+                self.env, policy, critic, DiagnosticRewardSpec(), args,
+                Path(directory) / "snapshots",
+            )
+            optimizers = objects["optimizers"]
+
+            scheduler.start(100)
+            for step, expected in (
+                (0, 0.001),
+                (25, 0.000882842712),
+                (50, 0.0006),
+                (75, 0.000317157288),
+                (100, 0.0002),
+                (125, 0.0002),
+            ):
+                with self.subTest(step=step):
+                    scheduler.advance(step)
+                    for optimizer in optimizers.values():
+                        self.assertAlmostEqual(
+                            optimizer.param_groups[0]["lr"], expected, places=9,
+                        )
+                    self.assertAlmostEqual(
+                        scheduler.metrics()["Schedule"]["learning_rate"], expected,
+                        places=9,
+                    )
+
+            scheduler.advance(25)
+            self.assertAlmostEqual(scheduler.metrics()["Schedule"]["entropy_coef"], 0.01625)
+            scheduler.advance(40)
+            saved_rate = optimizers["policy"].param_groups[0]["lr"]
+            # Trainer.run() reapplies the schedule at the restored clock step.
+            scheduler.start(100)
+            scheduler.advance(40)
+            for optimizer in optimizers.values():
+                self.assertAlmostEqual(optimizer.param_groups[0]["lr"], saved_rate)
+
     def test_start_from_basic_and_gaifo_policy_formats(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             for architecture in (

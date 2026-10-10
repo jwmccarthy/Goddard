@@ -70,6 +70,19 @@ BASIC_POLICY_ARCHITECTURE = "basic-gru-v1"
 DEFAULT_START_KL_COEF = 0.1
 
 
+@dataclass(frozen=True)
+class CosineAnnealingSchedule:
+    """Anneal from start to end over one half-cosine cycle."""
+
+    start: float
+    end: float
+
+    def __call__(self, progress: float) -> float:
+        return self.end + (self.start - self.end) * (
+            1.0 + math.cos(math.pi * progress)
+        ) / 2.0
+
+
 @dataclass(frozen=True, eq=False)
 class PolicyCheckpoint:
     architecture: str
@@ -517,6 +530,7 @@ def parse_arguments() -> argparse.Namespace:
         "--ppo-lr-end-factor", "--learning-rate-end-factor",
         dest="learning_rate_end_factor", type=float, default=0.5,
         metavar="PPO_LR_END_FACTOR",
+        help="final PPO learning rate as a fraction of the initial rate (cosine-annealed)",
     )
     add_feature_option(
         parser, "--bf16", default=True,
@@ -1065,7 +1079,7 @@ def build_ppo(
         ),
         section="PPO",
     )
-    learning_rate = LinearSchedule(
+    learning_rate = CosineAnnealingSchedule(
         arguments.learning_rate,
         arguments.learning_rate * arguments.learning_rate_end_factor,
     )
