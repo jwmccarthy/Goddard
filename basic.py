@@ -921,16 +921,6 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
                 self._reward_diagnostics[name] = total + sum(values), count + len(values)
         return env_step
 
-    @torch.no_grad()
-    def after_update(self, timesteps: int) -> None:
-        super().after_update(timesteps)
-        if self.state is not None:
-            self.state.zero_()
-        for capture in self.captures:
-            if isinstance(capture, (RecurrentCriticCapture, ReferenceLogitsCapture)):
-                if capture.state is not None:
-                    capture.state.zero_()
-
     def _record_diagnostics(self, env_step, learner_mask: torch.Tensor) -> None:
         if self._diagnostics is None or self._touch_steps is None:
             return

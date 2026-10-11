@@ -47,7 +47,7 @@ from jarl.runtime import (
     Trainer,
     ValueScheduler,
 )
-from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches
+from jarl.sample import RecurrentRolloutMinibatches, RolloutMinibatches, SequenceBatch
 from jarl.store import RolloutBuffer
 from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
@@ -135,6 +135,8 @@ FLICK_MIN_VELOCITY_CHANGE = 500.0
 GLOBAL_DISCRIMINATOR_WEIGHT = 0.5
 SPECIALIST_DISCRIMINATOR_WEIGHT = 0.5
 REFERENCE_FRAMESKIP = 4  # Existing reward and discount settings are per four physics ticks.
+REPLAY_WARMUP_STEPS = 16
+PPO_BURNIN_STEPS = 8
 RESET_MINING_CANDIDATES = 8
 RESET_MINING_FRACTION = 0.5
 RESET_MINING_MIN_CONFIDENCE = 0.6
@@ -728,6 +730,76 @@ def flip_state_from_internal(internal: th.Tensor) -> th.Tensor:
     return th.stack((available.to(internal.dtype), remaining * available), dim=-1)
 
 
+def replay_policy_observation(
+    scenes: th.Tensor, internal: th.Tensor, actor: int, pad_active: th.Tensor,
+) -> th.Tensor:
+    """Reconstruct CARL's normalized POV from a recorded physical scene."""
+    n_cars = scene_car_count(scenes)
+    if internal.shape != (*scenes.shape[:-1], INTERNAL_STATE_SIZE):
+        raise ValueError("replay POV needs the focal car's internal state")
+    if pad_active.shape != (*scenes.shape[:-1], carl.NUM_BOOST_PADS):
+        raise ValueError("replay POV needs the focal car's boost-pad flags")
+
+    view = actor_view(scenes, actor)
+    scale = view.new_tensor(POSITION_SCALE)
+    ball = view[..., :BALL_SIZE]
+    cars = view[..., BALL_SIZE:].reshape(*view.shape[:-1], n_cars, CAR_SIZE)
+    ego = cars[..., 0, :]
+    other = cars[..., 1:, :]
+    pads = view.new_tensor(carl.BOOST_PAD_POSITIONS)
+    pad_distances = th.linalg.vector_norm(
+        ego[..., None, :3] * scale - pads, dim=-1,
+    ) / 14692.54
+    relative_ball = th.cat((
+        (ball[..., :3] - ego[..., :3]) / 2,
+        (ball[..., 3:6] * BALL_MAX_SPEED - ego[..., 3:6] * CAR_MAX_SPEED)
+        / (BALL_MAX_SPEED + CAR_MAX_SPEED),
+    ), dim=-1)
+    relative_cars = th.cat((
+        (other[..., :3] - ego[..., None, :3]) / 2,
+        (other[..., 3:6] - ego[..., None, 3:6]) / 2,
+    ), dim=-1).flatten(-2)
+    opponent_goal = view.new_tensor((0.0, 5120.0, 321.3875)) / scale
+    own_goal = opponent_goal * view.new_tensor((1.0, -1.0, 1.0))
+    relative_goals = (
+        th.stack((own_goal, opponent_goal)) - ball[..., None, :3]
+    ).flatten(-2) / 2
+    return th.cat((
+        view, pad_active.to(view.dtype), pad_distances,
+        relative_ball, relative_cars, relative_goals,
+        flip_state_from_internal(internal),
+    ), dim=-1)
+
+
+def replay_policy_history(
+    expert: "ExpertSceneDataset", indices: th.Tensor, actor: int, length: int,
+) -> tuple[th.Tensor, th.Tensor]:
+    """Borrow only contiguous, recorded POVs preceding replay reset frames."""
+    if indices.ndim != 1 or not indices.numel() or (indices < 0).any():
+        raise ValueError("replay warmup needs nonempty, valid frame indices")
+    if length < 1:
+        raise ValueError("replay warmup length must be positive")
+    age = th.arange(length, 0, -1, device=indices.device)[:, None]
+    start = expert.replay_history_start[indices]
+    count = th.where(start >= 0, (indices - start).clamp(0, length), 0)
+    valid = age <= count[None, :]
+    source = (indices[None, :] - age).clamp_min(0)
+    # A missing intervening POV cannot supply the focal dodge timer. Borrow a
+    # contiguous suffix only, and never warm an actor absent at the reset.
+    available = expert.pov_available[source, actor]
+    valid &= available.flip(0).int().cumprod(0).flip(0).bool()
+    valid &= expert.pov_available[indices, actor][None, :]
+
+    packed = expert.pov_pad_flags[source, actor]
+    pad_indices = th.arange(carl.NUM_BOOST_PADS, device=indices.device)
+    pad_active = (packed[..., pad_indices // 8] >> (7 - pad_indices % 8)) & 1
+    observations = replay_policy_observation(
+        expert.frames[source], expert.internal_states[source, actor],
+        actor, pad_active,
+    )
+    return th.where(valid[..., None], observations, 0), valid
+
+
 def _unsafe_replay_reset_frames(
     path: Path, stored: np.ndarray, frame_skip: int,
 ) -> np.ndarray:
@@ -1256,6 +1328,7 @@ class ExpertSceneDataset:
         frames: list[th.Tensor] = []
         internal_states: list[th.Tensor] = []
         available_povs: list[th.Tensor] = []
+        pov_pad_flags: list[th.Tensor] = []
         invalid_frames: list[th.Tensor] = []
         contact_frames: list[th.Tensor] = []
         ego_touches: list[th.Tensor] = []
@@ -1307,6 +1380,12 @@ class ExpertSceneDataset:
                 for scene_field, internal_field in ((16, 0), (19, 7), (18, 8), (20, 17)):
                     internal[:, actor, internal_field] = car[:, scene_field]
             internal[:, 0] = ego_internal
+            pad_flags = np.ones(
+                (len(source), self.n_cars, carl.NUM_BOOST_PADS), dtype=bool,
+            )
+            pad_flags[:, 0] = stored[
+                :, self.scene_size:self.scene_size + carl.NUM_BOOST_PADS,
+            ] > 0.5
             available = np.zeros(self.n_cars, dtype=bool)
             available[0] = True
             for other_path in group[1:]:
@@ -1329,6 +1408,9 @@ class ExpertSceneDataset:
                 internal[:, actor] = other[
                     :, self.internal_start:self.internal_start + INTERNAL_STATE_SIZE,
                 ]
+                pad_flags[:, actor] = other[
+                    :, self.scene_size:self.scene_size + carl.NUM_BOOST_PADS,
+                ] > 0.5
                 if frame_skip is not None:
                     other_metadata = other_path.with_suffix(".unsafe-starts.npz")
                     if other_metadata.is_file():
@@ -1342,10 +1424,11 @@ class ExpertSceneDataset:
                 # Interpolation can hide an invalid source orientation. Never
                 # borrow scenes that straddle it, even if the result has axes.
                 history_invalid |= _invalid_reset_rotations(source, self.n_cars)
-                left, right, _ = _resample_coordinates(
+                left, right, alpha = _resample_coordinates(
                     len(stored), stored_frame_skip, frame_skip
                 )
                 history_invalid = history_invalid[left] | history_invalid[right]
+                pad_flags = pad_flags[np.where(alpha < 0.5, left, right)]
                 if reject_discontinuities:
                     invalid = invalid[left] | invalid[right]
                     event_prefix = np.pad(contact.astype(np.int64).cumsum(0), (1, 0))
@@ -1367,6 +1450,7 @@ class ExpertSceneDataset:
                     break
                 source = source[:keep]
                 internal = internal[:keep]
+                pad_flags = pad_flags[:keep]
                 history_invalid = history_invalid[:keep]
                 if reject_discontinuities:
                     invalid = invalid[:keep]
@@ -1392,6 +1476,7 @@ class ExpertSceneDataset:
             pad = trajectory_length - 1
             source = np.concatenate((np.repeat(source[:1], pad, axis=0), source))
             internal = np.concatenate((np.repeat(internal[:1], pad, axis=0), internal))
+            pad_flags = np.concatenate((np.repeat(pad_flags[:1], pad, axis=0), pad_flags))
             history_invalid = np.pad(history_invalid, (pad, 0), constant_values=True)
             run_start = np.maximum.accumulate(np.where(
                 history_invalid, np.arange(len(source)) + 1, pad,
@@ -1414,6 +1499,7 @@ class ExpertSceneDataset:
             available_povs.append(th.from_numpy(
                 np.broadcast_to(available, (len(source), self.n_cars)).copy(),
             ))
+            pov_pad_flags.append(th.from_numpy(np.packbits(pad_flags, axis=-1)))
             if reject_discontinuities:
                 invalid_frames.append(th.from_numpy(invalid.copy()))
                 contact_frames.append(th.from_numpy(contact.copy()))
@@ -1433,6 +1519,7 @@ class ExpertSceneDataset:
         self.frames = th.cat(frames).to(device)
         self.internal_states = th.cat(internal_states).to(device)
         self.pov_available = th.cat(available_povs).to(device)
+        self.pov_pad_flags = th.cat(pov_pad_flags).to(device)
         self.replay_history_start = th.cat(replay_history_starts).to(device)
         # Retain the 1v1 API used by existing analyses and checkpoints.
         self.opponent_pov_available = self.pov_available[:, self.team_size]
@@ -6013,17 +6100,79 @@ def build_discriminator(
     return model(**options)
 
 
-class RecurrentRolloutRunner(Runner):
-    """Start each post-update rollout with fresh policy and critic memory."""
+class ReplayWarmupRunner(Runner):
+    """Initialize recurrent actors from their recorded POV before a replay reset."""
+
+    def __init__(
+        self, env, policy, buffer, captures,
+        expert: ExpertSceneDataset, reset_provider: ReplayResetProvider,
+        critic_capture: RecurrentCriticCapture,
+        warmup_steps: int = REPLAY_WARMUP_STEPS,
+    ) -> None:
+        super().__init__(env, policy, buffer, captures=captures)
+        if warmup_steps < 1 or self.n_envs % expert.n_cars:
+            raise ValueError("replay warmup needs a positive length and complete matches")
+        self.expert = expert
+        self.reset_provider = reset_provider
+        self.critic_capture = critic_capture
+        self.warmup_steps = warmup_steps
 
     @th.no_grad()
-    def after_update(self, env_steps: int) -> None:
-        super().after_update(env_steps)
-        if self.state is not None:
-            self.state.zero_()
-        for capture in self.captures:
-            if isinstance(capture, RecurrentCriticCapture) and capture.state is not None:
-                capture.state.zero_()
+    def reset(self):
+        observation = super().reset()
+        self._warm_replay_resets(th.ones(
+            self.n_envs // self.expert.n_cars,
+            dtype=th.bool, device=self.policy.device,
+        ))
+        return observation
+
+    @th.no_grad()
+    def step(self):
+        env_step = super().step()
+        finished = th.as_tensor(
+            env_step.done, dtype=th.bool, device=self.policy.device,
+        ).view(-1, self.expert.n_cars).any(dim=1)
+        self._warm_replay_resets(finished)
+        return env_step
+
+    def _warm_replay_resets(self, finished: th.Tensor) -> None:
+        indices = self.reset_provider.last_reset_indices
+        if indices is None:
+            return
+        if indices.shape != finished.shape:
+            raise ValueError("replay reset frames must match the finished simulations")
+        safe = indices.clamp_min(0)
+        start = self.expert.replay_history_start[safe]
+        eligible = finished & indices.ge(0) & start.ge(0) & indices.gt(start)
+        simulations = eligible.nonzero(as_tuple=True)[0]
+        if not simulations.numel():
+            return
+        for actor in range(self.expert.n_cars):
+            recorded = self.expert.pov_available[indices[simulations], actor]
+            actor_simulations = simulations[recorded]
+            if not actor_simulations.numel():
+                continue
+            # Bound the [time, actor, observation] reconstruction for large GPU rollouts.
+            for selected in actor_simulations.split(512):
+                observations, valid = replay_policy_history(
+                    self.expert, indices[selected], actor, self.warmup_steps,
+                )
+                nonempty = valid.any(dim=0)
+                if not nonempty.any():
+                    continue
+                selected = selected[nonempty]
+                observations, valid = observations[:, nonempty], valid[:, nonempty]
+                reset = None
+                if not valid.all():
+                    previous = th.cat((th.zeros_like(valid[:1]), valid[:-1]))
+                    reset = valid & ~previous
+                _, policy_state = self.policy.body_features(observations, reset=reset)
+                _, critic_state = self.critic_capture.critic.body_features(
+                    observations, reset=reset,
+                )
+                actor_slots = selected * self.expert.n_cars + actor
+                self.state[actor_slots] = policy_state
+                self.critic_capture.state[actor_slots] = critic_state
 
 
 def build_runner(
@@ -6032,8 +6181,10 @@ def build_runner(
     expert: ExpertSceneDataset | None = None,
 ) -> Runner:
     captures = [LogProbCapture()]
+    critic_capture = None
     if args.gru:
-        captures.extend((RecurrentStateCapture(), RecurrentCriticCapture(critic)))
+        critic_capture = RecurrentCriticCapture(critic)
+        captures.extend((RecurrentStateCapture(), critic_capture))
     else:
         captures.append(CriticCapture(critic))
     if gameplay is not None:
@@ -6048,12 +6199,125 @@ def build_runner(
         flip_state_features=getattr(args, "flip_state_features", False),
         replay_expert=expert, reset_provider=provider,
     ))
-    runner_type = RecurrentRolloutRunner if args.gru else Runner
-    return runner_type(env, policy, buffer, captures=captures)
+    if critic_capture is not None and expert is not None:
+        return ReplayWarmupRunner(
+            env, policy, buffer, captures, expert, provider, critic_capture,
+        )
+    return Runner(env, policy, buffer, captures=captures)
 
 
-def build_ppo_sampler(args):
+class EpisodeRecurrentMinibatches:
+    """Keep warmed replay starts at sequence boundaries; refresh later states."""
+
+    def __init__(
+        self, sequence_length: int, sequences_per_batch: int, epochs: int,
+        policy: MultiCategoricalPolicy, critic: Critic,
+        burnin_steps: int = PPO_BURNIN_STEPS,
+    ) -> None:
+        if min(sequence_length, sequences_per_batch, epochs) < 1 or burnin_steps < 0:
+            raise ValueError("recurrent minibatch settings must be positive")
+        self.sequence_length = sequence_length
+        self.sequences_per_batch = sequences_per_batch
+        self.epochs = epochs
+        self.policy = policy
+        self.critic = critic
+        self.burnin_steps = burnin_steps
+        self._epoch_callback = None
+
+    def set_epoch_callback(self, callback) -> None:
+        self._epoch_callback = callback
+
+    def __call__(self, data: TensorBatch):
+        if len(data.shape) != 2 or not all(
+            key in data for key in ("policy_state", "critic_state", "terminated", "truncated")
+        ):
+            raise ValueError("recurrent sampling needs rollout states and episode endings")
+        time, num_envs = data.shape
+        done = (data["terminated"] | data["truncated"]).swapaxes(0, 1).cpu().numpy()
+        learner = data.get("learner_mask")
+        learner = learner.swapaxes(0, 1).cpu().numpy() if learner is not None else None
+        sequences = []
+        for env in range(num_envs):
+            episode_start = 0
+            boundaries = (np.flatnonzero(done[env]) + 1).tolist()
+            boundaries.append(time)
+            for episode_end in boundaries:
+                for start in range(episode_start, episode_end, self.sequence_length):
+                    end = min(start + self.sequence_length, episode_end)
+                    if learner is None or learner[env, start:end].any():
+                        sequences.append((
+                            env, max(episode_start, start - self.burnin_steps), start, end,
+                        ))
+                episode_start = episode_end
+        if not sequences:
+            raise RuntimeError("rollout contains no learner sequences")
+        batch_count = math.ceil(len(sequences) / self.sequences_per_batch)
+        small, larger = divmod(len(sequences), batch_count)
+        for _ in range(self.epochs):
+            order = th.randperm(len(sequences), device="cpu").tolist()
+            left = 0
+            for batch in range(batch_count):
+                size = small + (batch < larger)
+                selected = [sequences[index] for index in order[left:left + size]]
+                yield self._build_batch(data, selected)
+                left += size
+            if self._epoch_callback is not None:
+                self._epoch_callback()
+
+    @th.no_grad()
+    def _build_batch(
+        self, data: TensorBatch, sequences: list[tuple[int, int, int, int]],
+    ) -> SequenceBatch:
+        device = data.device
+        envs, burn_starts, starts, ends = (
+            th.tensor(column, dtype=th.long, device=device)
+            for column in zip(*sequences)
+        )
+        offsets = th.arange(self.sequence_length, device=device)[:, None]
+        valid = offsets < (ends - starts)[None, :]
+        indices = (starts[None, :] + offsets).clamp_max(data.shape[0] - 1)
+        fields = {}
+        for name, tensor in data.items():
+            if name in ("policy_state", "critic_state"):
+                continue
+            gathered = tensor[indices, envs[None, :]]
+            mask = valid.view(*valid.shape, *((1,) * (gathered.ndim - 2)))
+            fields[name] = th.where(mask, gathered, th.zeros_like(gathered))
+        steps = TensorBatch(fields)
+        if "learner_mask" in steps:
+            valid &= steps["learner_mask"].bool()
+
+        policy_state = data["policy_state"][starts, envs].clone()
+        critic_state = data["critic_state"][starts, envs].clone()
+        burn_lengths = starts - burn_starts
+        for length in range(1, self.burnin_steps + 1):
+            selected = burn_lengths.eq(length).nonzero(as_tuple=True)[0]
+            if not selected.numel():
+                continue
+            burn_times = burn_starts[selected][None, :] + th.arange(length, device=device)[:, None]
+            burn_envs = envs[selected]
+            history = data["observation"][burn_times, burn_envs[None, :]]
+            _, refreshed_policy = self.policy.body_features(
+                history, data["policy_state"][burn_starts[selected], burn_envs],
+            )
+            _, refreshed_critic = self.critic.body_features(
+                history, data["critic_state"][burn_starts[selected], burn_envs],
+            )
+            policy_state[selected] = refreshed_policy
+            critic_state[selected] = refreshed_critic
+        return SequenceBatch(steps, policy_state, None, valid, critic_state)
+
+
+def build_ppo_sampler(args, runner: Runner | None = None):
     if args.gru:
+        if isinstance(runner, ReplayWarmupRunner):
+            return EpisodeRecurrentMinibatches(
+                sequence_length=args.sequence_length,
+                sequences_per_batch=args.ppo_batch // args.sequence_length,
+                epochs=args.ppo_epochs,
+                policy=runner.policy,
+                critic=runner.critic_capture.critic,
+            )
         return RecurrentRolloutMinibatches(
             sequence_length=args.sequence_length,
             sequences_per_batch=args.ppo_batch // args.sequence_length,
@@ -6288,7 +6552,7 @@ def main() -> None:
     )
     ppo_update = Update(
         transforms=build_ppo_transforms(args, discriminator),
-        sampler=build_ppo_sampler(args),
+        sampler=build_ppo_sampler(args, runner),
         loss=ppo_loss,
         optimizer_step=IndependentOptimizerSteps(*ppo_optimizer_steps),
         section="PPO",

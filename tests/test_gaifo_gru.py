@@ -242,7 +242,7 @@ class GAIFOGruTests(unittest.TestCase):
                     self.assertGreater(policy_extra.weight.grad.abs().sum().item(), 0)
                     self.assertGreater(critic_extra.weight.grad.abs().sum().item(), 0)
 
-    def test_recurrent_policy_and_critic_start_each_rollout_from_zero(self):
+    def test_recurrent_policy_and_critic_continue_across_rollouts(self):
         args = self.args(True)
         policy = build_policy(self.env, args)
         critic = build_critic(self.env, args)
@@ -257,19 +257,19 @@ class GAIFOGruTests(unittest.TestCase):
         self.assertEqual(self.env.t, 1)  # No episode boundary before the update.
         self.assertGreater(runner.state.abs().sum().item(), 0)
         self.assertGreater(critic_capture.state.abs().sum().item(), 0)
+        policy_state = runner.state.clone()
+        critic_state = critic_capture.state.clone()
 
         buffer.finish()
         buffer.clear()  # The trainer clears the completed rollout before after_update.
         runner.after_update(self.env.n_envs)
-        th.testing.assert_close(runner.state, th.zeros_like(runner.state))
-        th.testing.assert_close(
-            critic_capture.state, th.zeros_like(critic_capture.state),
-        )
+        th.testing.assert_close(runner.state, policy_state)
+        th.testing.assert_close(critic_capture.state, critic_state)
 
         runner.step()
         steps = buffer.finish().steps
-        for name in ("policy_state", "critic_state"):
-            th.testing.assert_close(steps[name][0], th.zeros_like(steps[name][0]))
+        th.testing.assert_close(steps["policy_state"][0], policy_state)
+        th.testing.assert_close(steps["critic_state"][0], critic_state)
 
     def test_checkpoint_architecture_and_resume(self):
         for gru, layers in ((False, 1), (True, 1), (False, 2), (True, 2)):

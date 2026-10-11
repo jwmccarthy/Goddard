@@ -17,13 +17,13 @@ from carl.gymnasium import CARLTorchVectorEnv
 from gaifo import (
     BLUE_START, ConfidentExpertResetTransform, ExpertSceneDataset,
     GameplayDiagnostics, ORANGE_START, POSITION_SCALE, SceneWindowCapture, actor_view,
-    extract_scene_observations, load_resume_checkpoint, main,
+    extract_scene_observations, load_resume_checkpoint, main, replay_policy_observation,
 )
 from jarl.collect import Runner
 from jarl.data import TensorBatch
 from jarl.data.records import PolicyOutput
 from jarl.store import RolloutBuffer
-from replay_layout import team_live_observation_size
+from replay_layout import team_live_observation_size, team_scene_size
 from replay_resets import ReplayResetProvider
 from watch_checkpoints import EpisodeLimits, configure_match_timing
 
@@ -33,6 +33,40 @@ from watch_checkpoints import EpisodeLimits, configure_match_timing
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
+    def test_replay_pov_reconstruction_matches_carl_for_each_team_size(self):
+        for team_size in (1, 2, 3):
+            with self.subTest(team_size=team_size):
+                env = CARLTorchVectorEnv(
+                    n_sim=1, n_blue=team_size, n_orange=team_size,
+                    frameskip=4, normalize=True, discrete_actions=True,
+                )
+                try:
+                    env.reset()
+                    observation = env.set_ball(
+                        th.tensor([[320., -720., 275.]], device=env.device),
+                        th.tensor([[600., -450., 230.]], device=env.device),
+                        th.tensor([[1., 2., 3.]], device=env.device),
+                    )
+                    scene_size = team_scene_size(team_size)
+                    scene = observation[:1, :scene_size]
+                    for actor in range(2 * team_size):
+                        internal = th.zeros((1, 19), device=env.device)
+                        internal[0, 0] = observation[actor, 9 + 16]
+                        internal[0, 7] = observation[actor, 9 + 19]
+                        internal[0, 8] = observation[actor, 9 + 18]
+                        pad_active = observation[
+                            actor:actor + 1, scene_size:scene_size + 34,
+                        ]
+                        rebuilt = replay_policy_observation(
+                            scene, internal, actor, pad_active,
+                        )
+                        th.testing.assert_close(
+                            rebuilt, observation[actor:actor + 1],
+                            atol=2e-5, rtol=2e-5,
+                        )
+                finally:
+                    env.close()
+
     def test_no_touch_timeout_starts_after_either_player_last_touch(self):
         neutral = th.tensor([1, 1, 1, 0, 0, 1, 0], device="cuda:0").repeat(2, 1)
         for timeout_ticks in (12, None):
@@ -138,6 +172,16 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 runner = Runner(env, NeutralPolicy(), buffer, captures=(capture,))
                 runner.reset()
                 self.assertEqual(int(capture.episode_reset_indices[0]), int(indices[0]))
+                for actor in range(2):
+                    rebuilt = replay_policy_observation(
+                        expert.frames[indices[:1]],
+                        expert.internal_states[indices[:1], actor],
+                        actor, th.ones(1, 34, device=env.device),
+                    )
+                    th.testing.assert_close(
+                        rebuilt, runner.observation[actor:actor + 1],
+                        atol=2e-5, rtol=2e-5,
+                    )
                 for old, replacement in zip(indices[:2], indices[1:]):
                     step = runner.step()
                     self.assertTrue(step.done.all())
@@ -176,6 +220,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         invalid_rotations: bool = False, recurrent_global: bool = True,
         trajectory_length: int = 8,
         frameskip: int = 4,
+        gru: bool = False,
     ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -218,7 +263,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "--curated-skill-sampling", "false",  # Synthetic replays have no touch metadata.
                 "--n-sim", "2",
                 "--rollout", "8", "--trajectory-length", str(trajectory_length),
-                "--gru", "false",  # Exercise legacy MLP checkpoints explicitly.
+                "--gru", str(gru).lower(),
                 "--timesteps", "64", "--ppo-batch", "8", "--ppo-epochs", "1",
                 "--policy-hidden", "16", "--critic-hidden", "16",
                 "--discriminator-hidden", "16", "--frame-embedding", "8",
@@ -232,6 +277,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "--log-dir", str(root / "runs"),
                 "--checkpoint-dir", str(root / "checkpoints"),
             ]
+            if gru:
+                flags.extend(("--sequence-length", "4"))
             if transformer:
                 flags.extend(("--transformer", "--discriminator-context-length", "8",
                               "--discriminator-context-stride", "2",
@@ -289,6 +336,15 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         self.assertIn("D heldout accuracy", output)
         self.assertNotIn("short D", output)
         self.assertNotIn("long D", output)
+
+    def test_recurrent_training_with_replay_warmup_and_episode_sequences(self):
+        saved, output, _ = self._short_window_training(
+            False, gru=True, recurrent_global=False, trajectory_length=4,
+        )
+        self.assertEqual(saved["step"], 64)
+        self.assertTrue(saved["config"]["gru"])
+        self.assertIn("body.rnn.weight_ih_l0", saved["policy"])
+        self.assertIn("D heldout accuracy", output)
 
     def test_factorized_short_window_training(self):
         saved, output, _ = self._short_window_training(True)

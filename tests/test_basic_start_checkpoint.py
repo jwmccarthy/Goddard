@@ -585,12 +585,12 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                         else:
                             configure_starting_checkpoint(checkpoint_args(resume=tampered))
 
-    def test_rollout_boundary_resets_learner_opponent_critic_and_reference_states(self):
+    def test_rollout_keeps_recurrent_states_except_remapped_opponents(self):
         self.env.done_at = 100
         args = ppo_args(BASIC_POLICY_ARCHITECTURE)
         args.rollout_steps = 2
         args.self_play_current = 0.0  # Include frozen opponents in every match.
-        args.snapshot_interval = 1
+        args.snapshot_interval = 2
         policy, critic = build_policy_and_critic(self.env, args)
         reference = copy.deepcopy(policy).eval().requires_grad_(False)
         reward = DiagnosticRewardSpec(normalize=False)
@@ -618,25 +618,48 @@ class BasicStartingCheckpointTests(unittest.TestCase):
             self.assertGreater(
                 runner.state[~runner.matchmaker.learner_mask].abs().sum().item(), 0,
             )
+            policy_state = runner.state.clone()
+            critic_state = critic_capture.state.clone()
+            reference_state = reference_capture.state.clone()
 
             learner.update(buffer.finish())
             buffer.clear()
-            runner.after_update(self.env.n_envs * args.rollout_steps // 2)
-            self.assertEqual(runner.opponent_pool.ids, (0, 1))
-            self.assertEqual(runner.matchmaker.historical_ids, (1,))
-            for state in (runner.state, critic_capture.state, reference_capture.state):
-                torch.testing.assert_close(state, torch.zeros_like(state))
+            runner.after_update(runner.timestep_count * args.rollout_steps)
+            self.assertEqual(runner.opponent_pool.ids, (0,))
+            for actual, expected in (
+                (runner.state, policy_state),
+                (critic_capture.state, critic_state),
+                (reference_capture.state, reference_state),
+            ):
+                torch.testing.assert_close(actual, expected)
 
             runner.step()
             steps = buffer.finish().steps
-            for name in ("policy_state", "critic_state"):
-                torch.testing.assert_close(steps[name][0], torch.zeros_like(steps[name][0]))
+            torch.testing.assert_close(steps["policy_state"][0], policy_state)
+            torch.testing.assert_close(steps["critic_state"][0], critic_state)
             with torch.no_grad():
                 features, _ = reference.body_features(
-                    steps["observation"][0], reference.initial_state(self.env.n_envs),
+                    steps["observation"][0], reference_state,
                 )
                 expected = reference.head(features)
             torch.testing.assert_close(steps["reference_logits"][0], expected)
+
+            runner.step()
+            before_snapshot = runner.state.clone()
+            before_critic = critic_capture.state.clone()
+            before_reference = reference_capture.state.clone()
+            learner.update(buffer.finish())
+            buffer.clear()
+            runner.after_update(2 * runner.timestep_count * args.rollout_steps)
+            self.assertEqual(runner.opponent_pool.ids, (0, 1))
+            self.assertEqual(runner.matchmaker.historical_ids, (1,))
+            learner_mask = runner.matchmaker.learner_mask
+            torch.testing.assert_close(runner.state[learner_mask], before_snapshot[learner_mask])
+            torch.testing.assert_close(
+                runner.state[~learner_mask], torch.zeros_like(runner.state[~learner_mask]),
+            )
+            torch.testing.assert_close(critic_capture.state, before_critic)
+            torch.testing.assert_close(reference_capture.state, before_reference)
 
     def test_start_and_resume_require_native_carl_observation_width(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

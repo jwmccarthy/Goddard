@@ -142,6 +142,14 @@ select the discriminator. New runs use a GRU policy and critic by default;
 `--gru false` selects an MLP, and resumes preserve the saved architecture.
 `--transformer` cannot be combined with
 `--recurrent-global`.
+Policy and critic GRUs keep their hidden states across PPO updates, resetting at
+actual episode endings. At replay resets, actors with a recorded POV first
+process up to 16 contiguous preceding replay observations without gradients;
+missing POVs and fresh kickoffs start at zero. Historical boost-pad flags come
+from the replay, while CARL starts the new episode with active pads. PPO trains
+episode-aligned sequences (at most `--sequence-length`, default 16); later
+chunks refresh their starting states with up to eight preceding rollout steps
+under current weights before calculating the learning loss.
 
 ```bash
 .venv/bin/python gaifo.py --replay-dir parsed_replays/duels \
