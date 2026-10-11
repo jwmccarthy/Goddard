@@ -26,7 +26,13 @@ def write_experts(folder: Path) -> ExpertSceneDataset:
         for car in (BLUE_START, ORANGE_START):
             rows[:, car + 2] = 17 / POSITION_SCALE[2]
             rows[:, car + 9] = rows[:, car + 14] = rows[:, car + 16] = 1
-        np.save(folder / f"{index}-period.npy", rows)
+        path = folder / f"{index}-period.npy"
+        np.save(path, rows)
+        np.savez_compressed(
+            path.with_suffix(".unsafe-starts.npz"),
+            unsafe=np.zeros(len(rows), dtype=bool),
+            pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+        )
     return ExpertSceneDataset(folder, trajectory_length=2, heldout_size=3)
 
 

@@ -807,7 +807,11 @@ def _unsafe_replay_reset_frames(
     sidecar = path.with_suffix(".unsafe-starts.npz")
     if sidecar.is_file():
         with np.load(sidecar) as metadata:
-            unsafe = np.asarray(metadata["unsafe"], dtype=bool)
+            unsafe = np.asarray(
+                metadata["unsafe"] if "unsafe" in metadata else infer_unsafe_start_mask(
+                    stored[:, 3:6] * BALL_MAX_SPEED, frame_skip,
+                ), dtype=bool,
+            )
             pre_goal = np.asarray(metadata.get(
                 "pre_goal", pre_goal_start_mask(
                     len(stored), frame_skip, (len(stored) - 1) * frame_skip,
@@ -993,15 +997,17 @@ class AdvancedTouchCapture(CaptureBase):
 
 
 class EgoBallTouchCapture(CaptureBase):
-    """Capture which player caused a ball touch on the scored transition."""
+    """Capture focal, opposing-team, and other-player touches on the scored step."""
 
     def __init__(self, gameplay: GameplayDiagnostics) -> None:
         self.gameplay = gameplay
 
     def _capture(self, context: CaptureContext) -> dict[str, th.Tensor]:
+        touches = self.gameplay.last_ego_ball_touch.view(-1, self.gameplay.n_cars)
         return {
             "ego_ball_touch": self.gameplay.last_ego_ball_touch,
             "opponent_ball_touch": self.gameplay.last_opponent_ball_touch,
+            "other_ball_touch": (touches.any(dim=-1, keepdim=True) & ~touches).reshape(-1),
         }
 
 
@@ -1265,9 +1271,8 @@ class ExpertSceneDataset:
         device: str | th.device = "cpu",
         heldout_size: int = 0,
         reject_discontinuities: bool = False,
-        skill_sampling: bool = False,
-        driving_fraction: float = 0.10,
-        kickoff_fraction: float = 0.05,
+        catalog_skills: bool = False,
+        include_kickoffs: bool = True,
         team_size: int = 1,
         flip_state_features: bool = False,
     ) -> None:
@@ -1288,14 +1293,8 @@ class ExpertSceneDataset:
             raise ValueError("expert frame skip must be positive")
         if heldout_size < 0:
             raise ValueError("heldout size must be non-negative")
-        if not math.isfinite(driving_fraction) or not 0.0 <= driving_fraction < 1.0:
-            raise ValueError("general-driving fraction must be in [0, 1)")
-        if not math.isfinite(kickoff_fraction) or not 0.0 <= kickoff_fraction < 1.0:
-            raise ValueError("kickoff fraction must be in [0, 1)")
-        if driving_fraction + kickoff_fraction >= 1.0:
-            raise ValueError("driving and kickoff fractions must sum to less than one")
-        if skill_sampling and not reject_discontinuities:
-            raise ValueError("skill-filtered expert clips require discontinuity filtering")
+        if catalog_skills and not reject_discontinuities:
+            raise ValueError("expert skill cataloging requires discontinuity filtering")
         self.trajectory_length = trajectory_length
         self.heldout_size = heldout_size
         self.partition_span = trajectory_length - 1
@@ -1304,9 +1303,8 @@ class ExpertSceneDataset:
         self.kickoff_follow_through_steps = max(
             1, round(KICKOFF_FOLLOW_THROUGH_STEPS * 4 / self.frame_skip),
         )
-        self.skill_sampling = skill_sampling
-        self.driving_fraction = driving_fraction
-        self.kickoff_fraction = kickoff_fraction
+        self.catalog_skills = catalog_skills
+        self.include_kickoffs = include_kickoffs
 
         rng = np.random.default_rng(seed)
         paths = sorted(Path(replay_dir).glob("*.npy"))
@@ -1333,7 +1331,6 @@ class ExpertSceneDataset:
         contact_frames: list[th.Tensor] = []
         ego_touches: list[th.Tensor] = []
         unsafe_reset_frames: list[th.Tensor] = []
-        invalid_rotation_frames: list[th.Tensor] = []
         replay_history_starts: list[th.Tensor] = []
         lengths: list[int] = []
         goal_actors: list[int | None] = []
@@ -1341,21 +1338,22 @@ class ExpertSceneDataset:
         padded_total = 0
         for group in selected:
             path = group[0]
-            if frame_skip is not None:
-                metadata_path = path.with_suffix(".unsafe-starts.npz")
-                if metadata_path.is_file():
-                    with np.load(metadata_path) as metadata:
-                        stored_frame_skip = int(metadata.get("frame_skip", -1))
-                else:
-                    stored_frame_skip = _sampled_frame_skip(path, frame_skip)
+            metadata_path = path.with_suffix(".unsafe-starts.npz")
+            if metadata_path.is_file():
+                with np.load(metadata_path) as metadata:
+                    stored_frame_skip = int(
+                        metadata["frame_skip"] if "frame_skip" in metadata
+                        else _sampled_frame_skip(path, self.frame_skip)
+                    )
+            else:
+                stored_frame_skip = _sampled_frame_skip(path, self.frame_skip)
             stored = np.load(path, mmap_mode="r")
             goal_actor = _replay_goal_scorer(path, stored)
             # Even when expert scenes may contain parser corrections, never
             # borrow such frames as the learner's reset history.
             history_invalid = np.asarray(stored[:, -2:], dtype=bool).any(axis=-1)
-            if skill_sampling:
-                source_skip = stored_frame_skip if frame_skip is not None else 4
-                unsafe_reset = _unsafe_replay_reset_frames(path, stored, source_skip)
+            unsafe_reset = _unsafe_replay_reset_frames(path, stored, stored_frame_skip)
+            if catalog_skills:
                 touches = np.zeros((len(stored), self.n_cars), dtype=bool)
                 touches[:, 0] = stored[:, self.touch_index] > 0.5
             if reject_discontinuities:
@@ -1396,10 +1394,10 @@ class ExpertSceneDataset:
                 if available[actor]:
                     raise ValueError(f"duplicate stored actor for {path.name}")
                 available[actor] = True
-                if skill_sampling:
-                    unsafe_reset |= _unsafe_replay_reset_frames(
-                        other_path, other, source_skip,
-                    )
+                unsafe_reset |= _unsafe_replay_reset_frames(
+                    other_path, other, stored_frame_skip,
+                )
+                if catalog_skills:
                     touches[:, actor] = other[:, self.touch_index] > 0.5
                 if reject_discontinuities:
                     invalid |= np.asarray(other[:, -2:], dtype=bool).any(axis=-1)
@@ -1434,8 +1432,8 @@ class ExpertSceneDataset:
                     event_prefix = np.pad(contact.astype(np.int64).cumsum(0), (1, 0))
                     previous_right = np.concatenate(([-1], right[:-1]))
                     contact = (event_prefix[right + 1] - event_prefix[previous_right + 1]) > 0
-                if skill_sampling:
-                    unsafe_reset = unsafe_reset[left] | unsafe_reset[right]
+                unsafe_reset = unsafe_reset[left] | unsafe_reset[right]
+                if catalog_skills:
                     touches = touches[left] | touches[right]
             if frame_skip is not None:
                 source = resample_scene(source, stored_frame_skip, frame_skip)
@@ -1455,8 +1453,8 @@ class ExpertSceneDataset:
                 if reject_discontinuities:
                     invalid = invalid[:keep]
                     contact = contact[:keep]
-                if skill_sampling:
-                    unsafe_reset = unsafe_reset[:keep]
+                unsafe_reset = unsafe_reset[:keep]
+                if catalog_skills:
                     touches = touches[:keep]
             real_length = len(source)
             # Any car, including the 1v1 opponent, may have zero or parallel
@@ -1464,12 +1462,7 @@ class ExpertSceneDataset:
             # CARL from a frame whose axes cannot define a rotation.
             bad_rotations = _invalid_reset_rotations(source, self.n_cars)
             history_invalid |= bad_rotations
-            if skill_sampling:
-                unsafe_reset |= bad_rotations
-            else:
-                invalid_rotation_frames.append(th.from_numpy(np.pad(
-                    bad_rotations, (self.partition_span, 0), constant_values=True,
-                )))
+            unsafe_reset |= bad_rotations
             # A replay period begins at its kickoff state. Its repeated prefix
             # provides the skill classifier with setup context; generated
             # windows instead borrow only contiguous physical replay frames.
@@ -1487,10 +1480,10 @@ class ExpertSceneDataset:
             if reject_discontinuities:
                 invalid = np.concatenate((np.repeat(invalid[:1], pad), invalid))
                 contact = np.concatenate((np.repeat(contact[:1], pad), contact))
-            if skill_sampling:
-                unsafe_reset = np.concatenate((
-                    np.ones(pad, dtype=bool), unsafe_reset,
-                ))
+            unsafe_reset = np.concatenate((
+                np.ones(pad, dtype=bool), unsafe_reset,
+            ))
+            if catalog_skills:
                 touches = np.concatenate((
                     np.zeros((pad, self.n_cars), dtype=bool), touches,
                 ))
@@ -1503,8 +1496,8 @@ class ExpertSceneDataset:
             if reject_discontinuities:
                 invalid_frames.append(th.from_numpy(invalid.copy()))
                 contact_frames.append(th.from_numpy(contact.copy()))
-            if skill_sampling:
-                unsafe_reset_frames.append(th.from_numpy(unsafe_reset.copy()))
+            unsafe_reset_frames.append(th.from_numpy(unsafe_reset.copy()))
+            if catalog_skills:
                 ego_touches.append(th.from_numpy(touches.copy()))
             lengths.append(len(source))
             goal_actors.append(goal_actor if real_length == full_length else None)
@@ -1526,10 +1519,8 @@ class ExpertSceneDataset:
         self.contact_frames = (
             th.cat(contact_frames).to(device) if reject_discontinuities else None
         )
-        self.ego_touches = th.cat(ego_touches).to(device) if skill_sampling else None
-        self.unsafe_reset_frames = (
-            th.cat(unsafe_reset_frames).to(device) if skill_sampling else None
-        )
+        self.ego_touches = th.cat(ego_touches).to(device) if catalog_skills else None
+        self.unsafe_reset_frames = th.cat(unsafe_reset_frames).to(device)
         self.lengths = lengths
         self.segment_goal_actors = goal_actors
         window_starts = []
@@ -1571,17 +1562,10 @@ class ExpertSceneDataset:
             self.train_window_starts = safe_starts(self.train_window_starts)
             self.heldout_window_starts = safe_starts(self.heldout_window_starts)
             self.reset_indices = self.reset_indices[~invalid[self.reset_indices]]
-        if skill_sampling:
-            self.reset_indices = self.reset_indices[
-                ~self.unsafe_reset_frames[self.reset_indices]
-            ]
-        if invalid_rotation_frames:
-            invalid_rotations = th.cat(invalid_rotation_frames).to(device)
-            self.reset_indices = self.reset_indices[
-                ~invalid_rotations[self.reset_indices]
-            ]
-        # Keep skill clips as discriminator examples, but do not reset an
-        # unobserved active jump/flip or an unrecorded airborne opponent.
+        self.reset_indices = self.reset_indices[
+            ~self.unsafe_reset_frames[self.reset_indices]
+        ]
+        # Never reset an unobserved active jump/flip or an unrecorded airborne opponent.
         safe = observable_replay_reset_mask(
             self.frames[self.reset_indices],
             self.internal_states[self.reset_indices],
@@ -1598,11 +1582,8 @@ class ExpertSceneDataset:
         self._train_grounded_choices: tuple[th.Tensor, th.Tensor] | None = None
         self._curated_pools: dict[bool, tuple[th.Tensor, ...]] = {}
         self._curated_maneuvers: dict[bool, tuple[list[SceneManeuver], ...]] = {}
-        self._curated_labeled_pools: dict[bool, tuple[tuple[th.Tensor, ...], ...]] = {}
-        self._context_situation_pools: dict[bool, tuple[th.Tensor, ...]] = {}
-        self._curated_reset_pools: tuple[th.Tensor, ...] | None = None
         self._context_run_starts: dict[bool, th.Tensor] = {}
-        if skill_sampling:
+        if catalog_skills:
             self.curated_pools()
 
     def _split_heldout(self, device: str | th.device, seed: int) -> None:
@@ -1743,40 +1724,18 @@ class ExpertSceneDataset:
                 windows[chosen] = actor_view(windows[chosen], actor)
         return windows
 
-    def _sample_curated(
-        self, n: int, device: str | th.device, *, heldout: bool = False,
-    ) -> th.Tensor:
-        if n < 1 or th.device(device) != self.frames.device:
-            raise ValueError("curated samples require a positive count on the expert device")
-        weights = self.curated_weights(heldout=heldout)
-        generator = self._heldout_generator if heldout else self._train_generator
-        categories = th.multinomial(weights, n, replacement=True, generator=generator)
-        pairs = th.empty((n, 2), dtype=th.long, device=self.frames.device)
-        for category, pool in enumerate(self.curated_pools(heldout=heldout)):
-            selected = (categories == category).nonzero(as_tuple=True)[0]
-            if len(selected):
-                pairs[selected] = pool[th.randint(
-                    len(pool), (len(selected),),
-                    generator=generator, device=pool.device,
-                )]
-        return self._windows_for_povs(pairs)
-
     def sample(self, n: int, device: str | th.device) -> th.Tensor:
         """Sample ``n`` training scene windows without crossing file boundaries.
 
         Every eligible ego viewpoint has its own stored expert POV. Physical
         scenes are shared between the recorded POVs of one replay period.
         """
-        if self.skill_sampling:
-            return self._sample_curated(n, device)
         return self._sample_windows(
             self.train_window_starts, n, device, self._train_generator
         )
 
     def sample_heldout(self, n: int, device: str | th.device) -> th.Tensor:
         """Sample ``n`` held-out expert windows for discriminator evaluation."""
-        if self.skill_sampling:
-            return self._sample_curated(n, device, heldout=True)
         return self._sample_windows(
             self.heldout_window_starts, n, device, self._heldout_generator
         )
@@ -1786,20 +1745,6 @@ class ExpertSceneDataset:
         cached = self._heldout_near_pairs if heldout else self._train_near_pairs
         if cached is not None:
             return cached
-        if self.skill_sampling:
-            groups = self.curated_labeled_pools(heldout=heldout)
-            pools = [
-                group[label] for group in groups
-                for label in range(GROUND_MANEUVER_START) if label % 3 != 2
-                and len(group[label])
-            ]
-            starts = self.heldout_window_starts if heldout else self.train_window_starts
-            pairs = th.cat(pools) if pools else starts.new_empty((0, 2))
-            if heldout:
-                self._heldout_near_pairs = pairs
-            else:
-                self._train_near_pairs = pairs
-            return pairs
         if self._near_frames is None:
             cars = self.frames[:, BALL_SIZE:self.scene_size].reshape(
                 -1, self.n_cars, CAR_SIZE,
@@ -1857,20 +1802,6 @@ class ExpertSceneDataset:
         if n < 1:
             raise ValueError("expert sample count must be positive")
         generator = self._heldout_generator if heldout else self._train_generator
-        if self.skill_sampling:
-            categories = th.multinomial(
-                self.curated_weights(heldout=heldout), n, replacement=True,
-                generator=generator,
-            )
-            pairs = th.empty((n, 2), dtype=th.long, device=self.frames.device)
-            for category, pool in enumerate(self.curated_pools(heldout=heldout)):
-                selected = (categories == category).nonzero(as_tuple=True)[0]
-                if len(selected):
-                    pairs[selected] = pool[th.randint(
-                        len(pool), (len(selected),), device=self.frames.device,
-                        generator=generator,
-                    )]
-            return pairs
         starts = self.heldout_window_starts if heldout else self.train_window_starts
         if not len(starts):
             raise ValueError("no expert windows in the requested split")
@@ -1955,21 +1886,8 @@ class ExpertSceneDataset:
         return pools
 
     def context_situation_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
-        """Match recurrent positives to the same curated scene situations."""
-        if not self.skill_sampling:
-            return self.situation_pools(heldout=heldout)
-        if heldout not in self._context_situation_pools:
-            groups: list[list[th.Tensor]] = [[] for _ in range(N_SITUATIONS)]
-            for pool in self.curated_pools(heldout=heldout):
-                for chunk in pool.split(8_192):
-                    labels = scene_situation_ids(self._windows_for_povs(chunk))
-                    for label in labels.unique().tolist():
-                        groups[label].append(chunk[labels == label])
-            empty = self.train_window_starts.new_empty((0, 2))
-            self._context_situation_pools[heldout] = tuple(
-                th.cat(group) if group else empty for group in groups
-            )
-        return self._context_situation_pools[heldout]
+        """Match recurrent positives to physical situations across all expert windows."""
+        return self.situation_pools(heldout=heldout)
 
     def _grounded_choices(self) -> tuple[th.Tensor, th.Tensor]:
         """Cache physical training frames and eligible flat-ground POV flags."""
@@ -2141,15 +2059,14 @@ class ExpertSceneDataset:
         return th.from_numpy(mask).to(self.frames.device)
 
     def curated_pools(self, *, heldout: bool = False) -> tuple[th.Tensor, ...]:
-        """The same complete skill clips and limited driving used by D and resets.
+        """Catalog skill clips for replay inspection, never for training samples.
 
         Aerial touches need a real elevated contact; an aerial maneuver needs
         separate contacts while carrying a moving ball through the air.
-        Touches remain *inside* expert discriminator windows, but cannot be reset
-        targets. Each pair is a window start and a stored focal-player viewpoint.
+        Each pair is a window start and a stored focal-player viewpoint.
         """
-        if not self.skill_sampling:
-            raise ValueError("curated replay pools require skill sampling")
+        if not self.catalog_skills:
+            raise ValueError("skill cataloging must be enabled for replay inspection")
         if heldout in self._curated_pools:
             return self._curated_pools[heldout]
         starts = self.heldout_window_starts if heldout else self.train_window_starts
@@ -2197,11 +2114,10 @@ class ExpertSceneDataset:
                     indices, th.full_like(indices, actor),
                 ), dim=-1))
 
-        # Kickoff has its own quota, reaching beyond the initial approach to
-        # the first challenge. Neither kickoff nor general driving duplicates
-        # a selected aerial or ground-control skill phase.
+        # Include the first kickoff challenge when cataloging plays for inspection.
+        # Driving and kickoff spans do not duplicate a classified skill phase.
         kickoff_starts = (
-            self._kickoff_window_mask(ball_position) if self.kickoff_fraction
+            self._kickoff_window_mask(ball_position) if self.include_kickoffs
             else th.zeros(len(self.frames), dtype=th.bool, device=self.frames.device)
         )
         for actor in range(self.n_cars):
@@ -2232,66 +2148,7 @@ class ExpertSceneDataset:
         )
         self._curated_pools[heldout] = result
         self._curated_maneuvers[heldout] = tuple(kept_clips)
-        if not heldout:
-            eligible = th.zeros(len(self.frames), dtype=th.bool, device=self.frames.device)
-            eligible[self.reset_indices] = True
-            reset_pools = []
-            for pairs in result:
-                frames = pairs[:, 0] + self.partition_span
-                reset_pools.append(th.unique(frames[eligible[frames]]))
-            self._curated_reset_pools = tuple(reset_pools)
-            if any(len(pool) for pool in reset_pools):
-                self.reset_indices = th.unique(th.cat(reset_pools))
-            else:
-                self.reset_indices = self.reset_indices[:0]
         return result
-
-    def curated_labeled_pools(
-        self, *, heldout: bool = False,
-    ) -> tuple[tuple[th.Tensor, ...], ...]:
-        """Match every generated window to a curated expert of the same scene bin."""
-        if heldout in self._curated_labeled_pools:
-            return self._curated_labeled_pools[heldout]
-        categories = []
-        for pairs in self.curated_pools(heldout=heldout):
-            groups: list[list[th.Tensor]] = [[] for _ in range(GROUND_MANEUVER_START)]
-            for chunk in pairs.split(8_192):
-                windows = self.frames[chunk[:, 0, None] + self.window_offsets]
-                labels = th.empty(len(chunk), dtype=th.long, device=chunk.device)
-                for actor in chunk[:, 1].unique().tolist():
-                    selected = chunk[:, 1] == actor
-                    labels[selected] = scene_situation_ids(
-                        windows[selected], BALL_SIZE + actor * CAR_SIZE,
-                    )
-                for label in labels.unique().tolist():
-                    groups[label].append(chunk[labels == label])
-            categories.append(tuple(
-                th.cat(group) if group else pairs[:0] for group in groups
-            ))
-        result = tuple(categories)
-        self._curated_labeled_pools[heldout] = result
-        return result
-
-    def curated_weights(self, *, heldout: bool = False) -> th.Tensor:
-        """Split the remaining share 3:3:2:1 across aerials, dribble and flick."""
-        driving = self.driving_fraction
-        kickoff = self.kickoff_fraction
-        skills = 1 - driving - kickoff
-        weights = th.tensor((
-            skills / 3, skills / 3, skills * 2 / 9, skills / 9,
-            driving, kickoff,
-        ), device=self.frames.device)
-        available = self.curated_pools(heldout=heldout)
-        present = th.tensor(
-            [bool(len(pool)) for pool in available], device=weights.device,
-        )
-        # Keep the total aerial share when only one type is represented.
-        if present[:2].any():
-            weights[:2] *= 2 / present[:2].sum()
-        weights *= present
-        if not bool(weights.sum()):
-            raise ValueError("no eligible curated aerial, dribble, flick, driving, or kickoff windows")
-        return weights / weights.sum()
 
     def reset_dataset(self) -> TensorDataset:
         """Sample eligible training frame IDs without copying expert scenes."""
@@ -2953,52 +2810,6 @@ def load_legacy_factorized_optimizer_state(
             optimizer.state[layer.weight][name] = value[:, :width].clone()
 
 
-class CuratedReplayResetTransform:
-    """Draw safe states from balanced aerial-touch, carry and ground skill clips."""
-
-    def __init__(self, expert: ExpertSceneDataset) -> None:
-        if not expert.skill_sampling or expert._curated_reset_pools is None:
-            raise ValueError("skill-filtered reset sampling requires curated replay pools")
-        self.expert = expert
-        self.pools = expert._curated_reset_pools
-        weights = expert.curated_weights().clone()
-        weights *= th.tensor(
-            [bool(len(pool)) for pool in self.pools], device=weights.device,
-        )
-        if not bool(weights.sum()):
-            raise ValueError("no safe curated replay reset frames")
-        self.weights = weights / weights.sum()
-        self.counts = th.zeros(len(SKILL_CATEGORIES), dtype=th.long, device=weights.device)
-
-    def __call__(self, sample: TensorBatch, context: ResetContext) -> TensorBatch:
-        categories = th.multinomial(
-            self.weights, len(sample), replacement=True, generator=context.generator,
-        )
-        self.counts += th.bincount(categories, minlength=len(SKILL_CATEGORIES))
-        indices = sample["frame_index"].clone()
-        for category, pool in enumerate(self.pools):
-            chosen = (categories == category).nonzero(as_tuple=True)[0]
-            if len(chosen):
-                indices[chosen] = pool[th.randint(
-                    len(pool), (len(chosen),), device=pool.device,
-                    generator=context.generator,
-                )]
-        return sample.replace_fields(frame_index=indices).with_fields(
-            skill_category=categories,
-        )
-
-    def take_skill_fractions(self) -> dict[str, float]:
-        total = int(self.counts.sum())
-        if not total:
-            return {}
-        fractions = (self.counts.float() / total).tolist()
-        self.counts.zero_()
-        return {
-            f"reset_{name}_fraction": fraction
-            for name, fraction in zip(SKILL_CATEGORIES, fractions)
-        }
-
-
 class ConfidentExpertResetTransform:
     """Favor confidently expert window starts at reset, without scanning the corpus."""
 
@@ -3024,16 +2835,9 @@ class ConfidentExpertResetTransform:
         self.context_length = context_length
         resettable = th.zeros(len(expert.frames), dtype=th.bool, device=expert.frames.device)
         resettable[expert.reset_indices] = True
-        if expert.skill_sampling:
-            self.category_starts = tuple(
-                pool - expert.partition_span for pool in expert._curated_reset_pools
-            )
-            self.candidate_starts = th.cat(self.category_starts)
-        else:
-            self.category_starts = None
-            self.candidate_starts = expert.train_window_starts[
-                resettable[expert.train_window_starts]
-            ]
+        self.candidate_starts = expert.train_window_starts[
+            resettable[expert.train_window_starts]
+        ]
         self.ready = False
         self._total = 0
         self._mined = 0
@@ -3113,25 +2917,11 @@ class ConfidentExpertResetTransform:
         if not len(selected):
             return sample
 
-        if self.category_starts is None or "skill_category" not in sample:
-            starts = self.candidate_starts[th.randint(
-                len(self.candidate_starts),
-                (len(selected), RESET_MINING_CANDIDATES),
-                device=device, generator=context.generator,
-            )]
-        else:
-            starts = th.empty(
-                (len(selected), RESET_MINING_CANDIDATES),
-                dtype=th.long, device=device,
-            )
-            categories = sample["skill_category"][selected]
-            for category, pool in enumerate(self.category_starts):
-                positions = (categories == category).nonzero(as_tuple=True)[0]
-                if len(positions):
-                    starts[positions] = pool[th.randint(
-                        len(pool), (len(positions), RESET_MINING_CANDIDATES),
-                        device=device, generator=context.generator,
-                    )]
+        starts = self.candidate_starts[th.randint(
+            len(self.candidate_starts),
+            (len(selected), RESET_MINING_CANDIDATES),
+            device=device, generator=context.generator,
+        )]
         confidence = self._score(starts.flatten()).view(-1, RESET_MINING_CANDIDATES)
         best_score, best_candidate = confidence.max(dim=1)
         accepted = best_score >= RESET_MINING_MIN_CONFIDENCE
@@ -3140,8 +2930,6 @@ class ConfidentExpertResetTransform:
 
         selected = selected[accepted]
         best_starts = starts[accepted, best_candidate[accepted]]
-        if self.category_starts is not None:
-            best_starts = best_starts + self.expert.partition_span
         self._mined += len(selected)
         return sample.replace_fields(
             frame_index=sample["frame_index"].index_copy(0, selected, best_starts),
@@ -3874,7 +3662,7 @@ class GlobalContextMinibatches:
 
 
 class SceneGAIFOMinibatches:
-    """Match curated training windows; retain the old sampler for legacy datasets."""
+    """Sample all expert windows, with situation matches for the factorized judge."""
 
     def __init__(
         self,
@@ -3902,191 +3690,6 @@ class SceneGAIFOMinibatches:
     def set_epoch_callback(self, callback) -> None:
         self._epoch_callback = callback
 
-    def _sample_curated_windows(
-        self, windows: th.Tensor, indices: th.Tensor, n_envs: int,
-        episode_end: th.Tensor | None,
-        archived_flights: tuple[list[CompletedSceneManeuver], ...] | None,
-        ego_ball_touch: th.Tensor | None,
-        goal_scored: th.Tensor | None,
-        timeline: GeneratedSceneTimeline | None,
-    ):
-        """Pair curated experts by exact scene bin or complete-maneuver phase."""
-        if not len(indices):
-            raise ValueError("curated discriminator needs generated windows")
-        expert_groups = self.expert.curated_labeled_pools()
-        weights = self.expert.curated_weights()
-        agent_flights = (
-            generated_maneuver_pools(
-                windows, indices, n_envs, episode_end,
-                ego_ball_touch=ego_ball_touch, goal_scored=goal_scored,
-                timeline=timeline,
-            )
-            if self.factorize else tuple([] for _ in range(N_SITUATIONS))
-        )
-        archived_windows = None
-        if self.factorize and archived_flights is not None:
-            if len(archived_flights) != N_SITUATIONS:
-                raise ValueError("archived flights must have one pool per situation")
-            saved = []
-            next_start = len(windows)
-            for label, group in enumerate(archived_flights):
-                for complete in group:
-                    flight = complete.span
-                    if flight.situation != label:
-                        raise ValueError("archived flight has the wrong situation")
-                    agent_flights[label].append(replace(
-                        flight,
-                        setup_start=next_start + flight.setup_start,
-                        action_start=next_start + flight.action_start,
-                        action_stop=next_start + flight.action_stop,
-                        recovery_stop=next_start + flight.recovery_stop,
-                    ))
-                    saved.append(complete.windows)
-                    next_start += len(complete.windows)
-            if saved:
-                archived_windows = th.cat(saved)
-        expert_flights = self.expert._curated_maneuvers[False]
-        aligned_flights = [[] for _ in range(DRIVING_SKILL)]
-        for label in range(6, N_SITUATIONS):
-            if label < GROUND_MANEUVER_START:
-                for category in (AERIAL_TOUCH_SKILL, AERIAL_MANEUVER_SKILL):
-                    agents = [clip for clip in agent_flights[label]
-                              if clip.skill_category == category]
-                    experts = [clip for clip in expert_flights[label]
-                               if clip.skill_category == category]
-                    if agents and experts:
-                        aligned_flights[category].append((agents, experts))
-            else:
-                if agent_flights[label] and expert_flights[label]:
-                    aligned_flights[DRIBBLE_SKILL + label - GROUND_MANEUVER_START].append((
-                        agent_flights[label], expert_flights[label],
-                    ))
-        for _ in range(self.epochs):
-            shuffled = indices[th.randperm(len(indices), device=indices.device)]
-            for start in range(0, len(shuffled), self.batch_size):
-                selected = shuffled[start:start + self.batch_size]
-                count = len(selected)
-                n_history = 0
-                if self.history is not None and self.history.size:
-                    n_history = min(int(count * self.mix_fraction), self.history.size)
-                agents = windows[selected]
-                if n_history:
-                    agents = th.cat((
-                        agents[:count - n_history],
-                        self.history.sample(n_history, agents.device),
-                    ))
-                agent_labels = scene_situation_ids(agents)
-                agent_groups = tuple(
-                    (agent_labels == label).nonzero(as_tuple=True)[0]
-                    for label in range(GROUND_MANEUVER_START)
-                )
-                shared = tuple(
-                    tuple(label for label, pool in enumerate(category)
-                          if len(pool) and len(agent_groups[label]))
-                    for category in expert_groups
-                )
-                available = weights.clone()
-                available *= th.tensor(
-                    [bool(labels) for labels in shared], device=weights.device,
-                )
-                if not bool(available.sum()):
-                    # Do not turn unmatched generated scenes into easy negatives.
-                    continue
-                categories = th.multinomial(
-                    available / available.sum(), count, replacement=True,
-                )
-                sampled_agents = th.empty_like(agents)
-                sampled_experts = th.empty((count, 2), dtype=th.long, device=agents.device)
-                exactly_matched = th.zeros(count, dtype=th.bool, device=agents.device)
-                phase_aligned = th.zeros_like(exactly_matched)
-                for category, labels in enumerate(shared):
-                    positions = (categories == category).nonzero(as_tuple=True)[0]
-                    if not len(positions):
-                        continue
-                    candidates = th.cat([
-                        agent_groups[label] for label in labels
-                    ])
-                    selected_agents = candidates[th.randint(
-                        len(candidates), (len(positions),), device=agents.device,
-                    )]
-                    sampled_agents[positions] = agents[selected_agents]
-                    chosen_labels = agent_labels[selected_agents]
-                    for label in chosen_labels.unique().tolist():
-                        spots = positions[chosen_labels == label]
-                        exactly_matched[spots] = True
-                        pool = expert_groups[category][label]
-                        sampled_experts[spots] = pool[th.randint(
-                            len(pool), (len(spots),), device=agents.device,
-                        )]
-
-                # Keep full takeoff/carry -> action -> recovery alignment when
-                # the policy has completed a maneuver. The remaining examples
-                # are still matched by scene bin to the same curated pools.
-                for category, flight_groups in enumerate(aligned_flights):
-                    if not flight_groups:
-                        continue
-                    positions = (categories == category).nonzero(as_tuple=True)[0]
-                    budget = len(positions) // 4
-                    consumed = 0
-                    while budget - consumed >= 4:
-                        # These are Python list indices, not GPU tensor indices.
-                        # Draw on the CPU rather than synchronizing CUDA for
-                        # every clip choice during discriminator training.
-                        agent_group, expert_group = flight_groups[th.randint(
-                            len(flight_groups), (1,), device="cpu",
-                        ).item()]
-                        agent_clip = agent_group[th.randint(
-                            len(agent_group), (1,), device="cpu",
-                        ).item()]
-                        expert_clip = expert_group[th.randint(
-                            len(expert_group), (1,), device="cpu",
-                        ).item()]
-                        agent_ids, expert_pairs = aligned_maneuver_windows(
-                            agent_clip, expert_clip, budget - consumed,
-                            agents.device,
-                        )
-                        if not len(agent_ids):
-                            break
-                        chosen = positions[consumed:consumed + len(agent_ids)]
-                        current = agent_ids < len(windows)
-                        sampled_agents[chosen[current]] = windows[agent_ids[current]]
-                        if (~current).any():
-                            sampled_agents[chosen[~current]] = archived_windows[
-                                agent_ids[~current] - len(windows)
-                            ]
-                        sampled_experts[chosen] = expert_pairs
-                        expert_phases = self.expert._windows_for_povs(expert_pairs)
-                        exactly_matched[chosen] = (
-                            scene_situation_ids(sampled_agents[chosen])
-                            == scene_situation_ids(expert_phases)
-                        )
-                        phase_aligned[chosen] = True
-                        consumed += len(agent_ids)
-
-                expert_windows = self.expert._windows_for_povs(sampled_experts)
-                if self.factorize:
-                    ball_near = th.cat((
-                        nearest_ball_distance(sampled_agents) <= BALL_NEAR_DISTANCE,
-                        nearest_ball_distance(expert_windows) <= BALL_NEAR_DISTANCE,
-                    ))
-                agent_windows = add_scene_noise(sampled_agents, self.noise_std)
-                expert_windows = add_scene_noise(expert_windows, self.noise_std)
-                sample = TensorBatch({
-                    "window": th.cat((agent_windows, expert_windows)),
-                    "is_agent": th.cat((
-                        th.ones(count, device=agents.device),
-                        th.zeros(count, device=agents.device),
-                    )),
-                    "skill_category": th.cat((categories, categories)),
-                    "situation_matched": th.cat((exactly_matched, exactly_matched)),
-                    "phase_aligned": th.cat((phase_aligned, phase_aligned)),
-                    "grounded_random": th.cat((categories == DRIVING_SKILL,
-                                                categories == DRIVING_SKILL)),
-                })
-                yield sample.with_fields(ball_near=ball_near) if self.factorize else sample
-            if self._epoch_callback is not None:
-                self._epoch_callback()
-
     def sample_windows(
         self,
         windows: th.Tensor,
@@ -4099,12 +3702,6 @@ class SceneGAIFOMinibatches:
         goal_scored: th.Tensor | None = None,
         timeline: GeneratedSceneTimeline | None = None,
     ):
-        if self.expert.skill_sampling:
-            yield from self._sample_curated_windows(
-                windows, indices, n_envs, episode_end, archived_flights,
-                ego_ball_touch, goal_scored, timeline,
-            )
-            return
         agent_groups: list[th.Tensor] = [indices[:0] for _ in range(N_SITUATIONS)]
         grounded_agent = indices[:0]
         grounded_expert_available = False
@@ -4131,7 +3728,8 @@ class SceneGAIFOMinibatches:
             grounded_expert_available = len(self.expert._grounded_choices()[0]) > 0
             agent_flights = generated_maneuver_pools(
                 windows, indices, n_envs, episode_end,
-                goal_scored=goal_scored, timeline=timeline,
+                ego_ball_touch=ego_ball_touch, goal_scored=goal_scored,
+                timeline=timeline,
             )
             if archived_flights is not None:
                 if len(archived_flights) != N_SITUATIONS:
@@ -4333,11 +3931,6 @@ def train_discriminator_minibatch(
         metrics["phase_aligned_fraction"] = (
             sample["phase_aligned"][:n_agent].float().mean()
         )
-    if "skill_category" in sample:
-        for category, name in enumerate(SKILL_CATEGORIES):
-            metrics[f"{name}_fraction"] = (
-                (sample["skill_category"][:n_agent] == category).float().mean()
-            )
     band_weights = near = None
     if getattr(discriminator, "factorized", False) and not getattr(loss, "global_only", False):
         near = sample.get("ball_near")
@@ -5669,7 +5262,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     add_feature_option(
         parser, "--hard-positive-mining",
-        help="bias replay resets toward window starts the trained discriminator confidently recognizes as expert",
+        help="opt in to discriminator-biased resets instead of uniform expert-frame sampling",
     )
     add_feature_option(
         parser, "--exp-log-odds-reward",
@@ -5693,18 +5286,6 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--replay-reset-fraction", type=float, default=None)
-    add_feature_option(
-        parser, "--curated-skill-sampling", default=True,
-        help="restrict replay resets and discriminator positives to matched aerial, dribble, flick, driving, and kickoff clips",
-    )
-    parser.add_argument(
-        "--general-driving-fraction", type=float, default=0.10,
-        help="general driving share of curated reset and discriminator sampling",
-    )
-    parser.add_argument(
-        "--kickoff-fraction", type=float, default=0.05,
-        help="kickoff share of curated reset and discriminator sampling, separate from general driving",
-    )
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
     parser.add_argument(
         "--discriminator-batch", type=int, default=None,
@@ -5829,11 +5410,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     if args.discriminator_context_stride is None:
         args.discriminator_context_stride = 16 if args.transformer_global else 4
     if args.replay_reset_fraction is None:
-        default = 1.0 if args.curated_skill_sampling else 0.70
-        if (resume is not None and args.curated_skill_sampling ==
-                resume["config"].get("curated_skill_sampling", False)):
-            default = resume["config"].get("replay_reset_fraction", default)
-        args.replay_reset_fraction = default
+        args.replay_reset_fraction = (
+            resume["config"].get("replay_reset_fraction", 0.70)
+            if resume is not None else 0.70
+        )
     if args.replay_dir is None:
         parser.error("--replay-dir is required when it is absent from the checkpoint")
     return args, resume
@@ -5922,15 +5502,6 @@ def validate_args(args: argparse.Namespace) -> None:
         or not 0.0 <= args.replay_reset_fraction <= 1.0
     ):
         raise ValueError("--replay-reset-fraction must be between zero and one")
-    if (
-        not math.isfinite(args.general_driving_fraction)
-        or not 0.0 <= args.general_driving_fraction < 1.0
-    ):
-        raise ValueError("--general-driving-fraction must be in [0, 1)")
-    if not math.isfinite(args.kickoff_fraction) or not 0.0 <= args.kickoff_fraction < 1.0:
-        raise ValueError("--kickoff-fraction must be in [0, 1)")
-    if args.general_driving_fraction + args.kickoff_fraction >= 1.0:
-        raise ValueError("driving and kickoff fractions must sum to less than one")
     if not math.isfinite(args.discriminator_noise) or args.discriminator_noise < 0.0:
         raise ValueError("--discriminator-noise must be non-negative")
     if (
@@ -6427,39 +5998,29 @@ def main() -> None:
         frame_skip=args.frameskip,
         device=env.device,
         heldout_size=args.discriminator_heldout_size,
-        reject_discontinuities=args.curated_skill_sampling,
-        skill_sampling=args.curated_skill_sampling,
-        driving_fraction=args.general_driving_fraction,
-        kickoff_fraction=args.kickoff_fraction,
+        reject_discontinuities=True,
         team_size=args.team_size,
         flip_state_features=args.flip_state_features,
     )
     if expert.train_total < 1:
         raise ValueError("expert dataset contains no training windows")
-    if args.curated_skill_sampling and not len(expert.reset_indices):
-        raise ValueError("expert dataset contains no safe curated replay reset states")
+    if args.replay_reset_fraction and not len(expert.reset_indices):
+        raise ValueError("expert dataset contains no safe replay reset states")
 
-    reset_dataset = expert.reset_dataset()
-    curated_resets = (
-        CuratedReplayResetTransform(expert)
-        if args.curated_skill_sampling else None
-    )
+    reset_dataset = expert.reset_dataset() if len(expert.reset_indices) else None
     reset_miner = (
         ConfidentExpertResetTransform(
             expert, reset_dataset, discriminator, args.discriminator_microbatch,
             context_length=args.discriminator_context_length,
-        ) if args.hard_positive_mining else None
+        ) if reset_dataset is not None and args.hard_positive_mining else None
     )
     env.reset_state_provider = ReplayResetProvider(
         DatasetResetSampler(
             reset_dataset,
-            transforms=(
-                *((curated_resets,) if curated_resets is not None else ()),
-                *((reset_miner,) if reset_miner is not None else ()),
-            ),
+            transforms=(reset_miner,) if reset_miner is not None else (),
             probability=args.replay_reset_fraction,
             seed=args.seed,
-        ),
+        ) if reset_dataset is not None else None,
         expert.frames,
         expert.internal_states,
     )
@@ -6619,10 +6180,6 @@ def main() -> None:
 
     def update_callback(trainer: Trainer) -> None:
         metrics = gameplay.diagnostic_metrics()
-        if curated_resets is not None:
-            fractions = curated_resets.take_skill_fractions()
-            if fractions:
-                metrics.setdefault("Replay", {}).update(fractions)
         if metrics:
             trainer.logger.update(metrics, step=trainer.clock.env_steps)
 

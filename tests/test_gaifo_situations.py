@@ -259,7 +259,7 @@ class SituationBalanceTests(unittest.TestCase):
 
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             clips = [clip for group in expert._curated_maneuvers[False][:18]
                      for clip in group]

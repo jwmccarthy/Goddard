@@ -91,7 +91,7 @@ class ReplayResetProvider:
 
     def __init__(
         self,
-        sampler: DatasetResetSampler,
+        sampler: DatasetResetSampler | None,
         frames: th.Tensor,
         internal_states: th.Tensor,
     ) -> None:
@@ -116,7 +116,7 @@ class ReplayResetProvider:
             self.last_reset_indices = th.full_like(reset_mask, -1, dtype=th.long)
         else:
             self.last_reset_indices[reset_mask] = -1
-        sample = self.sampler(reset_mask)
+        sample = self.sampler(reset_mask) if self.sampler is not None else None
         if sample is None:
             return None
         indices = sample["frame_index"]

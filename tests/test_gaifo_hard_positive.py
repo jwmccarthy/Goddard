@@ -56,7 +56,13 @@ def make_expert(folder: Path, *, heldout_size: int = 8) -> ExpertSceneDataset:
             rows[:, car + 9] = 1
             rows[:, car + 14] = 1
             rows[:, car + 16] = 1
-        np.save(folder / f"segment{segment}.npy", rows)
+        path = folder / f"segment{segment}.npy"
+        np.save(path, rows)
+        np.savez_compressed(
+            path.with_suffix(".unsafe-starts.npz"),
+            unsafe=np.zeros(len(rows), dtype=bool),
+            pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+        )
     return ExpertSceneDataset(folder, trajectory_length=8, heldout_size=heldout_size)
 
 

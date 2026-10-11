@@ -171,16 +171,23 @@ the no-touch timeout in seconds.
 
 Transformer defaults to a 128-frame context, 256 simulations, a 2,048-window
 discriminator batch and 512 held-out windows in 1v1; all remain configurable.
-Without `--transformer`, the original 1v1 simulation, replay-sampling,
-and discriminator defaults remain. Team-mode simulation and discriminator
+Without `--transformer`, the original 1v1 simulation and discriminator
+defaults remain. Team-mode simulation and discriminator
 batch defaults scale down with scene size. Both learning rates stay constant
 unless an end value is supplied; schedules resume from checkpoint settings and
 the restored training step.
 
-Replay resets draw all cars and available internal control states from the
-selected mode's parsed data; curated skill categories choose *when* to reset,
-and `--replay-reset-fraction` controls the share versus fresh kickoffs. Resets
-skip hidden active jump/flip phases and unrecorded airborne opponents. GAIFO
+GAIFO samples ordinary discriminator expert windows uniformly over eligible
+training window starts and recorded player viewpoints. Factorized training
+still matches a fraction of agent and expert examples by broad scene situation
+using the full training split. Replay resets draw uniformly by
+frame from all safe training-split frames in the selected mode's parsed data.
+`--replay-reset-fraction` controls their share versus fresh kickoffs (default
+0.7). Explicit `--hard-positive-mining` still biases resets toward confident
+expert states when enabled. Resets include all cars and their available
+internal control states. Parser corrections and unsafe starts are excluded;
+all resets exclude invalid
+orientations, hidden active jump/flip phases, and unrecorded airborne opponents. GAIFO
 fills short-window history from contiguous physical replay frames when a reset
 has them; fresh kickoffs and replay gaps wait for real episode history. Early
 mixed windows train the short-window discriminator; rewards from heads that
@@ -204,8 +211,9 @@ Checkpoints must use the matching native observation width (139/193/247 for
 policies append their pending actions to the native observation instead.
 
 `watch_checkpoints.py --team-size 2` (or `3`) views team checkpoints with the
-corresponding replay resets; `watch_gaifo_experts.py` reads the team size from
-the checkpoint and inspects its recorded POVs. The viewer uses the blue
+corresponding uniformly cached safe replay resets; `watch_gaifo_experts.py`
+reads the team size from the checkpoint and catalogs recorded POVs for skill
+inspection only. The viewer uses the blue
 checkpoint's saved episode tick limit and no-touch timeout, updating both when
 switching matches. Override them with `--max-ticks` and `--no-touch-timeout`
 (seconds; `0` disables no-touch resets). Older checkpoints without timing
@@ -225,24 +233,100 @@ discrete GRU policy with PPO. Its separate four-layer encoder projects scenes
 onto the unit sphere. InfoNCE brings independently sampled expert windows
 together and contrasts each expert anchor against a batch of agent windows
 (temperature 0.07); a reward-gradient penalty uses weight 10 by default.
-The base imitation score is cosine similarity in `[-1, 1]` to a randomly
-sampled expert window, rather than GAIFO's discriminator log odds. Per-action
-rewards scale with `--frameskip` relative to the four-tick reference cadence.
+The base imitation score is expert cosine similarity in `[-1, 1]`, rather
+than GAIFO's discriminator log odds. Per-action rewards scale with `--frameskip`
+relative to the four-tick reference cadence.
+
+By default, `--context-matching` pairs expert positives and selects reward
+references by the observation **before** the scored transition: focal car on
+ground/wall/in low or high air, physical ego-to-ball distance, ball height,
+field half, and ball direction. Sparse situations broaden to the nearest
+available context; only training-split, recorded expert POVs are eligible.
+About half the contrastive anchors are chosen to match an agent negative's
+initial situation; the rest sample all eligible expert windows uniformly. A fresh,
+bounded bank includes each active context when it fits and is encoded just
+once per rollout. `--context-matching false` restores uniform expert sampling.
+
+PCIL also provides explicit **causal scene transitions**: deltas of ball and
+car positions/velocities at `--transition-lags` scene-frame intervals, alongside
+the original scene window. For the default `--trajectory-length 4`, the lags
+are `1,3`; a longer window can use `--trajectory-length 13` with
+`--transition-lags 1,4,12`. A lag is measured in *recorded scene frames*, each `--frameskip`
+physics ticks apart, and must be shorter than the trajectory length.
+`--transition-lags 0` turns explicit deltas off. Before each lag has elapsed
+within a window, its delta is zero; neither the MLP nor the optional causal
+Transformer sees future observations outside the scored scene window.
+
+For **attributed multi-agent imitation**, `--factorize` now trains three
+unit-sphere encoders by default: global scene context, focal-car motion with
+a fixed initial relative-ball context, and ego–ball interaction. Each has its
+own InfoNCE loss and reward-gradient penalty. The respective loss/reward
+weights are `0.2/0.4/0.4`, and each branch has separate progress metrics.
+The interaction reward uses the closest ego–ball distance across the scored
+transition: full strength within 350 units, linearly falling to zero at 1,500;
+a focal-player touch overrides distance. A touch by a teammate or opponent
+without a focal touch suppresses the interaction term, while ego-motion
+continues rewarding approach, aerial setup, and recovery at any distance.
+`--interaction-head false` retains the earlier two-branch global/ball-and-ego
+factorization, with equal branch weights.
+`--discriminator-relative-positions` optionally adds explicit relative
+positions to the global encoder. `--transformer` (or
+`--transformer-global`) uses a causal Transformer for the **global encoder over
+the PCIL scene window**, with `--frame-embedding` and `--temporal-hidden`;
+`--trajectory-length` controls its context. The ego and interaction encoders
+remain MLPs.
 
 ```bash
 .venv/bin/python pcil.py --replay-dir parsed_replays/duels \
   --expert-frame-limit 200000
+.venv/bin/python pcil.py --replay-dir parsed_replays/duels \
+  --factorize --transformer --discriminator-relative-positions \
+  --recency-replay \
+  --ppo-lr-end 3e-5 --discriminator-lr-end 3e-5
+# With more replay context, compare short and long-horizon motion:
+.venv/bin/python pcil.py --replay-dir parsed_replays/duels \
+  --factorize --trajectory-length 13 --transition-lags 1,4,12
 # Continue a run, specifying a new total timestep target:
 .venv/bin/python pcil.py --resume-checkpoint checkpoints/pcil/YOUR_RUN/pcil_000010000000.pt \
   --timesteps 200000000
 ```
 
 PCIL defaults to pure imitation (`--goal-reward-weight 0`); positive values
-add CARL's goal reward. Only fully generated windows become contrastive agent
-negatives; at replay resets, the cosine reward is weighted by the fraction of
-the scored window produced by the learner. PCIL checkpoints save the encoder,
-PPO networks, optimizers, and training clock, and can be viewed with
+add CARL's goal reward. `--aerial-touch-reward-weight` and
+`--flip-reset-reward-weight` optionally add GAIFO's team-shared, zero-sum
+physical bonuses; both default to zero. The progress bar reports touches,
+aerial touches, flip resets, goals for/against per 1,000 actor steps, and the
+no-touch timeout fraction even when these bonus weights are zero.
+PCIL samples recorded expert POV windows across the training split and draws
+replay reset frames uniformly from the safe reset pool (default replay-reset
+fraction 0.7). `--recency-replay` mixes recent agent windows with a historical
+reservoir. Only fully generated windows become contrastive agent negatives;
+at replay resets, the cosine reward is weighted by the fraction of the scored
+window produced by the learner.
+
+For faster training, PCIL now samples up to 4,096 generated windows for a
+contrastive update every four rollouts, estimates the reward-gradient penalty
+on up to 32 examples per minibatch, and encodes a fresh bank of up to 1,024
+expert POVs once per rollout for context-matched reward scoring. The sampled
+history still
+receives fully generated windows from skipped rollouts. Set
+`--contrastive-train-windows 0`, `--gradient-penalty-samples 0`, and
+`--reward-expert-bank 0` to use all available windows, a full gradient-penalty
+batch, and a reward bank as large as the number of valid scored transitions; set
+`--contrastive-update-interval 1` to update on every rollout. GAIFO's
+`--discriminator-batch`, `--discriminator-microbatch`, `--discriminator-epochs`,
+`--discriminator-update-interval`, `--discriminator-noise`,
+`--discriminator-hidden`, `--discriminator-lr`, and
+`--discriminator-lr-end` are accepted as aliases for the equivalent PCIL
+contrastive/encoder settings. `--ppo-lr-end` and `--entropy-end` schedule PPO
+using the training clock, including on resume.
+
+PCIL checkpoints save the encoder (including specialist branches when
+factorized), PPO networks, optimizers, and training clock, and can be viewed with
 `watch_checkpoints.py`. `--team-size 2` and `3` use matching parsed replays.
+Older checkpoints resume with their original encoder shapes: no explicit
+transition deltas, random references, and (if factorized) the original two
+branches. Model-shaping options must match the saved checkpoint on resume.
 
 ### BASIC queued-action reaction time
 

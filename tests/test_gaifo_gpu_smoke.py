@@ -22,6 +22,7 @@ from gaifo import (
 from jarl.collect import Runner
 from jarl.data import TensorBatch
 from jarl.data.records import PolicyOutput
+from jarl.envs import DatasetResetSampler
 from jarl.store import RolloutBuffer
 from replay_layout import team_live_observation_size, team_scene_size
 from replay_resets import ReplayResetProvider
@@ -221,6 +222,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         trajectory_length: int = 8,
         frameskip: int = 4,
         gru: bool = False,
+        require_optimizer_state: bool = True,
     ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -251,7 +253,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             if invalid_rotations:
                 expert = ExpertSceneDataset(
                     replays, trajectory_length, frame_skip=4,
-                    reject_discontinuities=True, skill_sampling=True,
+                    reject_discontinuities=True,
                 )
                 bad = expert.real_frame_indices[12:32]
                 self.assertFalse(th.isin(bad, expert.reset_indices).any())
@@ -260,7 +262,6 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 "gaifo.py", "--replay-dir", str(replays),
                 "--frameskip", str(frameskip),
                 "--replay-reset-fraction", "1",
-                "--curated-skill-sampling", "false",  # Synthetic replays have no touch metadata.
                 "--n-sim", "2",
                 "--rollout", "8", "--trajectory-length", str(trajectory_length),
                 "--gru", str(gru).lower(),
@@ -320,8 +321,23 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             self.assertEqual(saved["config"]["discriminator_context_length"],
                              8 if transformer else 16)
             optimizer = saved["discriminator_optimizer"]
-            self.assertEqual(len(optimizer["state"]), len(optimizer["param_groups"][0]["params"]))
+            if require_optimizer_state:
+                self.assertEqual(len(optimizer["state"]),
+                                 len(optimizer["param_groups"][0]["params"]))
             return saved, output.getvalue(), ready_resets
+
+    def test_discriminator_training_uses_uniform_expert_and_replay_reset_sampler(self):
+        with (patch("gaifo.DatasetResetSampler", wraps=DatasetResetSampler) as samplers,
+              patch.object(ExpertSceneDataset, "curated_pools",
+                           side_effect=AssertionError("skill catalog used for training"))):
+            saved, _, ready_resets = self._short_window_training(
+                False, recurrent_global=False,
+                require_optimizer_state=False,
+            )
+        self.assertNotIn("curated_skill_sampling", saved["config"])
+        self.assertEqual(len(samplers.call_args_list), 1)
+        self.assertEqual(samplers.call_args.kwargs["transforms"], ())
+        self.assertEqual(ready_resets, [])
 
     def test_short_window_training_and_terminal_metrics(self):
         saved, output, _ = self._short_window_training(False)

@@ -97,20 +97,21 @@ class GAIFOGruTests(unittest.TestCase):
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",
             "--flip-state-features", "false",
-            "--curated-skill-sampling", "false",
             "--exp-log-odds-reward", "true", "--recency-replay", "false",
             "--aerial-touch-reward-weight", "1.0",
         ]):
             parsed, _ = parse_args()
         self.assertFalse(parsed.flip_state_features)
-        self.assertFalse(parsed.curated_skill_sampling)
+        self.assertFalse(hasattr(parsed, "curated_skill_sampling"))
         self.assertTrue(parsed.exp_log_odds_reward)
         self.assertFalse(parsed.recency_replay)
         self.assertEqual(parsed.aerial_touch_reward_weight, 1.0)
         self.assertEqual(parsed.replay_reset_fraction, 0.70)
 
         for flags in (("--no-gru",), ("--no-exp-log-odds-reward",),
-                      ("--aerial-touch-reward", "5.0")):
+                      ("--aerial-touch-reward", "5.0"),
+                      ("--curated-skill-sampling",), ("--general-driving-fraction", ".2"),
+                      ("--kickoff-fraction", ".1")):
             error = io.StringIO()
             with (self.subTest(flags=flags),
                   patch.object(sys, "argv", [

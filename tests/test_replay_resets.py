@@ -149,6 +149,15 @@ class ReplayResetTests(unittest.TestCase):
             th.testing.assert_close(cars.boost, th.full((3, 2), 50.0))
             th.testing.assert_close(request.cars.boost, th.full((3, 2), 0.5))
 
+    def test_no_safe_replay_resets_can_use_kickoffs_only(self):
+        frames = th.zeros(1, 51)
+        internals = th.zeros(1, 2, 19)
+        provider = ReplayResetProvider(None, frames, internals)
+        self.assertIsNone(provider(th.tensor([True, False, True])))
+        th.testing.assert_close(provider.last_reset_indices, th.tensor([-1, -1, -1]))
+        self.assertIsNone(provider(th.tensor([False, True, False])))
+        th.testing.assert_close(provider.last_reset_indices, th.tensor([-1, -1, -1]))
+
     def test_invalid_car_rotations_are_excluded_before_reset_sampling(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)

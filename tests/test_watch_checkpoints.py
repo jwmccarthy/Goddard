@@ -136,7 +136,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                 )
                 self.assertEqual(policy.foot.model[0].in_features, 139)
 
-    def test_reset_type_api_offers_loaded_pools_and_rejects_unavailable_choices(self):
+    def test_reset_api_uses_uniform_replay_pool_and_rejects_skill_selection(self):
         state = SpectatorState()
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
@@ -149,35 +149,25 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
             client = http.client.HTTPConnection("127.0.0.1", server.server_port)
             try:
                 client.request("GET", "/api/reset-types")
-                response = client.getresponse()
-                self.assertEqual(json.load(response), {"types": [], "selected": "mixed"})
+                self.assertEqual(client.getresponse().status, 404)
 
-                state.configure_reset_types(("aerial_maneuver", "driving"))
-                client.request("GET", "/api/reset-types")
-                response = client.getresponse()
-                self.assertEqual([item["id"] for item in json.load(response)["types"]], [
-                    "mixed", "aerial_maneuver", "driving",
-                ])
+                client.request("POST", "/api/reset")
+                self.assertEqual(client.getresponse().status, 400)
+                state.mark_reset_ready()
 
                 client.request("POST", "/api/reset", json.dumps({
                     "reset_type": "aerial_maneuver",
-                }), {"Content-Type": "application/json"})
-                self.assertEqual(client.getresponse().status, 204)
-                self.assertEqual(state.take_reset_request(), (False, "aerial_maneuver"))
-
-                client.request("POST", "/api/reset", json.dumps({
-                    "reset_type": "flick",
                 }), {"Content-Type": "application/json"})
                 self.assertEqual(client.getresponse().status, 400)
                 self.assertIsNone(state.take_reset_request())
 
                 client.request("POST", "/api/reset")
                 self.assertEqual(client.getresponse().status, 204)
-                self.assertEqual(state.take_reset_request(), (False, "aerial_maneuver"))
+                self.assertIs(state.take_reset_request(), False)
 
                 client.request("POST", "/api/kickoff")
                 self.assertEqual(client.getresponse().status, 204)
-                self.assertEqual(state.take_reset_request(), (True, "aerial_maneuver"))
+                self.assertIs(state.take_reset_request(), True)
             finally:
                 client.close()
                 server.shutdown()

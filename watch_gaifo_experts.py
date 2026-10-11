@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect which curated expert sequences a GAIFO discriminator mistakes for agent play.
+"""Inspect which recorded expert sequences a GAIFO discriminator mistakes for agent play.
 
 Example: python watch_gaifo_experts.py --checkpoint-dir checkpoints --open
 For an external checkpoint directory, pass --checkpoint-dir /path/to/checkpoints
@@ -243,21 +243,8 @@ def collect_sequences(
                 min(expert.trajectory_length, DRIVING_SPAN),
             )
             if len(candidates) > max_driving:
-                goal_candidates = []
-                other_candidates = []
-                for index, (start, stop, actor) in enumerate(candidates):
-                    segment = bisect_right(offsets, start) - 1
-                    is_goal = (expert.segment_goal_actors[segment] == actor // expert.team_size
-                               and stop == offsets[segment + 1] - expert.partition_span)
-                    (goal_candidates if is_goal else other_candidates).append(index)
                 random = np.random.default_rng(seed + int(heldout))
-                n_goal = min(len(goal_candidates), max(1, max_driving // 4))
-                n_other = min(len(other_candidates), max_driving - n_goal)
-                n_goal = min(len(goal_candidates), max_driving - n_other)
-                selected = list(random.choice(goal_candidates, size=n_goal, replace=False))
-                selected.extend(random.choice(
-                    other_candidates, size=n_other, replace=False,
-                ))
+                selected = random.choice(len(candidates), size=max_driving, replace=False)
                 candidates = [candidates[int(index)] for index in sorted(selected)]
             for start, stop, actor in candidates:
                 append("driving", split, actor, start, start, stop, stop)
@@ -523,9 +510,7 @@ class InspectionService:
                 directory, trajectory_length=int(config["trajectory_length"]),
                 limit=limit, seed=seed, frame_skip=int(config["frameskip"]),
                 heldout_size=int(config.get("discriminator_heldout_size", 0)),
-                device="cpu", reject_discontinuities=True, skill_sampling=True,
-                driving_fraction=float(config.get("general_driving_fraction", 0.05)),
-                kickoff_fraction=float(config.get("kickoff_fraction", 0.0)),
+                device="cpu", reject_discontinuities=True, catalog_skills=True,
                 team_size=int(config.get("team_size", 1)),
                 flip_state_features=bool(config.get("flip_state_features", False)),
             )
@@ -533,7 +518,7 @@ class InspectionService:
                 expert, directory, seed, limit, self.max_driving,
             )
             if not records:
-                raise ValueError("no eligible curated expert sequences in this replay directory")
+                raise ValueError("no eligible expert sequences in this replay directory")
             total = sum(record.length for record in records)
             self._progress(0, total)
             heads = score_sequences(

@@ -32,11 +32,23 @@ def write_pov(folder: Path, name: str, ball_x: float, paired: bool) -> None:
     rows[:, ORANGE_START] = ball_x + 0.01  # The opponent is near the ball.
     for car in (BLUE_START, ORANGE_START):
         rows[:, car + 9] = rows[:, car + 14] = 1
-    np.save(folder / f"100-0-{name}.npy", rows)
+    path = folder / f"100-0-{name}.npy"
+    np.save(path, rows)
+    np.savez_compressed(
+        path.with_suffix(".unsafe-starts.npz"),
+        unsafe=np.zeros(len(rows), dtype=bool),
+        pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+    )
     if paired:
         other = rows.copy()
         other[:, :SCENE_SIZE] = opponent_view(th.from_numpy(rows[:, :SCENE_SIZE])).numpy()
-        np.save(folder / f"200-0-{name}.npy", other)
+        partner = folder / f"200-0-{name}.npy"
+        np.save(partner, other)
+        np.savez_compressed(
+            partner.with_suffix(".unsafe-starts.npz"),
+            unsafe=np.zeros(len(rows), dtype=bool),
+            pre_goal=np.zeros(len(rows), dtype=bool), frame_skip=4,
+        )
 
 
 class ExpertPOVTests(unittest.TestCase):

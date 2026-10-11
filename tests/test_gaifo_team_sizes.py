@@ -20,7 +20,7 @@ from carl.gymnasium.state import (
 )
 from carl.gymnasium.torch import CARLTorchVectorEnv, _forward_up_to_quat
 from gaifo import (
-    ExpertSceneDataset, FactorizedSceneDiscriminator,
+    EgoBallTouchCapture, ExpertSceneDataset, FactorizedSceneDiscriminator,
     GAIFO_TEAM_ARCHITECTURE,
     GameplayDiagnostics, GeneratedContextTimeline, SceneDiscriminator,
     SceneWindowCapture, actor_view, advanced_touch_events, build_discriminator,
@@ -212,11 +212,11 @@ class TeamSizeUnitTests(unittest.TestCase):
             ) as directory:
                 folder = Path(directory)
                 write_team_povs(folder, size, invalid_rotations=True)
-                for curated in (False, True):
-                    with self.subTest(curated=curated):
+                for catalog_skills in (False, True):
+                    with self.subTest(catalog_skills=catalog_skills):
                         expert = ExpertSceneDataset(
                             folder, trajectory_length=4, team_size=size, frame_skip=4,
-                            reject_discontinuities=curated, skill_sampling=curated,
+                            reject_discontinuities=True, catalog_skills=catalog_skills,
                         )
                         bad = expert.real_frame_indices[th.tensor([28, 29])]
                         self.assertEqual(expert.total_windows, 48)
@@ -225,10 +225,7 @@ class TeamSizeUnitTests(unittest.TestCase):
                         ).all())
                         self.assertFalse(th.isin(bad, expert.reset_indices).any())
                         self.assertGreater(len(expert.reset_indices), 0)
-                        if curated:
-                            self.assertTrue(expert.unsafe_reset_frames[bad].all())
-                            for pool in expert._curated_reset_pools:
-                                self.assertFalse(th.isin(bad, pool).any())
+                        self.assertTrue(expert.unsafe_reset_frames[bad].all())
 
                         request = ReplayResetProvider(
                             DatasetResetSampler(expert.reset_dataset(), seed=7),
@@ -250,7 +247,7 @@ class TeamSizeUnitTests(unittest.TestCase):
                 rows = write_team_povs(folder, size, recorded)
                 expert = ExpertSceneDataset(
                     folder, trajectory_length=4, team_size=size, frame_skip=4,
-                    reject_discontinuities=True, skill_sampling=True,
+                    reject_discontinuities=True, catalog_skills=True,
                 )
                 self.assertEqual(expert.frames.shape[-1], team_scene_size(size))
                 self.assertEqual(expert.internal_states.shape[-2:], (2 * size, 19))
@@ -350,6 +347,8 @@ class TeamSizeUnitTests(unittest.TestCase):
                 self.assertAlmostEqual(aerial.sum().item(), 0.)
                 self.assertFalse(diagnostics.last_opponent_ball_touch[:size].any())
                 self.assertTrue(diagnostics.last_opponent_ball_touch[size:].all())
+                other = EgoBallTouchCapture(diagnostics)(None)["other_ball_touch"]
+                self.assertEqual(other.tolist(), [i != 1 for i in range(n_cars)])
 
     def test_resume_preserves_team_size_and_rejects_changes(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
@@ -397,7 +396,7 @@ class TeamSizeUnitTests(unittest.TestCase):
                 write_team_povs(folder, size, (size * 2 - 1,))
                 expert = ExpertSceneDataset(
                     folder, trajectory_length=4, team_size=size, frame_skip=4,
-                    reject_discontinuities=True, skill_sampling=True,
+                    reject_discontinuities=True, catalog_skills=True,
                 )
                 model = SceneDiscriminator(8, 8, 16, n_cars=2 * size)
                 path = folder / "gaifo_000000000001.pt"

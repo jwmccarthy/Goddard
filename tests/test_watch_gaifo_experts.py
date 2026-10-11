@@ -126,7 +126,6 @@ def checkpoint(path: Path, replay_dir: Path, *, factorize: bool = True,
             "discriminator_hidden": 8, "trajectory_length": 8,
             "replay_dir": str(replay_dir), "frameskip": 4,
             "seed": 0, "discriminator_heldout_size": 16,
-            "general_driving_fraction": .10, "kickoff_fraction": .05,
             **({"discriminator_relative_positions": relative_positions}
                if relative_positions is not None else {}),
         },
@@ -225,7 +224,7 @@ class ExpertInspectorTests(unittest.TestCase):
             write_periods(folder)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4, heldout_size=16,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             path = folder / "gaifo_000000000042.pt"
             checkpoint(path, folder)
@@ -257,13 +256,13 @@ class ExpertInspectorTests(unittest.TestCase):
                     ).item()
                 self.assertAlmostEqual(record.probabilities[-1, 3], expected, places=6)
 
-    def test_ranked_curated_clips_use_unnoised_causal_windows_and_stored_povs(self):
+    def test_ranked_skill_clips_use_unnoised_causal_windows_and_stored_povs(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temporary:
             folder = Path(temporary)
             write_periods(folder)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4, heldout_size=16,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             records = collect_sequences(expert, folder, seed=0, limit=None, max_driving=1)
             self.assertEqual({"aerial_touch", "aerial_maneuver", "dribble", "flick", "driving", "kickoff"},
@@ -346,7 +345,7 @@ class ExpertInspectorTests(unittest.TestCase):
             write_periods(folder)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, limit=75, seed=17,
-                frame_skip=4, reject_discontinuities=True, skill_sampling=True,
+                frame_skip=4, reject_discontinuities=True, catalog_skills=True,
             )
             sources, offsets = replay_sources(folder, expert, seed=17, limit=75)
             self.assertEqual(len(sources), 2)

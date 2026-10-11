@@ -67,7 +67,7 @@ def actor_observations(
 
 
 class KickoffRetentionTests(unittest.TestCase):
-    def test_curated_kickoff_covers_first_challenge_and_respects_replay_safety(self):
+    def test_cataloged_kickoff_covers_first_challenge_and_respects_replay_safety(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
             for name in ("kickoff", "nonkickoff"):
@@ -103,7 +103,7 @@ class KickoffRetentionTests(unittest.TestCase):
 
             expert = ExpertSceneDataset(
                 folder, 8, frame_skip=4, reject_discontinuities=True,
-                skill_sampling=True,
+                catalog_skills=True,
             )
             start = int(expert.segment_window_starts[0][0])
             kickoff = expert.curated_pools()[KICKOFF_SKILL]
@@ -119,14 +119,14 @@ class KickoffRetentionTests(unittest.TestCase):
                 ).any())
             self.assertTrue(th.isin(kickoff[:, 0], expert.train_window_starts).all())
             self.assertFalse(th.isin(
-                expert._curated_reset_pools[KICKOFF_SKILL],
+                expert.reset_indices,
                 th.tensor([start + 65 + expert.partition_span]),
             ).any())
             self.assertGreater(len(expert.curated_pools()[DRIVING_SKILL]), 0)
 
             old_style = ExpertSceneDataset(
                 folder, 8, frame_skip=4, reject_discontinuities=True,
-                skill_sampling=True, kickoff_fraction=0,
+                catalog_skills=True, include_kickoffs=False,
             )
             self.assertFalse(len(old_style.curated_pools()[KICKOFF_SKILL]))
             self.assertTrue(th.isin(
@@ -135,7 +135,7 @@ class KickoffRetentionTests(unittest.TestCase):
 
             heldout = ExpertSceneDataset(
                 folder, 8, heldout_size=16, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             for split, eligible in ((False, heldout.train_window_starts),
                                     (True, heldout.heldout_window_starts)):
@@ -149,7 +149,7 @@ class KickoffRetentionTests(unittest.TestCase):
             # A smaller frame skip must not truncate the kickoff before contact.
             faster = ExpertSceneDataset(
                 folder, 8, frame_skip=2, reject_discontinuities=True,
-                skill_sampling=True,
+                catalog_skills=True,
             )
             quick_start = int(faster.segment_window_starts[0][0])
             quick_kickoff = faster.curated_pools()[KICKOFF_SKILL]
@@ -161,6 +161,14 @@ class KickoffRetentionTests(unittest.TestCase):
             folder = Path(directory)
             save_period(folder, "single", 10)
             save_period(folder, "paired", 100, paired=True)
+            # Synthetic velocity markers are not physical; this boundary test
+            # supplies explicit safety annotations instead of inferring them.
+            for path in folder.glob("*.npy"):
+                np.savez_compressed(
+                    path.with_suffix(".unsafe-starts.npz"),
+                    unsafe=np.zeros(8, dtype=bool),
+                    pre_goal=np.zeros(8, dtype=bool), frame_skip=4,
+                )
             expert = ExpertSceneDataset(folder, trajectory_length=4)
             self.assertEqual(expert.train_total, 16)  # One scored window per physical frame.
             self.assertEqual(len(expert.reset_indices), 16)  # No duplicate reset states.

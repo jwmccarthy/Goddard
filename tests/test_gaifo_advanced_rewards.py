@@ -160,6 +160,8 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             touches["opponent_ball_touch"].view(4, 2),
             touches["ego_ball_touch"].view(4, 2).flip(-1),
         )
+        th.testing.assert_close(touches["other_ball_touch"],
+                                touches["opponent_ball_touch"])
 
         batch = TensorBatch({
             "observation": th.zeros(1, 8, 51),

@@ -10,7 +10,6 @@ const goals = document.getElementById('goals');
 const roundLabel = document.getElementById('round');
 const blueCheckpoint = document.getElementById('blueCheckpoint');
 const orangeCheckpoint = document.getElementById('orangeCheckpoint');
-const resetType = document.getElementById('resetType');
 const resetMatch = document.getElementById('resetMatch');
 const blueBoost = document.getElementById('blue-boost');
 const orangeBoost = document.getElementById('orange-boost');
@@ -169,8 +168,10 @@ source.onmessage = ({ data }) => {
   if (frame.error) {
     connection.textContent = frame.error;
     connection.classList.remove('live');
+    resetMatch.disabled = true;
     return;
   }
+  resetMatch.disabled = false;
   for (const [index, car] of frame.cars.entries()) {
     if (!cars[index]) cars[index] = makeCar(carColors[car.team][(car.player - 1) % 3]);
     setCar(index, car);
@@ -217,38 +218,17 @@ async function refreshCheckpoints() {
   if (checkpoints.some((item) => item.path === previous[1])) orangeCheckpoint.value = previous[1];
 }
 
-async function refreshResetTypes() {
-  const { types, selected } = await fetch('/api/reset-types').then((response) => response.json());
-  const previous = resetType.value;
-  resetType.replaceChildren();
-  for (const type of types) {
-    const option = document.createElement('option');
-    option.value = type.id;
-    option.textContent = type.label;
-    resetType.appendChild(option);
-  }
-  if (types.length) resetType.value = types.some((type) => type.id === previous) ? previous : selected;
-  resetType.disabled = types.length === 0;
-  resetMatch.disabled = types.length === 0;
-}
-
 document.getElementById('applyMatch').addEventListener('click', () => fetch('/api/match', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ blue: blueCheckpoint.value, orange: orangeCheckpoint.value }),
 }));
-resetMatch.addEventListener('click', () => fetch('/api/reset', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ reset_type: resetType.value }),
-}));
+resetMatch.addEventListener('click', () => fetch('/api/reset', { method: 'POST' }));
 document.getElementById('kickoffMatch').addEventListener('click', () => {
   fetch('/api/kickoff', { method: 'POST' });
 });
 refreshCheckpoints();
-refreshResetTypes();
 setInterval(refreshCheckpoints, 5000);
-setInterval(refreshResetTypes, 5000);
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();

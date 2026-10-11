@@ -92,7 +92,7 @@ class GoalTerminalTests(unittest.TestCase):
             path = write_goal(folder, rows, paired=True)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             clips = [clip for group in expert._curated_maneuvers[False]
                      for clip in group if isinstance(clip, AirManeuver)]
@@ -132,7 +132,7 @@ class GoalTerminalTests(unittest.TestCase):
             # A frame-limit cut and a parser-invalid row may not invent a goal play.
             truncated = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4, limit=40,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             self.assertEqual(truncated.segment_goal_actors, [None])
             partial = [m for group in truncated._curated_maneuvers[False] for m in group
@@ -146,7 +146,7 @@ class GoalTerminalTests(unittest.TestCase):
             np.save(path, broken)
             interrupted = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             self.assertFalse(any(isinstance(m, AirManeuver) and m.goal_terminal
                                  for group in interrupted._curated_maneuvers[False]
@@ -162,7 +162,7 @@ class GoalTerminalTests(unittest.TestCase):
             write_goal(folder, canonical)
             unpaired = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             self.assertEqual(unpaired.segment_goal_actors, [1])
             self.assertFalse(any(isinstance(m, AirManeuver) for group in
@@ -172,7 +172,7 @@ class GoalTerminalTests(unittest.TestCase):
             np.save(partner, scorer_rows)
             paired = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             clips = [m for group in paired._curated_maneuvers[False] for m in group
                      if isinstance(m, AirManeuver)]
@@ -191,7 +191,7 @@ class GoalTerminalTests(unittest.TestCase):
             )
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             clips = expert._curated_maneuvers[False]
             partial = [m for group in clips for m in group
@@ -216,7 +216,7 @@ class GoalTerminalTests(unittest.TestCase):
             write_goal(folder, interrupted)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             fragments = [m for group in expert._curated_maneuvers[False]
                          for m in group if isinstance(m, AirManeuver)]
@@ -234,7 +234,7 @@ class GoalTerminalTests(unittest.TestCase):
             write_goal(folder, separated)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             self.assertFalse(any(m.skill_category == AERIAL_MANEUVER_SKILL
                                  for group in expert._curated_maneuvers[False]
@@ -298,7 +298,7 @@ class GoalTerminalTests(unittest.TestCase):
             write_goal(folder, rows)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
             flicks = expert._curated_maneuvers[False][GROUND_MANEUVER_START + 1]
             self.assertEqual(len(flicks), 1)
@@ -311,7 +311,7 @@ class GoalTerminalTests(unittest.TestCase):
                 expert.train_window_starts,
             ).all()))
 
-    def test_inspector_keeps_goal_driving_with_a_small_comparison_sample(self):
+    def test_inspector_samples_driving_without_goal_based_quotas(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
             rows = scoring_air_rows()
@@ -325,14 +325,25 @@ class GoalTerminalTests(unittest.TestCase):
                 np.save(folder / f"100-0-driving-{index}.npy", regular)
             expert = ExpertSceneDataset(
                 folder, trajectory_length=8, frame_skip=4,
-                reject_discontinuities=True, skill_sampling=True,
+                reject_discontinuities=True, catalog_skills=True,
             )
+            all_driving = [record for record in collect_sequences(
+                expert, folder, seed=3, limit=None, max_driving=1000,
+            ) if record.skill == "driving"]
+            self.assertEqual(sum(record.goal_terminal for record in all_driving), 1)
             records = collect_sequences(
                 expert, folder, seed=3, limit=None, max_driving=2,
             )
             driving = [record for record in records if record.skill == "driving"]
             self.assertEqual(len(driving), 2)
-            self.assertEqual(sum(record.goal_terminal for record in driving), 1)
+            selected = np.sort(np.random.default_rng(3).choice(
+                len(all_driving), size=2, replace=False,
+            ))
+            self.assertEqual(
+                [(record.source, record.start, record.actor) for record in driving],
+                [(all_driving[index].source, all_driving[index].start, all_driving[index].actor)
+                 for index in selected],
+            )
 
     def test_generated_scoring_actions_survive_terminal_across_rollouts(self):
         frames = []
