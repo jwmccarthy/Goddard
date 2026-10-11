@@ -43,7 +43,7 @@ from gaifo import (
     CAR_MAX_SPEED, LOW_AIR_HEIGHT, POSITION_SCALE,
     ExpertSceneDataset, GameplayDiagnostics, HistoricalReplayBuffer, RecencyReplayBuffer,
     SelectPPOFields, add_feature_option, add_scene_noise, build_critic, build_env,
-    build_policy, build_ppo_sampler, build_runner, frameskip_ratio,
+    build_policy, build_ppo_sampler, build_runner, frameskip_ratio, nearest_ball_distance,
     relative_scene_positions,
 )
 from replay_layout import (
@@ -174,7 +174,7 @@ class PCILEncoder(nn.Module):
 
 
 class FactorizedPCILEncoder(nn.Module):
-    """Separate global context, ego motion, and optional ego-ball interaction."""
+    """Separate global context, far-car motion, and near-ball interaction."""
 
     factorized = True
 
@@ -256,7 +256,7 @@ class FactorizedPCILEncoder(nn.Module):
 
 
 class PCILContrastiveLoss:
-    """One independent expert positive and all agent negatives per expert anchor."""
+    """Match expert positives against generated negatives in each active band."""
 
     def __init__(
         self, encoder: PCILEncoder | FactorizedPCILEncoder, temperature: float = 0.07,
@@ -289,27 +289,55 @@ class PCILContrastiveLoss:
             positive = positive[:, None]
             negative = negative[:, None]
         heads = anchor.shape[1]
+        all_rows = th.ones(len(anchors), dtype=th.bool, device=anchors.device)
+        anchor_masks = [all_rows] * heads
+        negative_masks = [all_rows] * heads
+        if heads == 3:
+            # Train the car-motion specialist only on far examples and the
+            # ball-interaction specialist only on near ones. Restrict their
+            # negatives to the same band so distance alone cannot solve InfoNCE.
+            anchor_near = nearest_ball_distance(anchors) <= BALL_NEAR_DISTANCE
+            positive_near = nearest_ball_distance(positives) <= BALL_NEAR_DISTANCE
+            negative_near = nearest_ball_distance(negatives) <= BALL_NEAR_DISTANCE
+            anchor_masks = [all_rows, ~anchor_near & ~positive_near,
+                            anchor_near & positive_near]
+            negative_masks = [all_rows, ~negative_near, negative_near]
         positive_similarity = (anchor * positive).sum(dim=-1)
-        negative_bank = negative.transpose(0, 1).transpose(1, 2)
-        contrastive = anchor.new_zeros(heads)
-        negative_similarity = anchor.new_zeros(heads)
-        for start in range(0, len(anchors), self.anchor_microbatch or len(anchors)):
-            end = min(start + (self.anchor_microbatch or len(anchors)), len(anchors))
-            similarity = th.bmm(
-                anchor[start:end].transpose(0, 1), negative_bank,
+        contrastive, negative_similarity, positive_means = [], [], []
+        trained_heads = []
+        for head in range(heads):
+            active = anchor_masks[head]
+            candidate = negative_masks[head]
+            n_active = int(active.sum())
+            n_negative = int(candidate.sum())
+            head_loss = anchor.new_zeros(())
+            head_negative_similarity = anchor.new_zeros(())
+            positive_means.append(
+                positive_similarity[active, head].mean() if n_active else head_loss
             )
-            logits = th.cat((
-                positive_similarity[start:end].T[..., None], similarity,
-            ), dim=-1) / self.temperature
-            losses = F.cross_entropy(
-                logits.reshape(-1, len(anchors) + 1),
-                th.zeros(heads * (end - start), dtype=th.long, device=anchors.device),
-                reduction="none",
-            ).reshape(heads, -1)
-            contrastive = contrastive + losses.sum(dim=1) / len(anchors)
-            negative_similarity = negative_similarity + similarity.sum(dim=(1, 2)) / (
-                len(anchors) ** 2
-            )
+            if n_active and n_negative:
+                trained_heads.append(head)
+                negative_bank = negative[candidate, head].T
+                for start in range(0, len(anchors), self.anchor_microbatch or len(anchors)):
+                    end = min(start + (self.anchor_microbatch or len(anchors)), len(anchors))
+                    selected = active[start:end]
+                    if not selected.any():
+                        continue
+                    similarities = anchor[start:end, head][selected] @ negative_bank
+                    logits = th.cat((
+                        positive_similarity[start:end, head][selected][:, None], similarities,
+                    ), dim=-1) / self.temperature
+                    head_loss = head_loss + F.cross_entropy(
+                        logits, th.zeros(len(logits), dtype=th.long, device=anchors.device),
+                        reduction="sum",
+                    ) / n_active
+                    head_negative_similarity = head_negative_similarity + (
+                        similarities.sum() / (n_active * n_negative)
+                    )
+            contrastive.append(head_loss)
+            negative_similarity.append(head_negative_similarity)
+        contrastive = th.stack(contrastive)
+        negative_similarity = th.stack(negative_similarity)
 
         penalty = th.zeros_like(contrastive)
         if self.gradient_penalty_weight:
@@ -336,9 +364,13 @@ class PCILContrastiveLoss:
                 reward = (embedded * anchor[selected].detach()).sum(dim=-1)
                 penalties = []
                 for head in range(heads):
+                    active = anchor_masks[head][selected] & negative_masks[head][selected]
+                    if not active.any():
+                        penalties.append(reward.new_zeros(()))
+                        continue
                     gradient = th.autograd.grad(
-                        reward[:, head].sum(), mixed, create_graph=True,
-                    )[0].flatten(1)
+                        reward[active, head].sum(), mixed, create_graph=True,
+                    )[0][active].flatten(1)
                     penalties.append((gradient.norm(dim=1) - 1).square().mean())
                 penalty = th.stack(penalties)
 
@@ -351,23 +383,29 @@ class PCILContrastiveLoss:
             "loss": loss.detach(),
             "contrastive_loss": contrastive_mean.detach(),
             "gradient_penalty": penalty_mean.detach(),
-            "positive_similarity": positive_similarity.mean().detach(),
-            "negative_similarity": negative_similarity.mean().detach(),
+            "positive_similarity": th.stack([
+                positive_means[head] for head in trained_heads
+            ]).mean().detach(),
+            "negative_similarity": negative_similarity[trained_heads].mean().detach(),
         }
         if heads == 2:
             for head, name in enumerate(("global", "ego")):
                 metrics.update({
                     f"{name}_contrastive_loss": contrastive[head].detach(),
                     f"{name}_gradient_penalty": penalty[head].detach(),
-                    f"{name}_positive_similarity": positive_similarity[:, head].mean().detach(),
+                    f"{name}_positive_similarity": positive_means[head].detach(),
                     f"{name}_negative_similarity": negative_similarity[head].detach(),
                 })
         elif heads == 3:
+            metrics.update({
+                "far_anchor_fraction": anchor_masks[1].float().mean(),
+                "near_anchor_fraction": anchor_masks[2].float().mean(),
+            })
             for head, name in enumerate(("global", "ego", "interaction")):
                 metrics.update({
                     f"{name}_contrastive_loss": contrastive[head].detach(),
                     f"{name}_gradient_penalty": penalty[head].detach(),
-                    f"{name}_positive_similarity": positive_similarity[:, head].mean().detach(),
+                    f"{name}_positive_similarity": positive_means[head].detach(),
                     f"{name}_negative_similarity": negative_similarity[head].detach(),
                 })
         return LossOutput(loss, metrics)
@@ -803,29 +841,24 @@ class PCILReward:
                                          else (GLOBAL_WEIGHT, EGO_WEIGHT))
             global_reward = global_weight * scores[:, 0].reshape_as(valid)
             ego_reward = ego_weight * scores[:, 1].reshape_as(valid)
-            imitation = global_reward + ego_reward
             if interaction_head:
                 own_touch, other_touch = batch.get("ego_ball_touch"), batch.get("other_ball_touch")
                 if own_touch is None or other_touch is None:
                     raise ValueError("attributed PCIL reward needs ego_ball_touch and other_ball_touch")
                 if own_touch.shape != valid.shape or other_touch.shape != valid.shape:
                     raise ValueError("PCIL ball touches must match actor rollout shape")
-                # Motion remains rewarded during aerial setups; the interaction
-                # branch matters near the ball or on an actual focal-player
-                # touch, never on another player's touch alone.
-                pre_and_post = windows[..., -2:, :]
-                distance = th.linalg.vector_norm(
-                    (pre_and_post[..., :3] - pre_and_post[..., BALL_SIZE:BALL_SIZE + 3])
-                    * windows.new_tensor(POSITION_SCALE), dim=-1,
-                ).amin(dim=-1)
-                proximity = ((BALL_NEAR_DISTANCE - distance) / (
-                    BALL_NEAR_DISTANCE - BALL_CLOSE_DISTANCE
-                )).clamp(0, 1)
-                proximity = th.maximum(proximity, own_touch.to(proximity.dtype))
-                agency = proximity * (~other_touch.bool() | own_touch.bool()).to(proximity.dtype)
+                # Match GAIFO's complementary far/near specialists. An actual
+                # focal-player touch takes precedence over noisy replay geometry;
+                # another player's touch cannot earn near-ball interaction credit.
+                near = ((nearest_ball_distance(flat).reshape_as(valid) <= BALL_NEAR_DISTANCE)
+                        | own_touch.bool()) & valid
+                ego_reward *= (~near).to(ego_reward.dtype)
                 interaction_reward = (ATTRIBUTED_WEIGHTS[2] * scores[:, 2].reshape_as(valid)
-                                      * agency)
-                imitation = imitation + interaction_reward
+                                      * near.to(scores.dtype)
+                                      * (~other_touch.bool() | own_touch.bool()).to(scores.dtype))
+                imitation = global_reward + ego_reward + interaction_reward
+            else:
+                imitation = global_reward + ego_reward
         else:
             imitation = scores.reshape_as(valid)
         fraction = batch.get("scene_window_agent_fraction")
@@ -1297,24 +1330,29 @@ def register_progress_metrics(logger: Logger, args: argparse.Namespace) -> None:
     if args.factorize:
         for key, label in (
             ("global_contrastive_loss", "global InfoNCE"),
-            ("ego_contrastive_loss", "ego InfoNCE"),
+            ("ego_contrastive_loss", "far InfoNCE" if args.interaction_head else "ego InfoNCE"),
             ("global_gradient_penalty", "global GP"),
-            ("ego_gradient_penalty", "ego GP"),
+            ("ego_gradient_penalty", "far GP" if args.interaction_head else "ego GP"),
         ):
             logger.register_progress_metric("PCIL", key, label, ".4f")
         for key, label in (
             ("global_imitation_reward", "global reward"),
-            ("ego_imitation_reward", "ego reward"),
+            ("ego_imitation_reward", "far reward" if args.interaction_head else "ego reward"),
         ):
             logger.register_progress_metric("Reward", key, label, ".3f")
         if args.interaction_head:
             for key, label in (
-                ("interaction_contrastive_loss", "interaction InfoNCE"),
-                ("interaction_gradient_penalty", "interaction GP"),
+                ("interaction_contrastive_loss", "near InfoNCE"),
+                ("interaction_gradient_penalty", "near GP"),
             ):
                 logger.register_progress_metric("PCIL", key, label, ".4f")
+            for key, label in (
+                ("far_anchor_fraction", "far anchors"),
+                ("near_anchor_fraction", "near anchors"),
+            ):
+                logger.register_progress_metric("PCIL", key, label, ".1%")
             logger.register_progress_metric(
-                "Reward", "interaction_imitation_reward", "interaction reward", ".3f",
+                "Reward", "interaction_imitation_reward", "near reward", ".3f",
             )
     for enabled, key, label, fmt in (
         (args.entropy_end is not None, "entropy_coef", "entropy coef", ".4f"),

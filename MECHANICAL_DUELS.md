@@ -258,15 +258,18 @@ within a window, its delta is zero; neither the MLP nor the optional causal
 Transformer sees future observations outside the scored scene window.
 
 For **attributed multi-agent imitation**, `--factorize` now trains three
-unit-sphere encoders by default: global scene context, focal-car motion with
-a fixed initial relative-ball context, and ego–ball interaction. Each has its
-own InfoNCE loss and reward-gradient penalty. The respective loss/reward
-weights are `0.2/0.4/0.4`, and each branch has separate progress metrics.
-The interaction reward uses the closest ego–ball distance across the scored
-transition: full strength within 350 units, linearly falling to zero at 1,500;
-a focal-player touch overrides distance. A touch by a teammate or opponent
-without a focal touch suppresses the interaction term, while ego-motion
-continues rewarding approach, aerial setup, and recovery at any distance.
+unit-sphere encoders by default: always-on global scene context, far-car motion
+with a fixed initial relative-ball context, and near-ball ego–ball interaction.
+Like GAIFO, the two specialists are mutually exclusive at a 1,500-unit closest
+ego–ball approach over the causal window. Each specialist's InfoNCE contrasts
+expert and agent windows *within its own distance band*, so merely being near
+cannot distinguish expert from agent; the global head trains on all windows.
+Each has a reward-gradient penalty on eligible examples. The respective
+loss/reward weights remain `0.2/0.4/0.4` (only one specialist earns reward per
+transition), and each branch has separate progress metrics. A focal-player
+touch overrides the distance band to select near interaction; another player's
+touch without a focal touch suppresses that interaction reward. Far-car motion
+rewards approach, aerial setup, and recovery while outside the near band.
 `--interaction-head false` retains the earlier two-branch global/ball-and-ego
 factorization, with equal branch weights.
 `--discriminator-relative-positions` optionally adds explicit relative

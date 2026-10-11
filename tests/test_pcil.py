@@ -388,6 +388,8 @@ class PCILTests(unittest.TestCase):
             interaction_head=True,
         )
         scenes = th.randn(9, 4, 53) * .2
+        scenes[..., :3] = scenes[..., 9:12] = 0
+        scenes[[0, 3, 6], :, 9] = 2_500 / 4_108  # Both specialists have examples.
         original = model(scenes)
         self.assertEqual(original.shape, (9, 3, 5))
         th.testing.assert_close(original.norm(dim=-1), th.ones(9, 3))
@@ -415,6 +417,64 @@ class PCILTests(unittest.TestCase):
         for branch in (model.global_encoder, model.ego_encoder, model.interaction_encoder):
             self.assertTrue(th.isfinite(branch.model[0].weight.grad).all())
             self.assertGreater(branch.model[0].weight.grad.abs().sum(), 0)
+
+    def test_attributed_contrastive_heads_compare_experts_to_agents_in_the_same_band(self):
+        anchors = th.zeros(4, 2, 51)
+        positives = anchors.clone()
+        negatives = anchors.clone()
+        for windows in (anchors, positives, negatives):
+            windows[:2, :, 9] = 2_000 / 4_108
+        objective = PCILContrastiveLoss(
+            AttributedAxisEncoder(), temperature=1, gradient_penalty_weight=0,
+            anchor_microbatch=1,
+        )
+        output = objective(anchors, positives, negatives)
+        expected = th.log(th.tensor([5., 3., 3.]))
+        for name, value in zip(("global", "ego", "interaction"), expected):
+            th.testing.assert_close(output.metrics[f"{name}_contrastive_loss"], value)
+        th.testing.assert_close(output.loss, (expected * th.tensor(ATTRIBUTED_WEIGHTS)).sum())
+        self.assertEqual(output.metrics["far_anchor_fraction"], .5)
+        self.assertEqual(output.metrics["near_anchor_fraction"], .5)
+
+        # An expert positive crossing the band boundary is not a far positive.
+        positives[0, :, 9] = 0
+        shifted = objective(anchors, positives, negatives)
+        self.assertEqual(shifted.metrics["far_anchor_fraction"], .25)
+        th.testing.assert_close(shifted.metrics["ego_contrastive_loss"], expected[1])
+
+        # When there are no far negatives, the far head receives no loss.
+        negatives[:2, :, 9] = 0
+        unmatched = objective(anchors, positives, negatives)
+        th.testing.assert_close(unmatched.metrics["ego_contrastive_loss"], th.tensor(0.))
+        th.testing.assert_close(unmatched.metrics["interaction_contrastive_loss"],
+                                th.log(th.tensor(5.)))
+        th.testing.assert_close(unmatched.metrics["positive_similarity"], th.tensor(1.))
+        th.testing.assert_close(unmatched.metrics["negative_similarity"], th.tensor(1.))
+
+    def test_attributed_specialists_only_train_in_their_active_distance_band(self):
+        for far in (False, True):
+            with self.subTest(far=far):
+                model = FactorizedPCILEncoder(
+                    4, 53, hidden_size=12, embedding_size=5, interaction_head=True,
+                )
+                windows = th.randn(6, 4, 53) * .2
+                windows[..., :3] = windows[..., 9:12] = 0
+                if far:
+                    windows[..., 9] = 2_500 / 4_108
+                loss = PCILContrastiveLoss(
+                    model, gradient_penalty_weight=1, gradient_penalty_samples=2,
+                )(windows[:2], windows[2:4], windows[4:6])
+                loss.loss.backward()
+                active = model.ego_encoder if far else model.interaction_encoder
+                inactive = model.interaction_encoder if far else model.ego_encoder
+                inactive_name = "interaction" if far else "ego"
+                th.testing.assert_close(loss.metrics[f"{inactive_name}_contrastive_loss"],
+                                        th.tensor(0.))
+                th.testing.assert_close(loss.metrics[f"{inactive_name}_gradient_penalty"],
+                                        th.tensor(0.))
+                self.assertGreater(active.model[0].weight.grad.abs().sum().item(), 0)
+                if inactive.model[0].weight.grad is not None:
+                    self.assertFalse(inactive.model[0].weight.grad.any())
 
     def test_cosine_reward_respects_validity_replay_fraction_and_frame_skip(self):
         windows = th.zeros(2, 2, 2, 2)
@@ -459,7 +519,7 @@ class PCILTests(unittest.TestCase):
         th.testing.assert_close(reward["training_reward"],
                                 th.tensor([[4.35, 1.5], [-2.35, -1.5]]))
 
-    def test_interaction_reward_is_proximity_and_own_touch_attributed(self):
+    def test_far_and_near_reward_are_complementary_and_own_touch_attributed(self):
         windows = th.zeros(1, 5, 2, 51)
         windows[0, 3, :, 9] = 2000 / 4108  # Too far to credit a ball interaction.
         windows[0, 4, :, 9] = 2000 / 4108
@@ -478,11 +538,11 @@ class PCILTests(unittest.TestCase):
         th.testing.assert_close(reward["global_imitation_reward"],
                                 th.tensor([[.2, .2, .1, .2, .2]]))
         th.testing.assert_close(reward["ego_imitation_reward"],
-                                th.tensor([[.4, .4, .2, .4, .4]]))
+                                th.tensor([[0., 0., 0., .4, 0.]]))
         th.testing.assert_close(reward["interaction_imitation_reward"],
                                 th.tensor([[.4, 0., .2, 0., .4]]))
         th.testing.assert_close(reward["training_reward"],
-                                th.tensor([[1., 2.6, .5, .6, 1.]]))
+                                th.tensor([[.6, 2.2, .3, .6, .6]]))
         with self.assertRaisesRegex(ValueError, "other_ball_touch"):
             PCILReward(AttributedAxisExpert(), AttributedAxisEncoder())(
                 TensorBatch({name: value for name, value in batch.items()
@@ -853,8 +913,9 @@ class PCILGPUSmokeTests(unittest.TestCase):
             self.assertTrue(any(name.startswith("global_encoder.") for name in saved["encoder"]))
             self.assertTrue(any(name.startswith("ego_encoder.") for name in saved["encoder"]))
             self.assertTrue(any(name.startswith("interaction_encoder.") for name in saved["encoder"]))
-            for label in ("global InfoNCE", "ego InfoNCE", "touches/1k", "aerial/1k",
-                          "goals for/1k", "PPO LR", "PCIL LR", "interaction InfoNCE"):
+            for label in ("global InfoNCE", "far InfoNCE", "near InfoNCE",
+                          "far anchors", "near anchors", "touches/1k", "aerial/1k",
+                          "goals for/1k", "PPO LR", "PCIL LR"):
                 self.assertIn(label, output.getvalue())
 
             env = build_env(argparse.Namespace(
