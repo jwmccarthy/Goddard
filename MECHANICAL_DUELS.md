@@ -215,6 +215,35 @@ GAIFO's `timeout frac` is the share of finished episodes that went a full
 no-touch interval after **either team's last ball touch**; an episode can have
 earlier touches and still end this way.
 
+## Train PCIL
+
+`pcil.py` adapts [Policy Contrastive Imitation Learning](https://proceedings.mlr.press/v202/huang23n.html)
+to the parsed replays. The paper uses expert state-action demonstrations and
+continuous-control DrQ-v2; these replays have no recorded actions, so PCIL
+compares short causal scenes from recorded player POVs and trains the native
+discrete GRU policy with PPO. Its separate four-layer encoder projects scenes
+onto the unit sphere. InfoNCE brings independently sampled expert windows
+together and contrasts each expert anchor against a batch of agent windows
+(temperature 0.07); a reward-gradient penalty uses weight 10 by default.
+The base imitation score is cosine similarity in `[-1, 1]` to a randomly
+sampled expert window, rather than GAIFO's discriminator log odds. Per-action
+rewards scale with `--frameskip` relative to the four-tick reference cadence.
+
+```bash
+.venv/bin/python pcil.py --replay-dir parsed_replays/duels \
+  --expert-frame-limit 200000
+# Continue a run, specifying a new total timestep target:
+.venv/bin/python pcil.py --resume-checkpoint checkpoints/pcil/YOUR_RUN/pcil_000010000000.pt \
+  --timesteps 200000000
+```
+
+PCIL defaults to pure imitation (`--goal-reward-weight 0`); positive values
+add CARL's goal reward. Only fully generated windows become contrastive agent
+negatives; at replay resets, the cosine reward is weighted by the fraction of
+the scored window produced by the learner. PCIL checkpoints save the encoder,
+PPO networks, optimizers, and training clock, and can be viewed with
+`watch_checkpoints.py`. `--team-size 2` and `3` use matching parsed replays.
+
 ### BASIC queued-action reaction time
 
 Add `--reaction-time-ms 100` to a BASIC training command to delay execution of

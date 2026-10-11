@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch BASIC, GAIFO, or deep contrastive checkpoints play in the browser."""
+"""Watch BASIC, GAIFO, PCIL, or deep contrastive checkpoints in the browser."""
 
 import argparse
 import json
@@ -38,6 +38,7 @@ from gaifo import (
     ExpertSceneDataset,
     build_policy as build_gaifo_policy,
 )
+from pcil import PCIL_ARCHITECTURE
 from replay_resets import (
     ReplayResetProvider, reset_index_dataset,
 )
@@ -48,6 +49,7 @@ ROOT = Path(__file__).resolve().parent
 CAR_OFFSET = (13.8757, 0.0, 20.755)
 CHECKPOINT_PATTERNS = (
     "gaifo_*.pt",
+    "pcil_*.pt",
     "deep_*.pt",
     "training_latest.pt",
     "actor_critic_final.pt",
@@ -59,6 +61,8 @@ CHECKPOINT_PATTERNS = (
 def checkpoint_kind(path: Path) -> str:
     if path.match("gaifo_*.pt"):
         return "gaifo"
+    if path.match("pcil_*.pt"):
+        return "pcil"
     if path.match("deep_*.pt"):
         return "deep"
     return "basic"
@@ -95,7 +99,7 @@ class EpisodeLimits:
 def checkpoint_episode_limits(path: Path, payload: dict) -> EpisodeLimits:
     """Recover training limits, with defaults for older checkpoint formats."""
     kind = checkpoint_kind(path)
-    if kind == "gaifo":
+    if kind in ("gaifo", "pcil"):
         config, default_ticks = payload.get("config", {}), 1_000_000
     elif kind == "deep":
         config, default_ticks = payload.get("arguments", {}), 36_000
@@ -149,7 +153,7 @@ class CheckpointRegistry:
         checkpoints = self.list()
         if not checkpoints:
             raise FileNotFoundError(
-                f"no BASIC, GAIFO, or deep checkpoints found in {self.directory}"
+                f"no BASIC, GAIFO, PCIL, or deep checkpoints found in {self.directory}"
             )
         newest = checkpoints[0]
         orange = next(
@@ -440,18 +444,20 @@ def load_policy_checkpoint(
         policy, signature = load_deep_policy(path, payload, env)
         policy.episode_limits = checkpoint_episode_limits(path, payload)
         return policy, signature
-    if kind == "gaifo":
+    if kind in ("gaifo", "pcil"):
         architecture = config.get("architecture")
-        if architecture not in (
+        supported = ((PCIL_ARCHITECTURE,) if kind == "pcil" else (
             GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
             GAIFO_TEAM_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE,
-        ):
-            raise ValueError(f"unsupported GAIFO architecture in {path}")
+        ))
+        if architecture not in supported:
+            raise ValueError(f"unsupported {kind.upper()} architecture in {path}")
         team_size = config.get("team_size", 1)
         if 2 * team_size != getattr(env, "n_cars", 2):
             raise ValueError(f"checkpoint team size does not match the viewer: {path}")
-        gru = architecture in (GAIFO_GRU_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE)
-        if config.get("gru", False) != gru:
+        gru = (config.get("gru", True) if kind == "pcil" else
+               architecture in (GAIFO_GRU_ARCHITECTURE, GAIFO_TEAM_GRU_ARCHITECTURE))
+        if kind == "gaifo" and config.get("gru", False) != gru:
             raise ValueError(f"checkpoint GRU setting does not match architecture in {path}")
         hidden = int(config["policy_hidden"])
         layers = int(config.get("policy_layers", 1))
@@ -496,7 +502,7 @@ def load_policy_checkpoint(
     signature = (kind, hidden, architecture, layers)
     if architecture is None:
         signature = (*signature, checkpoint.policy_gru_layers)
-    if kind == "gaifo" and team_size > 1:
+    if kind in ("gaifo", "pcil") and team_size > 1:
         signature = (*signature, team_size)
     return policy.eval().requires_grad_(False), signature
 
