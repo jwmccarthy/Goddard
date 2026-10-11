@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import mimetypes
 import threading
 import time
@@ -24,6 +25,7 @@ from jarl.envs import DatasetResetSampler
 from jarl.modules import GoalActor
 
 from action_codec import enable_grounded_aerial_controls
+from action_delay import QueuedActionEnv
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic, policy_checkpoint
 from deep import ARCHITECTURE as DEEP_ARCHITECTURE, GOAL_SLICES, goal_size
 from gaifo import (
@@ -82,6 +84,36 @@ class CheckpointMetadata:
             "modified": self.modified,
             "kind": self.kind,
         }
+
+
+@dataclass(frozen=True)
+class EpisodeLimits:
+    max_ticks: int
+    no_touch_timeout_seconds: float | None
+
+
+def checkpoint_episode_limits(path: Path, payload: dict) -> EpisodeLimits:
+    """Recover training limits, with defaults for older checkpoint formats."""
+    kind = checkpoint_kind(path)
+    if kind == "gaifo":
+        config, default_ticks = payload.get("config", {}), 1_000_000
+    elif kind == "deep":
+        config, default_ticks = payload.get("arguments", {}), 36_000
+    else:
+        config = payload.get("config", {})
+        default_ticks = 36_000 if config else 4096
+    if not isinstance(config, dict):
+        raise ValueError(f"invalid checkpoint episode settings in {path}")
+    max_ticks = config.get("max_ticks", default_ticks)
+    seconds = config.get("no_touch_timeout", 30.0)
+    if type(max_ticks) is not int or max_ticks < 1:
+        raise ValueError(f"invalid checkpoint max ticks in {path}")
+    if seconds is not None and (
+        not isinstance(seconds, (int, float))
+        or not math.isfinite(seconds) or seconds <= 0
+    ):
+        raise ValueError(f"invalid checkpoint no-touch timeout in {path}")
+    return EpisodeLimits(max_ticks, seconds)
 
 
 class CheckpointRegistry:
@@ -405,7 +437,9 @@ def load_policy_checkpoint(
         )
 
     if kind == "deep":
-        return load_deep_policy(path, payload, env)
+        policy, signature = load_deep_policy(path, payload, env)
+        policy.episode_limits = checkpoint_episode_limits(path, payload)
+        return policy, signature
     if kind == "gaifo":
         architecture = config.get("architecture")
         if architecture not in (
@@ -435,7 +469,10 @@ def load_policy_checkpoint(
             None if checkpoint.architecture == BASIC_POLICY_ARCHITECTURE
             else checkpoint.architecture
         )
-        policy_env = checkpoint_policy_environment(env, policy_state, path)
+        delay_steps = basic_action_delay_steps(payload, checkpoint.observation_size, env)
+        policy_env = checkpoint_policy_environment(
+            QueuedActionEnv(env, delay_steps) if delay_steps else env, policy_state, path,
+        )
         if architecture is None:
             policy, _ = build_policy_and_critic(
                 policy_env, argparse.Namespace(
@@ -452,8 +489,10 @@ def load_policy_checkpoint(
                     gru=architecture == GAIFO_GRU_ARCHITECTURE,
                 ),
             )
+        policy.action_delay_steps = delay_steps
 
     policy.load_state_dict(policy_state)
+    policy.episode_limits = checkpoint_episode_limits(path, payload)
     signature = (kind, hidden, architecture, layers)
     if architecture is None:
         signature = (*signature, checkpoint.policy_gru_layers)
@@ -462,10 +501,24 @@ def load_policy_checkpoint(
     return policy.eval().requires_grad_(False), signature
 
 
+def basic_action_delay_steps(payload: dict, input_size: int, env) -> int:
+    """Use saved timing, or infer queue width for bare BASIC policy snapshots."""
+    config = payload.get("config", {})
+    native_size = env.single_observation_space.shape[0]
+    width = len(ACTION_NVECS)
+    if "action_delay_steps" in config:
+        steps = config["action_delay_steps"]
+        if not isinstance(steps, int) or steps < 0 or input_size != native_size + steps * width:
+            raise ValueError("checkpoint action delay does not match its policy input width")
+        return steps
+    extra = input_size - native_size
+    return extra // width if not config and extra > 0 and extra % width == 0 else 0
+
+
 def checkpoint_policy_environment(
     env: CARLTorchVectorEnv, state: dict, path: Path,
 ):
-    """Require the network's saved input width to match native CARL."""
+    """Require the network's saved input width to match the viewer observation."""
     foot = state.get("foot.model.0.weight")
     if not isinstance(foot, th.Tensor) or foot.ndim != 2:
         raise ValueError(f"checkpoint has no supported policy encoder: {path}")
@@ -494,7 +547,22 @@ def load_match(
     orange, orange_signature = load_policy_checkpoint(orange_path, base, frameskip, hidden_size)
     if blue_signature != orange_signature and "deep" not in (blue_kind, orange_kind):
         raise ValueError("selected policies use different trainer architectures")
-    return base, blue, orange
+    blue_delay = getattr(blue, "action_delay_steps", 0)
+    orange_delay = getattr(orange, "action_delay_steps", 0)
+    if blue_delay != orange_delay:
+        raise ValueError("selected policies use different reaction times")
+    return QueuedActionEnv(base, blue_delay) if blue_delay else base, blue, orange
+
+
+def configure_match_timing(base: CARLTorchVectorEnv, blue: nn.Module, args: argparse.Namespace) -> None:
+    """Use the blue checkpoint's episode limits, unless the viewer overrides them."""
+    limits = blue.episode_limits
+    seconds = (limits.no_touch_timeout_seconds if args.no_touch_timeout is None
+               else args.no_touch_timeout)
+    base._env.max_ticks = limits.max_ticks if args.max_ticks is None else args.max_ticks
+    base._env.no_touch_timeout_ticks = (
+        math.ceil(seconds * carl.PHYS_TICKS_PER_SECOND) if seconds else 0
+    )
 
 
 def raw_state(environment: CARLTorchVectorEnv) -> th.Tensor:
@@ -559,7 +627,7 @@ def render_frame(
     }
 
 
-def reset_observation(env: CARLTorchVectorEnv, kickoff: bool):
+def reset_observation(env: CARLTorchVectorEnv | QueuedActionEnv, kickoff: bool):
     """Reset via demonstration states or a plain random kickoff."""
     if not kickoff:
         return env.reset()
@@ -592,7 +660,7 @@ def simulate(
             n_orange=args.team_size,
             seed=args.seed,
             frameskip=args.frameskip,
-            max_ticks=args.max_ticks,
+            max_ticks=args.max_ticks or 4096,
             normalize=True,
             synchronize=True,
             reset_state_provider=reset_provider,
@@ -601,6 +669,7 @@ def simulate(
         env, blue, orange = load_match(
             blue_path, orange_path, base, args.frameskip, args.hidden_size,
         )
+        configure_match_timing(base, blue, args)
         observation = env.reset()
         blue_state = blue.initial_state(args.team_size)
         orange_state = orange.initial_state(args.team_size)
@@ -617,6 +686,7 @@ def simulate(
                         pending[0], pending[1], base, args.frameskip,
                         args.hidden_size,
                     )
+                    configure_match_timing(base, next_blue, args)
                 except Exception as error:
                     state.publish({"error": f"{type(error).__name__}: {error}"})
                 else:
@@ -817,7 +887,14 @@ def parse_args() -> argparse.Namespace:
         "--policy-hidden", "--hidden-size", dest="hidden_size",
         type=int, metavar="POLICY_HIDDEN",
     )
-    parser.add_argument("--max-ticks", type=int, default=4096)
+    parser.add_argument(
+        "--max-ticks", type=int,
+        help="match duration in physics ticks (default: blue checkpoint's training limit)",
+    )
+    parser.add_argument(
+        "--no-touch-timeout", type=float, metavar="SECONDS",
+        help="seconds since any ball touch before reset (default: blue checkpoint; 0 disables)",
+    )
     parser.add_argument("--reset-state-limit", type=int, default=4096)
     parser.add_argument(
         "--reset-corpus-limit", type=int, default=200_000,
@@ -834,8 +911,13 @@ def parse_args() -> argparse.Namespace:
                            f"pro_{args.team_size}v{args.team_size}_fs4")
     if (args.blue is None) != (args.orange is None):
         parser.error("--blue and --orange must be provided together")
-    if args.frameskip < 1 or args.max_ticks < 1 or args.reset_state_limit < 1:
+    if (args.frameskip < 1 or (args.max_ticks is not None and args.max_ticks < 1)
+            or args.reset_state_limit < 1):
         parser.error("frame, episode, and replay limits must be positive")
+    if args.no_touch_timeout is not None and (
+        not math.isfinite(args.no_touch_timeout) or args.no_touch_timeout < 0
+    ):
+        parser.error("no-touch timeout must be non-negative and finite")
     if args.reset_corpus_limit < 0 or 0 < args.reset_corpus_limit < 8:
         parser.error("reset corpus limit must be zero or at least eight frames")
     if args.hidden_size is not None and args.hidden_size < 1:

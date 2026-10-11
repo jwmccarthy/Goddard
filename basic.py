@@ -53,6 +53,7 @@ from jarl.store import RolloutBuffer
 from jarl.transform import GAE, TeamSpirit
 
 from action_codec import enable_grounded_aerial_controls
+from action_delay import QueuedActionEnv, reaction_delay_steps
 from reward_spec import RewardSpec
 from replay_resets import (
     ReplayResetProvider, load_demonstration_reset_frames, reset_index_dataset,
@@ -281,7 +282,8 @@ def configure_starting_checkpoint(
         arguments.checkpoint_observation_size = checkpoint.observation_size
 
         if arguments.resume_checkpoint is not None:
-            saved_frameskip = payload.get("config", {}).get("frameskip")
+            config = payload.get("config", {})
+            saved_frameskip = config.get("frameskip")
             if getattr(arguments, "frameskip", None) is None:
                 # Older BASIC checkpoints did not save their default of 8.
                 arguments.frameskip = 8 if saved_frameskip is None else saved_frameskip
@@ -289,6 +291,21 @@ def configure_starting_checkpoint(
                 raise ValueError(
                     f"--frameskip must match the checkpoint ({saved_frameskip}) when resuming"
                 )
+            saved_reaction = config.get("reaction_time_ms", 0.0)
+            saved_delay = config.get("action_delay_steps", 0)
+            if reaction_delay_steps(saved_reaction, arguments.frameskip) != saved_delay:
+                raise ValueError("checkpoint reaction time does not match its action delay")
+            requested = getattr(arguments, "reaction_time_ms", None)
+            if requested is None:
+                arguments.reaction_time_ms = saved_reaction
+            elif reaction_delay_steps(requested, arguments.frameskip) != saved_delay:
+                raise ValueError(
+                    "--reaction-time-ms must match the checkpoint when resuming"
+                )
+        elif getattr(arguments, "reaction_time_ms", None) is None:
+            arguments.reaction_time_ms = payload.get("config", {}).get(
+                "reaction_time_ms", 0.0,
+            )
 
         if arguments.start_kl_coef is None and resumed_reference:
             arguments.start_kl_coef = payload.get("config", {}).get(
@@ -299,6 +316,8 @@ def configure_starting_checkpoint(
         arguments.hidden_size = 256
     if getattr(arguments, "frameskip", None) is None:
         arguments.frameskip = 4
+    if getattr(arguments, "reaction_time_ms", None) is None:
+        arguments.reaction_time_ms = 0.0
     if source is None:
         arguments.policy_architecture = BASIC_POLICY_ARCHITECTURE
     (
@@ -317,6 +336,17 @@ def configure_starting_checkpoint(
             if arguments.resume_checkpoint is not None else False
         )
     return starting, resumed_reference
+
+
+def load_starting_policy(policy: MultiCategoricalPolicy, checkpoint: PolicyCheckpoint) -> None:
+    """Initialize a delayed policy from native weights with neutral queue inputs."""
+    state = checkpoint.state
+    key = "foot.model.0.weight"
+    old = state[key]
+    new = policy.foot.model[0].weight
+    if old.shape[1] < new.shape[1]:
+        state = {**state, key: nn.functional.pad(old, (0, new.shape[1] - old.shape[1]))}
+    policy.load_state_dict(state)
 
 
 class ReferenceLogitsCapture(CaptureBase):
@@ -497,6 +527,12 @@ def parse_arguments() -> argparse.Namespace:
         "--frameskip", type=int, default=None,
         help="physics ticks per policy action (default: 4; inherited on resume)",
     )
+    parser.add_argument(
+        "--reaction-time-ms", "--action-delay-ms", type=float, default=None,
+        metavar="MS",
+        help="delay queued actions by at least MS milliseconds, rounded up to whole "
+             "policy steps (default: 0; inherited on resume)",
+    )
     parser.add_argument("--max-ticks",                  type=int,   default=36_000)
     parser.add_argument(
         "--no-touch-timeout",
@@ -673,6 +709,7 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
     ]
     if invalid:
         raise ValueError(f"Arguments must be positive: {', '.join(invalid)}")
+    reaction_delay_steps(arguments.reaction_time_ms, arguments.frameskip)
     if (
         getattr(arguments, "policy_architecture", BASIC_POLICY_ARCHITECTURE)
         != GAIFO_ARCHITECTURE
@@ -883,6 +920,16 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
                 total, count = self._reward_diagnostics.get(name, (0.0, 0))
                 self._reward_diagnostics[name] = total + sum(values), count + len(values)
         return env_step
+
+    @torch.no_grad()
+    def after_update(self, timesteps: int) -> None:
+        super().after_update(timesteps)
+        if self.state is not None:
+            self.state.zero_()
+        for capture in self.captures:
+            if isinstance(capture, (RecurrentCriticCapture, ReferenceLogitsCapture)):
+                if capture.state is not None:
+                    capture.state.zero_()
 
     def _record_diagnostics(self, env_step, learner_mask: torch.Tensor) -> None:
         if self._diagnostics is None or self._touch_steps is None:
@@ -1178,6 +1225,10 @@ def build_ppo(
             "critic_gru_layers": critic_gru_layers,
             "start_kl_coef": arguments.start_kl_coef,
             "frameskip": arguments.frameskip,
+            "reaction_time_ms": getattr(arguments, "reaction_time_ms", 0.0),
+            "action_delay_steps": reaction_delay_steps(
+                getattr(arguments, "reaction_time_ms", 0.0), arguments.frameskip,
+            ),
             "sparse": arguments.sparse,
         },
     }
@@ -1186,7 +1237,7 @@ def build_ppo(
 def build_training_environment(
     arguments: argparse.Namespace,
     reset_provider: SyntheticMatchResetProvider,
-) -> CARLTorchVectorEnv:
+) -> CARLTorchVectorEnv | QueuedActionEnv:
     saved_size = getattr(arguments, "checkpoint_observation_size", None)
     environment = enable_grounded_aerial_controls(CARLTorchVectorEnv(
         n_sim=arguments.num_simulations,
@@ -1202,14 +1253,21 @@ def build_training_environment(
         normalize=arguments.normalize,
         discrete_actions=True,
     ))
-    actual_size = environment.single_observation_space.shape[0]
-    if saved_size is not None and saved_size != actual_size:
+    native_size = environment.single_observation_space.shape[0]
+    delay_steps = reaction_delay_steps(
+        getattr(arguments, "reaction_time_ms", 0.0), arguments.frameskip,
+    )
+    delayed_size = native_size + delay_steps * len(environment.single_action_space.nvec)
+    # A fresh run may warm-start from a native checkpoint, widening only its
+    # first policy layer. A resume must retain the exact trained input layout.
+    compatible = (native_size, delayed_size) if arguments.start_checkpoint else (delayed_size,)
+    if saved_size is not None and saved_size not in compatible:
         environment.close()
         raise ValueError(
             f"checkpoint policy needs {saved_size} observation features, "
-            f"but CARL provides {actual_size}"
+            f"but CARL provides {native_size}"
         )
-    return environment
+    return QueuedActionEnv(environment, delay_steps) if delay_steps else environment
 
 
 def main() -> None:
@@ -1264,7 +1322,7 @@ def main() -> None:
             "critic": critic,
         }
         if starting is not None:
-            policy.load_state_dict(starting.state)
+            load_starting_policy(policy, starting)
         elif arguments.resume_checkpoint is not None:
             TrainingCheckpointer.load_modules(
                 arguments.resume_checkpoint,

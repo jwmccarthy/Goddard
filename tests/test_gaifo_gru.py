@@ -26,6 +26,7 @@ from gaifo import (
     restore_training_checkpoint,
     validate_resume_args,
 )
+from jarl.collect import RecurrentCriticCapture
 from jarl.learn import PPOConfig, PPOLoss
 from jarl.modules import GRU, MLP
 from jarl.runtime import Clock
@@ -240,6 +241,35 @@ class GAIFOGruTests(unittest.TestCase):
                     critic_extra = critic.head.model[0] if gru else critic.body.model[2]
                     self.assertGreater(policy_extra.weight.grad.abs().sum().item(), 0)
                     self.assertGreater(critic_extra.weight.grad.abs().sum().item(), 0)
+
+    def test_recurrent_policy_and_critic_start_each_rollout_from_zero(self):
+        args = self.args(True)
+        policy = build_policy(self.env, args)
+        critic = build_critic(self.env, args)
+        buffer = RolloutBuffer(1, self.env.n_envs, self.env.device)
+        runner = build_runner(self.env, policy, critic, buffer, args)
+        critic_capture = next(
+            capture for capture in runner.captures
+            if isinstance(capture, RecurrentCriticCapture)
+        )
+        runner.reset()
+        runner.step()
+        self.assertEqual(self.env.t, 1)  # No episode boundary before the update.
+        self.assertGreater(runner.state.abs().sum().item(), 0)
+        self.assertGreater(critic_capture.state.abs().sum().item(), 0)
+
+        buffer.finish()
+        buffer.clear()  # The trainer clears the completed rollout before after_update.
+        runner.after_update(self.env.n_envs)
+        th.testing.assert_close(runner.state, th.zeros_like(runner.state))
+        th.testing.assert_close(
+            critic_capture.state, th.zeros_like(critic_capture.state),
+        )
+
+        runner.step()
+        steps = buffer.finish().steps
+        for name in ("policy_state", "critic_state"):
+            th.testing.assert_close(steps[name][0], th.zeros_like(steps[name][0]))
 
     def test_checkpoint_architecture_and_resume(self):
         for gru, layers in ((False, 1), (True, 1), (False, 2), (True, 2)):

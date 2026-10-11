@@ -14,6 +14,7 @@ from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
 from gymnasium.spaces import Box, MultiDiscrete
 from http.server import ThreadingHTTPServer
 
+from action_delay import NEUTRAL_ACTION, QueuedActionEnv
 from basic import BASIC_POLICY_ARCHITECTURE, build_policy_and_critic
 from deep import (
     ContrastiveLearner, parse_arguments as deep_arguments,
@@ -26,9 +27,9 @@ from gaifo import (
 )
 from replay_layout import team_live_observation_size
 from watch_checkpoints import (
-    CheckpointRegistry, SpectatorState, checkpoint_policy_environment, load_match,
-    deep_watch_goal, load_policy_checkpoint, make_handler, parse_args,
-    render_frame,
+    CheckpointRegistry, SpectatorState, checkpoint_policy_environment,
+    configure_match_timing, load_match, deep_watch_goal, load_policy_checkpoint,
+    make_handler, parse_args, render_frame,
 )
 
 
@@ -50,6 +51,7 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
         env = DeepEnv()
         arguments = deep_arguments([
             "--goal-kind", "both", "--frameskip", "4",
+            "--max-ticks", "8192", "--no-touch-timeout", "0.25",
             "--actor-width", "16", "--actor-depth", "4",
             "--critic-width", "16", "--critic-depth", "4",
             "--embedding-size", "8",
@@ -73,6 +75,9 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
 
             loaded, signature = load_policy_checkpoint(deep_path, env, 4, None)
             self.assertEqual(signature, ("deep", 139, "both", 16, 4))
+            self.assertEqual((loaded.episode_limits.max_ticks,
+                              loaded.episode_limits.no_touch_timeout_seconds),
+                             (8192, .25))
             target = deep_watch_goal(observation, "both")
             th.testing.assert_close(target[0, :3], th.tensor([
                 0.0, 5120 / 6000, 321.3875 / 2076,
@@ -195,6 +200,8 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
         with patch.object(sys, "argv", ["watch_checkpoints.py"]):
             args = parse_args()
         self.assertEqual(args.replay_dir.name, "pro_1v1_fs4")
+        self.assertIsNone(args.max_ticks)
+        self.assertIsNone(args.no_touch_timeout)
         with patch.object(sys, "argv", ["watch_checkpoints.py", "--team-size", "3"]):
             self.assertEqual(parse_args().replay_dir.name, "pro_3v3_fs4")
 
@@ -305,6 +312,55 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
 
         self.assertNotEqual(signatures[0], signatures[1])
 
+    def test_live_match_uses_blue_checkpoint_timing_or_explicit_overrides(self):
+        class Native:
+            max_ticks = 4096
+            no_touch_timeout_ticks = 0
+
+        class Env(FakeEnv):
+            n_cars = 2
+            _env = Native()
+
+        env = Env()
+        reference = build_policy(
+            env, argparse.Namespace(policy_hidden=16, gru=False),
+        )
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            paths = []
+            for index, (max_ticks, seconds) in enumerate(((100_000, .1), (200_000, .2))):
+                path = Path(directory) / f"gaifo_{index:012d}.pt"
+                th.save({
+                    "config": {
+                        "architecture": GAIFO_ARCHITECTURE,
+                        "policy_hidden": 16, "frameskip": 4,
+                        "max_ticks": max_ticks, "no_touch_timeout": seconds,
+                    },
+                    "policy": reference.state_dict(),
+                }, path)
+                paths.append(path)
+
+            with patch.object(sys, "argv", ["watch_checkpoints.py"]):
+                args = parse_args()
+            _, blue, _ = load_match(paths[0], paths[1], env, 4, None)
+            configure_match_timing(env, blue, args)
+            self.assertEqual((env._env.max_ticks, env._env.no_touch_timeout_ticks),
+                             (100_000, 12))
+
+            # The same live CARL environment is reconfigured when the match changes.
+            _, blue, _ = load_match(paths[1], paths[0], env, 4, None)
+            configure_match_timing(env, blue, args)
+            self.assertEqual((env._env.max_ticks, env._env.no_touch_timeout_ticks),
+                             (200_000, 24))
+
+            with patch.object(sys, "argv", [
+                "watch_checkpoints.py", "--max-ticks", "512",
+                "--no-touch-timeout", "0",
+            ]):
+                args = parse_args()
+            configure_match_timing(env, blue, args)
+            self.assertEqual((env._env.max_ticks, env._env.no_touch_timeout_ticks),
+                             (512, 0))
+
     def test_viewer_only_pairs_native_gaifo_policies(self):
         class NativeEnv(FakeEnv):
             n_cars = 2
@@ -385,6 +441,70 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "trained at frameskip 8"):
                             load_policy_checkpoint(training, env, 4, None)
                         load_policy_checkpoint(training, env, 8, None)
+
+    def test_delayed_basic_training_and_raw_snapshots_play_with_their_action_queue(self):
+        class PlaybackEnv:
+            n_envs = n_cars = 2
+            device = th.device("cpu")
+            action_codec = CARLActionCodec()
+            single_observation_space = Box(-np.inf, np.inf, (139,), np.float32)
+            single_action_space = MultiDiscrete(ACTION_NVECS)
+            reset_state_provider = None
+
+            def reset(self):
+                self.executed = []
+                return th.zeros(2, 139)
+
+            def step(self, action):
+                self.executed.append(action.clone())
+                return (th.zeros(2, 139), th.zeros(2), th.zeros(2, dtype=th.bool),
+                        th.zeros(2, dtype=th.bool), {})
+
+            def close(self):
+                pass
+
+        base = PlaybackEnv()
+        delayed = QueuedActionEnv(base, 2)
+        policy, _ = build_policy_and_critic(delayed, argparse.Namespace(hidden_size=16))
+        native, _ = build_policy_and_critic(base, argparse.Namespace(hidden_size=16))
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            training = Path(directory) / "training_latest.pt"
+            snapshot = Path(directory) / "actor_critic_final.pt"
+            native_path = Path(directory) / "policy_000000000001.pt"
+            th.save({
+                "modules": {"policy": policy.state_dict()},
+                "config": {
+                    "frameskip": 4, "policy_architecture": BASIC_POLICY_ARCHITECTURE,
+                    "action_delay_steps": 2, "reaction_time_ms": 50.,
+                },
+            }, training)
+            th.save(policy.state_dict(), snapshot)
+            th.save(native.state_dict(), native_path)
+
+            for path in (training, snapshot):
+                with self.subTest(path=path):
+                    loaded, _ = load_policy_checkpoint(path, base, 4, None)
+                    self.assertEqual(loaded.action_delay_steps, 2)
+                    env, blue, orange = load_match(path, path, base, 4, None)
+                    self.assertIsInstance(env, QueuedActionEnv)
+                    observation = env.reset()
+                    self.assertEqual(observation.shape, (2, 153))
+                    with th.no_grad():
+                        first = blue.act(observation[:1], blue.initial_state(1), deterministic=True)
+                        second = orange.act(observation[1:], orange.initial_state(1), deterministic=True)
+                    queued = th.cat((first.action, second.action))
+                    following, *_ = env.step(queued)
+                    th.testing.assert_close(base.executed[0], th.tensor(NEUTRAL_ACTION).expand(2, -1))
+                    th.testing.assert_close(following[:, -7:],
+                                            (queued - th.tensor(NEUTRAL_ACTION)).float())
+
+            with self.assertRaisesRegex(ValueError, "different reaction times"):
+                load_match(training, native_path, base, 4, None)
+            mismatched = th.load(training, weights_only=True)
+            mismatched["config"]["action_delay_steps"] = 1
+            th.save(mismatched, training)
+            with self.assertRaisesRegex(ValueError, "action delay does not match"):
+                load_policy_checkpoint(training, base, 4, None)
 
     def test_deeper_basic_snapshots_and_training_checkpoints_are_watchable(self):
         env = FakeEnv()

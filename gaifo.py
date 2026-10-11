@@ -6013,6 +6013,19 @@ def build_discriminator(
     return model(**options)
 
 
+class RecurrentRolloutRunner(Runner):
+    """Start each post-update rollout with fresh policy and critic memory."""
+
+    @th.no_grad()
+    def after_update(self, env_steps: int) -> None:
+        super().after_update(env_steps)
+        if self.state is not None:
+            self.state.zero_()
+        for capture in self.captures:
+            if isinstance(capture, RecurrentCriticCapture) and capture.state is not None:
+                capture.state.zero_()
+
+
 def build_runner(
     env, policy, critic, buffer, args,
     gameplay: GameplayDiagnostics | None = None,
@@ -6035,7 +6048,8 @@ def build_runner(
         flip_state_features=getattr(args, "flip_state_features", False),
         replay_expert=expert, reset_provider=provider,
     ))
-    return Runner(env, policy, buffer, captures=captures)
+    runner_type = RecurrentRolloutRunner if args.gru else Runner
+    return runner_type(env, policy, buffer, captures=captures)
 
 
 def build_ppo_sampler(args):

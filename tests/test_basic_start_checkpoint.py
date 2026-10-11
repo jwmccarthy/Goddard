@@ -13,8 +13,11 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 from carl.gymnasium import CARLTorchVectorEnv
+from carl.gymnasium.action import ACTION_NVECS
 from gymnasium.spaces import Box, MultiDiscrete
+from jarl.collect import RecurrentCriticCapture
 
+from action_delay import NEUTRAL_ACTION, QueuedActionEnv, reaction_delay_steps
 from basic import (
     BASIC_POLICY_ARCHITECTURE,
     DEFAULT_START_KL_COEF,
@@ -26,6 +29,7 @@ from basic import (
     build_ppo,
     build_training_environment,
     configure_starting_checkpoint,
+    load_starting_policy,
     load_policy_checkpoint,
     parse_arguments,
     validate_arguments,
@@ -52,13 +56,15 @@ class FakeEnv:
 
     def reset(self):
         self.t = 0
+        self.actions = []
         return torch.randn(self.n_envs, 51) * 0.1
 
     def step(self, action):
         self.t += 1
+        self.actions.append(action.clone())
         self.reward.last_touches = torch.zeros(self.n_sim, 2, dtype=torch.bool)
         self.reward.last_score_delta = torch.zeros(self.n_sim)
-        done = torch.full((self.n_envs,), self.t == 2)
+        done = torch.full((self.n_envs,), self.t == getattr(self, "done_at", 2))
         return (
             torch.randn(self.n_envs, 51) * 0.1,
             torch.zeros(self.n_envs),
@@ -66,6 +72,9 @@ class FakeEnv:
             torch.zeros_like(done),
             {},
         )
+
+    def close(self):
+        pass
 
 
 def checkpoint_args(start=None, resume=None, hidden=None, kl=None):
@@ -133,6 +142,120 @@ class BasicStartingCheckpointTests(unittest.TestCase):
             explicit = resumed("--frameskip", "2")
             configure_starting_checkpoint(explicit)
             self.assertEqual(explicit.frameskip, 2)
+
+    def test_reaction_time_rounding_and_resume_keep_the_policy_input_layout(self):
+        self.env.single_action_space = MultiDiscrete(ACTION_NVECS)
+        delayed = QueuedActionEnv(self.env, reaction_delay_steps(100, 4))
+        policy, critic = build_policy_and_critic(delayed, argparse.Namespace(hidden_size=16))
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            path = Path(directory) / "training_latest.pt"
+            torch.save({
+                "modules": {"policy": policy.state_dict(), "critic": critic.state_dict()},
+                "optimizers": {},
+                "config": {
+                    "frameskip": 4, "reaction_time_ms": 100., "action_delay_steps": 3,
+                },
+            }, path)
+
+            def resumed(*flags):
+                with patch.object(sys, "argv", [
+                    "basic.py", "--resume-checkpoint", str(path), *flags,
+                ]):
+                    arguments = parse_arguments()
+                configure_starting_checkpoint(arguments)
+                return arguments
+
+            args = resumed()
+            self.assertEqual(args.reaction_time_ms, 100.)
+            self.assertEqual(reaction_delay_steps(args.reaction_time_ms, args.frameskip), 3)
+            self.assertEqual(resumed("--reaction-time-ms", "90").reaction_time_ms, 90.)
+            with self.assertRaisesRegex(ValueError, "--reaction-time-ms must match"):
+                resumed("--reaction-time-ms", "34")
+
+            args.num_simulations = 2
+            args.seed, args.max_ticks, args.no_touch_timeout = 0, 100, 30
+            args.reward_scale, args.normalize = 1, True
+            with patch("basic.CARLTorchVectorEnv", return_value=self.env):
+                built = build_training_environment(args, None)
+            self.assertIsInstance(built, QueuedActionEnv)
+            self.assertEqual(built.single_observation_space.shape, (72,))
+
+    def test_native_warm_start_widens_encoder_for_pending_actions(self):
+        self.env.single_action_space = MultiDiscrete(ACTION_NVECS)
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            for architecture in (
+                BASIC_POLICY_ARCHITECTURE, GAIFO_ARCHITECTURE, GAIFO_GRU_ARCHITECTURE,
+            ):
+                with self.subTest(architecture=architecture):
+                    original, _ = build_policy_and_critic(
+                        self.env, argparse.Namespace(hidden_size=16), architecture,
+                    )
+                    path = Path(directory) / "policy_000000000000.pt"
+                    torch.save(original.state_dict(), path)
+                    args = checkpoint_args(start=path)
+                    args.reaction_time_ms = 100.
+                    starting, _ = configure_starting_checkpoint(args)
+                    args.num_simulations = 2
+                    args.seed, args.max_ticks, args.no_touch_timeout = 0, 100, 30
+                    args.reward_scale, args.normalize = 1, True
+                    with patch("basic.CARLTorchVectorEnv", return_value=self.env):
+                        delayed = build_training_environment(args, None)
+                    policy, _ = build_policy_and_critic(
+                        delayed, args, args.policy_architecture,
+                    )
+                    load_starting_policy(policy, starting)
+                    torch.testing.assert_close(
+                        policy.foot.model[0].weight[:, :51], original.foot.model[0].weight,
+                    )
+                    torch.testing.assert_close(
+                        policy.foot.model[0].weight[:, 51:], torch.zeros(16, 21),
+                    )
+                    observation = delayed.reset()
+                    with torch.no_grad():
+                        actual = policy.act(
+                            observation, policy.initial_state(4), deterministic=True,
+                        )
+                        expected = original.act(
+                            observation[:, :51], original.initial_state(4), deterministic=True,
+                        )
+                    torch.testing.assert_close(actual.action, expected.action)
+                    torch.testing.assert_close(actual.log_prob, expected.log_prob)
+
+    def test_ppo_records_enqueued_actions_with_visible_history_and_original_gae(self):
+        self.env.single_action_space = MultiDiscrete(ACTION_NVECS)
+        self.env.done_at = 4
+        env = QueuedActionEnv(self.env, delay_steps=3)
+        args = ppo_args(BASIC_POLICY_ARCHITECTURE)
+        args.reaction_time_ms = 100.
+        args.start_kl_coef = 0.
+        policy, critic = build_policy_and_critic(env, args)
+        reward = DiagnosticRewardSpec(normalize=False)
+        self.env.reward = reward
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            runner, buffer, learner, _, objects = build_ppo(
+                env, policy, critic, reward, args, Path(directory) / "snapshots",
+            )
+            self.assertEqual(objects["config"]["action_delay_steps"], 3)
+            runner.reset()
+            for _ in range(args.rollout_steps):
+                runner.step()
+            collected = buffer.finish()
+            steps = collected.steps
+            self.assertEqual(steps["observation"].shape, (4, 4, 72))
+            neutral = torch.tensor(NEUTRAL_ACTION).expand(4, -1)
+            for executed in self.env.actions[:3]:
+                torch.testing.assert_close(executed, neutral)
+            torch.testing.assert_close(self.env.actions[3], steps["action"][0])
+            torch.testing.assert_close(
+                steps["observation"][1, :, -7:], (steps["action"][0] - neutral).float(),
+            )
+            with torch.no_grad():
+                evaluation = policy.evaluate_actions(
+                    steps["observation"][0], steps["action"][0], steps["policy_state"][0],
+                )
+            torch.testing.assert_close(evaluation.log_prob, steps["old_log_prob"][0])
+            metrics = learner.update(collected)["PPO"]
+            self.assertTrue(np.isfinite(metrics["policy_loss"]))
 
     def test_cosine_learning_rate_updates_both_optimizers_and_resumes(self):
         args = ppo_args(BASIC_POLICY_ARCHITECTURE)
@@ -461,6 +584,59 @@ class BasicStartingCheckpointTests(unittest.TestCase):
                             load_policy_checkpoint(tampered)
                         else:
                             configure_starting_checkpoint(checkpoint_args(resume=tampered))
+
+    def test_rollout_boundary_resets_learner_opponent_critic_and_reference_states(self):
+        self.env.done_at = 100
+        args = ppo_args(BASIC_POLICY_ARCHITECTURE)
+        args.rollout_steps = 2
+        args.self_play_current = 0.0  # Include frozen opponents in every match.
+        args.snapshot_interval = 1
+        policy, critic = build_policy_and_critic(self.env, args)
+        reference = copy.deepcopy(policy).eval().requires_grad_(False)
+        reward = DiagnosticRewardSpec(normalize=False)
+        self.env.reward = reward
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            runner, buffer, learner, _, _ = build_ppo(
+                self.env, policy, critic, reward, args,
+                Path(directory) / "snapshots", reference,
+            )
+            critic_capture = next(
+                capture for capture in runner.captures
+                if isinstance(capture, RecurrentCriticCapture)
+            )
+            reference_capture = next(
+                capture for capture in runner.captures
+                if isinstance(capture, ReferenceLogitsCapture)
+            )
+            runner.reset()
+            for _ in range(args.rollout_steps):
+                runner.step()
+            self.assertEqual(self.env.t, 2)  # All episodes continue across the update.
+            for state in (runner.state, critic_capture.state, reference_capture.state):
+                self.assertGreater(state.abs().sum().item(), 0)
+            self.assertTrue((~runner.matchmaker.learner_mask).any())
+            self.assertGreater(
+                runner.state[~runner.matchmaker.learner_mask].abs().sum().item(), 0,
+            )
+
+            learner.update(buffer.finish())
+            buffer.clear()
+            runner.after_update(self.env.n_envs * args.rollout_steps // 2)
+            self.assertEqual(runner.opponent_pool.ids, (0, 1))
+            self.assertEqual(runner.matchmaker.historical_ids, (1,))
+            for state in (runner.state, critic_capture.state, reference_capture.state):
+                torch.testing.assert_close(state, torch.zeros_like(state))
+
+            runner.step()
+            steps = buffer.finish().steps
+            for name in ("policy_state", "critic_state"):
+                torch.testing.assert_close(steps[name][0], torch.zeros_like(steps[name][0]))
+            with torch.no_grad():
+                features, _ = reference.body_features(
+                    steps["observation"][0], reference.initial_state(self.env.n_envs),
+                )
+                expected = reference.head(features)
+            torch.testing.assert_close(steps["reference_logits"][0], expected)
 
     def test_start_and_resume_require_native_carl_observation_width(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:

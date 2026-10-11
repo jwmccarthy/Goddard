@@ -184,18 +184,54 @@ opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
 `--aerial-touch-reward-weight` (default `0.5`).
 
-GAIFO, BASIC, deep training, and the checkpoint viewer use CARL's native
-observation and a shared project action mask. Its final two observation fields
-report whether the focal car can jump or flip and how much dodge time remains.
+GAIFO, BASIC without reaction time, deep training, and the checkpoint viewer
+use CARL's native observation and a shared project action mask. The last two
+**native** observation fields report whether the focal car can jump or flip
+and how much dodge time remains.
 The mask permits grounded pitch and air roll, while still masking expired
 airborne dodges, including during PPO updates. New BASIC runs use frameskip 4;
 checkpoint resumes inherit their saved cadence (8 for older BASIC checkpoints).
 Checkpoints must use the matching native observation width (139/193/247 for
-1v1/2v2/3v3); jump-age-extended policies are not supported.
+1v1/2v2/3v3); jump-age-extended policies are not supported. BASIC reaction-time
+policies append their pending actions to the native observation instead.
 
 `watch_checkpoints.py --team-size 2` (or `3`) views team checkpoints with the
 corresponding replay resets; `watch_gaifo_experts.py` reads the team size from
-the checkpoint and inspects its recorded POVs.
+the checkpoint and inspects its recorded POVs. The viewer uses the blue
+checkpoint's saved episode tick limit and no-touch timeout, updating both when
+switching matches. Override them with `--max-ticks` and `--no-touch-timeout`
+(seconds; `0` disables no-touch resets). Older checkpoints without timing
+metadata use training defaults where known. `--sample` watches stochastic
+actions like GAIFO training; otherwise the viewer takes the most likely action.
+GAIFO's `timeout frac` is the share of finished episodes that went a full
+no-touch interval after **either team's last ball touch**; an episode can have
+earlier touches and still end this way.
+
+### BASIC queued-action reaction time
+
+Add `--reaction-time-ms 100` to a BASIC training command to delay execution of
+each chosen action by at least 100 ms. At the default frameskip 4, that is
+three policy steps (100 ms at 120 physics ticks/s); at frameskip 8, it rounds
+up to two steps. The default is zero delay. On each step, the oldest queued
+action controls the car, and the newly chosen action joins the queue. Pending
+actions are appended to each actor's observation in execution order, with
+neutral controls encoded as zeros. New episodes begin with neutral commands;
+queues are cleared independently when matches end, including CARL autoresets.
+Historical opponents use the same reaction time as the learner.
+
+PPO records and evaluates the **queued** action at the decision observation;
+the reward comes from the action executed on that step. The pending queue is
+part of the policy and critic observation, so ordinary GAE can credit later
+outcomes to earlier decisions. Terminal bootstrap observations retain their
+pending queue before autoreset clears it. `--resume-checkpoint` inherits the
+original delay and rejects a different number of queue steps. To begin a new
+delayed run from a native BASIC or GAIFO policy, use `--start-checkpoint`:
+the new input weights for pending actions start at zero. The checkpoint viewer
+recreates the action queue for delayed BASIC checkpoints and policy snapshots.
+
+```bash
+uv run python basic.py --replay-dir parsed_replays/ --reaction-time-ms 100
+```
 
 ## Ranked doubles coverage
 

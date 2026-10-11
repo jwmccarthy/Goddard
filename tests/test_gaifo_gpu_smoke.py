@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -15,7 +16,7 @@ import torch as th
 from carl.gymnasium import CARLTorchVectorEnv
 from gaifo import (
     BLUE_START, ConfidentExpertResetTransform, ExpertSceneDataset,
-    ORANGE_START, POSITION_SCALE, SceneWindowCapture, actor_view,
+    GameplayDiagnostics, ORANGE_START, POSITION_SCALE, SceneWindowCapture, actor_view,
     extract_scene_observations, load_resume_checkpoint, main,
 )
 from jarl.collect import Runner
@@ -24,6 +25,7 @@ from jarl.data.records import PolicyOutput
 from jarl.store import RolloutBuffer
 from replay_layout import team_live_observation_size
 from replay_resets import ReplayResetProvider
+from watch_checkpoints import EpisodeLimits, configure_match_timing
 
 
 @unittest.skipUnless(
@@ -31,6 +33,50 @@ from replay_resets import ReplayResetProvider
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
+    def test_no_touch_timeout_starts_after_either_player_last_touch(self):
+        neutral = th.tensor([1, 1, 1, 0, 0, 1, 0], device="cuda:0").repeat(2, 1)
+        for timeout_ticks in (12, None):
+            with self.subTest(no_touch_timeout_ticks=timeout_ticks):
+                env = CARLTorchVectorEnv(
+                    n_sim=1, n_blue=1, n_orange=1, frameskip=4,
+                    max_ticks=4096,
+                    normalize=True, discrete_actions=True,
+                )
+                gameplay = env.register_reward(GameplayDiagnostics(
+                    1, env.device, no_touch_timeout_steps=3,
+                ))
+                try:
+                    configure_match_timing(
+                        env, SimpleNamespace(episode_limits=EpisodeLimits(
+                            100_000, .1 if timeout_ticks is not None else None,
+                        )), SimpleNamespace(max_ticks=None, no_touch_timeout=None),
+                    )
+                    env.reset()
+                    orange_position = env._state.car_position[0, 1]
+                    orange_forward = env._state.car_forward[0, 1]
+                    ball_position = (orange_position + 110 * orange_forward).clone()
+                    ball_position[2] = 93.15
+                    env.set_ball(
+                        ball_position[None], (-1400 * orange_forward)[None],
+                        th.zeros(1, 3, device=env.device),
+                    )
+                    for step in range(4):
+                        _, _, terminated, truncated, _ = env.step(neutral)
+                        self.assertFalse(terminated.any())
+                        if step == 0:
+                            self.assertEqual(gameplay.last_ego_ball_touch.tolist(),
+                                             [False, True])
+                        if step < 3:
+                            self.assertFalse(truncated.any())
+                    self.assertEqual(bool(truncated.all()), timeout_ticks is not None)
+                    metrics = gameplay.diagnostic_metrics()["Gameplay"]
+                    if timeout_ticks is not None:
+                        self.assertEqual(metrics["timeout_fraction"], 1.0)
+                    else:
+                        self.assertNotIn("timeout_fraction", metrics)
+                finally:
+                    env.close()
+
     def test_one_step_carl_resets_keep_terminal_scenes_and_previous_replay_history(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
