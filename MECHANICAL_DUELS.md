@@ -176,6 +176,12 @@ defaults remain. Team-mode simulation and discriminator
 batch defaults scale down with scene size. Both learning rates stay constant
 unless an end value is supplied; schedules resume from checkpoint settings and
 the restored training step.
+On a scheduled discriminator update, GAIFO first checks held-out accuracy and
+trains only when the weakest measured head is below
+`--discriminator-accuracy-target` (default 0.8). When training is needed, it
+runs every configured `--discriminator-epochs` pass over the available batches;
+it does not stop partway through when accuracy crosses the target. A skipped
+update stays due and is reconsidered on the next rollout.
 
 GAIFO samples ordinary discriminator expert windows uniformly over eligible
 training window starts and recorded player viewpoints. Factorized training

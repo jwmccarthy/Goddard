@@ -523,7 +523,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
         th.testing.assert_close(outcomes[0][3], outcomes[1][3])
         self.assertGreater(outcomes[0][0]["near_loss"].item(), 0.8)
 
-    def test_near_ball_heldout_accuracy_prevents_early_stop_on_far_examples(self):
+    def test_near_ball_heldout_accuracy_is_the_weakest_head_on_far_examples(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             folder = Path(directory)
             rows = np.zeros((32, 161), dtype=np.float32)
@@ -555,7 +555,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertEqual(result["near_heldout_accuracy"], 0.0)
             self.assertEqual(result["heldout_accuracy"], 0.0)
 
-    def test_heldout_examples_are_reused_and_scored_together_within_update(self):
+    def test_heldout_examples_are_reused_for_pre_and_post_update_checks(self):
         class CountingHeads(th.nn.Module):
             factorized = True
 
@@ -600,7 +600,61 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertEqual(heldout.call_count, 1)
             self.assertEqual(near.call_count, 1)
             self.assertEqual(timeline.call_count, 1)
-            self.assertEqual(discriminator.validation_batch_sizes, [4] * 12)
+            self.assertEqual(discriminator.validation_batch_sizes, [4] * 8)
+
+    def test_scheduled_discriminator_update_skips_strong_heads_and_completes_weak_ones(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            folder = Path(directory)
+            rows = np.zeros((32, 161), dtype=np.float32)
+            rows[:, BLUE_START] = rows[:, 30] = 3_000 / 4_108
+            rows[8:13, BLUE_START] = 0
+            for name in ("first", "second"):
+                np.save(folder / f"{name}.npy", rows)
+            expert = ExpertSceneDataset(folder, 2, device="cpu", frame_skip=4, heldout_size=4)
+            discriminator = NearMistakeHeads()
+            optimizer = th.optim.SGD(discriminator.parameters(), lr=0)
+            update = AdaptiveDiscriminatorUpdate(
+                expert=expert, history=None, batch_size=4, epochs=2, noise_std=0,
+                heldout_size=4, accuracy_target=0.8, history_add_size=0,
+                history_mix_fraction=0, max_grad_norm=1, discriminator=discriminator,
+                optimizer=optimizer, loss=SceneDiscriminatorLoss(discriminator),
+                microbatch_size=2, update_interval=2,
+            )
+            rollout = TensorBatch({
+                "scene_window": th.zeros(4, 4, 2, 51),
+                "scene_window_valid": th.ones(4, 4, dtype=th.bool),
+            })
+            with (patch.object(update, "_evaluate", side_effect=(
+                    {"heldout_accuracy": 0.8},  # A healthy weakest head skips training.
+                    {"heldout_accuracy": 0.1},  # A weak head starts a full update.
+                    {"heldout_accuracy": 0.9},  # Above target after the update.
+                    {"heldout_accuracy": 0.1},  # Wait for the rollout interval.
+                    {"heldout_accuracy": 0.1},
+                    {"heldout_accuracy": 0.9},
+                )) as evaluate,
+                  patch.object(optimizer, "step", wraps=optimizer.step) as optimizer_step):
+                _, healthy = update.run(rollout)
+                self.assertEqual(healthy["Discriminator"]["scheduled"], 1)
+                self.assertEqual(healthy["Discriminator"]["updated"], 0)
+                self.assertEqual(healthy["Discriminator"]["minibatches"], 0)
+                self.assertEqual(optimizer_step.call_count, 0)
+
+                _, weak = update.run(rollout)
+                self.assertEqual(weak["Discriminator"]["updated"], 1)
+                # Eight training windows: two four-window batches per epoch.
+                self.assertEqual(weak["Discriminator"]["minibatches"], 4)
+                self.assertEqual(weak["Discriminator"]["heldout_accuracy"], 0.9)
+                self.assertEqual(optimizer_step.call_count, 4)
+                self.assertEqual(evaluate.call_count, 3)
+
+                _, waiting = update.run(rollout)
+                self.assertEqual(waiting["Discriminator"]["scheduled"], 0)
+                self.assertEqual(waiting["Discriminator"]["minibatches"], 0)
+                _, due = update.run(rollout)
+                self.assertEqual(due["Discriminator"]["scheduled"], 1)
+                self.assertEqual(due["Discriminator"]["minibatches"], 4)
+                self.assertEqual(optimizer_step.call_count, 8)
+                self.assertEqual(evaluate.call_count, 6)
 
     def test_flag_defaults_to_unified_and_checkpoint_resume_keeps_mode(self):
         with patch.object(sys, "argv", ["gaifo.py", "--replay-dir", "parsed_replays"]):

@@ -4543,9 +4543,8 @@ class AdaptiveDiscriminatorUpdate:
                 nearest_ball_distance(heldout_generated) <= BALL_NEAR_DISTANCE
             ]
 
-        # Use the same held-out examples to check every minibatch in this update.
-        # Resampling and gathering the full validation set on every check was
-        # nearly as costly as training the discriminator itself.
+        # Compare the weakest held-out head before training and reuse those
+        # examples to report its accuracy after a complete update.
         validation = self._heldout_pairs(
             heldout_generated, heldout_near,
             flat_windows=flat_windows if self.contextual_global else None,
@@ -4565,7 +4564,8 @@ class AdaptiveDiscriminatorUpdate:
             "scheduled": float(scheduled),
         }
 
-        if scheduled and len(train_indices) > 0:
+        if (scheduled and len(train_indices) > 0
+                and evaluation["heldout_accuracy"] < self.accuracy_target):
             sampler = SceneGAIFOMinibatches(
                 self.expert,
                 self.batch_size,
@@ -4618,12 +4618,11 @@ class AdaptiveDiscriminatorUpdate:
             metric_totals: dict[str, float | th.Tensor] = {}
             metric_counts: dict[str, int] = {}
             minibatch_count = 0
-            evaluated_last_batch = False
             callback = self._progress_callback
             if callback is not None:
                 callback.start(self.epochs, self.section)
             try:
-                for group_index, group in enumerate(batches, 1):
+                for group in batches:
                     for sample, selected_loss in group:
                         minibatch_metrics = train_discriminator_minibatch(
                             sample, self.discriminator, self.optimizer, selected_loss,
@@ -4636,20 +4635,7 @@ class AdaptiveDiscriminatorUpdate:
                             metric_totals[key] = metric_totals.get(key, 0.0) + value
                             metric_counts[key] = metric_counts.get(key, 0) + 1
                         minibatch_count += 1
-                    if self.contextual_global and group_index != 1 and group_index % 4:
-                        evaluated_last_batch = False
-                        continue
-                    evaluation = self._evaluate(
-                        heldout_generated, heldout_near, validation=validation,
-                    )
-                    evaluated_last_batch = True
-                    if evaluation["heldout_accuracy"] >= self.accuracy_target:
-                        metrics["updated"] = 1.0
-                        break
-                else:
-                    if minibatch_count > 0:
-                        metrics["updated"] = 1.0
-                if self.contextual_global and minibatch_count and not evaluated_last_batch:
+                if minibatch_count:
                     evaluation = self._evaluate(
                         heldout_generated, heldout_near, validation=validation,
                     )
@@ -4664,6 +4650,7 @@ class AdaptiveDiscriminatorUpdate:
                 if self.reset_miner is not None:
                     self.reset_miner.ready = True
                 self._rollouts_since_update = 0
+                metrics["updated"] = 1.0
                 metrics["minibatches"] = float(minibatch_count)
                 for key, total in metric_totals.items():
                     averaged = total / metric_counts[key]
