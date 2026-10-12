@@ -213,16 +213,18 @@ discriminator imitation reward:
   unchanged. Speed losses cost the full `0.75`, even while boosting; merely
   holding speed pays nothing.
 - A solo aerial touch pays for increasing the ball's upward velocity, scaled by
-  ball height, but large increases in ball-to-car relative speed reduce the
-  bonus. Downward velocity changes are charged; repeated contact without
-  improvement pays nothing.
+  ball height. A hard increase in ball-to-car relative speed reduces the bonus
+  only once the ball moves faster than 1.5 times the car's speed.
+  Downward velocity changes are charged; repeated contact without improvement
+  pays nothing.
 - A solo aerial touch above the crossbar pays for improving the ball's
   goalward velocity and aim at the opponent's goal (up to `1`), and charges a
   touch that spoils a good shot.
 - Exposing the car's wheels to the underside of a nearby ball pays a
-  discounted *change* in alignment, not a standing pose reward. The potential
-  reaches its maximum above the crossbar and falls to zero at ground level;
-  dropping the pose or ending the episode debits it.
+  discounted *change* in alignment only when the car has no actionable dodge,
+  not a standing pose reward. The potential reaches its maximum above the
+  crossbar and falls to zero at ground level; regaining a dodge, dropping the
+  pose, or ending the episode debits it.
 - The first touch within the opening 3.2 seconds of a real kickoff pays `0.5`
   to the touching team and `-0.5` to its opponents. Replay resets away from
   kickoff do not qualify.

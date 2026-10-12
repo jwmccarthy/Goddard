@@ -13,7 +13,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 import carl
 from carl.gymnasium import CARLTorchVectorEnv
-from carl.gymnasium.state import CarlState, RewardContext
+from carl.gymnasium.state import CARLObservation, CarlState, RewardContext
 from jarl.collect import (
     CaptureContext,
     CriticCapture,
@@ -917,7 +917,9 @@ class RewardPlus:
         )
 
     @staticmethod
-    def _underside_potential(state: CarlState) -> th.Tensor:
+    def _underside_potential(
+        state: CarlState, observation: CARLObservation,
+    ) -> th.Tensor:
         car_to_ball = state.ball_position[:, None, :] - state.car_position
         height = ((state.ball_position[:, None, 2] - BALL_RADIUS)
                   / (GOAL_HEIGHT - BALL_RADIUS)).clamp(0.0, 1.0)
@@ -930,11 +932,16 @@ class RewardPlus:
         on_surface = _arena_surface_contact(
             state.car_on_ground, state.car_position, state.car_up[..., 2],
         )
-        # The car must be beneath the ball, wheels facing its underside.
+        # The native dodge window can expire without either spent-flip state flag.
+        dodge_available = (
+            observation.ego_has_flip_or_jump
+            & observation.ego_flip_window_remaining.gt(carl.PHYS_DT)
+        ).reshape(len(state.raw), state.n_cars)
+        # The car must have no actionable dodge beneath the ball.
         eligible = (
             car_to_ball[..., 2].gt(0.0)
             & state.car_position[..., 2].gt(2.0 * BALL_RADIUS)
-            & ~on_surface & ~state.car_demoed
+            & ~on_surface & ~state.car_demoed & ~dodge_available
         )
         return eligible * height * alignment * proximity
 
@@ -1006,8 +1013,15 @@ class RewardPlus:
             (current.ball_velocity[:, None, :] - current.car_velocity).norm(dim=-1)
             - (previous.ball_velocity[:, None, :] - previous.car_velocity).norm(dim=-1)
         ).clamp_min(0.0)
-        control = (1.0 - relative_change / 1200.0).clamp(0.0, 1.0)
-        # A hard touch cannot earn a lift, but lowering the ball still costs reward.
+        # Only discount a hard touch once the ball exceeds 1.5x the car's speed.
+        excess_ball_speed = (
+            current.ball_velocity.norm(dim=-1, keepdim=True)
+            - 1.5 * current.car_velocity.norm(dim=-1)
+        ).clamp_min(0.0)
+        control = (
+            1.0 - th.minimum(relative_change, excess_ball_speed) / 1200.0
+        ).clamp(0.0, 1.0)
+        # Touches that send the ball far ahead lose lift credit; lowering it still costs.
         lift = aerial * height * (
             upward_change.clamp_max(0.0)
             + upward_change.clamp_min(0.0) * control
@@ -1027,8 +1041,12 @@ class RewardPlus:
             - self._shot_quality(previous.ball_velocity, toward_goal)
         )
 
-        previous_potential = self._underside_potential(previous)
-        current_potential = self._underside_potential(current)
+        previous_potential = self._underside_potential(
+            previous, context.previous_observation,
+        )
+        current_potential = self._underside_potential(
+            current, context.current_observation,
+        )
         # The discounted potential telescopes; clear its terminal value so a
         # reset or goal cannot repeatedly pay for the same upside-down pose.
         underside = 0.5 * continuous * (

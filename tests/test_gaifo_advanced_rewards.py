@@ -322,6 +322,28 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         th.testing.assert_close(lift.sum(-1), th.zeros(7))
         th.testing.assert_close(shot.sum(-1), th.zeros(7))
 
+    def test_reward_plus_aerial_control_waits_until_ball_is_1_5_times_car_speed(self):
+        current = physical_state(4)
+        current[:, 2] = 800.0
+        cars = current[:, 9:53].view(4, 2, 22)
+        cars[:, 0, 2] = 650.0
+        cars[:, 0, 4] = 600.0
+        cars[:, 0, 16] = 0.0
+        cars[:, 0, 21] = 1.0
+        previous = current.clone()
+        previous[:, 4] = 600.0
+        current[:, 4] = th.tensor([500.0, 700.0, 1_000.0, 1_300.0])
+        current[:, 5] = 400.0
+
+        gameplay = GameplayDiagnostics(4, th.device("cpu"), 900, reward_plus=True)
+        gameplay(physical_context(current, previous))
+        lift = AdvancedTouchCapture(gameplay)(None)["reward_plus_aerial_lift"].view(4, 2)
+        self.assertGreater(lift[0, 0], 0)
+        th.testing.assert_close(lift[0, 0], lift[1, 0])  # Below 1.5x car speed.
+        self.assertGreater(lift[1, 0], lift[2, 0])
+        self.assertGreater(lift[2, 0], lift[3, 0])
+        th.testing.assert_close(lift.sum(-1), th.zeros(4))
+
     def test_reward_plus_underside_is_discounted_progress_and_terminally_debited(self):
         current = physical_state(9)
         current[:, 2] = 800.0
@@ -358,6 +380,42 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertLess(underside[4, 0], underside[0, 0])
         th.testing.assert_close(underside[[5, 6, 7]], th.zeros(3, 2))
         th.testing.assert_close(underside.sum(-1), th.zeros(9))
+
+    def test_reward_plus_underside_requires_no_actionable_dodge(self):
+        current = physical_state(4)
+        current[:, 2] = 800.0
+        cars = current[:, 9:53].view(4, 2, 22)
+        cars[:, 0, 1] = 0.0
+        cars[:, 0, 2] = 650.0
+        cars[:, 0, 14] = -1.0
+        cars[:, 0, 16] = 0.0
+        previous = current.clone()
+        previous_cars = previous[:, 9:53].view(4, 2, 22)
+        previous_cars[[0, 1, 3], 0, 14] = 1.0
+        previous_cars[2, 0, 18] = 1.0  # A flip reset restores the spent dodge.
+        cars[2, 0, 21] = 1.0
+
+        before = th.zeros(8, 51)
+        after = th.zeros_like(before)
+        before[0, -2:] = after[0, -2:] = th.tensor([1.0, 1.25])
+        before[2, -2:] = after[2, -2:] = th.tensor([1.0, 0.005])  # Dodge expired.
+        after[4, -2:] = th.tensor([1.0, 1.25])  # Reset gives the dodge back.
+        before[6, -2:] = th.tensor([1.0, 1.25])
+        after[6, -2:] = th.tensor([1.0, 0.005])
+
+        context = replace(
+            physical_context(current, previous),
+            current_observation=CARLObservation.from_tensor(after, 2),
+            previous_observation=CARLObservation.from_tensor(before, 2),
+        )
+        gameplay = GameplayDiagnostics(4, th.device("cpu"), 900, reward_plus=True)
+        gameplay(context)
+        underside = AdvancedTouchCapture(gameplay)(None)["reward_plus_underside"].view(4, 2)
+        self.assertEqual(underside[0, 0].item(), 0)  # Aligning with a dodge pays nothing.
+        self.assertGreater(underside[1, 0], 0)  # Expired, though no flip was spent.
+        self.assertAlmostEqual(underside[2, 0].item(), -0.5)  # Restore debits potential.
+        self.assertGreater(underside[3, 0], 0)
+        th.testing.assert_close(underside.sum(-1), th.zeros(4))
 
     def test_reward_plus_kickoff_first_touch_is_once_per_real_kickoff(self):
         spawn = physical_state(1, n_cars=4)
