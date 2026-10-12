@@ -223,6 +223,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         frameskip: int = 4,
         gru: bool = False,
         require_optimizer_state: bool = True,
+        reward_plus: bool = False,
     ):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             root = Path(directory)
@@ -290,6 +291,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 flags.append("--factorize")
             if hard_positive_mining:
                 flags.extend(("--hard-positive-mining", "--no-touch-timeout", "0.3"))
+            if reward_plus:
+                flags.append("--reward-plus")
             if exp_log_odds_reward:
                 flags.append("--exp-log-odds-reward")
             if differential:
@@ -375,6 +378,30 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
         self.assertIn("D far accuracy", output)
         self.assertIn("D near accuracy", output)
         self.assertIn("D global accuracy", output)
+
+    def test_reward_plus_factorized_training_captures_physical_rewards(self):
+        saved, _, _ = self._short_window_training(
+            True, recurrent_global=False, reward_plus=True,
+        )
+        self.assertEqual(saved["step"], 64)
+        self.assertTrue(saved["config"]["reward_plus"])
+
+    def test_reward_plus_recognizes_real_carl_kickoff(self):
+        env = CARLTorchVectorEnv(
+            n_sim=1, n_blue=1, n_orange=1, frameskip=4,
+            normalize=True, discrete_actions=True,
+        )
+        gameplay = env.register_reward(GameplayDiagnostics(
+            1, env.device, no_touch_timeout_steps=900, reward_plus=True,
+        ))
+        try:
+            env.reset()
+            action = th.tensor([1, 1, 1, 0, 0, 1, 0], device=env.device).repeat(2, 1)
+            env.step(action)
+            self.assertTrue(gameplay.reward_plus.kickoff_pending[0].item())
+            self.assertEqual(gameplay.last_reward_plus["reward_plus_kickoff"].abs().sum(), 0)
+        finally:
+            env.close()
 
     def test_smaller_frame_skip_trains_with_resampled_replay_states(self):
         saved, output, _ = self._short_window_training(

@@ -667,7 +667,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             flags = [
                 "gaifo.py", "--replay-dir", "parsed_replays", "--factorize",
-                "--hard-positive-mining",
+                "--hard-positive-mining", "--reward-plus",
                 "--n-sim", "1", "--rollout", "4", "--policy-hidden", "16",
                 "--critic-hidden", "16", "--discriminator-hidden", "16",
                 "--frame-embedding", "8", "--temporal-hidden", "8",
@@ -695,6 +695,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 resumed, _ = parse_args()
             self.assertTrue(resumed.factorize)
             self.assertTrue(resumed.hard_positive_mining)
+            self.assertTrue(resumed.reward_plus)
             self.assertTrue(resumed.discriminator_relative_positions)
             validate_resume_args(resumed, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
@@ -702,6 +703,11 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 mismatch, _ = parse_args()
             with self.assertRaisesRegex(ValueError, "--factorize must match"):
                 validate_resume_args(mismatch, payload)
+            with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
+                                            "--reward-plus", "false"]):
+                disabled, _ = parse_args()
+            self.assertFalse(disabled.reward_plus)
+            validate_resume_args(disabled, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
                                              "--discriminator-relative-positions", "false"]):
                 mismatch, _ = parse_args()

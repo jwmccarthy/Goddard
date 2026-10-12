@@ -205,6 +205,35 @@ opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
 `--aerial-touch-reward-weight` (default `0.5`).
 
+`--reward-plus` adds five bounded, zero-sum team bonuses alongside the
+discriminator imitation reward:
+
+- Signed speed change pays `0.25` per normalized speed gained, plus `0.5` when
+  boost is not pressed, neither state is boosting, and the boost amount is
+  unchanged. Speed losses cost the full `0.75`, even while boosting; merely
+  holding speed pays nothing.
+- A solo aerial touch pays for increasing the ball's upward velocity, scaled by
+  ball height, but large increases in ball-to-car relative speed reduce the
+  bonus. Downward velocity changes are charged; repeated contact without
+  improvement pays nothing.
+- A solo aerial touch above the crossbar pays for improving the ball's
+  goalward velocity and aim at the opponent's goal (up to `1`), and charges a
+  touch that spoils a good shot.
+- Exposing the car's wheels to the underside of a nearby ball pays a
+  discounted *change* in alignment, not a standing pose reward. The potential
+  reaches its maximum above the crossbar and falls to zero at ground level;
+  dropping the pose or ending the episode debits it.
+- The first touch within the opening 3.2 seconds of a real kickoff pays `0.5`
+  to the touching team and `-0.5` to its opponents. Replay resets away from
+  kickoff do not qualify.
+
+Existing zero-sum goal and flip-reset rewards remain governed by
+`--goal-reward-weight` and `--flip-reset-reward-weight` (both default to `1`);
+they are not counted twice. The ordinary `--aerial-touch-reward-weight` remains
+separate; set it to `0` to pay only for the controlled aerial touches above.
+`--reward-plus` is off by default and is stored in GAIFO checkpoints;
+on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
+
 GAIFO, BASIC without reaction time, deep training, and the checkpoint viewer
 use CARL's native observation and a shared project action mask. The last two
 **native** observation fields report whether the focal car can jump or flip

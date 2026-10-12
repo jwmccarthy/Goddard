@@ -487,6 +487,12 @@ class TeamSizeTrainingSmoke(unittest.TestCase):
             with self.subTest(team_size=size):
                 self._train(size)
 
+    def test_reward_plus_training_across_team_sizes(self):
+        for size in (2, 3):
+            with self.subTest(team_size=size):
+                saved = self._train(size, ("--reward-plus",))
+                self.assertTrue(saved["config"]["reward_plus"])
+
     def test_factorized_and_transformer_team_training(self):
         scenarios = (
             (2, ("--factorize",)),

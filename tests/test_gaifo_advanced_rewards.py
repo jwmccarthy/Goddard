@@ -17,6 +17,7 @@ from gaifo import (
     AdvancedTouchCapture,
     EgoBallTouchCapture,
     GameplayDiagnostics,
+    REWARD_PLUS_COMPONENTS,
     SceneDiscriminatorReward,
     advanced_touch_events, build_ppo_transforms, parse_args,
 )
@@ -89,6 +90,49 @@ def touch_context() -> RewardContext:
         actions=th.zeros(n_sim * 2, 7),
         score_difference=th.zeros(n_sim),
         episode_ticks=th.zeros(n_sim),
+        overtime=th.zeros(n_sim, dtype=th.bool),
+    )
+
+
+def physical_state(n_sim: int, n_cars: int = 2) -> th.Tensor:
+    raw = th.zeros(n_sim, 9 + 22 * n_cars + len(BOOST_PAD_POSITIONS))
+    raw[:, 2] = BALL_RADIUS
+    cars = raw[:, 9:9 + 22 * n_cars].view(n_sim, n_cars, 22)
+    cars[:, :n_cars // 2, 1] = -120.0
+    cars[:, n_cars // 2:, 1] = 120.0
+    cars[:, :, 2] = 17.0
+    cars[:, :, 14] = 1.0
+    cars[:, :, 15] = 50.0
+    cars[:, :, 16] = 1.0
+    return raw
+
+
+def physical_context(
+    current: th.Tensor, previous: th.Tensor, *, n_cars: int = 2,
+    actions: th.Tensor | None = None, done: th.Tensor | None = None,
+    episode_ticks: int = 120,
+) -> RewardContext:
+    n_sim = len(current)
+    pads = th.tensor(BOOST_PAD_POSITIONS)
+    team_size = n_cars // 2
+    teams = th.tensor([1.0] * team_size + [-1.0] * team_size)
+    observation = CARLObservation.from_tensor(th.zeros(n_sim * n_cars, 51), n_cars)
+    if done is None:
+        done = th.zeros(n_sim, dtype=th.bool)
+    if actions is None:
+        actions = th.zeros(n_sim * n_cars, 7, dtype=th.int32)
+    return RewardContext(
+        current=CarlState.from_raw(current, n_cars, pads, teams),
+        previous=CarlState.from_raw(previous, n_cars, pads, teams),
+        current_observation=observation,
+        previous_observation=observation,
+        events=CarlEvents(
+            score_delta=th.zeros(n_sim), done=done, terminated=done,
+            truncated=th.zeros(n_sim, dtype=th.bool),
+        ),
+        actions=actions,
+        score_difference=th.zeros(n_sim),
+        episode_ticks=th.full((n_sim,), episode_ticks),
         overtime=th.zeros(n_sim, dtype=th.bool),
     )
 
@@ -198,6 +242,207 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         # Continuing ball contact cannot award a second flip reset.
         gameplay(replace(context, previous=context.current))
         self.assertFalse(gameplay.last_flip_reset.any())
+
+    def test_reward_plus_speed_rewards_boost_free_gains_and_charges_losses(self):
+        current = physical_state(8)
+        previous = current.clone()
+        cars = current[:, 9:53].view(8, 2, 22)
+        old_cars = previous[:, 9:53].view(8, 2, 22)
+        cars[:, 0, 4] = 1_000.0
+        old_cars[:, 0, 4] = 600.0
+        actions = th.zeros(16, 7, dtype=th.int32)
+        actions.view(8, 2, 7)[1, 0, 4] = 1  # Boost held despite no net boost loss.
+        cars[2, 0, 15] = 45.0  # Boost spent.
+        cars[3, 0, 15] = 62.0  # Boost pad picked up.
+        cars[4, 0, 20] = 1.0  # Still boosting.
+        cars[5, 0, 17] = 1.0  # Demoed car cannot farm a speed change.
+        cars[6, 0, 1] = 1_000.0  # Teleport cannot farm a speed change.
+        done = th.zeros(8, dtype=th.bool)
+        done[7] = True
+
+        gameplay = GameplayDiagnostics(8, th.device("cpu"), 900, reward_plus=True)
+        gameplay(physical_context(current, previous, actions=actions, done=done))
+        speed = AdvancedTouchCapture(gameplay)(None)["reward_plus_speed"].view(8, 2)
+        delta = 400.0 / 2300.0
+        self.assertAlmostEqual(speed[0, 0].item(), 0.75 * delta)
+        th.testing.assert_close(speed[1:5, 0], th.full((4,), 0.25 * delta))
+        th.testing.assert_close(speed[5:], th.zeros(3, 2))
+        th.testing.assert_close(speed.sum(dim=-1), th.zeros(8))
+
+        reversed_actions = actions[:2].clone()
+        reversed_actions[0, 4] = 1
+        single_gameplay = GameplayDiagnostics(1, th.device("cpu"), 900, reward_plus=True)
+        single_gameplay(physical_context(
+            previous[:1], current[:1], actions=reversed_actions,
+        ))
+        reversed_speed = AdvancedTouchCapture(single_gameplay)(None)["reward_plus_speed"].view(1, 2)
+        self.assertAlmostEqual(reversed_speed[0, 0].item(), -0.75 * delta)
+        single_gameplay(physical_context(current[:1], current[:1]))
+        th.testing.assert_close(
+            AdvancedTouchCapture(single_gameplay)(None)["reward_plus_speed"], th.zeros(2),
+        )
+
+    def test_reward_plus_aerial_lifts_and_shots_require_controlled_touch_changes(self):
+        current = physical_state(7)
+        current[:, 2] = 800.0
+        cars = current[:, 9:53].view(7, 2, 22)
+        cars[:, 0, 2] = 650.0
+        cars[:, 0, 16] = 0.0
+        cars[:, 0, 21] = 1.0
+        current[:, 4] = 1_100.0
+        current[:, 5] = 400.0
+        current[1, 4:6] = th.tensor([3_300.0, 1_500.0])  # Hard upward hit.
+        current[2, 4:6] = th.tensor([100.0, -500.0])  # Downward hit.
+        cars[3, 0, 21] = 0.0  # Same change without a touch.
+        cars[4, 0, 2] = 17.0
+        cars[4, 0, 16] = 1.0  # Ground touch.
+        current[5, 2] = 600.0  # Below the crossbar.
+        cars[5, 0, 2] = 500.0
+        current[6, 4:6] = th.tensor([100.0, 0.0])  # Spoils a fast aerial shot.
+
+        previous = current.clone()
+        previous[:, 4] = 600.0
+        previous[:, 5] = 0.0
+        previous[2, 5] = 300.0
+        previous[6, 4:6] = th.tensor([1_500.0, -100.0])
+        gameplay = GameplayDiagnostics(7, th.device("cpu"), 900, reward_plus=True)
+        gameplay(physical_context(current, previous))
+        bonus = AdvancedTouchCapture(gameplay)(None)
+        lift = bonus["reward_plus_aerial_lift"].view(7, 2)
+        shot = bonus["reward_plus_aerial_shot"].view(7, 2)
+        self.assertGreater(lift[0, 0], 0)
+        self.assertEqual(lift[1, 0], 0)  # Excessive relative-speed increase removes lift.
+        self.assertLess(lift[2, 0], 0)
+        th.testing.assert_close(lift[3:5], th.zeros(2, 2))
+        self.assertGreater(lift[5, 0], 0)
+        self.assertLess(lift[5, 0], lift[0, 0])  # The same lift is worth less when lower.
+        self.assertGreater(shot[0, 0], 0)
+        th.testing.assert_close(shot[3:6], th.zeros(3, 2))
+        self.assertLess(shot[6, 0], 0)
+        th.testing.assert_close(lift.sum(-1), th.zeros(7))
+        th.testing.assert_close(shot.sum(-1), th.zeros(7))
+
+    def test_reward_plus_underside_is_discounted_progress_and_terminally_debited(self):
+        current = physical_state(9)
+        current[:, 2] = 800.0
+        cars = current[:, 9:53].view(9, 2, 22)
+        cars[:, 0, 1] = 0.0
+        cars[:, 0, 2] = 650.0
+        cars[:, 0, 14] = -1.0  # Wheels face the underside of the ball.
+        cars[:, 0, 16] = 0.0
+        previous = current.clone()
+        old_cars = previous[:, 9:53].view(9, 2, 22)
+        old_cars[[0, 4, 5, 7], 0, 14] = 1.0
+        cars[2, 0, 14] = 1.0
+        current[4, 2] = previous[4, 2] = 350.0
+        cars[4, 0, 2] = old_cars[4, 0, 2] = 220.0
+        cars[5, 0, 14] = 1.0
+        cars[6, 0, 2] = old_cars[6, 0, 2] = 900.0  # Car above the ball.
+        cars[6, 0, 14] = old_cars[6, 0, 14] = 1.0
+        old_cars[7, 0, 0] = 2_000.0  # Teleport to alignment is not progress.
+        cars[8, 0, 17] = 1.0  # Demo loses the potential rather than farming it.
+        done = th.zeros(9, dtype=th.bool)
+        done[3] = True
+
+        gameplay = GameplayDiagnostics(
+            9, th.device("cpu"), 900, reward_plus=True, frameskip=8, gamma=.81,
+        )
+        gameplay(physical_context(current, previous, done=done))
+        underside = AdvancedTouchCapture(gameplay)(None)["reward_plus_underside"].view(9, 2)
+        effective_gamma = .81 ** 2
+        self.assertAlmostEqual(underside[0, 0].item(), .5 * effective_gamma)
+        self.assertAlmostEqual(underside[1, 0].item(), .5 * (effective_gamma - 1))
+        for index in (2, 3, 8):
+            self.assertAlmostEqual(underside[index, 0].item(), -.5)
+        self.assertGreater(underside[4, 0], 0)
+        self.assertLess(underside[4, 0], underside[0, 0])
+        th.testing.assert_close(underside[[5, 6, 7]], th.zeros(3, 2))
+        th.testing.assert_close(underside.sum(-1), th.zeros(9))
+
+    def test_reward_plus_kickoff_first_touch_is_once_per_real_kickoff(self):
+        spawn = physical_state(1, n_cars=4)
+        cars = spawn[:, 9:97].view(1, 4, 22)
+        cars[:, :2, 1] = -2_500.0
+        cars[:, 2:, 1] = 2_500.0
+        gameplay = GameplayDiagnostics(1, th.device("cpu"), 900, n_cars=4,
+                                       reward_plus=True)
+        capture = AdvancedTouchCapture(gameplay)
+
+        gameplay(physical_context(spawn, spawn, n_cars=4, episode_ticks=4))
+        touch = spawn.clone()
+        touch[:, 9:97].view(1, 4, 22)[0, 1, 21] = 1.0
+        gameplay(physical_context(touch, spawn, n_cars=4))
+        th.testing.assert_close(capture(None)["reward_plus_kickoff"],
+                                th.tensor([.5, .5, -.5, -.5]))
+        opponent_touch = spawn.clone()
+        opponent_touch[:, 9:97].view(1, 4, 22)[0, 2, 21] = 1.0
+        gameplay(physical_context(opponent_touch, touch, n_cars=4))
+        th.testing.assert_close(capture(None)["reward_plus_kickoff"], th.zeros(4))
+
+        gameplay(physical_context(spawn, spawn, n_cars=4,
+                                  done=th.ones(1, dtype=th.bool)))
+        gameplay(physical_context(touch, spawn, n_cars=4, episode_ticks=4))
+        th.testing.assert_close(capture(None)["reward_plus_kickoff"],
+                                th.tensor([.5, .5, -.5, -.5]))
+
+        gameplay(physical_context(spawn, spawn, n_cars=4,
+                                  done=th.ones(1, dtype=th.bool)))
+        double_touch = touch.clone()
+        double_touch[:, 9:97].view(1, 4, 22)[0, 0, 21] = 1.0
+        gameplay(physical_context(double_touch, spawn, n_cars=4, episode_ticks=4))
+        th.testing.assert_close(capture(None)["reward_plus_kickoff"],
+                                th.tensor([.5, .5, -.5, -.5]))
+
+        gameplay(physical_context(spawn, spawn, n_cars=4,
+                                  done=th.ones(1, dtype=th.bool)))
+        gameplay(physical_context(spawn, spawn, n_cars=4, episode_ticks=4))
+        gameplay(physical_context(touch, spawn, n_cars=4, episode_ticks=500))
+        th.testing.assert_close(capture(None)["reward_plus_kickoff"], th.zeros(4))
+
+        gameplay(physical_context(spawn, spawn, n_cars=4,
+                                  done=th.ones(1, dtype=th.bool)))
+        replay_start = spawn.clone()
+        replay_start[:, 9:97].view(1, 4, 22)[:, :2, 1] = -120.0
+        replay_start[:, 9:97].view(1, 4, 22)[:, 2:, 1] = 120.0
+        gameplay(physical_context(replay_start, replay_start, n_cars=4,
+                                  episode_ticks=4))
+        gameplay(physical_context(touch, replay_start, n_cars=4))
+        th.testing.assert_close(capture(None)["reward_plus_kickoff"], th.zeros(4))
+
+    def test_reward_plus_adds_opt_in_events_without_doubling_goals_or_resets(self):
+        context = touch_context()
+        gameplay = GameplayDiagnostics(4, th.device("cpu"), 900, reward_plus=True)
+        goal_only = gameplay(context)
+        events = AdvancedTouchCapture(gameplay)(None)
+        self.assertTrue(all(name in events for name in REWARD_PLUS_COMPONENTS))
+        batch = TensorBatch({
+            "observation": th.zeros(1, 8, 51),
+            "scene_window": th.zeros(1, 8, 2, 51),
+            "scene_window_valid": th.zeros(1, 8, dtype=th.bool),
+            "reward": goal_only.reshape(1, 8),
+            **{name: value.unsqueeze(0) for name, value in events.items()},
+        })
+        args = dict(noise_std=0, trajectory_length=2, goal_reward_weight=3,
+                    aerial_touch_reward_weight=.5, flip_reset_reward_weight=1)
+        baseline = SceneDiscriminatorReward(ZeroDiscriminator(), **args)(
+            batch, PrepareContext(),
+        )
+        with_plus = SceneDiscriminatorReward(
+            ZeroDiscriminator(), **args, reward_plus=True,
+        )(batch, PrepareContext())
+        additional = sum((events[name] for name in REWARD_PLUS_COMPONENTS), th.zeros(8))
+        th.testing.assert_close(with_plus["training_reward"],
+                                baseline["training_reward"] + additional.unsqueeze(0))
+        th.testing.assert_close(with_plus["reward_plus_reward"], additional.unsqueeze(0))
+        th.testing.assert_close(with_plus["goal_reward"], goal_only.reshape(1, 8) * 3)
+        th.testing.assert_close(with_plus["flip_reset_reward"],
+                                events["flip_reset_event"].unsqueeze(0))
+        th.testing.assert_close(with_plus["training_reward"].view(4, 2).sum(-1), th.zeros(4))
+        with self.assertRaisesRegex(ValueError, "missing reward_plus_speed"):
+            SceneDiscriminatorReward(ZeroDiscriminator(), **args, reward_plus=True)(
+                TensorBatch({name: value for name, value in batch.items()
+                             if name not in REWARD_PLUS_COMPONENTS}), PrepareContext(),
+            )
 
     def test_short_window_reward_and_terminal_event_on_invalid_window(self):
         windows = th.zeros(1, 4, 2, 51)
@@ -482,6 +727,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             "--aerial-touch-reward-weight", "0.25",
             "--flip-reset-reward-weight", "2.0",
             "--exp-log-odds-reward", "--recency-replay",
+            "--reward-plus",
             "--history-reservoir-fraction", "0.3",
         ]):
             args, _ = parse_args()
@@ -489,6 +735,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertEqual(args.flip_reset_reward_weight, 2.0)
         self.assertTrue(args.exp_log_odds_reward)
         self.assertTrue(args.recency_replay)
+        self.assertTrue(args.reward_plus)
         self.assertEqual(args.history_reservoir_fraction, 0.3)
         with patch.object(sys, "argv", [
             "gaifo.py", "--replay-dir", "parsed_replays",
@@ -496,6 +743,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             defaults, _ = parse_args()
         self.assertFalse(defaults.exp_log_odds_reward)
         self.assertFalse(defaults.recency_replay)
+        self.assertFalse(defaults.reward_plus)
 
 
 if __name__ == "__main__":

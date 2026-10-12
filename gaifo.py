@@ -13,7 +13,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 import carl
 from carl.gymnasium import CARLTorchVectorEnv
-from carl.gymnasium.state import RewardContext
+from carl.gymnasium.state import CarlState, RewardContext
 from jarl.collect import (
     CaptureContext,
     CriticCapture,
@@ -140,6 +140,13 @@ PPO_BURNIN_STEPS = 8
 RESET_MINING_CANDIDATES = 8
 RESET_MINING_FRACTION = 0.5
 RESET_MINING_MIN_CONFIDENCE = 0.6
+REWARD_PLUS_COMPONENTS = (
+    "reward_plus_speed",
+    "reward_plus_aerial_lift",
+    "reward_plus_aerial_shot",
+    "reward_plus_underside",
+    "reward_plus_kickoff",
+)
 
 
 def frameskip_ratio(frameskip: int) -> float:
@@ -887,12 +894,164 @@ def advanced_touch_events(
     return aerial_score, aerial, flip_reset
 
 
+class RewardPlus:
+    """Bounded mechanical progress and one-off events, separate from imitation."""
+
+    def __init__(
+        self, n_sim: int, n_cars: int, device: th.device, frameskip: int, gamma: float,
+    ) -> None:
+        self.frameskip = frameskip
+        self.team_size = n_cars // 2
+        self.gamma = gamma ** frameskip_ratio(frameskip)
+        self.kickoff_pending = th.zeros(n_sim, dtype=th.bool, device=device)
+
+    @staticmethod
+    def _shot_quality(velocity: th.Tensor, toward_goal: th.Tensor) -> th.Tensor:
+        goalward_speed = (velocity[:, None, :] * toward_goal).sum(dim=-1)
+        alignment = F.cosine_similarity(
+            velocity[:, None, :], toward_goal, dim=-1, eps=1e-6,
+        )
+        return (
+            ((goalward_speed - 400.0) / 1200.0).clamp(0.0, 1.0)
+            * ((alignment - 0.8) / 0.2).clamp(0.0, 1.0)
+        )
+
+    @staticmethod
+    def _underside_potential(state: CarlState) -> th.Tensor:
+        car_to_ball = state.ball_position[:, None, :] - state.car_position
+        height = ((state.ball_position[:, None, 2] - BALL_RADIUS)
+                  / (GOAL_HEIGHT - BALL_RADIUS)).clamp(0.0, 1.0)
+        alignment = ((F.cosine_similarity(
+            car_to_ball, -state.car_up, dim=-1, eps=1e-6,
+        ) - 0.7) / 0.3).clamp(0.0, 1.0)
+        proximity = (
+            1.0 - (car_to_ball.norm(dim=-1) - 2.0 * BALL_RADIUS).clamp_min(0.0) / 500.0
+        ).clamp(0.0, 1.0)
+        on_surface = _arena_surface_contact(
+            state.car_on_ground, state.car_position, state.car_up[..., 2],
+        )
+        # The car must be beneath the ball, wheels facing its underside.
+        eligible = (
+            car_to_ball[..., 2].gt(0.0)
+            & state.car_position[..., 2].gt(2.0 * BALL_RADIUS)
+            & ~on_surface & ~state.car_demoed
+        )
+        return eligible * height * alignment * proximity
+
+    def _kickoff_touch(self, context: RewardContext) -> th.Tensor:
+        previous = context.previous
+        spawn = (
+            previous.ball_position[:, :2].norm(dim=-1).lt(2.0 * BALL_RADIUS)
+            & previous.ball_velocity.norm(dim=-1).lt(250.0)
+            & (previous.ball_position[:, 2] - BALL_RADIUS).abs().lt(60.0)
+            & previous.car_position[:, 0, 1].lt(-2_000.0)
+            & previous.car_position[:, self.team_size, 1].gt(2_000.0)
+            & previous.car_position[..., 2].lt(120.0).all(dim=-1)
+        )
+        first_step = context.episode_ticks.le(self.frameskip)
+        self.kickoff_pending = th.where(first_step, spawn, self.kickoff_pending)
+        self.kickoff_pending &= context.episode_ticks.le(
+            KICKOFF_MAX_STEPS * REFERENCE_FRAMESKIP
+        )
+        touches = context.current.car_ball_touches
+        first_touch = (touches & self.kickoff_pending[:, None]).to(previous.raw.dtype)
+        self.kickoff_pending &= ~(touches.any(dim=-1) | context.events.done)
+        # Split a simultaneous challenge so one kickoff never pays more than once.
+        return 0.5 * first_touch / first_touch.sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+    def __call__(
+        self, context: RewardContext, aerial_touches: th.Tensor,
+    ) -> dict[str, th.Tensor]:
+        current, previous = context.current, context.previous
+        ball_displacement = (current.ball_position - previous.ball_position).norm(dim=-1)
+        car_displacement = (current.car_position - previous.car_position).norm(dim=-1)
+        max_car_displacement = CAR_MAX_SPEED * self.frameskip / 120.0 + 150.0
+        continuous = (
+            ~previous.car_demoed
+            & ball_displacement[:, None].le(
+                BALL_MAX_SPEED * self.frameskip / 120.0 + 2.0 * BALL_RADIUS
+            )
+            & (car_displacement.le(max_car_displacement) | current.car_demoed)
+        )
+        valid = (
+            continuous & car_displacement.le(max_car_displacement)
+            & ~current.car_demoed & ~context.events.done[:, None]
+        )
+
+        speed_change = (
+            current.car_velocity.norm(dim=-1) - previous.car_velocity.norm(dim=-1)
+        ) / CAR_MAX_SPEED
+        boost_action = context.actions.reshape(len(current.raw), current.n_cars, -1)[
+            ..., 4
+        ].gt(0)
+        no_boost = (
+            ~boost_action & ~current.car_is_boosting & ~previous.car_is_boosting
+            & (current.car_boost - previous.car_boost).abs().lt(0.01)
+        )
+        # Charge speed loss at the full rate even if boost was used to accelerate.
+        boost_free_change = th.where(no_boost, speed_change, speed_change.clamp_max(0.0))
+        speed = valid * (0.25 * speed_change + 0.5 * boost_free_change)
+
+        touches = current.car_ball_touches
+        solo_touch = touches & touches.sum(dim=-1, keepdim=True).eq(1)
+        aerial = (
+            valid & solo_touch & aerial_touches
+            & current.ball_position[:, None, 2].gt(2.0 * BALL_RADIUS)
+        )
+        height = ((current.ball_position[:, None, 2] - BALL_RADIUS)
+                  / (CEILING_Z - BALL_RADIUS)).clamp(0.0, 1.0)
+        upward_change = ((current.ball_velocity[:, None, 2]
+                          - previous.ball_velocity[:, None, 2]) / 400.0).clamp(-1.0, 1.0)
+        relative_change = (
+            (current.ball_velocity[:, None, :] - current.car_velocity).norm(dim=-1)
+            - (previous.ball_velocity[:, None, :] - previous.car_velocity).norm(dim=-1)
+        ).clamp_min(0.0)
+        control = (1.0 - relative_change / 1200.0).clamp(0.0, 1.0)
+        # A hard touch cannot earn a lift, but lowering the ball still costs reward.
+        lift = aerial * height * (
+            upward_change.clamp_max(0.0)
+            + upward_change.clamp_min(0.0) * control
+            * current.ball_velocity[:, None, 2].gt(0.0)
+        )
+
+        opponent_goal = th.zeros_like(current.car_position)
+        opponent_goal[..., 1] = current.team_sign[None, :] * GOAL_Y
+        opponent_goal[..., 2] = GOAL_HEIGHT / 2.0
+        toward_goal = F.normalize(
+            opponent_goal - current.ball_position[:, None, :], dim=-1, eps=1e-6,
+        )
+        aerial_shot = (
+            aerial & current.ball_position[:, None, 2].gt(GOAL_HEIGHT)
+        ) * (
+            self._shot_quality(current.ball_velocity, toward_goal)
+            - self._shot_quality(previous.ball_velocity, toward_goal)
+        )
+
+        previous_potential = self._underside_potential(previous)
+        current_potential = self._underside_potential(current)
+        # The discounted potential telescopes; clear its terminal value so a
+        # reset or goal cannot repeatedly pay for the same upside-down pose.
+        underside = 0.5 * continuous * (
+            self.gamma * current_potential * ~context.events.done[:, None]
+            - previous_potential
+        )
+        return {
+            "reward_plus_speed": speed,
+            "reward_plus_aerial_lift": lift,
+            "reward_plus_aerial_shot": aerial_shot,
+            "reward_plus_underside": underside,
+            "reward_plus_kickoff": self._kickoff_touch(context),
+        }
+
+
 class GameplayDiagnostics:
     """Record physical events and goal-only episode rewards before CARL auto-resets."""
 
     def __init__(
         self, n_sim: int, device: th.device, no_touch_timeout_steps: int,
         n_cars: int = N_CARS,
+        reward_plus: bool = False, frameskip: int = REFERENCE_FRAMESKIP,
+        gamma: float = 0.99,
     ) -> None:
         if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
             raise ValueError("gameplay needs two, four, or six cars")
@@ -904,6 +1063,10 @@ class GameplayDiagnostics:
         self.last_flip_reset = th.zeros(n_sim * n_cars, device=device)
         self.last_ego_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
         self.last_opponent_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
+        self.reward_plus = (
+            RewardPlus(n_sim, n_cars, device, frameskip, gamma) if reward_plus else None
+        )
+        self.last_reward_plus: dict[str, th.Tensor] = {}
         self.counts = {
             name: th.zeros((), dtype=th.float32, device=device)
             for name in (
@@ -936,6 +1099,11 @@ class GameplayDiagnostics:
         self.last_aerial_touch_score = self._team_difference(aerial_score)
         flip_reset_score = flip_reset.to(aerial_score.dtype)
         self.last_flip_reset = self._team_difference(flip_reset_score)
+        if self.reward_plus is not None:
+            self.last_reward_plus = {
+                name: self._team_difference(value)
+                for name, value in self.reward_plus(context, aerial).items()
+            }
 
         self.touch_steps += 1
         self.touch_steps[touches.any(dim=-1)] = 0
@@ -984,7 +1152,7 @@ class GameplayDiagnostics:
 
 
 class AdvancedTouchCapture(CaptureBase):
-    """Keep physical touch rewards separate from CARL's goal-only episode return."""
+    """Capture physical bonuses without changing CARL's goal-only episode return."""
 
     def __init__(self, gameplay: GameplayDiagnostics) -> None:
         self.gameplay = gameplay
@@ -993,6 +1161,7 @@ class AdvancedTouchCapture(CaptureBase):
         return {
             "aerial_touch_score": self.gameplay.last_aerial_touch_score,
             "flip_reset_event": self.gameplay.last_flip_reset,
+            **self.gameplay.last_reward_plus,
         }
 
 
@@ -3970,7 +4139,7 @@ def train_discriminator_minibatch(
 
 
 class SceneDiscriminatorReward:
-    """Combine imitation, goal, and physical touch rewards per actor.
+    """Combine imitation, goal, and opt-in physical rewards per actor.
 
     Short windows receive normalized expert log-odds by default, or capped
     expert-to-agent odds with the optional exponential reward. Differential
@@ -3998,6 +4167,7 @@ class SceneDiscriminatorReward:
         differential: bool = False,
         gamma: float = 0.99,
         frameskip: int = REFERENCE_FRAMESKIP,
+        reward_plus: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -4028,6 +4198,7 @@ class SceneDiscriminatorReward:
         self.goal_reward_weight = goal_reward_weight
         self.aerial_touch_reward_weight = aerial_touch_reward_weight
         self.flip_reset_reward_weight = flip_reset_reward_weight
+        self.reward_plus = reward_plus
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
         self.exp_log_odds_reward = exp_log_odds_reward
@@ -4356,6 +4527,11 @@ class SceneDiscriminatorReward:
             batch, "flip_reset_event", self.flip_reset_reward_weight,
             imitation_reward,
         )
+        reward_plus_reward = (
+            sum((self._event_reward(batch, name, 1.0, imitation_reward)
+                 for name in REWARD_PLUS_COMPONENTS), th.zeros_like(imitation_reward))
+            if self.reward_plus else 0.0
+        )
 
         result = batch.with_fields(
             imitation_reward=imitation_reward,
@@ -4363,8 +4539,10 @@ class SceneDiscriminatorReward:
             goal_reward=goal_reward,
             aerial_touch_reward=aerial_touch_reward,
             flip_reset_reward=flip_reset_reward,
+            **({"reward_plus_reward": reward_plus_reward} if self.reward_plus else {}),
             training_reward=(
                 imitation_reward + goal_reward + aerial_touch_reward + flip_reset_reward
+                + reward_plus_reward
             ),
         )
         if "learner_mask" in result:
@@ -5259,6 +5437,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         parser, "--differential",
         help="reward expert log-odds changes, or current capped expert odds minus --gamma times previous capped odds with --exp-log-odds-reward (Transformer global reward always compares before and after)",
     )
+    add_feature_option(
+        parser, "--reward-plus",
+        help="add boost-aware speed progress, controlled aerial lifts and shots, underside setup, and first kickoff touch",
+    )
     parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,
         help="scale the +/-1 goal reward per actor (0 disables it)",
@@ -5906,6 +6088,7 @@ def build_ppo_transforms(
             differential=args.differential,
             gamma=args.gamma,
             frameskip=args.frameskip,
+            reward_plus=getattr(args, "reward_plus", False),
         ),
         GAE(
             gamma=gamma,
@@ -5972,6 +6155,7 @@ def main() -> None:
         env.device,
         math.ceil(args.no_touch_timeout * 120.0 / args.frameskip),
         n_cars=team_car_count(args.team_size),
+        reward_plus=args.reward_plus, frameskip=args.frameskip, gamma=args.gamma,
     ))
     policy = build_policy(env, args)
     critic = build_critic(env, args)
