@@ -1,6 +1,8 @@
 """Check the RLBot adapter against the GAIFO training policy and native CARL."""
 
 import argparse
+import hashlib
+import json
 import math
 import tempfile
 import unittest
@@ -236,6 +238,38 @@ class RLBotGAIFOTests(unittest.TestCase):
                 finally:
                     env.close()
 
+    @unittest.skipUnless(th.cuda.is_available(), "native CARL requires CUDA")
+    def test_packet_observations_match_native_carl_during_jumps_and_flips(self):
+        env = CARLTorchVectorEnv(
+            n_sim=1, n_blue=1, n_orange=1, seed=7, frameskip=4,
+            normalize=True, discrete_actions=True,
+        )
+        try:
+            env.reset()
+            for action in (
+                (0, 0, 0, 0, 0, 0, 1),
+                (0, 0, 2, 0, 1, 0, 0),
+                (2, 1, 2, 0, 1, 2, 0),
+                (2, 1, 2, 0, 1, 2, 1),
+                (0, 0, 2, 0, 0, 2, 0),
+            ):
+                actions = th.tensor([action] * 2, dtype=th.int32, device=env.device)
+                reference, _, _, _, _ = env.step(actions)
+                raw = th.from_dlpack(env._env.get_state()).cpu().numpy()[0]
+                field, packet = packet_from_carl(raw, 1)
+                # Provide the equivalent native timer: Rocket League's timer
+                # can include up to 0.2 seconds of additional held-jump time.
+                for i, player in enumerate(packet.players):
+                    player.dodge_timeout = float(reference[i, -1])
+                builder = CARLObservationBuilder(1, field, "ground")
+                for i in range(2):
+                    np.testing.assert_allclose(
+                        builder.build(packet, i), reference[i].cpu().numpy(),
+                        atol=1e-5, rtol=1e-5,
+                    )
+        finally:
+            env.close()
+
     def test_rlbot_v5_runner_loads_checkpoint_and_uses_saved_cadence(self):
         try:
             from rlbot import flat
@@ -282,22 +316,45 @@ class RLBotGAIFOTests(unittest.TestCase):
             bot = GoddardBot.__new__(GoddardBot)
             bot.field_info = field
             bot.team, bot.index = 0, 0
-            with patch.dict("os.environ", {"GODDARD_CHECKPOINT": str(path)}):
+            with (patch.dict("os.environ", {"GODDARD_CHECKPOINT": str(path)}),
+                  patch("builtins.print") as output):
                 bot.initialize()
-            np.testing.assert_array_equal(
-                bot.builder.build(packet(0, flat.MatchPhase.Kickoff), 0)[-2:],
-                (1.0, 1.25),
-            )
-            first = bot.get_output(packet(0, flat.MatchPhase.Kickoff))
-            self.assertIsInstance(first, flat.ControllerState)
-            self.assertEqual(bot.last_inference_frame, 0)
-            self.assertIs(bot.get_output(packet(3, flat.MatchPhase.Active)), first)
-            self.assertIsNot(bot.get_output(packet(4, flat.MatchPhase.Active)), first)
-            self.assertEqual(bot.last_inference_frame, 4)
-            self.assertIsInstance(
-                bot.get_output(packet(5, flat.MatchPhase.Countdown)), flat.ControllerState,
-            )
-            self.assertLess(bot.last_inference_frame, 0)
+                np.testing.assert_array_equal(
+                    bot.builder.build(packet(0, flat.MatchPhase.Kickoff), 0)[-2:],
+                    (1.0, 1.25),
+                )
+                first = bot.get_output(packet(0, flat.MatchPhase.Kickoff))
+                self.assertIsInstance(first, flat.ControllerState)
+                self.assertEqual(bot.last_inference_frame, 0)
+                self.assertIs(bot.get_output(packet(3, flat.MatchPhase.Active)), first)
+                self.assertIsNot(bot.get_output(packet(4, flat.MatchPhase.Active)), first)
+                self.assertEqual(bot.last_inference_frame, 4)
+                self.assertIsInstance(
+                    bot.get_output(packet(5, flat.MatchPhase.Countdown)), flat.ControllerState,
+                )
+                self.assertLess(bot.last_inference_frame, 0)
+            entries = [json.loads(call.args[0].removeprefix("GODDARD_DIAG "))
+                       for call in output.call_args_list]
+            self.assertEqual(entries[0]["type"], "startup")
+            self.assertEqual(entries[0]["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertEqual(entries[0]["frameskip"], 4)
+            decisions = [entry for entry in entries if entry["type"] == "decision"]
+            self.assertEqual([entry["frame"] for entry in decisions], [0, 4])
+            self.assertEqual(decisions[0]["obs_ground"], 1.0)
+            self.assertEqual(len(decisions[0]["observation"]), 139)
+            self.assertEqual(len(decisions[0]["boost_pads_active"]), 34)
+            self.assertEqual(decisions[0]["controls"]["throttle"], first.throttle)
+            self.assertEqual(decisions[1]["frame_gap"], 4)
+
+            quiet_bot = GoddardBot.__new__(GoddardBot)
+            quiet_bot.field_info = field
+            quiet_bot.team, quiet_bot.index = 0, 0
+            with (patch.dict("os.environ", {
+                      "GODDARD_CHECKPOINT": str(path), "GODDARD_DIAGNOSTICS": "0",
+                  }), patch("builtins.print") as quiet_output):
+                quiet_bot.initialize()
+                quiet_bot.get_output(packet(0, flat.MatchPhase.Kickoff))
+            quiet_output.assert_not_called()
 
 
 if __name__ == "__main__":

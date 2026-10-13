@@ -34,3 +34,16 @@ positions are checked against the standard layout. The model chooses actions
 deterministically every saved `frameskip` physics ticks; controls are held
 between decisions. The RLBot packet supplies the dodge window used by the
 last two CARL observation fields.
+
+### Live comparison diagnostics
+
+The bot prints `GODDARD_DIAG` JSON lines to its RLBot console during the first
+900 policy decisions (about 30 seconds at frameskip 4). Startup shows the
+checkpoint path and SHA-256, policy shape, frame skip, map, and mutators.
+Decision lines show frame gaps, inference time, the raw ball/car state, the
+normalized CARL observation, and the action sent to Rocket League. Full packet
+and observation details are printed at kickoff, roughly once per second, and
+when the car's air state or jump/boost/powerslide buttons change; shorter samples
+appear between them. Save those console lines and compare them against the
+**same checkpoint** in CARL. Set `GODDARD_DIAGNOSTICS=0` to disable the console
+output after the comparison.

@@ -2,6 +2,7 @@
 
 import math
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -9,9 +10,11 @@ from rlbot import flat
 from rlbot.managers import Bot
 
 if __package__:
+    from .diagnostics import ConsoleDiagnostics
     from .observation import CARLObservationBuilder
     from .policy import decode_action, load_policy_checkpoint
 else:
+    from diagnostics import ConsoleDiagnostics
     from observation import CARLObservationBuilder
     from policy import decode_action, load_policy_checkpoint
 
@@ -28,6 +31,11 @@ class GoddardBot(Bot):
         self.last_game_time = -math.inf
         self.last_match_phase = None
         self._reset_episode()
+        self.diagnostics = None
+        if os.environ.get("GODDARD_DIAGNOSTICS", "1") != "0":
+            self.diagnostics = ConsoleDiagnostics(
+                checkpoint, self.policy.config, self.match_config, self.field_info,
+            )
 
     def _reset_episode(self) -> None:
         self.hidden = self.policy.initial_state()
@@ -40,6 +48,8 @@ class GoddardBot(Bot):
         now = float(info.seconds_elapsed)
         frame = int(info.frame_num)
         phase = info.match_phase
+        if self.diagnostics is not None:
+            self.diagnostics.phase(info)
         if phase not in (flat.MatchPhase.Kickoff, flat.MatchPhase.Active):
             self._reset_episode()
             self.last_match_phase = phase
@@ -61,11 +71,21 @@ class GoddardBot(Bot):
         if not packet.balls:
             return flat.ControllerState()
 
+        started = time.perf_counter()
+        previous_frame = self.last_inference_frame
         observation = torch.from_numpy(self.builder.build(packet, self.index)).unsqueeze(0)
         with torch.inference_mode():
             action, self.hidden = self.policy.act(observation, self.hidden)
         self.last_inference_frame = frame
-        self.controller = flat.ControllerState(**decode_action(action[0].tolist()))
+        chosen = action[0].tolist()
+        controls = decode_action(chosen)
+        self.controller = flat.ControllerState(**controls)
+        if self.diagnostics is not None:
+            self.diagnostics.decision(
+                packet, self.index, observation[0].numpy(), chosen, controls,
+                frame - previous_frame if previous_frame >= 0 else None,
+                (time.perf_counter() - started) * 1000,
+            )
         return self.controller
 
 
