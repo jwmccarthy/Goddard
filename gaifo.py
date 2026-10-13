@@ -145,6 +145,7 @@ REWARD_PLUS_COMPONENTS = (
     "reward_plus_aerial_lift",
     "reward_plus_aerial_shot",
     "reward_plus_underside",
+    "reward_plus_kickoff_speed",
     "reward_plus_kickoff",
 )
 
@@ -904,6 +905,7 @@ class RewardPlus:
         self.team_size = n_cars // 2
         self.gamma = gamma ** frameskip_ratio(frameskip)
         self.kickoff_pending = th.zeros(n_sim, dtype=th.bool, device=device)
+        self.kickoff_challenger = th.zeros(n_sim, n_cars, dtype=th.bool, device=device)
 
     @staticmethod
     def _shot_quality(velocity: th.Tensor, toward_goal: th.Tensor) -> th.Tensor:
@@ -945,7 +947,9 @@ class RewardPlus:
         )
         return eligible * height * alignment * proximity
 
-    def _kickoff_touch(self, context: RewardContext) -> th.Tensor:
+    def _kickoff_rewards(
+        self, context: RewardContext, valid: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
         previous = context.previous
         spawn = (
             previous.ball_position[:, :2].norm(dim=-1).lt(2.0 * BALL_RADIUS)
@@ -957,14 +961,32 @@ class RewardPlus:
         )
         first_step = context.episode_ticks.le(self.frameskip)
         self.kickoff_pending = th.where(first_step, spawn, self.kickoff_pending)
+        target = previous.ball_position[:, None, :2]
+        previous_distance = (previous.car_position[..., :2] - target).norm(dim=-1)
+        closest = previous_distance.reshape(-1, 2, self.team_size).argmin(dim=-1)
+        challengers = F.one_hot(closest, self.team_size).reshape(
+            -1, previous.n_cars,
+        ).bool()
+        self.kickoff_challenger = th.where(
+            first_step[:, None], challengers & spawn[:, None], self.kickoff_challenger,
+        )
         self.kickoff_pending &= context.episode_ticks.le(
             KICKOFF_MAX_STEPS * REFERENCE_FRAMESKIP
+        )
+        current_distance = (context.current.car_position[..., :2] - target).norm(dim=-1)
+        # Signed progress rewards moving toward the kickoff ball, not idling,
+        # driving away, or repeatedly accelerating without approaching it.
+        previous_approach = (1.0 - previous_distance / 5_000.0).clamp(0.0, 1.0)
+        current_approach = (1.0 - current_distance / 5_000.0).clamp(0.0, 1.0)
+        speed = 0.5 * (current_approach - previous_approach) * (
+            self.kickoff_pending[:, None] & self.kickoff_challenger & valid
         )
         touches = context.current.car_ball_touches
         first_touch = (touches & self.kickoff_pending[:, None]).to(previous.raw.dtype)
         self.kickoff_pending &= ~(touches.any(dim=-1) | context.events.done)
         # Split a simultaneous challenge so one kickoff never pays more than once.
-        return 0.5 * first_touch / first_touch.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        touch = 0.5 * first_touch / first_touch.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return speed, touch
 
     def __call__(
         self, context: RewardContext, aerial_touches: th.Tensor,
@@ -1053,12 +1075,14 @@ class RewardPlus:
             self.gamma * current_potential * ~context.events.done[:, None]
             - previous_potential
         )
+        kickoff_speed, kickoff_touch = self._kickoff_rewards(context, valid)
         return {
             "reward_plus_speed": speed,
             "reward_plus_aerial_lift": lift,
             "reward_plus_aerial_shot": aerial_shot,
             "reward_plus_underside": underside,
-            "reward_plus_kickoff": self._kickoff_touch(context),
+            "reward_plus_kickoff_speed": kickoff_speed,
+            "reward_plus_kickoff": kickoff_touch,
         }
 
 
@@ -1085,6 +1109,11 @@ class GameplayDiagnostics:
             RewardPlus(n_sim, n_cars, device, frameskip, gamma) if reward_plus else None
         )
         self.last_reward_plus: dict[str, th.Tensor] = {}
+        self.reward_plus_sums = {
+            name: th.zeros((), dtype=th.float32, device=device)
+            for name in REWARD_PLUS_COMPONENTS
+        } if reward_plus else {}
+        self.reward_plus_squares = th.zeros((), dtype=th.float32, device=device)
         self.counts = {
             name: th.zeros((), dtype=th.float32, device=device)
             for name in (
@@ -1118,10 +1147,15 @@ class GameplayDiagnostics:
         flip_reset_score = flip_reset.to(aerial_score.dtype)
         self.last_flip_reset = self._team_difference(flip_reset_score)
         if self.reward_plus is not None:
+            components = self.reward_plus(context, aerial)
             self.last_reward_plus = {
                 name: self._team_difference(value)
-                for name, value in self.reward_plus(context, aerial).items()
+                for name, value in components.items()
             }
+            for name, value in components.items():
+                self.reward_plus_sums[name] += value.sum()
+            combined = sum(self.last_reward_plus.values())
+            self.reward_plus_squares += combined.square().sum()
 
         self.touch_steps += 1
         self.touch_steps[touches.any(dim=-1)] = 0
@@ -1145,6 +1179,7 @@ class GameplayDiagnostics:
 
     def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
         metrics = {}
+        report = {}
         steps = self.counts["steps"].item()
         if steps > 0:
             metrics.update({
@@ -1154,6 +1189,19 @@ class GameplayDiagnostics:
                 "goals_for_per_1000_steps": self.counts["goals_for"].item() / steps * 1000,
                 "goals_against_per_1000_steps": self.counts["goals_against"].item() / steps * 1000,
             })
+            if self.reward_plus is not None:
+                raw_means = {
+                    name.removeprefix("reward_plus_"): total.item() / steps
+                    for name, total in self.reward_plus_sums.items()
+                }
+                report["RewardSpec"] = {
+                    **{f"component/{name}": value for name, value in raw_means.items()},
+                    "aggregate/reward_plus": sum(raw_means.values()),
+                    "scale/reward_plus": math.sqrt(self.reward_plus_squares.item() / steps),
+                }
+                for total in self.reward_plus_sums.values():
+                    total.zero_()
+                self.reward_plus_squares.zero_()
             for name in (
                 "steps", "touches", "aerial_touches", "flip_resets",
                 "goals_for", "goals_against",
@@ -1166,7 +1214,9 @@ class GameplayDiagnostics:
             self.counts["episodes"].zero_()
             self.counts["timeouts"].zero_()
 
-        return {"Gameplay": metrics} if metrics else {}
+        if metrics:
+            report["Gameplay"] = metrics
+        return report
 
 
 class AdvancedTouchCapture(CaptureBase):
@@ -5457,7 +5507,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     add_feature_option(
         parser, "--reward-plus",
-        help="add boost-aware speed progress, controlled aerial lifts and shots, underside setup, and first kickoff touch",
+        help="add boost-aware speed progress, controlled aerial lifts and shots, underside setup, kickoff approach speed and first touch",
     )
     parser.add_argument(
         "--goal-reward-weight", type=float, default=1.0,

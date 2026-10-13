@@ -205,7 +205,7 @@ opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
 `--aerial-touch-reward-weight` (default `0.5`).
 
-`--reward-plus` adds five bounded, zero-sum team bonuses alongside the
+`--reward-plus` adds six bounded, zero-sum team bonuses alongside the
 discriminator imitation reward:
 
 - Signed speed change pays `0.25` per normalized speed gained, plus `0.5` when
@@ -225,6 +225,11 @@ discriminator imitation reward:
   not a standing pose reward. The potential reaches its maximum above the
   crossbar and falls to zero at ground level; regaining a dodge, dropping the
   pose, or ending the episode debits it.
+- During a real kickoff, the nearest spawning car on each team earns up to
+  `0.5` for closing the distance to the kickoff ball's position. Retreating
+  debits progress; holding speed without moving closer pays nothing. The
+  bonus stops at first touch or after 3.2 seconds, and teammates are free to
+  defend or rotate instead of all rushing the ball.
 - The first touch within the opening 3.2 seconds of a real kickoff pays `0.5`
   to the touching team and `-0.5` to its opponents. Replay resets away from
   kickoff do not qualify.
@@ -235,6 +240,12 @@ they are not counted twice. The ordinary `--aerial-touch-reward-weight` remains
 separate; set it to `0` to pay only for the controlled aerial touches above.
 `--reward-plus` is off by default and is stored in GAIFO checkpoints;
 on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
+When enabled, TensorBoard logs their signed raw per-car means under
+`RewardSpec/component/{speed,aerial_lift,aerial_shot,underside,kickoff_speed,kickoff}` and
+their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
+zero-sum team difference; `RewardSpec/scale/reward_plus` logs the RMS of the
+combined zero-sum bonus actually used for training. They update each rollout,
+even if no episode ends.
 
 GAIFO, BASIC without reaction time, deep training, and the checkpoint viewer
 use CARL's native observation and a shared project action mask. The last two
@@ -256,6 +267,8 @@ switching matches. Override them with `--max-ticks` and `--no-touch-timeout`
 (seconds; `0` disables no-touch resets). Older checkpoints without timing
 metadata use training defaults where known. `--sample` watches stochastic
 actions like GAIFO training; otherwise the viewer takes the most likely action.
+The arena shows small and full boost pads in amber while ready, dimming them
+while they recharge.
 GAIFO's `timeout frac` is the share of finished episodes that went a full
 no-touch interval after **either team's last ball touch**; an episode can have
 earlier touches and still end this way.

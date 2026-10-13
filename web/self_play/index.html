@@ -99,6 +99,16 @@
     .boost-meter i { display: block; height: 5px; background: rgba(16, 37, 45, 0.12); }
     .boost-meter b { display: block; width: 0; height: 100%; background: var(--blue); transition: width 80ms linear; }
     .boost-meter.orange b { background: var(--orange); }
+    .pad-key { margin-top: 8px; color: var(--muted); font-size: 10px; font-weight: 650; }
+    .pad-key::before {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 6px;
+      border-radius: 50%;
+      background: #e88d29;
+      content: "";
+    }
 
     .controls {
       position: fixed;
@@ -196,6 +206,7 @@
           <i><b id="orange-boost-fill"></b></i>
         </div>
       </div>
+      <div class="pad-key">Boost pads: amber = ready · gray = recharging · large = full boost</div>
     </section>
   </header>
   <div class="controls">

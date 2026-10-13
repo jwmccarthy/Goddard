@@ -140,6 +140,56 @@ const ball = new THREE.Mesh(
 );
 ball.castShadow = true;
 scene.add(ball);
+const padShapes = {
+  large: {
+    base: new THREE.CylinderGeometry(116, 116, 6, 32),
+    ring: new THREE.RingGeometry(76, 104, 32),
+    orb: new THREE.SphereGeometry(46, 16, 12),
+  },
+  small: {
+    base: new THREE.CylinderGeometry(58, 58, 4, 24),
+    ring: new THREE.RingGeometry(32, 51, 24),
+    orb: new THREE.OctahedronGeometry(19),
+  },
+};
+const padMaterials = {
+  ready: new THREE.MeshStandardMaterial({
+    color: 0xffb452, emissive: 0xe67c1d, emissiveIntensity: 0.8, roughness: 0.36,
+  }),
+  recharging: new THREE.MeshStandardMaterial({ color: 0x597174, roughness: 0.85 }),
+  readyRing: new THREE.MeshBasicMaterial({ color: 0xffd080 }),
+  rechargingRing: new THREE.MeshBasicMaterial({ color: 0x779197 }),
+  orb: new THREE.MeshBasicMaterial({ color: 0xffd077 }),
+};
+const boostPads = [];
+
+function makeBoostPad(pad) {
+  const group = new THREE.Group();
+  const shape = pad.large ? padShapes.large : padShapes.small;
+  const base = new THREE.Mesh(shape.base, padMaterials.ready);
+  base.rotation.x = Math.PI / 2;
+  base.position.z = 6;
+  group.add(base);
+  const ring = new THREE.Mesh(shape.ring, padMaterials.readyRing);
+  ring.position.z = 10;
+  group.add(ring);
+  const orb = new THREE.Mesh(shape.orb, padMaterials.orb);
+  orb.position.z = pad.large ? pad.pos[2] : 27;
+  group.add(orb);
+  scene.add(group);
+  return { group, base, ring, orb };
+}
+
+function setBoostPad(index, pad) {
+  if (!boostPads[index]) boostPads[index] = makeBoostPad(pad);
+  const rig = boostPads[index];
+  rig.group.visible = true;
+  rig.group.position.set(pad.pos[0], pad.pos[1], 0);
+  rig.base.material = pad.active ? padMaterials.ready : padMaterials.recharging;
+  rig.ring.material = pad.active ? padMaterials.readyRing : padMaterials.rechargingRing;
+  rig.orb.visible = pad.active;
+}
+
 const basis = new THREE.Matrix4();
 const forward = new THREE.Vector3();
 const right = new THREE.Vector3();
@@ -177,6 +227,8 @@ source.onmessage = ({ data }) => {
     setCar(index, car);
   }
   for (const car of cars.slice(frame.cars.length)) car.group.visible = false;
+  for (const [index, pad] of frame.boostPads.entries()) setBoostPad(index, pad);
+  for (const pad of boostPads.slice(frame.boostPads.length)) pad.group.visible = false;
   const orangeIndex = frame.cars.length / 2;
   ball.position.fromArray(frame.ball.pos);
   blueLabel.textContent = frame.blue.checkpoint;

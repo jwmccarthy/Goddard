@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import torch as th
 from carl.gymnasium.action import ACTION_NVECS, CARLActionCodec
+from carl.gymnasium.state import BOOST_PAD_POSITIONS
 from gymnasium.spaces import Box, MultiDiscrete
 from http.server import ThreadingHTTPServer
 
@@ -232,12 +233,43 @@ class WatchGAIFOCheckpointsTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "team size does not match"):
                         load_policy_checkpoint(path, FakeEnv(), 4, None)
 
-                    raw = th.zeros(1, 9 + 22 * 2 * size + 34)
+                    raw = th.zeros(1, 9 + 22 * 2 * size + len(BOOST_PAD_POSITIONS))
                     frame = render_frame(raw, folder, path, path, 0, 0, 1, 4, size)
                     self.assertEqual([car["team"] for car in frame["cars"]],
                                      [0] * size + [1] * size)
                     self.assertEqual([car["player"] for car in frame["cars"]],
                                      list(range(1, size + 1)) * 2)
+
+    def test_viewer_frames_include_live_large_and_small_boost_pad_states(self):
+        folder = Path("/tmp/opencode")
+        path = folder / "gaifo_000000000001.pt"
+        for team_size in (1, 2, 3):
+            with self.subTest(team_size=team_size):
+                pad_start = 9 + 44 * team_size
+                raw = th.zeros(1, pad_start + len(BOOST_PAD_POSITIONS))
+                raw[0, pad_start:] = 1
+                raw[0, pad_start + 0] = 0
+                raw[0, pad_start + 6] = 0
+
+                frame = render_frame(raw, folder, path, path, 0, 0, 1, 4, team_size)
+                pads = frame["boostPads"]
+                self.assertEqual(len(pads), len(BOOST_PAD_POSITIONS))
+                self.assertEqual([pad["pos"] for pad in pads],
+                                 [list(position) for position in BOOST_PAD_POSITIONS])
+                self.assertEqual([pad["large"] for pad in pads],
+                                 [True] * 6 + [False] * (len(pads) - 6))
+                self.assertFalse(pads[0]["active"])
+                self.assertTrue(pads[1]["active"])
+                self.assertFalse(pads[6]["active"])
+                self.assertTrue(pads[7]["active"])
+
+                raw[0, pad_start + 0] = 1
+                raw[0, pad_start + 1] = 0
+                raw[0, pad_start + 6] = 1
+                updated = render_frame(raw, folder, path, path, 0, 0, 1, 8, team_size)
+                self.assertTrue(updated["boostPads"][0]["active"])
+                self.assertFalse(updated["boostPads"][1]["active"])
+                self.assertTrue(updated["boostPads"][6]["active"])
 
     def test_load_and_play_mlp_and_gru(self):
         th.manual_seed(0)

@@ -532,6 +532,13 @@ def render_frame(
             "boosting": bool(car[20]),
             "demoed": bool(car[17]),
         })
+    # CARL lists the six full-boost pads before the 28 small ones.
+    boost_pads = [
+        {"pos": list(position), "large": index < 6, "active": bool(active)}
+        for index, (position, active) in enumerate(zip(
+            carl.BOOST_PAD_POSITIONS, raw[9 + 44 * team_size:], strict=True,
+        ))
+    ]
     return {
         "tick": tick,
         "round": round_number,
@@ -547,6 +554,7 @@ def render_frame(
         },
         "cars": rendered,
         "ball": {"pos": vector(raw[:3])},
+        "boostPads": boost_pads,
     }
 
 

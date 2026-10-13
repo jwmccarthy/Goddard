@@ -313,6 +313,22 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                   patch.object(ConfidentExpertResetTransform, "__call__", record_reset)):
                 main()
 
+            if reward_plus:
+                from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+                event_files = list((root / "runs").rglob("events.out.tfevents.*"))
+                self.assertEqual(len(event_files), 1)
+                events = EventAccumulator(str(event_files[0]))
+                events.Reload()
+                for name in (
+                    "component/speed", "component/aerial_lift", "component/aerial_shot",
+                    "component/underside", "component/kickoff_speed", "component/kickoff",
+                    "aggregate/reward_plus", "scale/reward_plus",
+                ):
+                    tag = f"RewardSpec/{name}"
+                    self.assertIn(tag, events.Tags()["scalars"])
+                    self.assertTrue(events.Scalars(tag))
+
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)
             saved = load_resume_checkpoint(max(checkpoints))
@@ -400,6 +416,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             env.step(action)
             self.assertTrue(gameplay.reward_plus.kickoff_pending[0].item())
             self.assertEqual(gameplay.last_reward_plus["reward_plus_kickoff"].abs().sum(), 0)
+            action[0, 0] = 2  # Only blue drives toward the center ball.
+            env.step(action)
+            self.assertGreater(gameplay.last_reward_plus["reward_plus_kickoff_speed"][0], 0)
+            self.assertLess(gameplay.last_reward_plus["reward_plus_kickoff_speed"][1], 0)
         finally:
             env.close()
 

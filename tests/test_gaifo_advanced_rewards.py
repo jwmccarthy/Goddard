@@ -417,6 +417,84 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertGreater(underside[3, 0], 0)
         th.testing.assert_close(underside.sum(-1), th.zeros(4))
 
+    def test_reward_plus_kickoff_speed_rewards_only_closest_challengers(self):
+        for team_size in (1, 2, 3):
+            with self.subTest(team_size=team_size):
+                n_cars = 2 * team_size
+                spawn = physical_state(1, n_cars=n_cars)
+                cars = spawn[:, 9:9 + 22 * n_cars].view(1, n_cars, 22)
+                cars[:, :team_size, 1] = -3_500.0
+                cars[:, team_size:, 1] = 3_500.0
+                blue, orange = team_size - 1, n_cars - 1
+                cars[0, blue, 1] = -2_500.0
+                cars[0, orange, 1] = 2_500.0
+
+                moved = spawn.clone()
+                moved_cars = moved[:, 9:9 + 22 * n_cars].view(1, n_cars, 22)
+                moved_cars[0, blue, 1] += 100.0
+                moved_cars[0, orange, 1] += 100.0  # Retreat costs the orange team.
+                if team_size > 1:
+                    moved_cars[0, 0, 1] += 100.0  # A non-challenger cannot farm.
+                    moved_cars[0, team_size, 1] -= 100.0
+
+                gameplay = GameplayDiagnostics(
+                    1, th.device("cpu"), 900, n_cars=n_cars, reward_plus=True,
+                )
+                capture = AdvancedTouchCapture(gameplay)
+                gameplay(physical_context(moved, spawn, n_cars=n_cars, episode_ticks=4))
+                speed = capture(None)["reward_plus_kickoff_speed"]
+                th.testing.assert_close(speed, th.tensor(
+                    [0.02] * team_size + [-0.02] * team_size,
+                ), atol=1e-7, rtol=0)
+
+                gameplay(physical_context(spawn, moved, n_cars=n_cars))
+                th.testing.assert_close(
+                    speed + capture(None)["reward_plus_kickoff_speed"],
+                    th.zeros(n_cars), atol=1e-7, rtol=0,
+                )
+
+                touched = spawn.clone()
+                touched_cars = touched[:, 9:9 + 22 * n_cars].view(1, n_cars, 22)
+                touched_cars[0, blue, 1] += 100.0
+                touched_cars[0, blue, 21] = 1.0
+                gameplay(physical_context(touched, spawn, n_cars=n_cars))
+                th.testing.assert_close(
+                    capture(None)["reward_plus_kickoff_speed"], th.tensor(
+                        [0.01] * team_size + [-0.01] * team_size,
+                    ), atol=1e-7, rtol=0,
+                )
+                th.testing.assert_close(
+                    capture(None)["reward_plus_kickoff"], th.tensor(
+                        [0.5] * team_size + [-0.5] * team_size,
+                    ),
+                )
+                gameplay(physical_context(moved, touched, n_cars=n_cars))
+                th.testing.assert_close(
+                    capture(None)["reward_plus_kickoff_speed"], th.zeros(n_cars),
+                )
+
+                new_kickoff = GameplayDiagnostics(
+                    1, th.device("cpu"), 900, n_cars=n_cars, reward_plus=True,
+                )
+                new_kickoff(physical_context(moved, spawn, n_cars=n_cars, episode_ticks=4))
+                new_kickoff(physical_context(spawn, moved, n_cars=n_cars,
+                                             episode_ticks=500))
+                th.testing.assert_close(
+                    AdvancedTouchCapture(new_kickoff)(None)["reward_plus_kickoff_speed"],
+                    th.zeros(n_cars),
+                )
+
+                replay = spawn.clone()
+                replay[0, 0] = 500.0  # A replay reset, not a centered kickoff.
+                replay_moved = replay.clone()
+                replay_moved[:, 9:9 + 22 * n_cars].view(1, n_cars, 22)[0, blue, 1] += 100.0
+                new_kickoff(physical_context(replay_moved, replay, n_cars=n_cars,
+                                             episode_ticks=4))
+                th.testing.assert_close(
+                    AdvancedTouchCapture(new_kickoff)(None)["reward_plus_kickoff_speed"],
+                    th.zeros(n_cars),
+                )
+
     def test_reward_plus_kickoff_first_touch_is_once_per_real_kickoff(self):
         spawn = physical_state(1, n_cars=4)
         cars = spawn[:, 9:97].view(1, 4, 22)
@@ -501,6 +579,28 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                 TensorBatch({name: value for name, value in batch.items()
                              if name not in REWARD_PLUS_COMPONENTS}), PrepareContext(),
             )
+
+    def test_reward_plus_diagnostics_report_components_before_zero_sum(self):
+        current = physical_state(2)
+        previous = current.clone()
+        current[0, 9 + 4] = 400.0
+        gameplay = GameplayDiagnostics(2, th.device("cpu"), 900, reward_plus=True)
+        gameplay(physical_context(current, previous))
+        self.assertEqual(gameplay.last_reward_plus["reward_plus_speed"].sum().item(), 0)
+
+        report = gameplay.diagnostic_metrics()
+        components = report["RewardSpec"]
+        speed = (400.0 / 2300.0) * 0.75
+        self.assertAlmostEqual(components["component/speed"], speed / 4)
+        self.assertAlmostEqual(components["aggregate/reward_plus"], speed / 4)
+        self.assertAlmostEqual(components["scale/reward_plus"], speed / 2 ** 0.5)
+        for name in REWARD_PLUS_COMPONENTS[1:]:
+            self.assertEqual(components[f"component/{name.removeprefix('reward_plus_')}"], 0)
+        self.assertNotIn("RewardSpec", gameplay.diagnostic_metrics())
+
+        gameplay(physical_context(current, current))
+        quiet = gameplay.diagnostic_metrics()["RewardSpec"]
+        self.assertTrue(all(value == 0 for value in quiet.values()))
 
     def test_short_window_reward_and_terminal_event_on_invalid_window(self):
         windows = th.zeros(1, 4, 2, 51)
