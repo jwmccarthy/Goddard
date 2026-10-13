@@ -10,6 +10,7 @@ const goals = document.getElementById('goals');
 const objectivesLabel = document.getElementById('objectives');
 const blueCheckpoint = document.getElementById('blueCheckpoint');
 const orangeCheckpoint = document.getElementById('orangeCheckpoint');
+const cameraMode = document.getElementById('cameraMode');
 const resetMatch = document.getElementById('resetMatch');
 const blueBoost = document.getElementById('blue-boost');
 const orangeBoost = document.getElementById('orange-boost');
@@ -207,6 +208,87 @@ function setCar(index, state) {
   rig.material.emissiveIntensity = state.boosting ? 1.2 : 0;
 }
 
+let cameraFrame = null;
+let cameraCars = '';
+let activeCameraMode = 'free';
+let snapCamera = false;
+const orbitPosition = camera.position.clone();
+const orbitTarget = controls.target.clone();
+const followPosition = new THREE.Vector3();
+const followTarget = new THREE.Vector3();
+const followHeading = new THREE.Vector3(0, 1, 0);
+const carPosition = new THREE.Vector3();
+
+function changeCameraMode() {
+  const mode = cameraMode.value;
+  if (mode === 'free') {
+    camera.position.copy(orbitPosition);
+    controls.target.copy(orbitTarget);
+    controls.enabled = true;
+    controls.update();
+  } else {
+    if (activeCameraMode === 'free') {
+      orbitPosition.copy(camera.position);
+      orbitTarget.copy(controls.target);
+    }
+    controls.enabled = false;
+    snapCamera = true;
+    if (mode.startsWith('car:')) followHeading.set(0, mode.startsWith('car:0:') ? 1 : -1, 0);
+  }
+  activeCameraMode = mode;
+}
+cameraMode.addEventListener('change', changeCameraMode);
+
+function updateCameraChoices(players) {
+  const signature = players.map((car) => `${car.team}:${car.player}`).join(',');
+  if (signature === cameraCars) return;
+  cameraCars = signature;
+  for (const option of cameraMode.querySelectorAll('option[data-car]')) option.remove();
+  for (const car of players) {
+    const option = document.createElement('option');
+    option.value = `car:${car.team}:${car.player}`;
+    option.textContent = `Follow ${car.team ? 'Orange' : 'Blue'} ${car.player}`;
+    option.dataset.car = '';
+    cameraMode.appendChild(option);
+  }
+  if (![...cameraMode.options].some((option) => option.value === activeCameraMode)) {
+    cameraMode.value = 'free';
+    changeCameraMode();
+  }
+}
+
+function updateFollowCamera(delta) {
+  if (!cameraFrame) return;
+  let car;
+  if (cameraMode.value.startsWith('car:')) {
+    const [, team, player] = cameraMode.value.split(':');
+    car = cameraFrame.cars.find((item) => item.team === Number(team) && item.player === Number(player));
+  }
+  if (car && !car.demoed) {
+    carPosition.fromArray(car.pos);
+    const horizontal = Math.hypot(car.fwd[0], car.fwd[1]);
+    if (horizontal > 0.2) followHeading.set(car.fwd[0] / horizontal, car.fwd[1] / horizontal, 0);
+    followPosition.copy(carPosition).addScaledVector(followHeading, -650);
+    followPosition.z = carPosition.z + 260;
+    followTarget.copy(carPosition).addScaledVector(followHeading, 220);
+    followTarget.z = carPosition.z + 80;
+  } else {
+    // Follow the ball while the selected car is demolished or unavailable.
+    followTarget.fromArray(cameraFrame.ball.pos);
+    followPosition.set(followTarget.x, followTarget.y - 1300, followTarget.z + 900);
+  }
+  if (snapCamera || controls.target.distanceToSquared(followTarget) > 1500 ** 2) {
+    camera.position.copy(followPosition);
+    controls.target.copy(followTarget);
+    snapCamera = false;
+  } else {
+    const blend = 1 - Math.exp(-10 * delta);
+    camera.position.lerp(followPosition, blend);
+    controls.target.lerp(followTarget, blend);
+  }
+  camera.lookAt(controls.target);
+}
+
 let initialSelection = false;
 const source = new EventSource('/api/stream');
 source.onopen = () => {
@@ -222,6 +304,13 @@ source.onmessage = ({ data }) => {
   }
   connection.hidden = true;
   resetMatch.disabled = false;
+  if (cameraFrame && (frame.round !== cameraFrame.round || frame.tick < cameraFrame.tick
+      || frame.cars.length !== cameraFrame.cars.length
+      || frame.blue.path !== cameraFrame.blue.path || frame.orange.path !== cameraFrame.orange.path)) {
+    snapCamera = true;
+  }
+  cameraFrame = frame;
+  updateCameraChoices(frame.cars);
   for (const [index, car] of frame.cars.entries()) {
     if (!cars[index]) cars[index] = makeCar(carColors[car.team][(car.player - 1) % 3]);
     setCar(index, car);
@@ -286,9 +375,13 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
-function render() {
-  controls.update();
+let lastRenderTime = 0;
+function render(time) {
+  const delta = Math.min(0.1, (time - lastRenderTime) / 1000);
+  lastRenderTime = time;
+  if (cameraMode.value === 'free') controls.update();
+  else updateFollowCamera(delta);
   renderer.render(scene, camera);
   requestAnimationFrame(render);
 }
-render();
+requestAnimationFrame(render);

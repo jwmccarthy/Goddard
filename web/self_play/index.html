@@ -98,6 +98,7 @@
       font-size: 11px;
     }
     .selector .form-select { min-width: 0; }
+    .camera-selector { width: 175px; }
     #connection {
       margin-left: auto;
       align-self: center;
@@ -146,6 +147,7 @@
   <div class="controls">
     <label class="selector">Blue checkpoint<select class="form-select form-select-sm" id="blueCheckpoint"></select></label>
     <label class="selector">Orange checkpoint<select class="form-select form-select-sm" id="orangeCheckpoint"></select></label>
+    <label class="selector camera-selector">Camera<select class="form-select form-select-sm" id="cameraMode"><option value="free">Free orbit</option><option value="ball">Follow ball</option></select></label>
     <button class="btn btn-sm btn-primary" id="applyMatch">Apply match</button>
     <button class="btn btn-sm btn-outline-secondary" id="resetMatch" disabled>Random demo state</button>
     <button class="btn btn-sm btn-outline-secondary" id="kickoffMatch">Kickoff</button>
