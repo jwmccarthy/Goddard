@@ -1,0 +1,16 @@
+#:schema https://rlbot.org/schemas/agent.json
+[settings]
+name = "Goddard"
+loadout_file = "loadout.toml"
+root_dir = ""
+run_command = ".venv\\Scripts\\python.exe bot.py"
+agent_id = "jwmccarthy/goddard"
+logo_file = ""
+
+[details]
+description = "GAIFO policy trained in CARL"
+fun_fact = "Runs native CARL observations at the checkpoint's frame rate"
+source_link = "https://github.com/jwmccarthy/Goddard"
+developer = "Jack"
+language = "Python"
+tags = ["1v1", "2v2", "3v3"]

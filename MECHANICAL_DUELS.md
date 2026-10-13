@@ -269,6 +269,11 @@ metadata use training defaults where known. `--sample` watches stochastic
 actions like GAIFO training; otherwise the viewer takes the most likely action.
 The arena shows small and full boost pads in amber while ready, dimming them
 while they recharge.
+For real Rocket League, the RLBot v5 adapter in `rlbot_bot/` reads GAIFO
+checkpoint policy shapes, recurrence, and frame skip directly from saved
+configuration. Export a small deployment copy with
+`.venv/bin/python -m rlbot_bot.export_policy checkpoints/gaifo/RUN/gaifo_STEP.pt`;
+see `rlbot_bot/README.md` for Windows setup and matching 1v1/2v2/3v3 games.
 GAIFO's `timeout frac` is the share of finished episodes that went a full
 no-touch interval after **either team's last ball touch**; an episode can have
 earlier touches and still end this way.
