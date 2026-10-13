@@ -88,17 +88,13 @@
       flex-wrap: wrap;
       align-items: flex-end;
       gap: 8px;
-      padding: 10px;
-      border: 1px solid var(--border);
-      border-radius: 3px;
-      background: var(--surface);
     }
     .selector {
       display: grid;
       flex: none;
       width: 230px;
       gap: 3px;
-      color: var(--muted);
+      color: var(--ink);
       font-size: 11px;
     }
     .selector .form-select { min-width: 0; }
@@ -107,11 +103,9 @@
       align-self: center;
       max-width: 100%;
       overflow-wrap: anywhere;
-      color: var(--muted);
+      color: var(--ink);
       font-size: 11px;
     }
-    #connection.live { color: #206a4f; }
-
     @media (max-width: 760px) {
       .match-info { top: 8px; right: 8px; width: calc(100vw - 16px); }
       .controls {
@@ -122,7 +116,6 @@
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 6px;
-        padding: 8px;
       }
       .selector { width: auto; min-width: 0; }
       .controls .btn { width: 100%; }

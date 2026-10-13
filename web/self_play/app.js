@@ -210,17 +210,17 @@ function setCar(index, state) {
 let initialSelection = false;
 const source = new EventSource('/api/stream');
 source.onopen = () => {
-  connection.textContent = 'Live';
-  connection.classList.add('live');
+  connection.hidden = true;
 };
 source.onmessage = ({ data }) => {
   const frame = JSON.parse(data);
   if (frame.error) {
     connection.textContent = frame.error;
-    connection.classList.remove('live');
+    connection.hidden = false;
     resetMatch.disabled = true;
     return;
   }
+  connection.hidden = true;
   resetMatch.disabled = false;
   for (const [index, car] of frame.cars.entries()) {
     if (!cars[index]) cars[index] = makeCar(carColors[car.team][(car.player - 1) % 3]);
@@ -251,7 +251,7 @@ source.onmessage = ({ data }) => {
 };
 source.onerror = () => {
   connection.textContent = 'Reconnecting';
-  connection.classList.remove('live');
+  connection.hidden = false;
 };
 
 async function refreshCheckpoints() {
