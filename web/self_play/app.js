@@ -7,7 +7,7 @@ const connection = document.getElementById('connection');
 const blueLabel = document.getElementById('blue');
 const orangeLabel = document.getElementById('orange');
 const goals = document.getElementById('goals');
-const roundLabel = document.getElementById('round');
+const objectivesLabel = document.getElementById('objectives');
 const blueCheckpoint = document.getElementById('blueCheckpoint');
 const orangeCheckpoint = document.getElementById('orangeCheckpoint');
 const resetMatch = document.getElementById('resetMatch');
@@ -237,8 +237,8 @@ source.onmessage = ({ data }) => {
   const objectives = [frame.blue.objective, frame.orange.objective]
     .map((objective, index) => objective ? `${index ? 'orange' : 'blue'}: ${objective}` : null)
     .filter(Boolean);
-  roundLabel.textContent = `round ${frame.round} | tick ${frame.tick}`
-    + (objectives.length ? ` | ${objectives.join(' | ')}` : '');
+  objectivesLabel.textContent = objectives.join(' | ');
+  objectivesLabel.hidden = objectives.length === 0;
   blueBoost.textContent = frame.cars[0].boost.toFixed(0);
   orangeBoost.textContent = frame.cars[orangeIndex].boost.toFixed(0);
   blueBoostFill.style.width = `${frame.cars[0].boost}%`;
