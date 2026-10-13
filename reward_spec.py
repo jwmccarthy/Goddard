@@ -5,7 +5,7 @@ import torch
 from carl.gymnasium.state import CarlState, RewardContext, RewardResult
 from mechanical_rewards import (
     BALL_MAX_SPEED, BALL_RADIUS, CAR_MAX_SPEED, CEILING_Z, GOAL_HEIGHT,
-    MechanicalEventRewards, wall_contact,
+    AerialTouchCombo, MechanicalEventRewards, arena_surface_contact, wall_contact,
 )
 
 
@@ -110,6 +110,7 @@ class RewardSpec:
             raise ValueError("frameskip must be positive")
         self.frameskip = frameskip
         self.mechanical_events = MechanicalEventRewards(frameskip)
+        self.aerial_combo = AerialTouchCombo()
         self._last_touch = None
         self._count = 0
         self._mean = None
@@ -127,9 +128,28 @@ class RewardSpec:
         current = context.current
         previous = context.previous
         self._ensure_state(current.raw.shape[0], current.raw.device)
+        touches = current.car_ball_touches
+        ball_to_car = current.ball_position[:, None, :] - current.car_position
+        on_surface = arena_surface_contact(
+            current.car_on_ground, current.car_position, current.car_up[..., 2],
+        )
+        flip_reset = (
+            touches
+            & (previous.car_has_flipped | previous.car_has_double_jumped)
+            & ~(current.car_has_flipped | current.car_has_double_jumped)
+            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
+            & ball_to_car.square().sum(dim=-1).lt((2.0 * BALL_RADIUS) ** 2)
+            & self._cosine(ball_to_car, -current.car_up).gt(0.9)
+            & ~on_surface
+        )
+        aerial_contacts = (
+            touches & current.car_position[..., 2].gt(2.0 * BALL_RADIUS)
+            & ~on_surface
+        )
+        combo = self.aerial_combo(context, aerial_contacts, flip_reset)
         if self.sparse:
             return self._finish_reward(
-                context, self._sparse_components(context)
+                context, self._sparse_components(context, combo, flip_reset)
             )
 
         ball_position = current.ball_position[:, None, :]
@@ -263,7 +283,7 @@ class RewardSpec:
         touch_acceleration = touches * ball_acceleration
         aerial_touch = touches * (
             ball_position[..., 2] / AERIAL_TOUCH_HEIGHT_SCALE
-        ).clamp_min(0.0)
+        ).clamp_min(0.0) * combo
         angular_velocity = current.car_angular_velocity.norm(dim=-1) / 5.5
         touch_grass = (
             current.car_on_ground
@@ -331,11 +351,13 @@ class RewardSpec:
             "touch_grass":         -weights.touch_grass * touch_grass,
             "win_probability":      weights.win_probability * win_probability_progress,
         }
-        components.update(self._mechanics_components(context))
+        components.update(self._mechanics_components(context, combo, flip_reset))
 
         return self._finish_reward(context, components)
 
-    def _sparse_components(self, context: RewardContext) -> dict[str, torch.Tensor]:
+    def _sparse_components(
+        self, context: RewardContext, combo: torch.Tensor, flip_reset: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         current = context.current
         previous = context.previous
         touches = current.car_ball_touches
@@ -411,18 +433,20 @@ class RewardSpec:
             "goal_scored": weights.goal_scored * (
                 context.events.score_delta[:, None] * team_sign
             ).clamp_min(0.0),
-            "shot": weights.shot * shot * goalward_impulse,
+            "shot": weights.shot * shot * goalward_impulse * combo,
             "air_dribble_setup": weights.air_dribble_setup * setup * (
                 vertical_change / CAR_MAX_SPEED
-            ).clamp(0.0, 1.0),
+            ).clamp(0.0, 1.0) * combo,
             "car_velocity": weights.car_velocity * car_velocity,
-            "aerial_touch": weights.aerial_touch * aerial_touch * goalward_impulse,
+            "aerial_touch": weights.aerial_touch * aerial_touch * goalward_impulse * combo,
             "demo": weights.demo * demo,
         }
-        components.update(self._mechanics_components(context))
+        components.update(self._mechanics_components(context, combo, flip_reset))
         return components
 
-    def _mechanics_components(self, context: RewardContext) -> dict[str, torch.Tensor]:
+    def _mechanics_components(
+        self, context: RewardContext, combo: torch.Tensor, flip_reset: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         current, previous = context.current, context.previous
         ball_position = current.ball_position[:, None, :]
         car_to_ball = ball_position - current.car_position
@@ -489,16 +513,6 @@ class RewardSpec:
             * torch.where(ground_pop, 1.0, goalward_motion)
         )
 
-        flip_reset = (
-            current.car_ball_touches
-            & (previous.car_has_flipped | previous.car_has_double_jumped)
-            & ~(current.car_has_flipped | current.car_has_double_jumped)
-            & current.car_position[..., 2].gt(3.0 * BALL_RADIUS)
-            & car_to_ball.square().sum(dim=-1).lt((2.0 * BALL_RADIUS) ** 2)
-            & self._cosine(car_to_ball, -current.car_up).gt(0.9)
-            & ~wall_contact
-        )
-
         opponent_goal = torch.zeros_like(current.car_position)
         opponent_goal[..., 1] = team_sign * GOAL_Y
         opponent_goal[..., 2] = GOAL_HEIGHT / 2.0
@@ -527,9 +541,9 @@ class RewardSpec:
             "boost_free_speed_progress": (
                 weights.boost_free_speed_progress * valid * boost_free_speed
             ),
-            "soft_lift": weights.soft_lift * valid * soft_lift,
-            "flip_reset": weights.flip_reset * valid * flip_reset,
-            "aerial_shot": weights.aerial_shot * valid * aerial_shot,
+            "soft_lift": weights.soft_lift * valid * soft_lift * combo,
+            "flip_reset": weights.flip_reset * valid * flip_reset * combo,
+            "aerial_shot": weights.aerial_shot * valid * aerial_shot * combo,
         }
         components.update({
             name: getattr(weights, name) * value

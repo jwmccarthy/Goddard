@@ -53,7 +53,10 @@ from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
 from action_codec import enable_grounded_aerial_controls
-from mechanical_rewards import MechanicalEventRewards, wall_contact
+from mechanical_rewards import (
+    AerialTouchCombo, MechanicalEventRewards,
+    arena_surface_contact as _arena_surface_contact, wall_contact,
+)
 from replay_resets import (
     ReplayResetProvider, _invalid_reset_rotations, _sampled_frame_skip,
     observable_replay_reset_mask, reset_index_dataset,
@@ -292,15 +295,6 @@ class GroundManeuver(SceneManeuver):
     def release(self) -> int:
         """First recovery frame, after the flick impulse when present."""
         return self.action_stop
-
-
-def _arena_surface_contact(
-    on_ground: th.Tensor, position: th.Tensor, up_z: th.Tensor,
-) -> th.Tensor:
-    """Distinguish floor and side walls from wheel contact with a ball or roof."""
-    z = position[..., 2]
-    floor = (z < 2 * BALL_RADIUS) & (up_z > 0.5)
-    return (on_ground & floor) | wall_contact(on_ground, position, up_z)
 
 
 def recovery_surface_contact(
@@ -992,7 +986,7 @@ class RewardPlus:
         return speed, touch
 
     def __call__(
-        self, context: RewardContext, aerial_touches: th.Tensor,
+        self, context: RewardContext, aerial_touches: th.Tensor, combo: th.Tensor,
     ) -> dict[str, th.Tensor]:
         current, previous = context.current, context.previous
         ball_displacement = (current.ball_position - previous.ball_position).norm(dim=-1)
@@ -1082,8 +1076,8 @@ class RewardPlus:
         mechanics = self.mechanical_events(context, valid)
         return {
             "reward_plus_speed": speed,
-            "reward_plus_aerial_lift": lift,
-            "reward_plus_aerial_shot": aerial_shot,
+            "reward_plus_aerial_lift": lift * combo,
+            "reward_plus_aerial_shot": aerial_shot * combo,
             "reward_plus_underside": underside,
             "reward_plus_kickoff_speed": kickoff_speed,
             "reward_plus_kickoff": kickoff_touch,
@@ -1109,6 +1103,7 @@ class GameplayDiagnostics:
         self.team_size = n_cars // 2
         self.no_touch_timeout_steps = no_touch_timeout_steps
         self.touch_steps = th.zeros(n_sim, dtype=th.long, device=device)
+        self.aerial_combo = AerialTouchCombo()
         self.last_aerial_touch_score = th.zeros(n_sim * n_cars, device=device)
         self.last_flip_reset = th.zeros(n_sim * n_cars, device=device)
         self.last_ego_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
@@ -1151,11 +1146,12 @@ class GameplayDiagnostics:
         ).reshape(-1)
         score_for_actor = context.events.score_delta[:, None] * context.current.team_sign
         aerial_score, aerial, flip_reset = advanced_touch_events(context)
-        self.last_aerial_touch_score = self._team_difference(aerial_score)
-        flip_reset_score = flip_reset.to(aerial_score.dtype)
+        combo = self.aerial_combo(context, aerial, flip_reset)
+        self.last_aerial_touch_score = self._team_difference(aerial_score * combo)
+        flip_reset_score = flip_reset.to(aerial_score.dtype) * combo
         self.last_flip_reset = self._team_difference(flip_reset_score)
         if self.reward_plus is not None:
-            components = self.reward_plus(context, aerial)
+            components = self.reward_plus(context, aerial, combo)
             self.last_reward_plus = {
                 name: self._team_difference(value)
                 for name, value in components.items()

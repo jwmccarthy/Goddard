@@ -73,6 +73,178 @@ def gaifo_bonus(gameplay: GameplayDiagnostics, name: str, n_cars: int = 2) -> th
 
 
 class MechanicalRewardTests(unittest.TestCase):
+    def test_aerial_touch_combo_compounds_and_resets_across_training_modes(self):
+        flight = state(2)
+        flight[:, 2] = 700.0
+        cars = flight[:, 9:53].view(2, 2, 22)
+        cars[:, 0, 2] = 560.0
+        cars[:, 0, 16] = 0.0
+        touch = flight.clone()
+        touch[:, 4] = 600.0
+        touch[0, 9 + 21] = 1.0
+
+        gameplay = GameplayDiagnostics(2, th.device("cpu"), 900, reward_plus=True)
+        dense = RewardSpec(normalize=False, weights=only_weights("aerial_touch"))
+        sparse = RewardSpec(normalize=False, sparse=True, weights=only_weights("aerial_touch"))
+
+        def scores(current: th.Tensor, previous: th.Tensor):
+            ctx = context(current, previous)
+            gameplay(ctx)
+            return (
+                gameplay.last_aerial_touch_score.view(2, 2).clone(),
+                dense(ctx).clone(), sparse(ctx).clone(),
+                gaifo_bonus(gameplay, "aerial_shot").clone(),
+            )
+
+        first = scores(touch, flight)
+        for reward in first:
+            self.assertGreater(reward[0, 0].item(), 0.0)
+            th.testing.assert_close(reward.sum(-1), th.zeros(2))
+
+        held_touch = touch.clone()
+        held_touch[0, 4] = 900.0
+        held = scores(held_touch, touch)
+        # A continuous touch flag still pays the original bonus, not a combo.
+        for index in (0, 1):
+            th.testing.assert_close(held[index][0], first[index][0])
+        scores(flight, held_touch)
+
+        for contact_number in range(2, 8):
+            earned = scores(touch, flight)
+            factor = min(1.5 ** (contact_number - 1), 4.0)
+            for reward, original in zip(earned, first):
+                th.testing.assert_close(reward[0], original[0] * factor)
+                th.testing.assert_close(reward[1], th.zeros(2))
+            scores(flight, touch)
+
+        # A different simulation starts at 1x even while the first is capped.
+        other_touch = flight.clone()
+        other_touch[1, 4] = 600.0
+        other_touch[1, 9 + 21] = 1.0
+        for reward, original in zip(scores(other_touch, flight), first):
+            th.testing.assert_close(reward[0], th.zeros(2))
+            th.testing.assert_close(reward[1], original[0])
+
+        landed = flight.clone()
+        landed[:, 9 + 2] = 17.0
+        landed[:, 9 + 16] = 1.0
+        scores(landed, other_touch)
+        scores(flight, landed)
+        for reward, original in zip(scores(touch, flight), first):
+            th.testing.assert_close(reward[0], original[0])
+
+    def test_aerial_touch_combo_is_per_car_not_per_team(self):
+        flight = state(n_cars=4)
+        flight[0, 2] = 700.0
+        cars = flight[0, 9:97].view(4, 22)
+        cars[:2, 2] = 560.0
+        cars[:2, 16] = 0.0
+        first_touch = flight.clone()
+        first_touch[0, 9 + 21] = 1.0
+        teammate_touch = flight.clone()
+        teammate_touch[0, 9 + 22 + 21] = 1.0
+
+        gameplay = GameplayDiagnostics(1, th.device("cpu"), 900, n_cars=4)
+
+        def blue_reward(current: th.Tensor, previous: th.Tensor) -> th.Tensor:
+            gameplay(context(current, previous, n_cars=4))
+            reward = gameplay.last_aerial_touch_score.view(4)
+            th.testing.assert_close(reward[:2], reward[0].expand(2))
+            th.testing.assert_close(reward[2:], -reward[0].expand(2))
+            return reward[0].clone()
+
+        first = blue_reward(first_touch, flight)
+        blue_reward(flight, first_touch)
+        th.testing.assert_close(blue_reward(teammate_touch, flight), first)
+        blue_reward(flight, teammate_touch)
+        th.testing.assert_close(blue_reward(first_touch, flight), first * 1.5)
+
+    def test_aerial_touch_combo_clears_on_wall_contact_and_demolition(self):
+        flight = state()
+        flight[0, 0] = 3950.0
+        flight[0, 2] = 700.0
+        car = flight[0, 9:31]
+        car[0] = 4050.0
+        car[1] = 0.0
+        car[2] = 560.0
+        car[16] = 0.0
+        touch = flight.clone()
+        touch[0, 9 + 21] = 1.0
+        wall = flight.clone()
+        wall[0, 9 + 12] = 1.0
+        wall[0, 9 + 14] = 0.0
+        wall[0, 9 + 16] = 1.0
+        demolished = flight.clone()
+        demolished[0, 9 + 17] = 1.0
+
+        gameplay = GameplayDiagnostics(1, th.device("cpu"), 900)
+
+        def blue_reward(current: th.Tensor, previous: th.Tensor) -> float:
+            gameplay(context(current, previous))
+            return gameplay.last_aerial_touch_score[0].item()
+
+        first = blue_reward(touch, flight)
+        blue_reward(flight, touch)
+        self.assertAlmostEqual(blue_reward(touch, flight), first * 1.5)
+
+        blue_reward(wall, touch)
+        blue_reward(flight, wall)
+        self.assertAlmostEqual(blue_reward(touch, flight), first)
+
+        blue_reward(demolished, touch)
+        blue_reward(flight, demolished)
+        self.assertAlmostEqual(blue_reward(touch, flight), first)
+
+    def test_flip_resets_advance_and_share_the_aerial_touch_combo(self):
+        flight = state()
+        flight[0, 2] = 350.0
+        car = flight[0, 9:31]
+        car[1] = 0.0
+        car[2] = 500.0
+        car[16] = 0.0
+        car[18] = 1.0  # The flip was spent before wheel contact with the ball.
+        reset = flight.clone()
+        reset[0, 9 + 16] = 1.0  # Ball contact sets CARL's on-ground flag.
+        reset[0, 9 + 18] = 0.0
+        reset[0, 9 + 21] = 1.0
+        spent_again = reset.clone()
+        spent_again[0, 9 + 16] = 0.0
+        spent_again[0, 9 + 18] = 1.0
+
+        gameplay = GameplayDiagnostics(1, th.device("cpu"), 900)
+        dense = RewardSpec(normalize=False, weights=only_weights("flip_reset"))
+        sparse = RewardSpec(normalize=False, sparse=True, weights=only_weights("flip_reset"))
+
+        def bonuses(current: th.Tensor, previous: th.Tensor, done: bool = False):
+            ctx = context(current, previous, done=th.tensor([done]))
+            gameplay(ctx)
+            return (
+                gameplay.last_flip_reset.view(1, 2).clone(),
+                gameplay.last_aerial_touch_score.view(1, 2).clone(),
+                dense(ctx).clone(), sparse(ctx).clone(),
+            )
+
+        first = bonuses(reset, flight)
+        th.testing.assert_close(first[0], th.tensor([[1.0, -1.0]]))
+        for reward in first[2:]:
+            th.testing.assert_close(reward, th.tensor([[3.0, -3.0]]))
+
+        bonuses(spent_again, reset)
+        # No gap in the ball-touch flag: a second actual flip reset still counts.
+        second = bonuses(reset, spent_again)
+        for reward, original in zip(second, first):
+            th.testing.assert_close(reward, original * 1.5)
+
+        bonuses(spent_again, reset)
+        third = bonuses(reset, spent_again, done=True)
+        th.testing.assert_close(third[0], first[0] * 2.25)
+        th.testing.assert_close(third[1], first[1] * 2.25)
+        # BASIC excludes terminal mechanics, but its streak must also reset.
+        th.testing.assert_close(third[2], th.zeros(1, 2))
+        th.testing.assert_close(third[3], th.zeros(1, 2))
+        for reward, original in zip(bonuses(reset, flight), first):
+            th.testing.assert_close(reward, original)
+
     def test_wasted_aerial_and_boost_charge_once_on_landing_unless_touched(self):
         grounded = state(4)
         flight = grounded.clone()

@@ -203,7 +203,13 @@ still credit all early actions for later rewards. Goal
 rewards and the default aerial-touch bonus are shared across teammates and
 opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
-`--aerial-touch-reward-weight` (default `0.5`).
+`--aerial-touch-reward-weight` (default `0.5`). Distinct contacts by the same
+car during one flight compound by `1.5` per touch (1x, 1.5x, 2.25x, 3.375x,
+then capped at 4x). A held ball-touch flag does not build or collect the extra
+bonus. Flip resets count as contacts even when that flag stays set, and the same
+multiplier applies to both their bonus and the aerial-touch bonus. Floor or wall
+contact, an upside-down floor landing, demolition, or an episode end resets the
+streak; wheel contact with the ball does not.
 
 `--reward-plus` adds twelve bounded, zero-sum team signals alongside the
 discriminator imitation reward:
@@ -216,10 +222,10 @@ discriminator imitation reward:
   ball height. A hard increase in ball-to-car relative speed reduces the bonus
   only once the ball moves faster than 1.5 times the car's speed.
   Downward velocity changes are charged; repeated contact without improvement
-  pays nothing.
+  pays nothing. Distinct airborne touches use the same combo multiplier.
 - A solo aerial touch above the crossbar pays for improving the ball's
   goalward velocity and aim at the opponent's goal (up to `1`), and charges a
-  touch that spoils a good shot.
+  touch that spoils a good shot. Its signed change also uses the combo multiplier.
 - Exposing the car's wheels to the underside of a nearby ball pays a
   discounted *change* in alignment only when the car has no actionable dodge,
   not a standing pose reward. The potential reaches its maximum above the
@@ -265,7 +271,8 @@ BASIC's dense and `--sparse` reward presets use the same six new mechanical
 events and weights. Their signed component means appear under
 `RewardSpec/component/{wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
 in TensorBoard. Both training modes scale per-time bonuses by their physics
-frame skip.
+frame skip. Both also compound distinct airborne touches and flip resets with
+the same per-car multiplier; ground touches retain their ordinary rewards.
 
 GAIFO, BASIC without reaction time, deep training, and the checkpoint viewer
 use CARL's native observation and a shared project action mask. The last two

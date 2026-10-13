@@ -21,6 +21,57 @@ def wall_contact(on_ground: torch.Tensor, position: torch.Tensor,
     return on_ground & z.lt(1700.0) & up_z.abs().lt(0.5) & near_wall
 
 
+def arena_surface_contact(on_ground: torch.Tensor, position: torch.Tensor,
+                          up_z: torch.Tensor) -> torch.Tensor:
+    """Distinguish floor and side walls from wheel contact with a ball or roof."""
+    floor = position[..., 2].lt(2 * BALL_RADIUS) & up_z.gt(0.5)
+    return (on_ground & floor) | wall_contact(on_ground, position, up_z)
+
+
+class AerialTouchCombo:
+    """Compound distinct aerial contacts per car until landing or an episode reset."""
+
+    def __init__(self) -> None:
+        self.streak: torch.Tensor | None = None
+        self.last_touch: torch.Tensor | None = None
+
+    @torch.no_grad()
+    def __call__(self, context: RewardContext, aerial: torch.Tensor,
+                 flip_reset: torch.Tensor) -> torch.Tensor:
+        current = context.current
+        shape = (len(current.raw), current.n_cars)
+        if (self.streak is None or self.streak.shape != shape
+                or self.streak.device != current.raw.device):
+            self.streak = torch.zeros(shape, dtype=torch.int32, device=current.raw.device)
+            self.last_touch = torch.zeros(shape, dtype=torch.bool, device=current.raw.device)
+
+        on_surface = arena_surface_contact(
+            current.car_on_ground, current.car_position, current.car_up[..., 2],
+        )
+        # CARL's ground flag stays false when a car lands upside down on its roof.
+        roof_landing = (
+            current.car_position[..., 2].lt(65.0)
+            & current.car_up[..., 2].lt(-0.7)
+            & current.car_velocity[..., 2].abs().lt(120.0)
+        )
+        reset = (on_surface | roof_landing | current.car_demoed
+                 | context.previous.car_demoed)
+        # A sustained contact is still worth its ordinary touch reward, but
+        # cannot repeatedly grow or collect the combo. A flip reset is a new
+        # event even if the ball-touch flag stayed set across observations.
+        new_contact = aerial & ~reset & (~self.last_touch | flip_reset)
+        streak = torch.where(reset, 0, self.streak)
+        streak = torch.where(new_contact, (streak + 1).clamp_max(5), streak)
+        multiplier = current.raw.new_tensor(1.5).pow(
+            (streak - 1).clamp_min(0)
+        ).clamp_max(4.0)
+        self.streak = torch.where(context.events.done[:, None], 0, streak)
+        self.last_touch = torch.where(
+            reset | context.events.done[:, None], False, current.car_ball_touches,
+        )
+        return torch.where(new_contact, multiplier, 1.0)
+
+
 class MechanicalEventRewards:
     """Resolve missed aerials, ceiling rebounds, wall control, and roof landings."""
 
