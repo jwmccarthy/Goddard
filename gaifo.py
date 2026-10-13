@@ -53,6 +53,7 @@ from jarl.store.rollout import Rollout
 from jarl.transform import GAE, PrepareContext
 
 from action_codec import enable_grounded_aerial_controls
+from mechanical_rewards import MechanicalEventRewards, wall_contact
 from replay_resets import (
     ReplayResetProvider, _invalid_reset_rotations, _sampled_frame_skip,
     observable_replay_reset_mask, reset_index_dataset,
@@ -65,7 +66,7 @@ from replay_safety import (
     GOAL_EXCLUSION_SECONDS, TICKS_PER_SECOND,
     infer_unsafe_start_mask, pre_goal_start_mask,
 )
-from reward_spec import CEILING_Z
+from reward_spec import CEILING_Z, RewardWeights
 
 
 SCENE_SIZE = 51
@@ -147,6 +148,12 @@ REWARD_PLUS_COMPONENTS = (
     "reward_plus_underside",
     "reward_plus_kickoff_speed",
     "reward_plus_kickoff",
+    "reward_plus_wasted_air",
+    "reward_plus_wasted_boost",
+    "reward_plus_ball_ceiling",
+    "reward_plus_wall_touch",
+    "reward_plus_wall_control",
+    "reward_plus_inverted_ground",
 )
 
 
@@ -291,15 +298,9 @@ def _arena_surface_contact(
     on_ground: th.Tensor, position: th.Tensor, up_z: th.Tensor,
 ) -> th.Tensor:
     """Distinguish floor and side walls from wheel contact with a ball or roof."""
-    x = position[..., 0].abs()
-    y = position[..., 1].abs()
     z = position[..., 2]
     floor = (z < 2 * BALL_RADIUS) & (up_z > 0.5)
-    near_wall = (
-        (x > 3_900) | (y > 4_900) | ((x > 3_000) & (y > 4_300))
-    )
-    wall = near_wall & (z < NEAR_CEILING_HEIGHT) & (up_z.abs() < 0.5)
-    return on_ground & (floor | wall)
+    return (on_ground & floor) | wall_contact(on_ground, position, up_z)
 
 
 def recovery_surface_contact(
@@ -904,6 +905,8 @@ class RewardPlus:
         self.frameskip = frameskip
         self.team_size = n_cars // 2
         self.gamma = gamma ** frameskip_ratio(frameskip)
+        self.mechanical_events = MechanicalEventRewards(frameskip)
+        self.mechanical_weights = RewardWeights()
         self.kickoff_pending = th.zeros(n_sim, dtype=th.bool, device=device)
         self.kickoff_challenger = th.zeros(n_sim, n_cars, dtype=th.bool, device=device)
 
@@ -1076,6 +1079,7 @@ class RewardPlus:
             - previous_potential
         )
         kickoff_speed, kickoff_touch = self._kickoff_rewards(context, valid)
+        mechanics = self.mechanical_events(context, valid)
         return {
             "reward_plus_speed": speed,
             "reward_plus_aerial_lift": lift,
@@ -1083,6 +1087,10 @@ class RewardPlus:
             "reward_plus_underside": underside,
             "reward_plus_kickoff_speed": kickoff_speed,
             "reward_plus_kickoff": kickoff_touch,
+            **{
+                f"reward_plus_{name}": getattr(self.mechanical_weights, name) * value
+                for name, value in mechanics.items()
+            },
         }
 
 

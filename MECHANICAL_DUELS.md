@@ -205,7 +205,7 @@ opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
 `--aerial-touch-reward-weight` (default `0.5`).
 
-`--reward-plus` adds six bounded, zero-sum team bonuses alongside the
+`--reward-plus` adds twelve bounded, zero-sum team signals alongside the
 discriminator imitation reward:
 
 - Signed speed change pays `0.25` per normalized speed gained, plus `0.5` when
@@ -233,6 +233,20 @@ discriminator imitation reward:
 - The first touch within the opening 3.2 seconds of a real kickoff pays `0.5`
   to the touching team and `-0.5` to its opponents. Replay resets away from
   kickoff do not qualify.
+- A flight that ends without a ball touch charges up to `0.2` for height and
+  time spent airborne, plus up to `0.3` for boost spent in the air beyond eight
+  boost units. Each debit occurs once when the flight ends; low wavedash hops
+  earn no height debit, and touching the ball during the flight avoids both.
+- A ball bounced off the arena ceiling charges `0.35` to its last toucher(s)
+  within the preceding two seconds. The velocity reversal detects bounces
+  between policy decisions without charging an ordinary high-ball apex.
+- A solo, goalward wall touch pays up to `0.2` when the car has wheel contact
+  with the wall and the ball stays close rather than escaping at high relative
+  speed. For up to 1.5 seconds after a qualifying touch, staying within 400
+  units of the goalward-moving ball pays up to `0.3` per second; another
+  player's touch ends that follow-up. Wild pinches cannot start it.
+- An upside-down car resting low on the floor with little vertical motion is
+  charged `0.1` per second. Passing overhead without floor contact is exempt.
 
 Existing zero-sum goal and flip-reset rewards remain governed by
 `--goal-reward-weight` and `--flip-reset-reward-weight` (both default to `1`);
@@ -241,11 +255,17 @@ separate; set it to `0` to pay only for the controlled aerial touches above.
 `--reward-plus` is off by default and is stored in GAIFO checkpoints;
 on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
 When enabled, TensorBoard logs their signed raw per-car means under
-`RewardSpec/component/{speed,aerial_lift,aerial_shot,underside,kickoff_speed,kickoff}` and
-their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
+`RewardSpec/component/{speed,aerial_lift,aerial_shot,underside,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
+and their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
 zero-sum team difference; `RewardSpec/scale/reward_plus` logs the RMS of the
 combined zero-sum bonus actually used for training. They update each rollout,
 even if no episode ends.
+
+BASIC's dense and `--sparse` reward presets use the same six new mechanical
+events and weights. Their signed component means appear under
+`RewardSpec/component/{wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
+in TensorBoard. Both training modes scale per-time bonuses by their physics
+frame skip.
 
 GAIFO, BASIC without reaction time, deep training, and the checkpoint viewer
 use CARL's native observation and a shared project action mask. The last two

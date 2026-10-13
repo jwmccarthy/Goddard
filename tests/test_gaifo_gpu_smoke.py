@@ -323,6 +323,9 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 for name in (
                     "component/speed", "component/aerial_lift", "component/aerial_shot",
                     "component/underside", "component/kickoff_speed", "component/kickoff",
+                    "component/wasted_air", "component/wasted_boost",
+                    "component/ball_ceiling", "component/wall_touch",
+                    "component/wall_control", "component/inverted_ground",
                     "aggregate/reward_plus", "scale/reward_plus",
                 ):
                     tag = f"RewardSpec/{name}"

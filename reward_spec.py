@@ -3,14 +3,13 @@ from dataclasses import dataclass, fields, replace
 import torch
 
 from carl.gymnasium.state import CarlState, RewardContext, RewardResult
+from mechanical_rewards import (
+    BALL_MAX_SPEED, BALL_RADIUS, CAR_MAX_SPEED, CEILING_Z, GOAL_HEIGHT,
+    MechanicalEventRewards, wall_contact,
+)
 
 
-BALL_RADIUS = 91.25
-BALL_MAX_SPEED = 6000.0
-CAR_MAX_SPEED = 2300.0
-CEILING_Z = 2044.0
 GOAL_Y = 5124.25
-GOAL_HEIGHT = 642.775
 GOAL_DISTANCE_OFFSET = GOAL_Y - 5120.0 + BALL_RADIUS
 AERIAL_TOUCH_HEIGHT_SCALE = 2250.0
 MATCH_TICKS = 5 * 60 * 120
@@ -56,6 +55,12 @@ class RewardWeights:
     boost_free_speed_progress: float = 0.2
     soft_lift:            float = 0.4
     aerial_shot:          float = 1.0
+    wasted_air:           float = 0.2
+    wasted_boost:         float = 0.3
+    ball_ceiling:         float = 0.35
+    wall_touch:           float = 0.2
+    wall_control:         float = 0.3
+    inverted_ground:      float = 0.1
 
     @classmethod
     def sparse(cls) -> "RewardWeights":
@@ -74,6 +79,12 @@ class RewardWeights:
             soft_lift=0.4,
             flip_reset=3.0,
             demo=5.0,
+            wasted_air=0.2,
+            wasted_boost=0.3,
+            ball_ceiling=0.35,
+            wall_touch=0.2,
+            wall_control=0.3,
+            inverted_ground=0.1,
         )
         return cls(**values)
 
@@ -98,6 +109,7 @@ class RewardSpec:
         if frameskip < 1:
             raise ValueError("frameskip must be positive")
         self.frameskip = frameskip
+        self.mechanical_events = MechanicalEventRewards(frameskip)
         self._last_touch = None
         self._count = 0
         self._mean = None
@@ -504,7 +516,7 @@ class RewardSpec:
         )
 
         weights = self.weights
-        return {
+        components = {
             "aerial_carry_progress": weights.aerial_carry_progress * valid * (
                 carry - previous_carry
             ),
@@ -519,6 +531,11 @@ class RewardSpec:
             "flip_reset": weights.flip_reset * valid * flip_reset,
             "aerial_shot": weights.aerial_shot * valid * aerial_shot,
         }
+        components.update({
+            name: getattr(weights, name) * value
+            for name, value in self.mechanical_events(context, valid).items()
+        })
+        return components
 
     @classmethod
     def _aerial_shot_quality(
@@ -575,12 +592,8 @@ class RewardSpec:
 
     @staticmethod
     def _wall_contact(state: CarlState) -> torch.Tensor:
-        position = state.car_position
-        x, y, z = position[..., 0].abs(), position[..., 1].abs(), position[..., 2]
-        near_wall = (x > 3900.0) | (y > 4900.0) | ((x > 3000.0) & (y > 4300.0))
-        return (
-            state.car_on_ground & z.lt(1700.0)
-            & state.car_up[..., 2].abs().lt(0.5) & near_wall
+        return wall_contact(
+            state.car_on_ground, state.car_position, state.car_up[..., 2],
         )
 
     def _finish_reward(

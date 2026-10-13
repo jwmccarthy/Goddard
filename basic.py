@@ -875,6 +875,12 @@ class DiagnosticSelfPlayRunner(SelfPlayRunner):
         "reward_spec/component/soft_lift",
         "reward_spec/component/flip_reset",
         "reward_spec/component/demo",
+        "reward_spec/component/wasted_air",
+        "reward_spec/component/wasted_boost",
+        "reward_spec/component/ball_ceiling",
+        "reward_spec/component/wall_touch",
+        "reward_spec/component/wall_control",
+        "reward_spec/component/inverted_ground",
     )
 
     def __init__(
