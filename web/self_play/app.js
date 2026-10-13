@@ -127,7 +127,11 @@ function makeCar(color) {
   nose.position.x = 75;
   group.add(nose);
   scene.add(group);
-  return { group, material };
+  return {
+    group, material, initialized: false,
+    startPosition: new THREE.Vector3(), targetPosition: new THREE.Vector3(),
+    startRotation: new THREE.Quaternion(), targetRotation: new THREE.Quaternion(),
+  };
 }
 
 const cars = [];
@@ -141,6 +145,9 @@ const ball = new THREE.Mesh(
 );
 ball.castShadow = true;
 scene.add(ball);
+const ballStart = new THREE.Vector3();
+const ballTarget = new THREE.Vector3();
+let ballInitialized = false;
 const padShapes = {
   large: {
     base: new THREE.CylinderGeometry(116, 116, 6, 32),
@@ -196,44 +203,66 @@ const forward = new THREE.Vector3();
 const right = new THREE.Vector3();
 const up = new THREE.Vector3();
 
-function setCar(index, state) {
+function setCar(index, state, snap) {
   const rig = cars[index];
+  const wasVisible = rig.group.visible;
   rig.group.visible = !state.demoed;
-  rig.group.position.fromArray(state.pos);
+  rig.startPosition.copy(rig.group.position);
+  rig.targetPosition.fromArray(state.pos);
   forward.fromArray(state.fwd);
   right.fromArray(state.rgt);
   up.fromArray(state.up);
   basis.makeBasis(forward, right, up);
-  rig.group.quaternion.setFromRotationMatrix(basis);
+  rig.startRotation.copy(rig.group.quaternion);
+  rig.targetRotation.setFromRotationMatrix(basis);
+  if (snap || !rig.initialized || !wasVisible
+      || rig.group.position.distanceToSquared(rig.targetPosition) > 1000 ** 2) {
+    rig.group.position.copy(rig.targetPosition);
+    rig.group.quaternion.copy(rig.targetRotation);
+    rig.startPosition.copy(rig.targetPosition);
+    rig.startRotation.copy(rig.targetRotation);
+  }
+  rig.initialized = true;
   rig.material.emissiveIntensity = state.boosting ? 1.2 : 0;
+}
+
+let poseStartedAt = performance.now();
+let poseDuration = 1000 / 30;
+function updatePoses(time) {
+  const fraction = Math.max(0, Math.min(1, (time - poseStartedAt) / poseDuration));
+  for (const rig of cars) {
+    rig.group.position.lerpVectors(rig.startPosition, rig.targetPosition, fraction);
+    rig.group.quaternion.slerpQuaternions(rig.startRotation, rig.targetRotation, fraction);
+  }
+  ball.position.lerpVectors(ballStart, ballTarget, fraction);
 }
 
 let cameraFrame = null;
 let cameraCars = '';
 let activeCameraMode = 'free';
-let snapCamera = false;
+let initializeFollow = false;
 const orbitPosition = camera.position.clone();
 const orbitTarget = controls.target.clone();
-const followPosition = new THREE.Vector3();
 const followTarget = new THREE.Vector3();
-const followHeading = new THREE.Vector3(0, 1, 0);
-const carPosition = new THREE.Vector3();
+const followDelta = new THREE.Vector3();
+const followHeading = new THREE.Vector3();
 
 function changeCameraMode() {
   const mode = cameraMode.value;
   if (mode === 'free') {
     camera.position.copy(orbitPosition);
     controls.target.copy(orbitTarget);
-    controls.enabled = true;
+    controls.enablePan = true;
+    controls.minDistance = 1200;
     controls.update();
   } else {
     if (activeCameraMode === 'free') {
       orbitPosition.copy(camera.position);
       orbitTarget.copy(controls.target);
     }
-    controls.enabled = false;
-    snapCamera = true;
-    if (mode.startsWith('car:')) followHeading.set(0, mode.startsWith('car:0:') ? 1 : -1, 0);
+    controls.enablePan = false;
+    controls.minDistance = 250;
+    initializeFollow = true;
   }
   activeCameraMode = mode;
 }
@@ -257,36 +286,43 @@ function updateCameraChoices(players) {
   }
 }
 
-function updateFollowCamera(delta) {
+function updateFollowCamera() {
   if (!cameraFrame) return;
-  let car;
+  let car, rig;
   if (cameraMode.value.startsWith('car:')) {
     const [, team, player] = cameraMode.value.split(':');
-    car = cameraFrame.cars.find((item) => item.team === Number(team) && item.player === Number(player));
+    const index = cameraFrame.cars.findIndex(
+      (item) => item.team === Number(team) && item.player === Number(player),
+    );
+    if (index >= 0 && !cameraFrame.cars[index].demoed) {
+      car = cameraFrame.cars[index];
+      rig = cars[index];
+    }
   }
-  if (car && !car.demoed) {
-    carPosition.fromArray(car.pos);
-    const horizontal = Math.hypot(car.fwd[0], car.fwd[1]);
-    if (horizontal > 0.2) followHeading.set(car.fwd[0] / horizontal, car.fwd[1] / horizontal, 0);
-    followPosition.copy(carPosition).addScaledVector(followHeading, -650);
-    followPosition.z = carPosition.z + 260;
-    followTarget.copy(carPosition).addScaledVector(followHeading, 220);
-    followTarget.z = carPosition.z + 80;
-  } else {
-    // Follow the ball while the selected car is demolished or unavailable.
-    followTarget.fromArray(cameraFrame.ball.pos);
-    followPosition.set(followTarget.x, followTarget.y - 1300, followTarget.z + 900);
-  }
-  if (snapCamera || controls.target.distanceToSquared(followTarget) > 1500 ** 2) {
-    camera.position.copy(followPosition);
+  // Follow the ball while the selected car is demolished or unavailable.
+  followTarget.copy(rig ? rig.group.position : ball.position);
+  if (rig) followTarget.z += 80;
+  if (initializeFollow) {
     controls.target.copy(followTarget);
-    snapCamera = false;
+    if (car) {
+      const horizontal = Math.hypot(car.fwd[0], car.fwd[1]);
+      followHeading.set(
+        horizontal > 0.2 ? car.fwd[0] / horizontal : 0,
+        horizontal > 0.2 ? car.fwd[1] / horizontal : (car.team ? -1 : 1), 0,
+      );
+      camera.position.copy(followTarget).addScaledVector(followHeading, -750);
+      camera.position.z += 250;
+    } else {
+      camera.position.set(followTarget.x, followTarget.y - 1300, followTarget.z + 900);
+    }
+    initializeFollow = false;
   } else {
-    const blend = 1 - Math.exp(-10 * delta);
-    camera.position.lerp(followPosition, blend);
-    controls.target.lerp(followTarget, blend);
+    // Move the camera with the interpolated subject, preserving the angle and
+    // zoom that OrbitControls (including a user's drag) chose around it.
+    followDelta.subVectors(followTarget, controls.target);
+    camera.position.add(followDelta);
+    controls.target.copy(followTarget);
   }
-  camera.lookAt(controls.target);
 }
 
 let initialSelection = false;
@@ -304,22 +340,32 @@ source.onmessage = ({ data }) => {
   }
   connection.hidden = true;
   resetMatch.disabled = false;
-  if (cameraFrame && (frame.round !== cameraFrame.round || frame.tick < cameraFrame.tick
-      || frame.cars.length !== cameraFrame.cars.length
-      || frame.blue.path !== cameraFrame.blue.path || frame.orange.path !== cameraFrame.orange.path)) {
-    snapCamera = true;
+  const receivedAt = performance.now();
+  updatePoses(receivedAt);
+  const snap = !cameraFrame || frame.round !== cameraFrame.round || frame.tick < cameraFrame.tick
+    || frame.cars.length !== cameraFrame.cars.length
+    || frame.blue.path !== cameraFrame.blue.path || frame.orange.path !== cameraFrame.orange.path;
+  if (cameraFrame && !snap && frame.tick > cameraFrame.tick) {
+    poseDuration = Math.max(12, Math.min(100, (frame.tick - cameraFrame.tick) * 1000 / 120));
   }
+  poseStartedAt = receivedAt;
   cameraFrame = frame;
   updateCameraChoices(frame.cars);
   for (const [index, car] of frame.cars.entries()) {
     if (!cars[index]) cars[index] = makeCar(carColors[car.team][(car.player - 1) % 3]);
-    setCar(index, car);
+    setCar(index, car, snap);
   }
   for (const car of cars.slice(frame.cars.length)) car.group.visible = false;
   for (const [index, pad] of frame.boostPads.entries()) setBoostPad(index, pad);
   for (const pad of boostPads.slice(frame.boostPads.length)) pad.group.visible = false;
   const orangeIndex = frame.cars.length / 2;
-  ball.position.fromArray(frame.ball.pos);
+  ballStart.copy(ball.position);
+  ballTarget.fromArray(frame.ball.pos);
+  if (snap || !ballInitialized || ball.position.distanceToSquared(ballTarget) > 900 ** 2) {
+    ball.position.copy(ballTarget);
+    ballStart.copy(ballTarget);
+  }
+  ballInitialized = true;
   blueLabel.textContent = frame.blue.checkpoint;
   orangeLabel.textContent = frame.orange.checkpoint;
   goals.textContent = `${frame.blue.score} - ${frame.orange.score}`;
@@ -375,12 +421,10 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
-let lastRenderTime = 0;
 function render(time) {
-  const delta = Math.min(0.1, (time - lastRenderTime) / 1000);
-  lastRenderTime = time;
-  if (cameraMode.value === 'free') controls.update();
-  else updateFollowCamera(delta);
+  updatePoses(time);
+  if (cameraMode.value !== 'free') updateFollowCamera();
+  controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(render);
 }
