@@ -62,10 +62,12 @@ def orientation(rotation) -> tuple[np.ndarray, np.ndarray]:
 
 
 class CARLObservationBuilder:
-    def __init__(self, team_size: int, field_info, on_ground_state) -> None:
+    def __init__(self, team_size: int, field_info, on_ground_state, jumping_state=None) -> None:
         self.team_size = team_size
         self.on_ground_state = on_ground_state
+        self.jumping_state = jumping_state
         self.previous_boost: dict[int, float] = {}
+        self.last_ground_frame: dict[int, int] = {}
         positions = np.asarray(
             [vector(pad.location) for pad in field_info.boost_pads], dtype=np.float32,
         )
@@ -81,6 +83,17 @@ class CARLObservationBuilder:
 
     def reset(self) -> None:
         self.previous_boost.clear()
+        self.last_ground_frame.clear()
+
+    def _on_ground(self, car, index: int, frame: int | None) -> bool:
+        if car.air_state == self.on_ground_state:
+            return True
+        # CARL's wheel-contact flag remains set for the first five ticks of a
+        # jump, even though RLBot already reports AirState.Jumping.
+        previous = self.last_ground_frame.get(index)
+        return (self.jumping_state is not None and car.air_state == self.jumping_state
+                and frame is not None and previous is not None
+                and 0 < frame - previous <= 5)
 
     def _physics(self, physics, invert: bool, *, ball: bool) -> list[float]:
         position = invert_vector(vector(physics.location), invert) / POSITION_SCALE
@@ -88,7 +101,7 @@ class CARLObservationBuilder:
         angular = invert_vector(vector(physics.angular_velocity), invert) / (6.0 if ball else 5.5)
         return [*position, *velocity, *angular]
 
-    def _car(self, car, invert: bool, index: int) -> list[float]:
+    def _car(self, car, invert: bool, index: int, on_ground: bool) -> list[float]:
         values = self._physics(car.physics, invert, ball=False)
         forward, up = orientation(car.physics.rotation)
         previous = self.previous_boost.get(index, car.boost)
@@ -99,7 +112,7 @@ class CARLObservationBuilder:
         values.extend((
             *invert_vector(forward, invert), *invert_vector(up, invert),
             car.boost / 100.0,
-            float(car.air_state == self.on_ground_state),
+            float(on_ground),
             float(car.demolished_timeout > 0),
             float(car.has_dodged),
             float(car.has_double_jumped),
@@ -110,13 +123,19 @@ class CARLObservationBuilder:
     def _dodge(self, car) -> tuple[float, float]:
         if car.has_dodged or car.has_double_jumped:
             return 0.0, 0.0
-        if car.air_state == self.on_ground_state or not car.has_jumped:
+        # RLBot reports dodge_timeout == -1 while the initial jump is active.
+        # CARL still exposes a fresh flip window throughout that phase.
+        if (car.air_state == self.on_ground_state
+                or (self.jumping_state is not None and car.air_state == self.jumping_state)
+                or not car.has_jumped):
             return 1.0, DOUBLEJUMP_MAX_DELAY
         remaining = max(0.0, min(DOUBLEJUMP_MAX_DELAY, float(car.dodge_timeout)))
         return float(remaining > 0.0), remaining
 
     def build(self, packet, index: int) -> np.ndarray:
         players = packet.players
+        match_info = getattr(packet, "match_info", None)
+        frame = int(match_info.frame_num) if match_info is not None else None
         if len(players) != 2 * self.team_size:
             raise ValueError(f"GAIFO checkpoint requires {self.team_size}v{self.team_size}")
         if not packet.balls:
@@ -133,7 +152,10 @@ class CARLObservationBuilder:
         ball = packet.balls[0].physics
         values = self._physics(ball, invert, ball=True)
         for player_index in order:
-            values.extend(self._car(players[player_index], invert, player_index))
+            car = players[player_index]
+            values.extend(self._car(
+                car, invert, player_index, self._on_ground(car, player_index, frame),
+            ))
 
         pad_order = INVERTED_PAD_INDICES if invert else range(34)
         values.extend(
@@ -164,4 +186,9 @@ class CARLObservationBuilder:
         if observation.shape != (observation_size(self.team_size),):
             raise ValueError(f"expected {observation_size(self.team_size)} CARL features")
         self.previous_boost = {i:car.boost for i, car in enumerate(players)}
+        if frame is not None:
+            self.last_ground_frame.update(
+                (i, frame) for i, car in enumerate(players)
+                if car.air_state == self.on_ground_state
+            )
         return observation

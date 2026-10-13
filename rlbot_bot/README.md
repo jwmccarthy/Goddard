@@ -33,7 +33,9 @@ Use a Soccar match with the same team size as the checkpoint. Boost-pad
 positions are checked against the standard layout. The model chooses actions
 deterministically every saved `frameskip` physics ticks; controls are held
 between decisions. The RLBot packet supplies the dodge window used by the
-last two CARL observation fields.
+last two CARL observation fields after the initial jump. During RLBot's
+`Jumping` phase, the adapter reconstructs CARL's fresh flip window and its
+short-lived wheel-contact flag from the game frame count.
 
 ### Live comparison diagnostics
 

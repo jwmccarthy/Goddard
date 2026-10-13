@@ -192,7 +192,7 @@ class RLBotGAIFOTests(unittest.TestCase):
     def test_dodge_window_and_action_decoding(self):
         field = Obj(boost_pads=[Obj(location=Obj(x=x, y=y, z=z))
                                 for x, y, z in BOOST_PAD_POSITIONS])
-        builder = CARLObservationBuilder(1, field, "ground")
+        builder = CARLObservationBuilder(1, field, "ground", "jumping")
         car = Obj(air_state="air", has_jumped=True, has_dodged=False,
                   has_double_jumped=False, dodge_timeout=0.7)
         self.assertEqual(builder._dodge(car), (1.0, 0.7))
@@ -202,6 +202,10 @@ class RLBotGAIFOTests(unittest.TestCase):
         self.assertEqual(builder._dodge(car), (1.0, 1.25))
         car.has_dodged = True
         self.assertEqual(builder._dodge(car), (0.0, 0.0))
+        car.has_dodged = False
+        car.has_jumped = True
+        car.air_state = "jumping"
+        self.assertEqual(builder._dodge(car), (1.0, 1.25))
         self.assertEqual(decode_action([2, 1, 2, 1, 1, 1, 1]), {
             "throttle": 1.0, "steer": 1.0, "yaw": 1.0,
             "pitch": -1.0, "roll": -1.0,
@@ -246,22 +250,35 @@ class RLBotGAIFOTests(unittest.TestCase):
         )
         try:
             env.reset()
-            for action in (
+            initial_raw = th.from_dlpack(env._env.get_state()).cpu().numpy()[0]
+            field, initial_packet = packet_from_carl(initial_raw, 1)
+            initial_packet.match_info = Obj(frame_num=0)
+            builder = CARLObservationBuilder(1, field, "ground", "jumping")
+            for i in range(2):
+                builder.build(initial_packet, i)
+            for step, action in enumerate((
+                (0, 0, 0, 0, 0, 0, 1),
                 (0, 0, 0, 0, 0, 0, 1),
                 (0, 0, 2, 0, 1, 0, 0),
                 (2, 1, 2, 0, 1, 2, 0),
                 (2, 1, 2, 0, 1, 2, 1),
                 (0, 0, 2, 0, 0, 2, 0),
-            ):
+            )):
                 actions = th.tensor([action] * 2, dtype=th.int32, device=env.device)
                 reference, _, _, _, _ = env.step(actions)
                 raw = th.from_dlpack(env._env.get_state()).cpu().numpy()[0]
                 field, packet = packet_from_carl(raw, 1)
-                # Provide the equivalent native timer: Rocket League's timer
-                # can include up to 0.2 seconds of additional held-jump time.
+                packet.match_info = Obj(frame_num=(step + 1) * 4)
                 for i, player in enumerate(packet.players):
-                    player.dodge_timeout = float(reference[i, -1])
-                builder = CARLObservationBuilder(1, field, "ground")
+                    if step <= 1:
+                        self.assertEqual(player.air_state, "ground" if step == 0 else "air")
+                        player.air_state = "jumping"
+                        player.has_jumped = True
+                        player.dodge_timeout = -1.0
+                    else:
+                        # After jumping, Rocket League's timer may include up
+                        # to 0.2 seconds of additional held-jump time.
+                        player.dodge_timeout = float(reference[i, -1])
                 for i in range(2):
                     np.testing.assert_allclose(
                         builder.build(packet, i), reference[i].cpu().numpy(),
@@ -327,8 +344,20 @@ class RLBotGAIFOTests(unittest.TestCase):
                 self.assertIsInstance(first, flat.ControllerState)
                 self.assertEqual(bot.last_inference_frame, 0)
                 self.assertIs(bot.get_output(packet(3, flat.MatchPhase.Active)), first)
+                players[0] = flat.PlayerInfo(
+                    team=0,
+                    physics=flat.Physics(
+                        location=flat.Vector3(0, -4608, 27),
+                        rotation=flat.Rotator(yaw=math.pi / 2),
+                    ),
+                    boost=33, air_state=flat.AirState.Jumping,
+                    has_jumped=True, dodge_timeout=-1.0, demolished_timeout=-1,
+                )
                 self.assertIsNot(bot.get_output(packet(4, flat.MatchPhase.Active)), first)
                 self.assertEqual(bot.last_inference_frame, 4)
+                self.assertIsInstance(
+                    bot.get_output(packet(8, flat.MatchPhase.Active)), flat.ControllerState,
+                )
                 self.assertIsInstance(
                     bot.get_output(packet(5, flat.MatchPhase.Countdown)), flat.ControllerState,
                 )
@@ -339,12 +368,16 @@ class RLBotGAIFOTests(unittest.TestCase):
             self.assertEqual(entries[0]["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
             self.assertEqual(entries[0]["frameskip"], 4)
             decisions = [entry for entry in entries if entry["type"] == "decision"]
-            self.assertEqual([entry["frame"] for entry in decisions], [0, 4])
+            self.assertEqual([entry["frame"] for entry in decisions], [0, 4, 8])
             self.assertEqual(decisions[0]["obs_ground"], 1.0)
             self.assertEqual(len(decisions[0]["observation"]), 139)
             self.assertEqual(len(decisions[0]["boost_pads_active"]), 34)
             self.assertEqual(decisions[0]["controls"]["throttle"], first.throttle)
             self.assertEqual(decisions[1]["frame_gap"], 4)
+            self.assertEqual(decisions[1]["obs_ground"], 1.0)
+            self.assertEqual(decisions[1]["obs_flip"], [1.0, 1.25])
+            self.assertEqual(decisions[2]["obs_ground"], 0.0)
+            self.assertEqual(decisions[2]["obs_flip"], [1.0, 1.25])
 
             quiet_bot = GoddardBot.__new__(GoddardBot)
             quiet_bot.field_info = field

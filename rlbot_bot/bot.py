@@ -26,7 +26,8 @@ class GoddardBot(Bot):
             checkpoint = Path(__file__).resolve().parent / checkpoint
         self.policy = load_policy_checkpoint(checkpoint)
         self.builder = CARLObservationBuilder(
-            self.policy.config.team_size, self.field_info, flat.AirState.OnGround,
+            self.policy.config.team_size, self.field_info,
+            flat.AirState.OnGround, flat.AirState.Jumping,
         )
         self.last_game_time = -math.inf
         self.last_match_phase = None
