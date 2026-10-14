@@ -4646,7 +4646,7 @@ class SceneDiscriminatorReward:
     def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
         scales = self._last_reward_scales
         self._last_reward_scales = {}
-        return {"RewardScale": {name: value.item() for name, value in scales.items()}} if scales else {}
+        return {"RewardSpec": {name: value.item() for name, value in scales.items()}} if scales else {}
 
 
 class SelectPPOFields:
@@ -6456,7 +6456,8 @@ def main() -> None:
 
     def update_callback(trainer: Trainer) -> None:
         metrics = gameplay.diagnostic_metrics()
-        metrics.update(ppo_transforms[0].diagnostic_metrics())
+        for section, values in ppo_transforms[0].diagnostic_metrics().items():
+            metrics.setdefault(section, {}).update(values)
         if metrics:
             trainer.logger.update(metrics, step=trainer.clock.env_steps)
 

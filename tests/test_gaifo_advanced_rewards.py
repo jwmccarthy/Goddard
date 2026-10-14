@@ -616,7 +616,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                     + scale * (baseline["aerial_touch_reward"]
                                + baseline["flip_reset_reward"] + baseline["reward_plus_reward"]),
                 )
-                scales = transform.diagnostic_metrics()["RewardScale"]
+                scales = transform.diagnostic_metrics()["RewardSpec"]
                 self.assertAlmostEqual(scales["rms/imitation"], math.sqrt(.625), places=5)
                 self.assertAlmostEqual(scales["rms/goal"], math.sqrt(18), places=5)
                 self.assertAlmostEqual(scales["rms/physical"], scale * math.sqrt(.40625),
@@ -628,7 +628,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             PositionDiscriminator(), **options, physical_reward_scale=3,
         )
         transform(learner_only, PrepareContext())
-        scales = transform.diagnostic_metrics()["RewardScale"]
+        scales = transform.diagnostic_metrics()["RewardSpec"]
         self.assertAlmostEqual(scales["rms/imitation"], .5)
         self.assertAlmostEqual(scales["rms/physical"], 1.5)
         for invalid in (-1., float("nan"), float("inf")):

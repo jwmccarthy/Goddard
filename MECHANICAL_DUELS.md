@@ -269,7 +269,7 @@ Use `--physical-reward-scale 0` to disable the physical contribution. The scale
 is saved in GAIFO checkpoints and can be overridden on resume with an explicit
 `--physical-reward-scale` value (and a new `--timesteps` total above the saved
 step). TensorBoard logs per-rollout, learner-action RMS values under
-`RewardScale/rms/{imitation,physical,goal,aerial_touch,flip_reset,reward_plus}`
+`RewardSpec/rms/{imitation,physical,goal,aerial_touch,flip_reset,reward_plus}`
 (`reward_plus` appears when enabled), after applying all weights. Compare
 `physical` with `imitation` to tune their relative scale. RMS includes
 non-event steps, so sparse touches/resets are not overstated by their peak
