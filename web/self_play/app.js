@@ -10,7 +10,7 @@ const goals = document.getElementById('goals');
 const objectivesLabel = document.getElementById('objectives');
 const blueCheckpoint = document.getElementById('blueCheckpoint');
 const orangeCheckpoint = document.getElementById('orangeCheckpoint');
-const cameraMode = document.getElementById('cameraMode');
+const cameraModes = document.getElementById('cameraModes');
 const resetMatch = document.getElementById('resetMatch');
 const blueBoost = document.getElementById('blue-boost');
 const orangeBoost = document.getElementById('orange-boost');
@@ -266,8 +266,8 @@ const followTarget = new THREE.Vector3();
 const followDelta = new THREE.Vector3();
 const followHeading = new THREE.Vector3();
 
-function changeCameraMode() {
-  const mode = cameraMode.value;
+function changeCameraMode(mode) {
+  if (mode === activeCameraMode) return;
   if (mode === 'free') {
     camera.position.copy(orbitPosition);
     controls.target.copy(orbitTarget);
@@ -284,56 +284,58 @@ function changeCameraMode() {
     initializeFollow = true;
   }
   activeCameraMode = mode;
+  for (const button of cameraModes.querySelectorAll('[data-camera]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.camera === mode));
+  }
 }
-cameraMode.addEventListener('change', changeCameraMode);
+cameraModes.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-camera]');
+  if (button && cameraModes.contains(button)) changeCameraMode(button.dataset.camera);
+});
 
 function updateCameraChoices(players) {
   const signature = players.map((car) => `${car.team}:${car.player}`).join(',');
   if (signature === cameraCars) return;
   cameraCars = signature;
-  for (const option of cameraMode.querySelectorAll('option[data-car]')) option.remove();
+  for (const button of cameraModes.querySelectorAll('[data-car]')) button.remove();
   for (const car of players) {
-    const option = document.createElement('option');
-    option.value = `car:${car.team}:${car.player}`;
-    option.textContent = `Follow ${car.team ? 'Orange' : 'Blue'} ${car.player}`;
-    option.dataset.car = '';
-    cameraMode.appendChild(option);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-sm btn-outline-secondary camera-option';
+    button.dataset.camera = `car:${car.team}:${car.player}`;
+    button.dataset.car = '';
+    button.dataset.team = car.team;
+    button.textContent = `${car.team ? 'Orange' : 'Blue'} ${car.player}`;
+    button.setAttribute('aria-pressed', String(button.dataset.camera === activeCameraMode));
+    cameraModes.appendChild(button);
   }
-  if (![...cameraMode.options].some((option) => option.value === activeCameraMode)) {
-    cameraMode.value = 'free';
-    changeCameraMode();
+  if (![...cameraModes.querySelectorAll('[data-camera]')].some(
+    (button) => button.dataset.camera === activeCameraMode
+  )) {
+    changeCameraMode('free');
   }
 }
 
 function updateFollowCamera() {
   if (!cameraFrame) return;
-  let car, rig;
-  if (cameraMode.value.startsWith('car:')) {
-    const [, team, player] = cameraMode.value.split(':');
-    const index = cameraFrame.cars.findIndex(
-      (item) => item.team === Number(team) && item.player === Number(player),
-    );
-    if (index >= 0 && !cameraFrame.cars[index].demoed) {
-      car = cameraFrame.cars[index];
-      rig = cars[index];
-    }
-  }
-  // Follow the ball while the selected car is demolished or unavailable.
-  followTarget.copy(rig ? rig.group.position : ball.position);
-  if (rig) followTarget.z += 80;
+  const [, team, player] = activeCameraMode.split(':');
+  const index = cameraFrame.cars.findIndex(
+    (item) => item.team === Number(team) && item.player === Number(player),
+  );
+  // Hold the view while the car is demolished; follow it again on respawn.
+  if (index < 0 || cameraFrame.cars[index].demoed || !cars[index]) return;
+  const car = cameraFrame.cars[index];
+  followTarget.copy(cars[index].group.position);
+  followTarget.z += 80;
   if (initializeFollow) {
     controls.target.copy(followTarget);
-    if (car) {
-      const horizontal = Math.hypot(car.fwd[0], car.fwd[1]);
-      followHeading.set(
-        horizontal > 0.2 ? car.fwd[0] / horizontal : 0,
-        horizontal > 0.2 ? car.fwd[1] / horizontal : (car.team ? -1 : 1), 0,
-      );
-      camera.position.copy(followTarget).addScaledVector(followHeading, -750);
-      camera.position.z += 250;
-    } else {
-      camera.position.set(followTarget.x, followTarget.y - 1300, followTarget.z + 900);
-    }
+    const horizontal = Math.hypot(car.fwd[0], car.fwd[1]);
+    followHeading.set(
+      horizontal > 0.2 ? car.fwd[0] / horizontal : 0,
+      horizontal > 0.2 ? car.fwd[1] / horizontal : (car.team ? -1 : 1), 0,
+    );
+    camera.position.copy(followTarget).addScaledVector(followHeading, -750);
+    camera.position.z += 250;
     initializeFollow = false;
   } else {
     // Move the camera with the interpolated subject, preserving the angle and
@@ -442,7 +444,7 @@ addEventListener('resize', () => {
 });
 function render(time) {
   updatePoses(time);
-  if (cameraMode.value !== 'free') updateFollowCamera();
+  if (activeCameraMode !== 'free') updateFollowCamera();
   controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(render);

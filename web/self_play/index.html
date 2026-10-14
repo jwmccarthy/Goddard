@@ -98,7 +98,27 @@
       font-size: 11px;
     }
     .selector .form-select { min-width: 0; }
-    .camera-selector { width: 175px; }
+    .camera-picker {
+      display: grid;
+      flex: none;
+      gap: 3px;
+      max-width: 100%;
+      font-size: 11px;
+    }
+    .camera-options { display: flex; flex-wrap: wrap; gap: 4px; }
+    .camera-option[aria-pressed="true"] {
+      color: #fff;
+      background: var(--ink);
+      border-color: var(--ink);
+    }
+    .camera-option[data-team="0"][aria-pressed="true"] {
+      background: var(--blue);
+      border-color: var(--blue);
+    }
+    .camera-option[data-team="1"][aria-pressed="true"] {
+      background: var(--orange);
+      border-color: var(--orange);
+    }
     #connection {
       margin-left: auto;
       align-self: center;
@@ -119,7 +139,9 @@
         gap: 6px;
       }
       .selector { width: auto; min-width: 0; }
+      .camera-picker { grid-column: 1 / -1; }
       .controls .btn { width: 100%; }
+      .camera-options .btn { width: auto; }
       #connection { margin-left: 0; justify-self: end; }
     }
   </style>
@@ -147,7 +169,12 @@
   <div class="controls">
     <label class="selector">Blue checkpoint<select class="form-select form-select-sm" id="blueCheckpoint"></select></label>
     <label class="selector">Orange checkpoint<select class="form-select form-select-sm" id="orangeCheckpoint"></select></label>
-    <label class="selector camera-selector">Camera · drag to orbit<select class="form-select form-select-sm" id="cameraMode"><option value="free">Free orbit</option><option value="ball">Follow ball</option></select></label>
+    <div class="camera-picker" role="group" aria-label="Camera views">
+      <span>Camera · drag to orbit</span>
+      <div class="camera-options" id="cameraModes">
+        <button type="button" class="btn btn-sm btn-outline-secondary camera-option" data-camera="free" aria-pressed="true">Arena</button>
+      </div>
+    </div>
     <button class="btn btn-sm btn-primary" id="applyMatch">Apply match</button>
     <button class="btn btn-sm btn-outline-secondary" id="resetMatch" disabled>Random demo state</button>
     <button class="btn btn-sm btn-outline-secondary" id="kickoffMatch">Kickoff</button>
