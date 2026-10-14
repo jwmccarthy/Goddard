@@ -580,6 +580,65 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                              if name not in REWARD_PLUS_COMPONENTS}), PrepareContext(),
             )
 
+    def test_physical_reward_scale_multiplies_all_mechanics_but_not_imitation_or_goals(self):
+        windows = th.zeros(1, 2, 2, 51)
+        windows[0, 1, -1, 0] = math.log(2)
+        components = {name: th.zeros(1, 2) for name in REWARD_PLUS_COMPONENTS}
+        components["reward_plus_speed"] = th.tensor([[.25, -.25]])
+        batch = TensorBatch({
+            "observation": th.zeros(1, 2, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+            "reward": th.tensor([[0., 2.]]),
+            "aerial_touch_score": th.tensor([[1., -.5]]),
+            "flip_reset_event": th.tensor([[0., 1.]]),
+            **components,
+        })
+        options = dict(noise_std=0, trajectory_length=2, exp_log_odds_reward=True,
+                       goal_reward_weight=3, aerial_touch_reward_weight=.5,
+                       flip_reset_reward_weight=1, reward_plus=True)
+        baseline = SceneDiscriminatorReward(PositionDiscriminator(), **options)(
+            batch, PrepareContext(),
+        )
+        for scale in (0., 3.):
+            with self.subTest(scale=scale):
+                transform = SceneDiscriminatorReward(
+                    PositionDiscriminator(), **options, physical_reward_scale=scale,
+                )
+                result = transform(batch, PrepareContext())
+                for name in ("imitation_reward", "goal_reward"):
+                    th.testing.assert_close(result[name], baseline[name])
+                for name in ("aerial_touch_reward", "flip_reset_reward", "reward_plus_reward"):
+                    th.testing.assert_close(result[name], baseline[name] * scale)
+                th.testing.assert_close(
+                    result["training_reward"],
+                    baseline["imitation_reward"] + baseline["goal_reward"]
+                    + scale * (baseline["aerial_touch_reward"]
+                               + baseline["flip_reset_reward"] + baseline["reward_plus_reward"]),
+                )
+                scales = transform.diagnostic_metrics()["RewardScale"]
+                self.assertAlmostEqual(scales["rms/imitation"], math.sqrt(.625), places=5)
+                self.assertAlmostEqual(scales["rms/goal"], math.sqrt(18), places=5)
+                self.assertAlmostEqual(scales["rms/physical"], scale * math.sqrt(.40625),
+                                       places=5)
+                self.assertAlmostEqual(scales["rms/reward_plus"], scale * .25, places=5)
+                self.assertEqual(transform.diagnostic_metrics(), {})
+        learner_only = batch.with_fields(learner_mask=th.tensor([[False, True]]))
+        transform = SceneDiscriminatorReward(
+            PositionDiscriminator(), **options, physical_reward_scale=3,
+        )
+        transform(learner_only, PrepareContext())
+        scales = transform.diagnostic_metrics()["RewardScale"]
+        self.assertAlmostEqual(scales["rms/imitation"], .5)
+        self.assertAlmostEqual(scales["rms/physical"], 1.5)
+        for invalid in (-1., float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "physical reward scale must be finite and non-negative",
+            ):
+                SceneDiscriminatorReward(
+                    PositionDiscriminator(), **options, physical_reward_scale=invalid,
+                )
+
     def test_reward_plus_diagnostics_report_components_before_zero_sum(self):
         current = physical_state(2)
         previous = current.clone()
@@ -884,6 +943,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             "gaifo.py", "--replay-dir", "parsed_replays",
             "--aerial-touch-reward-weight", "0.25",
             "--flip-reset-reward-weight", "2.0",
+            "--physical-reward-scale", "3.0",
             "--exp-log-odds-reward", "--recency-replay",
             "--reward-plus",
             "--history-reservoir-fraction", "0.3",
@@ -891,6 +951,10 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             args, _ = parse_args()
         self.assertEqual(args.aerial_touch_reward_weight, 0.25)
         self.assertEqual(args.flip_reset_reward_weight, 2.0)
+        self.assertEqual(args.physical_reward_scale, 3.0)
+        self.assertEqual(
+            build_ppo_transforms(args, PositionDiscriminator())[0].physical_reward_scale, 3.0,
+        )
         self.assertTrue(args.exp_log_odds_reward)
         self.assertTrue(args.recency_replay)
         self.assertTrue(args.reward_plus)
@@ -902,6 +966,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertFalse(defaults.exp_log_odds_reward)
         self.assertFalse(defaults.recency_replay)
         self.assertFalse(defaults.reward_plus)
+        self.assertEqual(defaults.physical_reward_scale, 1.0)
 
 
 if __name__ == "__main__":

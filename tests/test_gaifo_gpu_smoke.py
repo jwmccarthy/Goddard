@@ -331,6 +331,11 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                     tag = f"RewardSpec/{name}"
                     self.assertIn(tag, events.Tags()["scalars"])
                     self.assertTrue(events.Scalars(tag))
+                for name in ("imitation", "physical", "aerial_touch", "flip_reset",
+                             "reward_plus", "goal"):
+                    tag = f"RewardScale/rms/{name}"
+                    self.assertIn(tag, events.Tags()["scalars"])
+                    self.assertTrue(events.Scalars(tag))
 
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)

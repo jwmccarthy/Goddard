@@ -258,14 +258,30 @@ Existing zero-sum goal and flip-reset rewards remain governed by
 `--goal-reward-weight` and `--flip-reset-reward-weight` (both default to `1`);
 they are not counted twice. The ordinary `--aerial-touch-reward-weight` remains
 separate; set it to `0` to pay only for the controlled aerial touches above.
+To make the physical signals stronger relative to the discriminator, use
+`--physical-reward-scale` (default `1`). It multiplies the aerial-touch and
+flip-reset bonuses **after** their individual weights, plus all twelve
+`--reward-plus` signals when enabled; it does not change imitation or goal
+rewards. For example, `--reward-plus --physical-reward-scale 3` triples the
+physical bonuses, including penalties. Increase the individual touch/reset
+weights instead when only those events need tuning; the two settings multiply.
+Use `--physical-reward-scale 0` to disable the physical contribution. The scale
+is saved in GAIFO checkpoints and can be overridden on resume with an explicit
+`--physical-reward-scale` value (and a new `--timesteps` total above the saved
+step). TensorBoard logs per-rollout, learner-action RMS values under
+`RewardScale/rms/{imitation,physical,goal,aerial_touch,flip_reset,reward_plus}`
+(`reward_plus` appears when enabled), after applying all weights. Compare
+`physical` with `imitation` to tune their relative scale. RMS includes
+non-event steps, so sparse touches/resets are not overstated by their peak
+bonuses alone.
 `--reward-plus` is off by default and is stored in GAIFO checkpoints;
 on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
 When enabled, TensorBoard logs their signed raw per-car means under
 `RewardSpec/component/{speed,aerial_lift,aerial_shot,underside,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
 and their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
 zero-sum team difference; `RewardSpec/scale/reward_plus` logs the RMS of the
-combined zero-sum bonus actually used for training. They update each rollout,
-even if no episode ends.
+combined zero-sum bonus *before* `--physical-reward-scale`. They update each
+rollout, even if no episode ends.
 
 BASIC's dense and `--sparse` reward presets use the same six new mechanical
 events and weights. Their signed component means appear under

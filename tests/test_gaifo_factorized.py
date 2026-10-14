@@ -667,7 +667,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             flags = [
                 "gaifo.py", "--replay-dir", "parsed_replays", "--factorize",
-                "--hard-positive-mining", "--reward-plus",
+                "--hard-positive-mining", "--reward-plus", "--physical-reward-scale", "2",
                 "--n-sim", "1", "--rollout", "4", "--policy-hidden", "16",
                 "--critic-hidden", "16", "--discriminator-hidden", "16",
                 "--frame-embedding", "8", "--temporal-hidden", "8",
@@ -691,11 +691,13 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertTrue(payload["config"]["factorize"])
             self.assertTrue(payload["config"]["hard_positive_mining"])
             self.assertTrue(payload["config"]["discriminator_relative_positions"])
+            self.assertEqual(payload["config"]["physical_reward_scale"], 2.0)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)]):
                 resumed, _ = parse_args()
             self.assertTrue(resumed.factorize)
             self.assertTrue(resumed.hard_positive_mining)
             self.assertTrue(resumed.reward_plus)
+            self.assertEqual(resumed.physical_reward_scale, 2.0)
             self.assertTrue(resumed.discriminator_relative_positions)
             validate_resume_args(resumed, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
@@ -708,6 +710,11 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 disabled, _ = parse_args()
             self.assertFalse(disabled.reward_plus)
             validate_resume_args(disabled, payload)
+            with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
+                                            "--physical-reward-scale", "4"]):
+                scaled, _ = parse_args()
+            self.assertEqual(scaled.physical_reward_scale, 4.0)
+            validate_resume_args(scaled, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
                                              "--discriminator-relative-positions", "false"]):
                 mismatch, _ = parse_args()

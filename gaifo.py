@@ -4240,6 +4240,7 @@ class SceneDiscriminatorReward:
         gamma: float = 0.99,
         frameskip: int = REFERENCE_FRAMESKIP,
         reward_plus: bool = False,
+        physical_reward_scale: float = 1.0,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -4251,6 +4252,8 @@ class SceneDiscriminatorReward:
             raise ValueError("aerial touch reward weight must be non-negative")
         if not math.isfinite(flip_reset_reward_weight) or flip_reset_reward_weight < 0.0:
             raise ValueError("flip reset reward weight must be non-negative")
+        if not math.isfinite(physical_reward_scale) or physical_reward_scale < 0.0:
+            raise ValueError("physical reward scale must be finite and non-negative")
         if context_length < 1:
             raise ValueError("recurrent context length must be positive")
         if not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
@@ -4271,6 +4274,7 @@ class SceneDiscriminatorReward:
         self.aerial_touch_reward_weight = aerial_touch_reward_weight
         self.flip_reset_reward_weight = flip_reset_reward_weight
         self.reward_plus = reward_plus
+        self.physical_reward_scale = physical_reward_scale
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
         self.exp_log_odds_reward = exp_log_odds_reward
@@ -4283,6 +4287,7 @@ class SceneDiscriminatorReward:
         self._last_state: th.Tensor | None = None
         self._last_global_logits: th.Tensor | None = None
         self._context_version: int | None = None
+        self._last_reward_scales: dict[str, th.Tensor] = {}
 
     @staticmethod
     def _event_reward(
@@ -4594,16 +4599,34 @@ class SceneDiscriminatorReward:
         aerial_touch_reward = self._event_reward(
             batch, "aerial_touch_score", self.aerial_touch_reward_weight,
             imitation_reward,
-        )
+        ) * self.physical_reward_scale
         flip_reset_reward = self._event_reward(
             batch, "flip_reset_event", self.flip_reset_reward_weight,
             imitation_reward,
-        )
+        ) * self.physical_reward_scale
         reward_plus_reward = (
             sum((self._event_reward(batch, name, 1.0, imitation_reward)
                  for name in REWARD_PLUS_COMPONENTS), th.zeros_like(imitation_reward))
+            * self.physical_reward_scale
             if self.reward_plus else 0.0
         )
+        physical_reward = aerial_touch_reward + flip_reset_reward + reward_plus_reward
+        learner_mask = batch.get("learner_mask")
+        learner_mask = (learner_mask.bool() if learner_mask is not None
+                        else th.ones_like(valid))
+        learner_count = learner_mask.sum().clamp_min(1)
+        reward_components = {
+            "imitation": imitation_reward,
+            "goal": goal_reward,
+            "aerial_touch": aerial_touch_reward,
+            "flip_reset": flip_reset_reward,
+            "physical": physical_reward,
+            **({"reward_plus": reward_plus_reward} if self.reward_plus else {}),
+        }
+        self._last_reward_scales = {
+            f"rms/{name}": ((value.square() * learner_mask).sum() / learner_count).sqrt()
+            for name, value in reward_components.items()
+        }
 
         result = batch.with_fields(
             imitation_reward=imitation_reward,
@@ -4612,16 +4635,18 @@ class SceneDiscriminatorReward:
             aerial_touch_reward=aerial_touch_reward,
             flip_reset_reward=flip_reset_reward,
             **({"reward_plus_reward": reward_plus_reward} if self.reward_plus else {}),
-            training_reward=(
-                imitation_reward + goal_reward + aerial_touch_reward + flip_reset_reward
-                + reward_plus_reward
-            ),
+            training_reward=imitation_reward + goal_reward + physical_reward,
         )
         if "learner_mask" in result:
             return result.replace_fields(learner_mask=result["learner_mask"].bool())
         # Incomplete imitation context does not invalidate the policy action:
         # PPO still needs early steps to credit later goals and touches.
         return result.with_fields(learner_mask=th.ones_like(valid))
+
+    def diagnostic_metrics(self) -> dict[str, dict[str, float]]:
+        scales = self._last_reward_scales
+        self._last_reward_scales = {}
+        return {"RewardScale": {name: value.item() for name, value in scales.items()}} if scales else {}
 
 
 class SelectPPOFields:
@@ -5525,6 +5550,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--flip-reset-reward-weight", type=float, default=1.0,
         help="reward a spent flip returning on an underside ball touch (0 disables it)",
     )
+    parser.add_argument(
+        "--physical-reward-scale", type=float, default=1.0,
+        help="multiply aerial-touch, flip-reset, and --reward-plus bonuses after their individual weights (not goals or imitation)",
+    )
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--replay-reset-fraction", type=float, default=None)
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
@@ -5807,6 +5836,8 @@ def validate_args(args: argparse.Namespace) -> None:
         or args.flip_reset_reward_weight < 0.0
     ):
         raise ValueError("--flip-reset-reward-weight must be finite and non-negative")
+    if not math.isfinite(args.physical_reward_scale) or args.physical_reward_scale < 0.0:
+        raise ValueError("--physical-reward-scale must be finite and non-negative")
     if args.history_add_size > args.history_capacity:
         raise ValueError(
             "--history-add-size must not exceed --history-capacity"
@@ -6161,6 +6192,7 @@ def build_ppo_transforms(
             gamma=args.gamma,
             frameskip=args.frameskip,
             reward_plus=getattr(args, "reward_plus", False),
+            physical_reward_scale=args.physical_reward_scale,
         ),
         GAE(
             gamma=gamma,
@@ -6354,8 +6386,9 @@ def main() -> None:
         OptimizerStep(policy, policy_optimizer, max_grad_norm=args.max_grad_norm),
         OptimizerStep(critic, critic_optimizer, max_grad_norm=args.max_grad_norm),
     )
+    ppo_transforms = build_ppo_transforms(args, discriminator)
     ppo_update = Update(
-        transforms=build_ppo_transforms(args, discriminator),
+        transforms=ppo_transforms,
         sampler=build_ppo_sampler(args, runner),
         loss=ppo_loss,
         optimizer_step=IndependentOptimizerSteps(*ppo_optimizer_steps),
@@ -6423,6 +6456,7 @@ def main() -> None:
 
     def update_callback(trainer: Trainer) -> None:
         metrics = gameplay.diagnostic_metrics()
+        metrics.update(ppo_transforms[0].diagnostic_metrics())
         if metrics:
             trainer.logger.update(metrics, step=trainer.clock.env_steps)
 
