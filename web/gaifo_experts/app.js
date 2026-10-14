@@ -72,6 +72,13 @@ new OBJLoader().load('/arena.obj', (arena) => {
   scene.add(arena);
 });
 
+const tireGeometry = new THREE.CylinderGeometry(16, 16, 12, 16);
+const hubGeometry = new THREE.CylinderGeometry(7, 7, 13, 12);
+const tireMaterial = new THREE.MeshStandardMaterial({ color: 0x182126, roughness: 0.9 });
+const hubMaterial = new THREE.MeshStandardMaterial({
+  color: 0x879aa0, metalness: 0.35, roughness: 0.55,
+});
+
 function makeCar(color) {
   const group = new THREE.Group();
   const material = new THREE.MeshStandardMaterial({
@@ -88,6 +95,18 @@ function makeCar(color) {
   nose.position.x = 74;
   nose.rotation.z = -Math.PI / 2;
   group.add(nose);
+  for (const x of [-43, 43]) {
+    for (const y of [-49, 49]) {
+      const tire = new THREE.Mesh(tireGeometry, tireMaterial);
+      tire.position.set(x, y, -21);
+      tire.castShadow = true;
+      tire.receiveShadow = true;
+      group.add(tire);
+      const hub = new THREE.Mesh(hubGeometry, hubMaterial);
+      hub.position.copy(tire.position);
+      group.add(hub);
+    }
+  }
   scene.add(group);
   return { group, material };
 }
