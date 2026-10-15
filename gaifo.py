@@ -151,7 +151,6 @@ REWARD_PLUS_COMPONENTS = (
     "reward_plus_aerial_shot",
     "reward_plus_ground_pop",
     "reward_plus_air_dribble_setup",
-    "reward_plus_underside",
     "reward_plus_kickoff_speed",
     "reward_plus_kickoff",
     "reward_plus_wasted_air",
@@ -174,7 +173,6 @@ class RewardPlusWeights:
     aerial_shot: float = 50.0
     ground_pop: float = 10.0
     air_dribble_setup: float = 15.0
-    underside: float = 25.0
     kickoff_speed: float = 25.0
     kickoff: float = 25.0
     wasted_air: float = 10.0
@@ -190,7 +188,7 @@ class RewardPlusWeights:
         return cls(
             speed_progress=0.25, boost_free_speed_progress=0.5, boost_gain=0.0,
             aerial_lift=1.0, aerial_shot=1.0, ground_pop=0.0,
-            air_dribble_setup=0.0, underside=0.5,
+            air_dribble_setup=0.0,
             kickoff_speed=0.5, kickoff=0.5, wasted_air=0.2,
             wasted_boost=0.3, ball_ceiling=0.35, wall_touch=0.2,
             wall_control=0.3, inverted_ground=0.1,
@@ -897,7 +895,7 @@ def _replay_goal_scorer(path: Path, stored: np.ndarray) -> int | None:
 def _actionable_dodges(
     observation: CARLObservation, n_sim: int, n_cars: int,
 ) -> th.Tensor:
-    """Use the native dodge window for both reset detection and setup shaping."""
+    """Use the native dodge window to detect newly restored airborne flips."""
     return (
         observation.ego_has_flip_or_jump
         & observation.ego_flip_window_remaining.gt(carl.PHYS_DT)
@@ -948,12 +946,11 @@ class RewardPlus:
     """Bounded mechanical progress and one-off events, separate from imitation."""
 
     def __init__(
-        self, n_sim: int, n_cars: int, device: th.device, frameskip: int, gamma: float,
+        self, n_sim: int, n_cars: int, device: th.device, frameskip: int,
         weights: RewardPlusWeights | None = None,
     ) -> None:
         self.frameskip = frameskip
         self.team_size = n_cars // 2
-        self.gamma = gamma ** frameskip_ratio(frameskip)
         self.mechanical_events = MechanicalEventRewards(frameskip)
         self.weights = weights if weights is not None else RewardPlusWeights()
         self.kickoff_pending = th.zeros(n_sim, dtype=th.bool, device=device)
@@ -970,34 +967,6 @@ class RewardPlus:
             ((goalward_speed - 400.0) / 1200.0).clamp(0.0, 1.0)
             * ((alignment - 0.8) / 0.2).clamp(0.0, 1.0)
         )
-
-    @staticmethod
-    def _underside_potential(
-        state: CarlState, observation: CARLObservation,
-    ) -> th.Tensor:
-        car_to_ball = state.ball_position[:, None, :] - state.car_position
-        height = ((state.ball_position[:, None, 2] - BALL_RADIUS)
-                  / (GOAL_HEIGHT - BALL_RADIUS)).clamp(0.0, 1.0)
-        alignment = ((F.cosine_similarity(
-            car_to_ball, -state.car_up, dim=-1, eps=1e-6,
-        ) - 0.7) / 0.3).clamp(0.0, 1.0)
-        proximity = (
-            1.0 - (car_to_ball.norm(dim=-1) - 2.0 * BALL_RADIUS).clamp_min(0.0) / 500.0
-        ).clamp(0.0, 1.0)
-        on_surface = _arena_surface_contact(
-            state.car_on_ground, state.car_position, state.car_up[..., 2],
-        )
-        # The native dodge window can expire without either spent-flip state flag.
-        dodge_available = _actionable_dodges(
-            observation, len(state.raw), state.n_cars,
-        )
-        # The car must have no actionable dodge beneath the ball.
-        eligible = (
-            car_to_ball[..., 2].gt(0.0)
-            & state.car_position[..., 2].gt(2.0 * BALL_RADIUS)
-            & ~on_surface & ~state.car_demoed & ~dodge_available
-        )
-        return eligible * height * alignment * proximity
 
     def _kickoff_rewards(
         self, context: RewardContext, valid: th.Tensor,
@@ -1114,8 +1083,7 @@ class RewardPlus:
         return pop, setup
 
     def __call__(
-        self, context: RewardContext, aerial_touches: th.Tensor,
-        flip_reset: th.Tensor, combo: th.Tensor,
+        self, context: RewardContext, aerial_touches: th.Tensor, combo: th.Tensor,
     ) -> dict[str, th.Tensor]:
         current, previous = context.current, context.previous
         ball_displacement = (current.ball_position - previous.ball_position).norm(dim=-1)
@@ -1199,20 +1167,6 @@ class RewardPlus:
             - self._shot_quality(previous.ball_velocity, toward_goal)
         )
 
-        previous_potential = self._underside_potential(
-            previous, context.previous_observation,
-        )
-        current_potential = self._underside_potential(
-            current, context.current_observation,
-        )
-        # Misses and episode ends debit the discounted potential. A confirmed
-        # wheel-ball reset banks the setup instead of charging it away when the
-        # restored dodge makes the potential ineligible.
-        underside = self.weights.underside * continuous * (
-            self.gamma * current_potential * ~context.events.done[:, None]
-            - previous_potential
-        )
-        underside = underside.masked_fill(flip_reset, 0.0)
         ground_pop, air_dribble_setup = self._ground_air_dribble_rewards(context, valid)
         kickoff_speed, kickoff_touch = self._kickoff_rewards(context, valid)
         mechanics = self.mechanical_events(context, valid)
@@ -1225,7 +1179,6 @@ class RewardPlus:
             "reward_plus_air_dribble_setup": (
                 self.weights.air_dribble_setup * air_dribble_setup
             ),
-            "reward_plus_underside": underside,
             "reward_plus_kickoff_speed": kickoff_speed,
             "reward_plus_kickoff": kickoff_touch,
             **{
@@ -1242,7 +1195,6 @@ class GameplayDiagnostics:
         self, n_sim: int, device: th.device, no_touch_timeout_steps: int,
         n_cars: int = N_CARS,
         reward_plus: bool = False, frameskip: int = REFERENCE_FRAMESKIP,
-        gamma: float = 0.99,
         reward_plus_weights: RewardPlusWeights | None = None,
     ) -> None:
         if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
@@ -1257,7 +1209,7 @@ class GameplayDiagnostics:
         self.last_ego_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
         self.last_opponent_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
         self.reward_plus = (
-            RewardPlus(n_sim, n_cars, device, frameskip, gamma, reward_plus_weights)
+            RewardPlus(n_sim, n_cars, device, frameskip, reward_plus_weights)
             if reward_plus else None
         )
         self.last_reward_plus: dict[str, th.Tensor] = {}
@@ -1300,7 +1252,7 @@ class GameplayDiagnostics:
         flip_reset_score = flip_reset.to(aerial_score.dtype) * combo
         self.last_flip_reset = self._team_difference(flip_reset_score)
         if self.reward_plus is not None:
-            components = self.reward_plus(context, aerial, flip_reset, combo)
+            components = self.reward_plus(context, aerial, combo)
             self.last_reward_plus = {
                 name: self._team_difference(value)
                 for name, value in components.items()
@@ -5721,7 +5673,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     add_feature_option(
         parser, "--reward-plus",
-        help="add boost-aware speed progress, boost pickups, controlled ground pops and air-dribble setups, aerial lifts and shots, underside setup, and kickoff rewards",
+        help="add boost-aware speed progress, boost pickups, controlled ground pops and air-dribble setups, aerial lifts and shots, and kickoff rewards",
     )
     add_feature_option(
         parser, "--cap-physical-rewards", default=True,
@@ -5737,7 +5689,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--flip-reset-reward-weight", type=float, default=12.5,
-        help="reward a spent flip returning on an underside ball touch (default: 12.5; 0 disables it)",
+        help="reward a spent or expired flip regained by elevated wheel-ball contact (default: 12.5; 0 disables it)",
     )
     parser.add_argument(
         "--physical-reward-scale", type=float, default=1.0,
@@ -5862,6 +5814,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
                 "reward_plus_weights", asdict(RewardPlusWeights.legacy()),
             ),
         }
+        inherited["reward_plus_weights"].pop("underside", None)
         parser.set_defaults(**inherited)
     else:
         parser.set_defaults(reward_plus_weights=asdict(RewardPlusWeights()))
@@ -6460,7 +6413,7 @@ def main() -> None:
         env.device,
         math.ceil(args.no_touch_timeout * 120.0 / args.frameskip),
         n_cars=team_car_count(args.team_size),
-        reward_plus=args.reward_plus, frameskip=args.frameskip, gamma=args.gamma,
+        reward_plus=args.reward_plus, frameskip=args.frameskip,
         reward_plus_weights=RewardPlusWeights(**args.reward_plus_weights),
     ))
     policy = build_policy(env, args)

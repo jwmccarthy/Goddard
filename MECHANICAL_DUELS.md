@@ -211,7 +211,7 @@ multiplier applies to both their bonus and the aerial-touch bonus. Floor or wall
 contact, an upside-down floor landing, demolition, or an episode end resets the
 streak; wheel contact with the ball does not.
 
-`--reward-plus` adds fifteen bounded, zero-sum team signals alongside the
+`--reward-plus` adds fourteen bounded, zero-sum team signals alongside the
 discriminator imitation reward:
 
 - Signed speed change pays `12.5` per normalized speed gained, plus `25` when
@@ -241,13 +241,6 @@ discriminator imitation reward:
   controllable relative speed. Another player's touch, a grounded ball,
   demolition, or episode end stops the follow-up. A stationary ground dribble
   earns no continuing bonus.
-- Exposing the car's wheels to the underside of a nearby ball pays up to `25` for a
-  discounted *change* in alignment only when the car has no actionable dodge,
-  not a standing pose reward. The potential reaches its maximum above the
-  crossbar and falls to zero at ground level. A confirmed airborne wheel-ball
-  contact that restores the dodge banks this setup without a debit, including
-  when the dodge window expired without a flip. Otherwise dropping the pose,
-  landing on a surface, or ending the episode still debits it.
 - During a real kickoff, the nearest spawning car on each team earns up to
   `25` for closing the distance to the kickoff ball's position. Retreating
   debits progress; holding speed without moving closer pays nothing. The
@@ -278,7 +271,7 @@ the 4x combo cap; a rare single lift or shot can reach `200` *before* the
 rollout cap, and multiple mechanics can stack on one action. Relative reward
 strength is measured over all learner actions, not by single-event peaks. Set
 `--aerial-touch-reward-weight 0` to pay only for controlled aerial touches.
-GAIFO's original twelve `--reward-plus` signals include the former 50x
+GAIFO's remaining eleven original `--reward-plus` signals include the former 50x
 physical multiplier in their new-run weights, including penalties; boost gain,
 ground pops, and air-dribble setups are weighted separately. BASIC's weights
 are unchanged.
@@ -288,8 +281,9 @@ new-run commands rather than multiplying the physical rewards a second time.
 `--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
 flip-reset, and `--reward-plus` rewards after their component weights, but not
 imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
-new component weights; older checkpoints retain their original `--reward-plus`,
-touch/reset, and goal weights when resumed. Checkpoints predating boost gain or
+new component weights; older checkpoints retain their other `--reward-plus`,
+touch/reset, and goal weights when resumed, but discard the retired underside
+weight. Checkpoints predating boost gain or
 the ground setup signals keep those weights at zero. The physical scale is also
 saved and can be overridden on resume with an explicit value (and a new
 `--timesteps` total above the saved step).
@@ -314,7 +308,7 @@ sparse touches/resets are not overstated by peak bonuses alone.
 `--reward-plus` is off by default and is stored in GAIFO checkpoints;
 on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
 When enabled, TensorBoard logs their signed, weighted per-car means under
-`RewardSpec/component/{speed,boost_gain,aerial_lift,aerial_shot,ground_pop,air_dribble_setup,underside,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
+`RewardSpec/component/{speed,boost_gain,aerial_lift,aerial_shot,ground_pop,air_dribble_setup,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
 and their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
 zero-sum team difference; `RewardSpec/scale/reward_plus` logs the RMS of the
 combined zero-sum bonus *before* `--physical-reward-scale` and the rollout cap.

@@ -697,6 +697,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertTrue(payload["config"]["cap_physical_rewards"])
             self.assertEqual(payload["config"]["reward_plus_weights"],
                              asdict(RewardPlusWeights()))
+            self.assertNotIn("underside", payload["config"]["reward_plus_weights"])
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)]):
                 resumed, _ = parse_args()
             self.assertTrue(resumed.factorize)
@@ -727,14 +728,17 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 name: weight for name, weight in args.reward_plus_weights.items()
                 if name not in ("ground_pop", "air_dribble_setup")
             }
+            recent_config["reward_plus_weights"]["underside"] = 25.0
             with (patch("gaifo.load_resume_checkpoint",
                         return_value={"config": recent_config}),
                   patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
                 recent, _ = parse_args()
             self.assertEqual(recent.reward_plus_weights, {
-                **recent_config["reward_plus_weights"],
+                **{name: weight for name, weight in recent_config["reward_plus_weights"].items()
+                   if name != "underside"},
                 "ground_pop": 0.0, "air_dribble_setup": 0.0,
             })
+            self.assertEqual(RewardPlusWeights(**recent.reward_plus_weights).ground_pop, 0.0)
             self.assertTrue(recent.cap_physical_rewards)
             legacy_config = payload["config"].copy()
             legacy_config.pop("reward_plus_weights")

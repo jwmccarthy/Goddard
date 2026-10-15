@@ -325,7 +325,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                     "component/speed", "component/boost_gain", "component/aerial_lift",
                     "component/aerial_shot", "component/ground_pop",
                     "component/air_dribble_setup",
-                    "component/underside", "component/kickoff_speed", "component/kickoff",
+                    "component/kickoff_speed", "component/kickoff",
                     "component/wasted_air", "component/wasted_boost",
                     "component/ball_ceiling", "component/wall_touch",
                     "component/wall_control", "component/inverted_ground",
@@ -334,6 +334,9 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                     tag = f"RewardSpec/{name}"
                     self.assertIn(tag, events.Tags()["scalars"])
                     self.assertTrue(events.Scalars(tag))
+                self.assertNotIn("RewardSpec/component/underside", events.Tags()["scalars"])
+                self.assertNotIn("RewardSpec/rms/reward_plus_underside",
+                                 events.Tags()["scalars"])
                 for name in ("imitation", "physical", "aerial_touch", "flip_reset",
                              "reward_plus", "goal", *REWARD_PLUS_COMPONENTS):
                     tag = f"RewardSpec/rms/{name}"
