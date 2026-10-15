@@ -711,15 +711,31 @@ class FactorizedGAIFOTests(unittest.TestCase):
             prior_config.pop("cap_physical_rewards")
             prior_config["reward_plus_weights"] = {
                 name: weight for name, weight in args.reward_plus_weights.items()
-                if name != "boost_gain"
+                if name not in ("boost_gain", "ground_pop", "air_dribble_setup")
             }
             with (patch("gaifo.load_resume_checkpoint",
                         return_value={"config": prior_config}),
                   patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
                 prior, _ = parse_args()
-            self.assertEqual(prior.reward_plus_weights,
-                             {**prior_config["reward_plus_weights"], "boost_gain": 0.0})
+            self.assertEqual(prior.reward_plus_weights, {
+                **prior_config["reward_plus_weights"],
+                "boost_gain": 0.0, "ground_pop": 0.0, "air_dribble_setup": 0.0,
+            })
             self.assertFalse(prior.cap_physical_rewards)
+            recent_config = payload["config"].copy()
+            recent_config["reward_plus_weights"] = {
+                name: weight for name, weight in args.reward_plus_weights.items()
+                if name not in ("ground_pop", "air_dribble_setup")
+            }
+            with (patch("gaifo.load_resume_checkpoint",
+                        return_value={"config": recent_config}),
+                  patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
+                recent, _ = parse_args()
+            self.assertEqual(recent.reward_plus_weights, {
+                **recent_config["reward_plus_weights"],
+                "ground_pop": 0.0, "air_dribble_setup": 0.0,
+            })
+            self.assertTrue(recent.cap_physical_rewards)
             legacy_config = payload["config"].copy()
             legacy_config.pop("reward_plus_weights")
             legacy_config.update(goal_reward_weight=1., aerial_touch_reward_weight=.5,

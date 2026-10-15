@@ -323,7 +323,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 events.Reload()
                 for name in (
                     "component/speed", "component/boost_gain", "component/aerial_lift",
-                    "component/aerial_shot",
+                    "component/aerial_shot", "component/ground_pop",
+                    "component/air_dribble_setup",
                     "component/underside", "component/kickoff_speed", "component/kickoff",
                     "component/wasted_air", "component/wasted_boost",
                     "component/ball_ceiling", "component/wall_touch",

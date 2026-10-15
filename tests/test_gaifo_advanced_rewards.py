@@ -388,6 +388,153 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertGreater(lift[2, 0], lift[3, 0])
         th.testing.assert_close(lift.sum(-1), th.zeros(4))
 
+    def test_ground_pop_needs_a_controlled_new_touch_and_air_dribble_setup(self):
+        initial = physical_state(9)
+        initial[:, 1] = 170.0
+        initial[:, 4] = 500.0
+        start_cars = initial[:, 9:53].view(9, 2, 22)
+        start_cars[:, 0, 1] = 0.0
+        start_cars[:, 0, 5] = 500.0
+        start_cars[1, 0, 2] = 300.0
+        start_cars[1, 0, 14] = 0.0  # Wheels on a wall, not the floor.
+        start_cars[6, 0, 21] = 1.0  # Held contact is not a new pop.
+        initial[7, 1] = -200.0  # A ball behind the attacker cannot start a carry.
+
+        touched = initial.clone()
+        touched[:, 1] += 17.0
+        touched[:, 2] = 110.0
+        touched[:, 5] = 650.0
+        touched[:, 9 + 21] = 1.0
+        touched_cars = touched[:, 9:53].view(9, 2, 22)
+        touched[2, 4] = 2_400.0  # Wild pinch cannot be called control.
+        touched[3, 5] = -100.0  # No upward pop.
+        touched[8, 5] = 370.0  # Small hop will not put the ball in the air.
+        touched_cars[4, 0, 21] = 0.0
+        done = th.zeros(9, dtype=th.bool)
+        done[5] = True
+
+        gameplay = GameplayDiagnostics(9, th.device("cpu"), 900, reward_plus=True)
+        capture = AdvancedTouchCapture(gameplay)
+        gameplay(physical_context(touched, initial, done=done))
+        pop = capture(None)["reward_plus_ground_pop"].view(9, 2)
+        self.assertGreater(pop[0, 0].item(), 0.0)
+        self.assertLess(pop[0, 0].item(), 10.0)
+        th.testing.assert_close(pop[1:], th.zeros(8, 2))
+        th.testing.assert_close(pop.sum(dim=-1), th.zeros(9))
+        th.testing.assert_close(capture(None)["reward_plus_air_dribble_setup"], th.zeros(18))
+
+        grounded = touched.clone()
+        grounded[:, 9 + 21] = 0.0
+        grounded[:, 2] = 130.0
+        gameplay(physical_context(grounded, touched))
+        th.testing.assert_close(capture(None)["reward_plus_air_dribble_setup"], th.zeros(18))
+        following = grounded
+        for step in range(6):
+            airborne = following.clone()
+            airborne[:, 1] += 17.0
+            airborne[:, 2] += 21.0
+            car = airborne[:, 9:53].view(9, 2, 22)[:, 0]
+            car[:, 1] += 17.0
+            car[:, 2] += 20.0
+            car[:, 5] = 600.0
+            car[:, 16] = 0.0
+            gameplay(physical_context(airborne, following))
+            setup = capture(None)["reward_plus_air_dribble_setup"].view(9, 2)
+            if step == 5:
+                self.assertGreater(setup[0, 0].item(), 0.0)
+                self.assertLess(setup[0, 0].item(), 15 / 120 * 4)
+                th.testing.assert_close(setup[0, 1], -setup[0, 0])
+            else:
+                th.testing.assert_close(setup, th.zeros(9, 2))
+            th.testing.assert_close(setup[1:], th.zeros(8, 2))
+            following = airborne
+
+        stolen = following.clone()
+        stolen[0, 9 + 21] = 1.0  # Simultaneous contact still ends the setup.
+        stolen[0, 9 + 22 + 21] = 1.0
+        gameplay(physical_context(stolen, following))
+        th.testing.assert_close(capture(None)["reward_plus_air_dribble_setup"], th.zeros(18))
+        stolen[0, 9 + 21] = 0.0
+        stolen[0, 9 + 22 + 21] = 0.0
+        gameplay(physical_context(stolen, stolen))
+        th.testing.assert_close(capture(None)["reward_plus_air_dribble_setup"], th.zeros(18))
+
+        # A ball that bounces off the floor between actions cannot reactivate it.
+        fresh = GameplayDiagnostics(1, th.device("cpu"), 900, reward_plus=True)
+        fresh_capture = AdvancedTouchCapture(fresh)
+        fresh(physical_context(touched[:1], initial[:1]))
+        fresh(physical_context(following[:1], touched[:1]))
+        falling = following[:1].clone()
+        falling[0, 2] = 185.0
+        falling[0, 5] = -1_000.0
+        fresh(physical_context(falling, following[:1]))
+        rebounded = falling.clone()
+        rebounded[0, 2] = 120.0
+        rebounded[0, 5] = 450.0
+        fresh(physical_context(rebounded, falling))
+        fresh(physical_context(following[:1], rebounded))
+        th.testing.assert_close(
+            fresh_capture(None)["reward_plus_air_dribble_setup"], th.zeros(2),
+        )
+
+    def test_ground_pop_is_team_zero_sum_and_followup_expires_in_physics_time(self):
+        for team_size in (2, 3):
+            with self.subTest(team_size=team_size):
+                n_cars = team_size * 2
+                initial = physical_state(1, n_cars=n_cars)
+                initial[0, 1] = 170.0
+                initial[0, 4] = 500.0
+                cars = initial[:, 9:9 + 22 * n_cars].view(1, n_cars, 22)
+                cars[0, 0, 1] = 0.0
+                cars[0, 0, 5] = 500.0
+                touched = initial.clone()
+                touched[0, 1] = 187.0
+                touched[0, 2] = 110.0
+                touched[0, 5] = 650.0
+                touched[0, 9 + 21] = 1.0
+                gameplay = GameplayDiagnostics(1, th.device("cpu"), 900, n_cars=n_cars,
+                                               reward_plus=True)
+                gameplay(physical_context(touched, initial, n_cars=n_cars))
+                pop = AdvancedTouchCapture(gameplay)(None)["reward_plus_ground_pop"]
+                self.assertGreater(pop[0].item(), 0.0)
+                th.testing.assert_close(pop[:team_size], pop[0].expand(team_size))
+                th.testing.assert_close(pop[team_size:], -pop[0].expand(team_size))
+
+        initial = physical_state(1)
+        initial[0, 1] = 170.0
+        initial[0, 4] = 500.0
+        initial[0, 9 + 1] = 0.0
+        initial[0, 9 + 5] = 500.0
+        touched = initial.clone()
+        touched[0, 1] = 187.0
+        touched[0, 2] = 110.0
+        touched[0, 5] = 650.0
+        touched[0, 9 + 21] = 1.0
+        following = touched.clone()
+        following[0, 1] += 17.0
+        following[0, 2] = 256.0
+        following[0, 9 + 2] = 137.0
+        following[0, 9 + 5] = 600.0
+        following[0, 9 + 16] = 0.0
+        following[0, 9 + 21] = 0.0
+        for frameskip in (4, 8):
+            with self.subTest(frameskip=frameskip):
+                gameplay = GameplayDiagnostics(1, th.device("cpu"), 900,
+                                               reward_plus=True, frameskip=frameskip)
+                capture = AdvancedTouchCapture(gameplay)
+                gameplay(physical_context(touched, initial))
+                earned = 0.0
+                steps = math.ceil(1.5 * 120 / frameskip)
+                for _ in range(steps):
+                    gameplay(physical_context(following, following))
+                    earned += capture(None)["reward_plus_air_dribble_setup"][0].item()
+                self.assertGreater(earned, 0.0)
+                self.assertLessEqual(earned, 15 * 1.5)
+                gameplay(physical_context(following, following))
+                th.testing.assert_close(
+                    capture(None)["reward_plus_air_dribble_setup"], th.zeros(2),
+                )
+
     def test_reward_plus_underside_is_discounted_progress_and_terminally_debited(self):
         current = physical_state(9)
         current[:, 2] = 800.0
@@ -1124,8 +1271,11 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertTrue(transform.cap_physical_rewards)
         old = asdict(RewardPlusWeights.legacy())
         self.assertEqual(defaults.reward_plus_weights, {
-            **{name: weight * 50 for name, weight in old.items() if name != "boost_gain"},
+            **{name: weight * 50 for name, weight in old.items()
+               if name not in ("boost_gain", "ground_pop", "air_dribble_setup")},
             "boost_gain": 12.5,
+            "ground_pop": 10.0,
+            "air_dribble_setup": 15.0,
         })
 
 

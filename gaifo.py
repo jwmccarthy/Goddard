@@ -66,7 +66,7 @@ from replay_layout import (
     team_observation_size, team_replay_row_size, team_scene_size,
 )
 from replay_safety import (
-    GOAL_EXCLUSION_SECONDS, TICKS_PER_SECOND,
+    BALL_GRAVITY, GOAL_EXCLUSION_SECONDS, TICKS_PER_SECOND,
     infer_unsafe_start_mask, pre_goal_start_mask,
 )
 from reward_spec import CEILING_Z
@@ -149,6 +149,8 @@ REWARD_PLUS_COMPONENTS = (
     "reward_plus_boost_gain",
     "reward_plus_aerial_lift",
     "reward_plus_aerial_shot",
+    "reward_plus_ground_pop",
+    "reward_plus_air_dribble_setup",
     "reward_plus_underside",
     "reward_plus_kickoff_speed",
     "reward_plus_kickoff",
@@ -170,6 +172,8 @@ class RewardPlusWeights:
     boost_gain: float = 12.5
     aerial_lift: float = 50.0
     aerial_shot: float = 50.0
+    ground_pop: float = 10.0
+    air_dribble_setup: float = 15.0
     underside: float = 25.0
     kickoff_speed: float = 25.0
     kickoff: float = 25.0
@@ -185,7 +189,8 @@ class RewardPlusWeights:
         """Restore the weights used before component defaults were raised."""
         return cls(
             speed_progress=0.25, boost_free_speed_progress=0.5, boost_gain=0.0,
-            aerial_lift=1.0, aerial_shot=1.0, underside=0.5,
+            aerial_lift=1.0, aerial_shot=1.0, ground_pop=0.0,
+            air_dribble_setup=0.0, underside=0.5,
             kickoff_speed=0.5, kickoff=0.5, wasted_air=0.2,
             wasted_boost=0.3, ball_ceiling=0.35, wall_touch=0.2,
             wall_control=0.3, inverted_ground=0.1,
@@ -936,6 +941,7 @@ class RewardPlus:
         self.weights = weights if weights is not None else RewardPlusWeights()
         self.kickoff_pending = th.zeros(n_sim, dtype=th.bool, device=device)
         self.kickoff_challenger = th.zeros(n_sim, n_cars, dtype=th.bool, device=device)
+        self.ground_setup_ticks = th.zeros(n_sim, n_cars, dtype=th.int32, device=device)
 
     @staticmethod
     def _shot_quality(velocity: th.Tensor, toward_goal: th.Tensor) -> th.Tensor:
@@ -1018,6 +1024,78 @@ class RewardPlus:
         touch = (self.weights.kickoff * first_touch
                  / first_touch.sum(dim=-1, keepdim=True).clamp_min(1.0))
         return speed, touch
+
+    def _ground_air_dribble_rewards(
+        self, context: RewardContext, valid: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Credit a controlled ground pop and a short airborne follow-up."""
+        current, previous = context.current, context.previous
+        car_to_ball = current.ball_position[:, None, :] - current.car_position
+        distance = car_to_ball.norm(dim=-1)
+        relative_speed = (
+            current.ball_velocity[:, None, :] - current.car_velocity
+        ).norm(dim=-1)
+        control = (1.0 - relative_speed / 1200.0).clamp(0.0, 1.0)
+        goal_side = (
+            current.team_sign[None, :] * car_to_ball[..., 1]
+        ).gt(-BALL_RADIUS)
+        not_backwards = (
+            current.team_sign[None, :] * current.ball_velocity[:, None, 1]
+        ).gt(-200.0)
+        touches = current.car_ball_touches
+        fresh_solo_touch = (
+            touches & ~previous.car_ball_touches
+            & touches.sum(dim=-1, keepdim=True).eq(1)
+        )
+        # A jump taken on the touch step still counts as a ground-origin pop;
+        # wheels on a wall, a high airborne touch, and a lingering touch do not.
+        floor_start = (
+            previous.car_on_ground & previous.car_position[..., 2].lt(120.0)
+            & previous.car_up[..., 2].gt(0.65)
+            & current.car_position[..., 2].lt(2.0 * BALL_RADIUS)
+            & current.car_up[..., 2].gt(0.5)
+        )
+        rise = current.ball_velocity[:, None, 2] - previous.ball_velocity[:, None, 2]
+        peak = (
+            current.ball_position[:, 2]
+            + current.ball_velocity[:, 2].clamp_min(0.0).square() / (2.0 * BALL_GRAVITY)
+        )
+        pop = (
+            valid & fresh_solo_touch & floor_start
+            & previous.ball_position[:, None, 2].lt(3.0 * BALL_RADIUS)
+            & peak[:, None].gt(3.0 * BALL_RADIUS)
+            & distance.lt(280.0) & goal_side & not_backwards
+            & current.ball_velocity[:, None, 2].gt(350.0)
+            & rise.gt(300.0) & (self.ground_setup_ticks == 0)
+        ) * ((rise - 300.0) / 500.0).clamp(0.0, 1.0) * control
+
+        other_touch = touches.sum(dim=-1, keepdim=True) > touches.long()
+        proximity = ((400.0 - distance) / 300.0).clamp(0.0, 1.0)
+        remaining_seconds = self.ground_setup_ticks.clamp_max(self.frameskip).to(
+            current.raw.dtype
+        ) / TICKS_PER_SECOND
+        setup = (
+            (self.ground_setup_ticks > 0) & valid & ~other_touch
+            & ~current.car_on_ground & current.car_position[..., 2].gt(120.0)
+            & current.ball_position[:, None, 2].gt(2.5 * BALL_RADIUS)
+            & car_to_ball[..., 2].gt(0.0) & goal_side & not_backwards
+        ) * proximity * control * remaining_seconds
+
+        remaining = th.where(
+            pop.gt(0.0), int(1.5 * TICKS_PER_SECOND),
+            (self.ground_setup_ticks - self.frameskip).clamp_min(0),
+        )
+        # Stop at the floor even if the ball bounced between policy decisions.
+        ball_landed = (
+            (self.ground_setup_ticks > 0)
+            & current.ball_position[:, None, 2].le(2.0 * BALL_RADIUS)
+            & ((current.ball_velocity[:, None, 2].le(0.0))
+               | (previous.ball_velocity[:, None, 2].lt(0.0)))
+        )
+        self.ground_setup_ticks = th.where(
+            valid & ~other_touch & ~ball_landed, remaining, 0,
+        )
+        return pop, setup
 
     def __call__(
         self, context: RewardContext, aerial_touches: th.Tensor, combo: th.Tensor,
@@ -1116,6 +1194,7 @@ class RewardPlus:
             self.gamma * current_potential * ~context.events.done[:, None]
             - previous_potential
         )
+        ground_pop, air_dribble_setup = self._ground_air_dribble_rewards(context, valid)
         kickoff_speed, kickoff_touch = self._kickoff_rewards(context, valid)
         mechanics = self.mechanical_events(context, valid)
         return {
@@ -1123,6 +1202,10 @@ class RewardPlus:
             "reward_plus_boost_gain": boost_gain,
             "reward_plus_aerial_lift": self.weights.aerial_lift * lift * combo,
             "reward_plus_aerial_shot": self.weights.aerial_shot * aerial_shot * combo,
+            "reward_plus_ground_pop": self.weights.ground_pop * ground_pop,
+            "reward_plus_air_dribble_setup": (
+                self.weights.air_dribble_setup * air_dribble_setup
+            ),
             "reward_plus_underside": underside,
             "reward_plus_kickoff_speed": kickoff_speed,
             "reward_plus_kickoff": kickoff_touch,
@@ -5619,7 +5702,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     add_feature_option(
         parser, "--reward-plus",
-        help="add boost-aware speed progress, boost pickups, controlled aerial lifts and shots, underside setup, kickoff approach speed and first touch",
+        help="add boost-aware speed progress, boost pickups, controlled ground pops and air-dribble setups, aerial lifts and shots, underside setup, and kickoff rewards",
     )
     add_feature_option(
         parser, "--cap-physical-rewards", default=True,
@@ -5754,6 +5837,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("cap_physical_rewards", False)
         inherited["reward_plus_weights"] = {
             "boost_gain": 0.0,  # Pre-boost-gain checkpoints keep their original rewards.
+            "ground_pop": 0.0,  # Preserve rewards in pre-ground-setup checkpoints.
+            "air_dribble_setup": 0.0,
             **resume["config"].get(
                 "reward_plus_weights", asdict(RewardPlusWeights.legacy()),
             ),
