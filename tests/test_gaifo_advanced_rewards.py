@@ -604,9 +604,67 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         underside = AdvancedTouchCapture(gameplay)(None)["reward_plus_underside"].view(4, 2)
         self.assertEqual(underside[0, 0].item(), 0)  # Aligning with a dodge pays nothing.
         self.assertGreater(underside[1, 0], 0)  # Expired, though no flip was spent.
-        self.assertAlmostEqual(underside[2, 0].item(), -25)  # Restore debits potential.
+        self.assertEqual(underside[2, 0].item(), 0)  # Ball reset banks the setup.
         self.assertGreater(underside[3, 0], 0)
         th.testing.assert_close(underside.sum(-1), th.zeros(4))
+
+    def test_reward_plus_underside_banks_only_ball_dodge_restorations(self):
+        current = physical_state(5)
+        current[:, 2] = 800.0
+        cars = current[:, 9:53].view(5, 2, 22)
+        cars[:, 0, 1] = 0.0
+        cars[:, 0, 2] = 650.0
+        cars[:, 0, 14] = -1.0  # Wheels face the ball from below.
+        cars[:, 0, 16] = 0.0
+        previous = current.clone()
+        old_cars = previous[:, 9:53].view(5, 2, 22)
+        old_cars[[0, 2, 3], 0, 18] = 1.0
+        cars[[0, 1, 3], 0, 21] = 1.0
+
+        # An unrelated floor landing returns the dodge but must still debit
+        # the setup; a mere ball touch without restoration must do so as well.
+        current[2, 2] = previous[2, 2] = 350.0
+        old_cars[2, 0, 2] = 220.0
+        cars[2, 0, 2] = 120.0
+        cars[2, 0, 14] = 1.0
+        cars[2, 0, 16] = 1.0
+        cars[3, 0, 14] = 1.0
+        cars[3, 0, 18] = 1.0  # Glancing touch did not restore the flip.
+        # A coincident ball touch and wall landing restores a dodge via the
+        # wall, not via a flip reset on the ball.
+        current[4, 0] = previous[4, 0] = 3_900.0
+        current[4, 2] = previous[4, 2] = 690.0
+        cars[4, 0, 0] = old_cars[4, 0, 0] = 4_000.0
+        cars[4, 0, 12:15] = old_cars[4, 0, 12:15] = th.tensor([1., 0., -.4])
+        cars[4, 0, 16] = 1.0
+        cars[4, 0, 21] = 1.0
+
+        before = th.zeros(10, 51)
+        after = th.zeros_like(before)
+        before[2, -2:] = th.tensor([1.0, 0.005])  # Window expired unspent.
+        before[8, -2:] = th.tensor([1.0, 0.005])
+        after[[0, 2, 4, 8], -2:] = th.tensor([1.0, 1.25])
+        context = replace(
+            physical_context(current, previous),
+            previous_observation=CARLObservation.from_tensor(before, 2),
+            current_observation=CARLObservation.from_tensor(after, 2),
+        )
+        gameplay = GameplayDiagnostics(5, th.device("cpu"), 900, reward_plus=True)
+        gameplay(context)
+        captured = AdvancedTouchCapture(gameplay)(None)
+        th.testing.assert_close(
+            captured["flip_reset_event"].view(5, 2),
+            th.tensor([[1., -1.], [1., -1.], [0., 0.], [0., 0.], [0., 0.]]),
+        )
+        underside = captured["reward_plus_underside"].view(5, 2)
+        th.testing.assert_close(underside[:2], th.zeros(2, 2))
+        self.assertAlmostEqual(
+            underside[2, 0].item(),
+            -25 * (350 - BALL_RADIUS) / (GOAL_HEIGHT - BALL_RADIUS), places=5,
+        )
+        self.assertAlmostEqual(underside[3, 0].item(), -25, places=5)
+        self.assertAlmostEqual(underside[4, 0].item(), -25, places=5)
+        th.testing.assert_close(underside.sum(-1), th.zeros(5))
 
     def test_reward_plus_kickoff_speed_rewards_only_closest_challengers(self):
         for team_size in (1, 2, 3):

@@ -244,8 +244,10 @@ discriminator imitation reward:
 - Exposing the car's wheels to the underside of a nearby ball pays up to `25` for a
   discounted *change* in alignment only when the car has no actionable dodge,
   not a standing pose reward. The potential reaches its maximum above the
-  crossbar and falls to zero at ground level; regaining a dodge, dropping the
-  pose, or ending the episode debits it.
+  crossbar and falls to zero at ground level. A confirmed airborne wheel-ball
+  contact that restores the dodge banks this setup without a debit, including
+  when the dodge window expired without a flip. Otherwise dropping the pose,
+  landing on a surface, or ending the episode still debits it.
 - During a real kickoff, the nearest spawning car on each team earns up to
   `25` for closing the distance to the kickoff ball's position. Retreating
   debits progress; holding speed without moving closer pays nothing. The

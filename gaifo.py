@@ -894,6 +894,16 @@ def _replay_goal_scorer(path: Path, stored: np.ndarray) -> int | None:
     return None
 
 
+def _actionable_dodges(
+    observation: CARLObservation, n_sim: int, n_cars: int,
+) -> th.Tensor:
+    """Use the native dodge window for both reset detection and setup shaping."""
+    return (
+        observation.ego_has_flip_or_jump
+        & observation.ego_flip_window_remaining.gt(carl.PHYS_DT)
+    ).reshape(n_sim, n_cars)
+
+
 def advanced_touch_events(
     context: RewardContext,
 ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
@@ -907,20 +917,27 @@ def advanced_touch_events(
 
     spent_flip = previous.car_has_flipped | previous.car_has_double_jumped
     flip_available = ~(current.car_has_flipped | current.car_has_double_jumped)
+    on_surface = _arena_surface_contact(
+        current.car_on_ground, current.car_position, current.car_up[..., 2],
+    )
+    # A dodge can also expire without either spent-flip flag being set.
+    native_restored = (
+        ~_actionable_dodges(context.previous_observation, len(current.raw), current.n_cars)
+        & _actionable_dodges(context.current_observation, len(current.raw), current.n_cars)
+    )
     flip_reset = (
         touches
-        & spent_flip
+        & (spent_flip | native_restored)
         & flip_available
+        & ~on_surface  # A floor/wall landing can restore the dodge on a touch step.
         & car_height.gt(3.0 * BALL_RADIUS)
         & ball_to_car.square().sum(dim=-1).lt((2.0 * BALL_RADIUS) ** 2)
         & F.cosine_similarity(
             ball_to_car, -current.car_up, dim=-1, eps=1e-6
         ).gt(0.9)
     )
-    on_surface = _arena_surface_contact(
-        current.car_on_ground, current.car_position, current.car_up[..., 2],
-    )
-    aerial = touches & car_height.gt(2.0 * BALL_RADIUS) & (~on_surface | flip_reset)
+    # Wheel contact with the ball can set car_on_ground without being a landing.
+    aerial = touches & car_height.gt(2.0 * BALL_RADIUS) & ~on_surface
     # A low aerial earns a nonzero bonus; the configured weight caps it at the roof.
     height_fraction = ((ball_height - BALL_RADIUS) / (CEILING_Z - BALL_RADIUS)).clamp(0, 1)
     aerial_score = aerial.to(current.raw.dtype) * (0.5 + 0.5 * height_fraction)
@@ -971,10 +988,9 @@ class RewardPlus:
             state.car_on_ground, state.car_position, state.car_up[..., 2],
         )
         # The native dodge window can expire without either spent-flip state flag.
-        dodge_available = (
-            observation.ego_has_flip_or_jump
-            & observation.ego_flip_window_remaining.gt(carl.PHYS_DT)
-        ).reshape(len(state.raw), state.n_cars)
+        dodge_available = _actionable_dodges(
+            observation, len(state.raw), state.n_cars,
+        )
         # The car must have no actionable dodge beneath the ball.
         eligible = (
             car_to_ball[..., 2].gt(0.0)
@@ -1098,7 +1114,8 @@ class RewardPlus:
         return pop, setup
 
     def __call__(
-        self, context: RewardContext, aerial_touches: th.Tensor, combo: th.Tensor,
+        self, context: RewardContext, aerial_touches: th.Tensor,
+        flip_reset: th.Tensor, combo: th.Tensor,
     ) -> dict[str, th.Tensor]:
         current, previous = context.current, context.previous
         ball_displacement = (current.ball_position - previous.ball_position).norm(dim=-1)
@@ -1188,12 +1205,14 @@ class RewardPlus:
         current_potential = self._underside_potential(
             current, context.current_observation,
         )
-        # The discounted potential telescopes; clear its terminal value so a
-        # reset or goal cannot repeatedly pay for the same upside-down pose.
+        # Misses and episode ends debit the discounted potential. A confirmed
+        # wheel-ball reset banks the setup instead of charging it away when the
+        # restored dodge makes the potential ineligible.
         underside = self.weights.underside * continuous * (
             self.gamma * current_potential * ~context.events.done[:, None]
             - previous_potential
         )
+        underside = underside.masked_fill(flip_reset, 0.0)
         ground_pop, air_dribble_setup = self._ground_air_dribble_rewards(context, valid)
         kickoff_speed, kickoff_touch = self._kickoff_rewards(context, valid)
         mechanics = self.mechanical_events(context, valid)
@@ -1281,7 +1300,7 @@ class GameplayDiagnostics:
         flip_reset_score = flip_reset.to(aerial_score.dtype) * combo
         self.last_flip_reset = self._team_difference(flip_reset_score)
         if self.reward_plus is not None:
-            components = self.reward_plus(context, aerial, combo)
+            components = self.reward_plus(context, aerial, flip_reset, combo)
             self.last_reward_plus = {
                 name: self._team_difference(value)
                 for name, value in components.items()
