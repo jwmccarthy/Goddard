@@ -203,7 +203,7 @@ still credit all early actions for later rewards. Goal
 rewards and the default aerial-touch bonus are shared across teammates and
 opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
-`--aerial-touch-reward-weight` (default `0.5`). Distinct contacts by the same
+`--aerial-touch-reward-weight` (default `12.5`). Distinct contacts by the same
 car during one flight compound by `1.5` per touch (1x, 1.5x, 2.25x, 3.375x,
 then capped at 4x). A held ball-touch flag does not build or collect the extra
 bonus. Flip resets count as contacts even when that flag stays set, and the same
@@ -214,61 +214,68 @@ streak; wheel contact with the ball does not.
 `--reward-plus` adds twelve bounded, zero-sum team signals alongside the
 discriminator imitation reward:
 
-- Signed speed change pays `0.25` per normalized speed gained, plus `0.5` when
+- Signed speed change pays `12.5` per normalized speed gained, plus `25` when
   boost is not pressed, neither state is boosting, and the boost amount is
-  unchanged. Speed losses cost the full `0.75`, even while boosting; merely
+  unchanged. Speed losses cost the full `37.5`, even while boosting; merely
   holding speed pays nothing.
-- A solo aerial touch pays for increasing the ball's upward velocity, scaled by
-  ball height. A hard increase in ball-to-car relative speed reduces the bonus
-  only once the ball moves faster than 1.5 times the car's speed.
+- A solo aerial touch pays up to `50` for increasing the ball's upward velocity,
+  scaled by ball height. A hard increase in ball-to-car relative speed reduces
+  the bonus only once the ball moves faster than 1.5 times the car's speed.
   Downward velocity changes are charged; repeated contact without improvement
   pays nothing. Distinct airborne touches use the same combo multiplier.
 - A solo aerial touch above the crossbar pays for improving the ball's
-  goalward velocity and aim at the opponent's goal (up to `1`), and charges a
+  goalward velocity and aim at the opponent's goal (up to `50`), and charges a
   touch that spoils a good shot. Its signed change also uses the combo multiplier.
-- Exposing the car's wheels to the underside of a nearby ball pays a
+- Exposing the car's wheels to the underside of a nearby ball pays up to `25` for a
   discounted *change* in alignment only when the car has no actionable dodge,
   not a standing pose reward. The potential reaches its maximum above the
   crossbar and falls to zero at ground level; regaining a dodge, dropping the
   pose, or ending the episode debits it.
 - During a real kickoff, the nearest spawning car on each team earns up to
-  `0.5` for closing the distance to the kickoff ball's position. Retreating
+  `25` for closing the distance to the kickoff ball's position. Retreating
   debits progress; holding speed without moving closer pays nothing. The
   bonus stops at first touch or after 3.2 seconds, and teammates are free to
   defend or rotate instead of all rushing the ball.
-- The first touch within the opening 3.2 seconds of a real kickoff pays `0.5`
-  to the touching team and `-0.5` to its opponents. Replay resets away from
+- The first touch within the opening 3.2 seconds of a real kickoff pays `25`
+  to the touching team and `-25` to its opponents. Replay resets away from
   kickoff do not qualify.
-- A flight that ends without a ball touch charges up to `0.2` for height and
-  time spent airborne, plus up to `0.3` for boost spent in the air beyond eight
+- A flight that ends without a ball touch charges up to `10` for height and
+  time spent airborne, plus up to `15` for boost spent in the air beyond eight
   boost units. Each debit occurs once when the flight ends; low wavedash hops
   earn no height debit, and touching the ball during the flight avoids both.
-- A ball bounced off the arena ceiling charges `0.35` to its last toucher(s)
+- A ball bounced off the arena ceiling charges `17.5` to its last toucher(s)
   within the preceding two seconds. The velocity reversal detects bounces
   between policy decisions without charging an ordinary high-ball apex.
-- A solo, goalward wall touch pays up to `0.2` when the car has wheel contact
+- A solo, goalward wall touch pays up to `10` when the car has wheel contact
   with the wall and the ball stays close rather than escaping at high relative
   speed. For up to 1.5 seconds after a qualifying touch, staying within 400
-  units of the goalward-moving ball pays up to `0.3` per second; another
+  units of the goalward-moving ball pays up to `15` per second; another
   player's touch ends that follow-up. Wild pinches cannot start it.
 - An upside-down car resting low on the floor with little vertical motion is
-  charged `0.1` per second. Passing overhead without floor contact is exempt.
+  charged `5` per second. Passing overhead without floor contact is exempt.
 
-Existing zero-sum goal and flip-reset rewards remain governed by
-`--goal-reward-weight` and `--flip-reset-reward-weight` (both default to `1`);
-they are not counted twice. The ordinary `--aerial-touch-reward-weight` remains
-separate; set it to `0` to pay only for the controlled aerial touches above.
-To make the physical signals stronger relative to the discriminator, use
-`--physical-reward-scale` (default `1`). It multiplies the aerial-touch and
-flip-reset bonuses **after** their individual weights, plus all twelve
-`--reward-plus` signals when enabled; it does not change imitation or goal
-rewards. For example, `--reward-plus --physical-reward-scale 3` triples the
-physical bonuses, including penalties. Increase the individual touch/reset
-weights instead when only those events need tuning; the two settings multiply.
-Use `--physical-reward-scale 0` to disable the physical contribution. The scale
-is saved in GAIFO checkpoints and can be overridden on resume with an explicit
-`--physical-reward-scale` value (and a new `--timesteps` total above the saved
-step). TensorBoard logs per-rollout, learner-action RMS values under
+The goal, ordinary aerial-touch, and flip-reset bonuses are separate from
+`--reward-plus` and are not counted twice. Their new-run weights are `250`,
+`12.5`, and `12.5`, respectively. Each touch or reset reaches at most `50` at
+the 4x combo cap (twice the `25` kickoff event); a single lift or shot reaches
+at most `200`, so a goal exceeds the largest individual mechanical payout by
+25%. Multiple mechanics can still stack on one action. Set
+`--aerial-touch-reward-weight 0` to pay only for controlled aerial touches.
+GAIFO's individual `--reward-plus` weights now include the former 50x physical
+multiplier in new runs, including penalties. BASIC's weights are unchanged.
+`--reward-plus` remains opt-in. The new defaults absorb the previous 50x scale
+for its twelve signals, while touch/reset and goal weights are deliberately
+rebalanced. Remove `--physical-reward-scale 50` from new-run commands rather
+than multiplying the physical rewards a second time.
+
+`--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
+flip-reset, and `--reward-plus` rewards after their component weights, but not
+imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
+new component weights; older checkpoints without them retain their original
+`--reward-plus` weights when resumed, along with their saved touch/reset/goal
+weights. The physical scale is also saved and can be overridden on resume with
+an explicit value (and a new `--timesteps` total above the saved step).
+TensorBoard logs per-rollout, learner-action RMS values under
 `RewardSpec/rms/{imitation,physical,goal,aerial_touch,flip_reset,reward_plus}`
 (`reward_plus` appears when enabled), after applying all weights. Compare
 `physical` with `imitation` to tune their relative scale. RMS includes
@@ -276,15 +283,15 @@ non-event steps, so sparse touches/resets are not overstated by their peak
 bonuses alone.
 `--reward-plus` is off by default and is stored in GAIFO checkpoints;
 on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
-When enabled, TensorBoard logs their signed raw per-car means under
+When enabled, TensorBoard logs their signed, weighted per-car means under
 `RewardSpec/component/{speed,aerial_lift,aerial_shot,underside,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
 and their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
 zero-sum team difference; `RewardSpec/scale/reward_plus` logs the RMS of the
 combined zero-sum bonus *before* `--physical-reward-scale`. They update each
 rollout, even if no episode ends.
 
-BASIC's dense and `--sparse` reward presets use the same six new mechanical
-events and weights. Their signed component means appear under
+BASIC's dense and `--sparse` reward presets use the same six mechanical events,
+with their own unchanged weights. Their signed component means appear under
 `RewardSpec/component/{wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
 in TensorBoard. Both training modes scale per-time bonuses by their physics
 frame skip. Both also compound distinct airborne touches and flip resets with

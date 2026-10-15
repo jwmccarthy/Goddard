@@ -1,7 +1,7 @@
 import math
 import sys
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from unittest.mock import patch
 
 import torch as th
@@ -18,6 +18,7 @@ from gaifo import (
     EgoBallTouchCapture,
     GameplayDiagnostics,
     REWARD_PLUS_COMPONENTS,
+    RewardPlusWeights,
     SceneDiscriminatorReward,
     advanced_touch_events, build_ppo_transforms, parse_args,
 )
@@ -264,8 +265,8 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         gameplay(physical_context(current, previous, actions=actions, done=done))
         speed = AdvancedTouchCapture(gameplay)(None)["reward_plus_speed"].view(8, 2)
         delta = 400.0 / 2300.0
-        self.assertAlmostEqual(speed[0, 0].item(), 0.75 * delta)
-        th.testing.assert_close(speed[1:5, 0], th.full((4,), 0.25 * delta))
+        self.assertAlmostEqual(speed[0, 0].item(), 37.5 * delta, places=5)
+        th.testing.assert_close(speed[1:5, 0], th.full((4,), 12.5 * delta))
         th.testing.assert_close(speed[5:], th.zeros(3, 2))
         th.testing.assert_close(speed.sum(dim=-1), th.zeros(8))
 
@@ -276,7 +277,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             previous[:1], current[:1], actions=reversed_actions,
         ))
         reversed_speed = AdvancedTouchCapture(single_gameplay)(None)["reward_plus_speed"].view(1, 2)
-        self.assertAlmostEqual(reversed_speed[0, 0].item(), -0.75 * delta)
+        self.assertAlmostEqual(reversed_speed[0, 0].item(), -37.5 * delta, places=5)
         single_gameplay(physical_context(current[:1], current[:1]))
         th.testing.assert_close(
             AdvancedTouchCapture(single_gameplay)(None)["reward_plus_speed"], th.zeros(2),
@@ -310,6 +311,14 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         bonus = AdvancedTouchCapture(gameplay)(None)
         lift = bonus["reward_plus_aerial_lift"].view(7, 2)
         shot = bonus["reward_plus_aerial_shot"].view(7, 2)
+        legacy = GameplayDiagnostics(
+            7, th.device("cpu"), 900, reward_plus=True,
+            reward_plus_weights=RewardPlusWeights.legacy(),
+        )
+        legacy(physical_context(current, previous))
+        old_bonus = AdvancedTouchCapture(legacy)(None)
+        th.testing.assert_close(lift, old_bonus["reward_plus_aerial_lift"].view(7, 2) * 50)
+        th.testing.assert_close(shot, old_bonus["reward_plus_aerial_shot"].view(7, 2) * 50)
         self.assertGreater(lift[0, 0], 0)
         self.assertEqual(lift[1, 0], 0)  # Excessive relative-speed increase removes lift.
         self.assertLess(lift[2, 0], 0)
@@ -372,10 +381,10 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         gameplay(physical_context(current, previous, done=done))
         underside = AdvancedTouchCapture(gameplay)(None)["reward_plus_underside"].view(9, 2)
         effective_gamma = .81 ** 2
-        self.assertAlmostEqual(underside[0, 0].item(), .5 * effective_gamma)
-        self.assertAlmostEqual(underside[1, 0].item(), .5 * (effective_gamma - 1))
+        self.assertAlmostEqual(underside[0, 0].item(), 25 * effective_gamma, places=5)
+        self.assertAlmostEqual(underside[1, 0].item(), 25 * (effective_gamma - 1), places=5)
         for index in (2, 3, 8):
-            self.assertAlmostEqual(underside[index, 0].item(), -.5)
+            self.assertAlmostEqual(underside[index, 0].item(), -25)
         self.assertGreater(underside[4, 0], 0)
         self.assertLess(underside[4, 0], underside[0, 0])
         th.testing.assert_close(underside[[5, 6, 7]], th.zeros(3, 2))
@@ -413,7 +422,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         underside = AdvancedTouchCapture(gameplay)(None)["reward_plus_underside"].view(4, 2)
         self.assertEqual(underside[0, 0].item(), 0)  # Aligning with a dodge pays nothing.
         self.assertGreater(underside[1, 0], 0)  # Expired, though no flip was spent.
-        self.assertAlmostEqual(underside[2, 0].item(), -0.5)  # Restore debits potential.
+        self.assertAlmostEqual(underside[2, 0].item(), -25)  # Restore debits potential.
         self.assertGreater(underside[3, 0], 0)
         th.testing.assert_close(underside.sum(-1), th.zeros(4))
 
@@ -444,13 +453,13 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                 gameplay(physical_context(moved, spawn, n_cars=n_cars, episode_ticks=4))
                 speed = capture(None)["reward_plus_kickoff_speed"]
                 th.testing.assert_close(speed, th.tensor(
-                    [0.02] * team_size + [-0.02] * team_size,
-                ), atol=1e-7, rtol=0)
+                    [1.0] * team_size + [-1.0] * team_size,
+                ), atol=2e-6, rtol=0)
 
                 gameplay(physical_context(spawn, moved, n_cars=n_cars))
                 th.testing.assert_close(
                     speed + capture(None)["reward_plus_kickoff_speed"],
-                    th.zeros(n_cars), atol=1e-7, rtol=0,
+                    th.zeros(n_cars), atol=2e-6, rtol=0,
                 )
 
                 touched = spawn.clone()
@@ -460,12 +469,12 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                 gameplay(physical_context(touched, spawn, n_cars=n_cars))
                 th.testing.assert_close(
                     capture(None)["reward_plus_kickoff_speed"], th.tensor(
-                        [0.01] * team_size + [-0.01] * team_size,
-                    ), atol=1e-7, rtol=0,
+                        [0.5] * team_size + [-0.5] * team_size,
+                    ), atol=2e-6, rtol=0,
                 )
                 th.testing.assert_close(
                     capture(None)["reward_plus_kickoff"], th.tensor(
-                        [0.5] * team_size + [-0.5] * team_size,
+                        [25.0] * team_size + [-25.0] * team_size,
                     ),
                 )
                 gameplay(physical_context(moved, touched, n_cars=n_cars))
@@ -509,7 +518,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         touch[:, 9:97].view(1, 4, 22)[0, 1, 21] = 1.0
         gameplay(physical_context(touch, spawn, n_cars=4))
         th.testing.assert_close(capture(None)["reward_plus_kickoff"],
-                                th.tensor([.5, .5, -.5, -.5]))
+                                th.tensor([25., 25., -25., -25.]))
         opponent_touch = spawn.clone()
         opponent_touch[:, 9:97].view(1, 4, 22)[0, 2, 21] = 1.0
         gameplay(physical_context(opponent_touch, touch, n_cars=4))
@@ -519,7 +528,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                                   done=th.ones(1, dtype=th.bool)))
         gameplay(physical_context(touch, spawn, n_cars=4, episode_ticks=4))
         th.testing.assert_close(capture(None)["reward_plus_kickoff"],
-                                th.tensor([.5, .5, -.5, -.5]))
+                                th.tensor([25., 25., -25., -25.]))
 
         gameplay(physical_context(spawn, spawn, n_cars=4,
                                   done=th.ones(1, dtype=th.bool)))
@@ -527,7 +536,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         double_touch[:, 9:97].view(1, 4, 22)[0, 0, 21] = 1.0
         gameplay(physical_context(double_touch, spawn, n_cars=4, episode_ticks=4))
         th.testing.assert_close(capture(None)["reward_plus_kickoff"],
-                                th.tensor([.5, .5, -.5, -.5]))
+                                th.tensor([25., 25., -25., -25.]))
 
         gameplay(physical_context(spawn, spawn, n_cars=4,
                                   done=th.ones(1, dtype=th.bool)))
@@ -649,7 +658,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
 
         report = gameplay.diagnostic_metrics()
         components = report["RewardSpec"]
-        speed = (400.0 / 2300.0) * 0.75
+        speed = (400.0 / 2300.0) * 37.5
         self.assertAlmostEqual(components["component/speed"], speed / 4)
         self.assertAlmostEqual(components["aggregate/reward_plus"], speed / 4)
         self.assertAlmostEqual(components["scale/reward_plus"], speed / 2 ** 0.5)
@@ -967,6 +976,17 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertFalse(defaults.recency_replay)
         self.assertFalse(defaults.reward_plus)
         self.assertEqual(defaults.physical_reward_scale, 1.0)
+        self.assertEqual(defaults.goal_reward_weight, 250.0)
+        self.assertEqual(defaults.aerial_touch_reward_weight, 12.5)
+        self.assertEqual(defaults.flip_reset_reward_weight, 12.5)
+        self.assertEqual(defaults.reward_plus_weights, asdict(RewardPlusWeights()))
+        transform = build_ppo_transforms(defaults, PositionDiscriminator())[0]
+        self.assertEqual((transform.goal_reward_weight, transform.aerial_touch_reward_weight,
+                          transform.flip_reset_reward_weight), (250.0, 12.5, 12.5))
+        old = asdict(RewardPlusWeights.legacy())
+        self.assertEqual(defaults.reward_plus_weights, {
+            name: weight * 50 for name, weight in old.items()
+        })
 
 
 if __name__ == "__main__":

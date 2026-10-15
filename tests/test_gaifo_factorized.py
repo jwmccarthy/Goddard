@@ -3,6 +3,7 @@
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from gaifo import (
     GAIFOCheckpoints,
     ExpertSceneDataset,
     FactorizedSceneDiscriminator,
+    RewardPlusWeights,
     SceneDiscriminator,
     SceneDiscriminatorLoss,
     SceneDiscriminatorReward,
@@ -692,14 +694,28 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertTrue(payload["config"]["hard_positive_mining"])
             self.assertTrue(payload["config"]["discriminator_relative_positions"])
             self.assertEqual(payload["config"]["physical_reward_scale"], 2.0)
+            self.assertEqual(payload["config"]["reward_plus_weights"],
+                             asdict(RewardPlusWeights()))
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)]):
                 resumed, _ = parse_args()
             self.assertTrue(resumed.factorize)
             self.assertTrue(resumed.hard_positive_mining)
             self.assertTrue(resumed.reward_plus)
             self.assertEqual(resumed.physical_reward_scale, 2.0)
+            self.assertEqual(resumed.reward_plus_weights, args.reward_plus_weights)
             self.assertTrue(resumed.discriminator_relative_positions)
             validate_resume_args(resumed, payload)
+            legacy_config = payload["config"].copy()
+            legacy_config.pop("reward_plus_weights")
+            legacy_config.update(goal_reward_weight=1., aerial_touch_reward_weight=.5,
+                                 flip_reset_reward_weight=1.)
+            with (patch("gaifo.load_resume_checkpoint",
+                        return_value={"config": legacy_config}),
+                  patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
+                legacy, _ = parse_args()
+            self.assertEqual(legacy.reward_plus_weights, asdict(RewardPlusWeights.legacy()))
+            self.assertEqual((legacy.goal_reward_weight, legacy.aerial_touch_reward_weight,
+                              legacy.flip_reset_reward_weight), (1., .5, 1.))
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
                                             "--factorize", "false"]):
                 mismatch, _ = parse_args()

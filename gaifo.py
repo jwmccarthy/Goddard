@@ -69,7 +69,7 @@ from replay_safety import (
     GOAL_EXCLUSION_SECONDS, TICKS_PER_SECOND,
     infer_unsafe_start_mask, pre_goal_start_mask,
 )
-from reward_spec import CEILING_Z, RewardWeights
+from reward_spec import CEILING_Z
 
 
 SCENE_SIZE = 51
@@ -158,6 +158,36 @@ REWARD_PLUS_COMPONENTS = (
     "reward_plus_wall_control",
     "reward_plus_inverted_ground",
 )
+
+
+@dataclass(frozen=True)
+class RewardPlusWeights:
+    """GAIFO-only component weights; saved with each run for stable resumes."""
+
+    speed_progress: float = 12.5
+    boost_free_speed_progress: float = 25.0
+    aerial_lift: float = 50.0
+    aerial_shot: float = 50.0
+    underside: float = 25.0
+    kickoff_speed: float = 25.0
+    kickoff: float = 25.0
+    wasted_air: float = 10.0
+    wasted_boost: float = 15.0
+    ball_ceiling: float = 17.5
+    wall_touch: float = 10.0
+    wall_control: float = 15.0
+    inverted_ground: float = 5.0
+
+    @classmethod
+    def legacy(cls) -> "RewardPlusWeights":
+        """Restore the weights used before component defaults were raised."""
+        return cls(
+            speed_progress=0.25, boost_free_speed_progress=0.5,
+            aerial_lift=1.0, aerial_shot=1.0, underside=0.5,
+            kickoff_speed=0.5, kickoff=0.5, wasted_air=0.2,
+            wasted_boost=0.3, ball_ceiling=0.35, wall_touch=0.2,
+            wall_control=0.3, inverted_ground=0.1,
+        )
 
 
 def frameskip_ratio(frameskip: int) -> float:
@@ -895,12 +925,13 @@ class RewardPlus:
 
     def __init__(
         self, n_sim: int, n_cars: int, device: th.device, frameskip: int, gamma: float,
+        weights: RewardPlusWeights | None = None,
     ) -> None:
         self.frameskip = frameskip
         self.team_size = n_cars // 2
         self.gamma = gamma ** frameskip_ratio(frameskip)
         self.mechanical_events = MechanicalEventRewards(frameskip)
-        self.mechanical_weights = RewardWeights()
+        self.weights = weights if weights is not None else RewardPlusWeights()
         self.kickoff_pending = th.zeros(n_sim, dtype=th.bool, device=device)
         self.kickoff_challenger = th.zeros(n_sim, n_cars, dtype=th.bool, device=device)
 
@@ -975,14 +1006,15 @@ class RewardPlus:
         # driving away, or repeatedly accelerating without approaching it.
         previous_approach = (1.0 - previous_distance / 5_000.0).clamp(0.0, 1.0)
         current_approach = (1.0 - current_distance / 5_000.0).clamp(0.0, 1.0)
-        speed = 0.5 * (current_approach - previous_approach) * (
+        speed = self.weights.kickoff_speed * (current_approach - previous_approach) * (
             self.kickoff_pending[:, None] & self.kickoff_challenger & valid
         )
         touches = context.current.car_ball_touches
         first_touch = (touches & self.kickoff_pending[:, None]).to(previous.raw.dtype)
         self.kickoff_pending &= ~(touches.any(dim=-1) | context.events.done)
         # Split a simultaneous challenge so one kickoff never pays more than once.
-        touch = 0.5 * first_touch / first_touch.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        touch = (self.weights.kickoff * first_touch
+                 / first_touch.sum(dim=-1, keepdim=True).clamp_min(1.0))
         return speed, touch
 
     def __call__(
@@ -1016,7 +1048,10 @@ class RewardPlus:
         )
         # Charge speed loss at the full rate even if boost was used to accelerate.
         boost_free_change = th.where(no_boost, speed_change, speed_change.clamp_max(0.0))
-        speed = valid * (0.25 * speed_change + 0.5 * boost_free_change)
+        speed = valid * (
+            self.weights.speed_progress * speed_change
+            + self.weights.boost_free_speed_progress * boost_free_change
+        )
 
         touches = current.car_ball_touches
         solo_touch = touches & touches.sum(dim=-1, keepdim=True).eq(1)
@@ -1068,7 +1103,7 @@ class RewardPlus:
         )
         # The discounted potential telescopes; clear its terminal value so a
         # reset or goal cannot repeatedly pay for the same upside-down pose.
-        underside = 0.5 * continuous * (
+        underside = self.weights.underside * continuous * (
             self.gamma * current_potential * ~context.events.done[:, None]
             - previous_potential
         )
@@ -1076,13 +1111,13 @@ class RewardPlus:
         mechanics = self.mechanical_events(context, valid)
         return {
             "reward_plus_speed": speed,
-            "reward_plus_aerial_lift": lift * combo,
-            "reward_plus_aerial_shot": aerial_shot * combo,
+            "reward_plus_aerial_lift": self.weights.aerial_lift * lift * combo,
+            "reward_plus_aerial_shot": self.weights.aerial_shot * aerial_shot * combo,
             "reward_plus_underside": underside,
             "reward_plus_kickoff_speed": kickoff_speed,
             "reward_plus_kickoff": kickoff_touch,
             **{
-                f"reward_plus_{name}": getattr(self.mechanical_weights, name) * value
+                f"reward_plus_{name}": getattr(self.weights, name) * value
                 for name, value in mechanics.items()
             },
         }
@@ -1096,6 +1131,7 @@ class GameplayDiagnostics:
         n_cars: int = N_CARS,
         reward_plus: bool = False, frameskip: int = REFERENCE_FRAMESKIP,
         gamma: float = 0.99,
+        reward_plus_weights: RewardPlusWeights | None = None,
     ) -> None:
         if n_cars not in (N_CARS, DOUBLES_N_CARS, STANDARD_N_CARS):
             raise ValueError("gameplay needs two, four, or six cars")
@@ -1109,7 +1145,8 @@ class GameplayDiagnostics:
         self.last_ego_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
         self.last_opponent_ball_touch = th.zeros(n_sim * n_cars, dtype=th.bool, device=device)
         self.reward_plus = (
-            RewardPlus(n_sim, n_cars, device, frameskip, gamma) if reward_plus else None
+            RewardPlus(n_sim, n_cars, device, frameskip, gamma, reward_plus_weights)
+            if reward_plus else None
         )
         self.last_reward_plus: dict[str, th.Tensor] = {}
         self.reward_plus_sums = {
@@ -5539,20 +5576,20 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="add boost-aware speed progress, controlled aerial lifts and shots, underside setup, kickoff approach speed and first touch",
     )
     parser.add_argument(
-        "--goal-reward-weight", type=float, default=1.0,
-        help="scale the +/-1 goal reward per actor (0 disables it)",
+        "--goal-reward-weight", type=float, default=250.0,
+        help="scale the +/-1 goal reward per actor (default: 250; 0 disables it)",
     )
     parser.add_argument(
-        "--aerial-touch-reward-weight", type=float, default=0.5,
-        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (0 disables it)",
+        "--aerial-touch-reward-weight", type=float, default=12.5,
+        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (default: 12.5; 0 disables it)",
     )
     parser.add_argument(
-        "--flip-reset-reward-weight", type=float, default=1.0,
-        help="reward a spent flip returning on an underside ball touch (0 disables it)",
+        "--flip-reset-reward-weight", type=float, default=12.5,
+        help="reward a spent flip returning on an underside ball touch (default: 12.5; 0 disables it)",
     )
     parser.add_argument(
         "--physical-reward-scale", type=float, default=1.0,
-        help="multiply aerial-touch, flip-reset, and --reward-plus bonuses after their individual weights (not goals or imitation)",
+        help="multiply aerial-touch, flip-reset, and --reward-plus bonuses after their individual weights (default: 1; not goals or imitation)",
     )
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--replay-reset-fraction", type=float, default=None)
@@ -5664,7 +5701,12 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("discriminator_relative_positions", False)
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
+        inherited["reward_plus_weights"] = resume["config"].get(
+            "reward_plus_weights", asdict(RewardPlusWeights.legacy()),
+        )
         parser.set_defaults(**inherited)
+    else:
+        parser.set_defaults(reward_plus_weights=asdict(RewardPlusWeights()))
     args = parser.parse_args()
     if args.n_sim is None:
         args.n_sim = (256 // args.team_size if args.transformer_global else
@@ -6260,6 +6302,7 @@ def main() -> None:
         math.ceil(args.no_touch_timeout * 120.0 / args.frameskip),
         n_cars=team_car_count(args.team_size),
         reward_plus=args.reward_plus, frameskip=args.frameskip, gamma=args.gamma,
+        reward_plus_weights=RewardPlusWeights(**args.reward_plus_weights),
     ))
     policy = build_policy(env, args)
     critic = build_critic(env, args)
