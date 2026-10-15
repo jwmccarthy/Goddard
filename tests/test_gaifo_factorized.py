@@ -694,6 +694,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertTrue(payload["config"]["hard_positive_mining"])
             self.assertTrue(payload["config"]["discriminator_relative_positions"])
             self.assertEqual(payload["config"]["physical_reward_scale"], 2.0)
+            self.assertTrue(payload["config"]["cap_physical_rewards"])
             self.assertEqual(payload["config"]["reward_plus_weights"],
                              asdict(RewardPlusWeights()))
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)]):
@@ -702,9 +703,23 @@ class FactorizedGAIFOTests(unittest.TestCase):
             self.assertTrue(resumed.hard_positive_mining)
             self.assertTrue(resumed.reward_plus)
             self.assertEqual(resumed.physical_reward_scale, 2.0)
+            self.assertTrue(resumed.cap_physical_rewards)
             self.assertEqual(resumed.reward_plus_weights, args.reward_plus_weights)
             self.assertTrue(resumed.discriminator_relative_positions)
             validate_resume_args(resumed, payload)
+            prior_config = payload["config"].copy()
+            prior_config.pop("cap_physical_rewards")
+            prior_config["reward_plus_weights"] = {
+                name: weight for name, weight in args.reward_plus_weights.items()
+                if name != "boost_gain"
+            }
+            with (patch("gaifo.load_resume_checkpoint",
+                        return_value={"config": prior_config}),
+                  patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
+                prior, _ = parse_args()
+            self.assertEqual(prior.reward_plus_weights,
+                             {**prior_config["reward_plus_weights"], "boost_gain": 0.0})
+            self.assertFalse(prior.cap_physical_rewards)
             legacy_config = payload["config"].copy()
             legacy_config.pop("reward_plus_weights")
             legacy_config.update(goal_reward_weight=1., aerial_touch_reward_weight=.5,
@@ -714,6 +729,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                   patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
                 legacy, _ = parse_args()
             self.assertEqual(legacy.reward_plus_weights, asdict(RewardPlusWeights.legacy()))
+            self.assertTrue(legacy.cap_physical_rewards)
             self.assertEqual((legacy.goal_reward_weight, legacy.aerial_touch_reward_weight,
                               legacy.flip_reset_reward_weight), (1., .5, 1.))
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),

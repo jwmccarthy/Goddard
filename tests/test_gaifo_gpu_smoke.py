@@ -16,8 +16,9 @@ import torch as th
 from carl.gymnasium import CARLTorchVectorEnv
 from gaifo import (
     BLUE_START, ConfidentExpertResetTransform, ExpertSceneDataset,
-    GameplayDiagnostics, ORANGE_START, POSITION_SCALE, SceneWindowCapture, actor_view,
-    extract_scene_observations, load_resume_checkpoint, main, replay_policy_observation,
+    GameplayDiagnostics, ORANGE_START, POSITION_SCALE, REWARD_PLUS_COMPONENTS,
+    SceneWindowCapture, actor_view, extract_scene_observations, load_resume_checkpoint,
+    main, replay_policy_observation,
 )
 from jarl.collect import Runner
 from jarl.data import TensorBatch
@@ -321,7 +322,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 events = EventAccumulator(str(event_files[0]))
                 events.Reload()
                 for name in (
-                    "component/speed", "component/aerial_lift", "component/aerial_shot",
+                    "component/speed", "component/boost_gain", "component/aerial_lift",
+                    "component/aerial_shot",
                     "component/underside", "component/kickoff_speed", "component/kickoff",
                     "component/wasted_air", "component/wasted_boost",
                     "component/ball_ceiling", "component/wall_touch",
@@ -332,10 +334,22 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                     self.assertIn(tag, events.Tags()["scalars"])
                     self.assertTrue(events.Scalars(tag))
                 for name in ("imitation", "physical", "aerial_touch", "flip_reset",
-                             "reward_plus", "goal"):
+                             "reward_plus", "goal", *REWARD_PLUS_COMPONENTS):
                     tag = f"RewardSpec/rms/{name}"
                     self.assertIn(tag, events.Tags()["scalars"])
                     self.assertTrue(events.Scalars(tag))
+                self.assertIn("RewardSpec/scale/physical_rms_cap", events.Tags()["scalars"])
+                for point in events.Scalars("RewardSpec/scale/physical_rms_cap"):
+                    self.assertGreaterEqual(point.value, 0)
+                    self.assertLessEqual(point.value, 1)
+                style = {
+                    point.step: point.value
+                    for point in events.Scalars("RewardSpec/rms/imitation")
+                }
+                for name in ("physical", "aerial_touch", "flip_reset", "reward_plus",
+                             *REWARD_PLUS_COMPONENTS):
+                    for point in events.Scalars(f"RewardSpec/rms/{name}"):
+                        self.assertLessEqual(point.value, style[point.step] + 1e-4)
                 self.assertFalse(any(tag.startswith("RewardScale/")
                                      for tag in events.Tags()["scalars"]))
 

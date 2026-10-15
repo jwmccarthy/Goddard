@@ -211,13 +211,18 @@ multiplier applies to both their bonus and the aerial-touch bonus. Floor or wall
 contact, an upside-down floor landing, demolition, or an episode end resets the
 streak; wheel contact with the ball does not.
 
-`--reward-plus` adds twelve bounded, zero-sum team signals alongside the
+`--reward-plus` adds thirteen bounded, zero-sum team signals alongside the
 discriminator imitation reward:
 
 - Signed speed change pays `12.5` per normalized speed gained, plus `25` when
   boost is not pressed, neither state is boosting, and the boost amount is
   unchanged. Speed losses cost the full `37.5`, even while boosting; merely
   holding speed pays nothing.
+- Picking up boost pays up to `12.5` for a full refill, with the change in
+  `sqrt(boost / 100)` favoring pads collected when low on boost. A small pad
+  taken at zero boost pays about `4.3`. Demolitions, discontinuous resets,
+  and ended episodes cannot earn a refill bonus; merely holding boost pays
+  nothing.
 - A solo aerial touch pays up to `50` for increasing the ball's upward velocity,
   scaled by ball height. A hard increase in ball-to-car relative speed reduces
   the bonus only once the ball moves faster than 1.5 times the car's speed.
@@ -255,40 +260,52 @@ discriminator imitation reward:
   charged `5` per second. Passing overhead without floor contact is exempt.
 
 The goal, ordinary aerial-touch, and flip-reset bonuses are separate from
-`--reward-plus` and are not counted twice. Their new-run weights are `250`,
+`--reward-plus` and are not counted twice. Their new-run weights are `75`,
 `12.5`, and `12.5`, respectively. Each touch or reset reaches at most `50` at
-the 4x combo cap (twice the `25` kickoff event); a single lift or shot reaches
-at most `200`, so a goal exceeds the largest individual mechanical payout by
-25%. Multiple mechanics can still stack on one action. Set
+the 4x combo cap; a rare single lift or shot can reach `200` *before* the
+rollout cap, and multiple mechanics can stack on one action. Relative reward
+strength is measured over all learner actions, not by single-event peaks. Set
 `--aerial-touch-reward-weight 0` to pay only for controlled aerial touches.
-GAIFO's individual `--reward-plus` weights now include the former 50x physical
-multiplier in new runs, including penalties. BASIC's weights are unchanged.
-`--reward-plus` remains opt-in. The new defaults absorb the previous 50x scale
-for its twelve signals, while touch/reset and goal weights are deliberately
-rebalanced. Remove `--physical-reward-scale 50` from new-run commands rather
-than multiplying the physical rewards a second time.
+GAIFO's original twelve `--reward-plus` signals include the former 50x
+physical multiplier in their new-run weights, including penalties; the new
+boost-gain signal is weighted separately. BASIC's weights are unchanged.
+`--reward-plus` remains opt-in. Remove `--physical-reward-scale 50` from
+new-run commands rather than multiplying the physical rewards a second time.
 
 `--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
 flip-reset, and `--reward-plus` rewards after their component weights, but not
 imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
-new component weights; older checkpoints without them retain their original
-`--reward-plus` weights when resumed, along with their saved touch/reset/goal
-weights. The physical scale is also saved and can be overridden on resume with
-an explicit value (and a new `--timesteps` total above the saved step).
+new component weights; older checkpoints retain their original `--reward-plus`,
+touch/reset, and goal weights when resumed. Checkpoints predating boost gain
+keep its weight at zero. The physical scale is also saved and can be overridden
+on resume with an explicit value (and a new `--timesteps` total above the saved
+step).
+New runs enable `--cap-physical-rewards`: after weighting, GAIFO compares the
+per-rollout RMS of imitation with each zero-sum physical signal, the
+`reward_plus` subtotal, **and their combined reward**, counting learner actions
+only. When any physical RMS is larger, a shared multiplier reduces all physical
+signals so none exceeds imitation's RMS. It preserves their relative strengths
+and team zero-sum; goals are exempt. If a rollout has no style reward, it pays
+no physical reward.
+The multiplier can vary as the discriminator and policy learn. Disable with
+`--cap-physical-rewards false` if desired; older checkpoints inherit the
+uncapped setting unless explicitly enabled on resume.
 TensorBoard logs per-rollout, learner-action RMS values under
 `RewardSpec/rms/{imitation,physical,goal,aerial_touch,flip_reset,reward_plus}`
-(`reward_plus` appears when enabled), after applying all weights. Compare
-`physical` with `imitation` to tune their relative scale. RMS includes
-non-event steps, so sparse touches/resets are not overstated by their peak
-bonuses alone.
+(`reward_plus` appears when enabled) and each individual
+`RewardSpec/rms/reward_plus_*` signal, after weighting and any cap. Compare
+`physical` and each signal with `imitation` to check the balance;
+`RewardSpec/scale/physical_rms_cap` records the applied multiplier (1 when
+unneeded). RMS includes non-event steps, so
+sparse touches/resets are not overstated by peak bonuses alone.
 `--reward-plus` is off by default and is stored in GAIFO checkpoints;
 on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
 When enabled, TensorBoard logs their signed, weighted per-car means under
-`RewardSpec/component/{speed,aerial_lift,aerial_shot,underside,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
+`RewardSpec/component/{speed,boost_gain,aerial_lift,aerial_shot,underside,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
 and their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
 zero-sum team difference; `RewardSpec/scale/reward_plus` logs the RMS of the
-combined zero-sum bonus *before* `--physical-reward-scale`. They update each
-rollout, even if no episode ends.
+combined zero-sum bonus *before* `--physical-reward-scale` and the rollout cap.
+They update each rollout, even if no episode ends.
 
 BASIC's dense and `--sparse` reward presets use the same six mechanical events,
 with their own unchanged weights. Their signed component means appear under

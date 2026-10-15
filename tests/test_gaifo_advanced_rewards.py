@@ -283,6 +283,41 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             AdvancedTouchCapture(single_gameplay)(None)["reward_plus_speed"], th.zeros(2),
         )
 
+    def test_reward_plus_boost_gain_pays_for_pad_refills_but_not_resets_or_demos(self):
+        current = physical_state(8)
+        previous = current.clone()
+        cars = current[:, 9:53].view(8, 2, 22)
+        old_cars = previous[:, 9:53].view(8, 2, 22)
+        old_cars[:, 0, 15] = 0.0
+        cars[:, 0, 15] = 100.0
+        cars[0, 0, 15] = 12.0  # A small pad is worth more when nearly empty.
+        old_cars[2, 0, 15] = 25.0
+        old_cars[3, 0, 15] = 100.0
+        cars[3, 0, 15] = 75.0  # Spending boost is not a gain.
+        cars[4, 0, 17] = 1.0  # Demolition refills do not pay.
+        old_cars[5, 0, 17] = 1.0
+        cars[6, 0, 1] = 1_000.0  # A discontinuity is not a pad pickup.
+        done = th.zeros(8, dtype=th.bool)
+        done[7] = True
+
+        context = physical_context(current, previous, done=done)
+        gameplay = GameplayDiagnostics(8, th.device("cpu"), 900, reward_plus=True)
+        gameplay(context)
+        bonus = AdvancedTouchCapture(gameplay)(None)["reward_plus_boost_gain"].view(8, 2)
+        th.testing.assert_close(
+            bonus[:, 0], th.tensor([12.5 * math.sqrt(.12), 12.5, 6.25, 0., 0., 0., 0., 0.]),
+        )
+        th.testing.assert_close(bonus.sum(dim=-1), th.zeros(8))
+
+        legacy = GameplayDiagnostics(
+            8, th.device("cpu"), 900, reward_plus=True,
+            reward_plus_weights=RewardPlusWeights.legacy(),
+        )
+        legacy(context)
+        th.testing.assert_close(
+            AdvancedTouchCapture(legacy)(None)["reward_plus_boost_gain"], th.zeros(16),
+        )
+
     def test_reward_plus_aerial_lifts_and_shots_require_controlled_touch_changes(self):
         current = physical_state(7)
         current[:, 2] = 800.0
@@ -631,6 +666,8 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                 self.assertAlmostEqual(scales["rms/physical"], scale * math.sqrt(.40625),
                                        places=5)
                 self.assertAlmostEqual(scales["rms/reward_plus"], scale * .25, places=5)
+                self.assertAlmostEqual(scales["rms/reward_plus_speed"], scale * .25,
+                                       places=5)
                 self.assertEqual(transform.diagnostic_metrics(), {})
         learner_only = batch.with_fields(learner_mask=th.tensor([[False, True]]))
         transform = SceneDiscriminatorReward(
@@ -640,6 +677,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         scales = transform.diagnostic_metrics()["RewardSpec"]
         self.assertAlmostEqual(scales["rms/imitation"], .5)
         self.assertAlmostEqual(scales["rms/physical"], 1.5)
+        self.assertAlmostEqual(scales["rms/reward_plus_speed"], .75)
         for invalid in (-1., float("nan"), float("inf")):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(
                 ValueError, "physical reward scale must be finite and non-negative",
@@ -647,6 +685,105 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                 SceneDiscriminatorReward(
                     PositionDiscriminator(), **options, physical_reward_scale=invalid,
                 )
+
+    def test_reward_plus_rms_separates_canceling_components_on_learner_actions(self):
+        components = {name: th.zeros(1, 4) for name in REWARD_PLUS_COMPONENTS}
+        components["reward_plus_speed"] = th.tensor([[.5, -100., -.5, 100.]])
+        components["reward_plus_wall_touch"] = -components["reward_plus_speed"]
+        batch = TensorBatch({
+            "observation": th.zeros(1, 4, 51),
+            "scene_window": th.zeros(1, 4, 2, 51),
+            "scene_window_valid": th.ones(1, 4, dtype=th.bool),
+            "learner_mask": th.tensor([[True, False, True, False]]),
+            "reward": th.zeros(1, 4),
+            **components,
+        })
+        transform = SceneDiscriminatorReward(
+            ZeroDiscriminator(), noise_std=0, trajectory_length=2,
+            exp_log_odds_reward=True, reward_plus=True, physical_reward_scale=2,
+        )
+        result = transform(batch, PrepareContext())
+        th.testing.assert_close(result["reward_plus_reward"], th.zeros(1, 4))
+        th.testing.assert_close(result["training_reward"], th.ones(1, 4))
+        scales = transform.diagnostic_metrics()["RewardSpec"]
+        self.assertEqual(scales["rms/imitation"], 1)
+        self.assertEqual(scales["rms/physical"], 0)
+        self.assertEqual(scales["rms/reward_plus"], 0)
+        self.assertEqual(scales["rms/reward_plus_speed"], 1)
+        self.assertEqual(scales["rms/reward_plus_wall_touch"], 1)
+        self.assertTrue(all(scales[f"rms/{name}"] == 0 for name in REWARD_PLUS_COMPONENTS
+                            if name not in ("reward_plus_speed", "reward_plus_wall_touch")))
+
+    def test_physical_rms_cap_limits_each_bonus_and_their_sum_not_goals(self):
+        components = {name: th.zeros(1, 4) for name in REWARD_PLUS_COMPONENTS}
+        components["reward_plus_speed"] = th.tensor([[2., -100., -2., 100.]])
+        batch = TensorBatch({
+            "observation": th.zeros(1, 4, 51),
+            "scene_window": th.zeros(1, 4, 2, 51),
+            "scene_window_valid": th.ones(1, 4, dtype=th.bool),
+            "learner_mask": th.tensor([[True, False, True, False]]),
+            "reward": th.tensor([[1., 0., 0., 0.]]),
+            **components,
+        })
+        for sign, expected_cap in ((1, .25), (-1, .5)):
+            with self.subTest(sign=sign):
+                opposite = components["reward_plus_speed"] * sign
+                transform = SceneDiscriminatorReward(
+                    ZeroDiscriminator(), noise_std=0, trajectory_length=2,
+                    exp_log_odds_reward=True, reward_plus=True,
+                    goal_reward_weight=75, cap_physical_rewards=True,
+                )
+                result = transform(batch.replace_fields(
+                    reward_plus_wall_touch=opposite,
+                ), PrepareContext())
+                scales = transform.diagnostic_metrics()["RewardSpec"]
+                self.assertEqual(scales["scale/physical_rms_cap"], expected_cap)
+                self.assertEqual(scales["rms/imitation"], 1)
+                self.assertEqual(scales["rms/reward_plus_speed"], 2 * expected_cap)
+                self.assertEqual(scales["rms/reward_plus_wall_touch"], 2 * expected_cap)
+                self.assertEqual(scales["rms/physical"],
+                                 (2 + 2 * sign) * expected_cap)
+                self.assertAlmostEqual(scales["rms/goal"], 75 / math.sqrt(2), places=4)
+                self.assertLessEqual(max(
+                    scales[f"rms/{name}"] for name in (
+                        "physical", "aerial_touch", "flip_reset", *REWARD_PLUS_COMPONENTS,
+                    )
+                ), scales["rms/imitation"])
+                th.testing.assert_close(result["goal_reward"], batch["reward"] * 75)
+                th.testing.assert_close(result["training_reward"],
+                                        result["imitation_reward"] + result["goal_reward"]
+                                        + result["reward_plus_reward"])
+
+        # The reward-plus subtotal must be capped even if touch and reset
+        # bonuses cancel it in the combined physical reward.
+        transform = SceneDiscriminatorReward(
+            ZeroDiscriminator(), noise_std=0, trajectory_length=2,
+            exp_log_odds_reward=True, reward_plus=True,
+            aerial_touch_reward_weight=1, flip_reset_reward_weight=1,
+            cap_physical_rewards=True,
+        )
+        transform(batch.with_fields(
+            aerial_touch_score=-components["reward_plus_speed"],
+            flip_reset_event=-components["reward_plus_speed"],
+        ).replace_fields(
+            reward_plus_wall_touch=components["reward_plus_speed"],
+        ), PrepareContext())
+        subtotals = transform.diagnostic_metrics()["RewardSpec"]
+        self.assertEqual(subtotals["scale/physical_rms_cap"], .25)
+        self.assertEqual(subtotals["rms/reward_plus"], 1)
+        self.assertEqual(subtotals["rms/physical"], 0)
+
+        # A rollout with no valid imitation window cannot pay any physical bonus.
+        empty = batch.replace_fields(scene_window_valid=th.zeros(1, 4, dtype=th.bool))
+        transform = SceneDiscriminatorReward(
+            ZeroDiscriminator(), noise_std=0, trajectory_length=2,
+            exp_log_odds_reward=True, reward_plus=True, goal_reward_weight=75,
+            cap_physical_rewards=True,
+        )
+        result = transform(empty, PrepareContext())
+        th.testing.assert_close(result["training_reward"], empty["reward"] * 75)
+        self.assertEqual(transform.diagnostic_metrics()["RewardSpec"]["scale/physical_rms_cap"],
+                         0)
 
     def test_reward_plus_diagnostics_report_components_before_zero_sum(self):
         current = physical_state(2)
@@ -975,17 +1112,20 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertFalse(defaults.exp_log_odds_reward)
         self.assertFalse(defaults.recency_replay)
         self.assertFalse(defaults.reward_plus)
+        self.assertTrue(defaults.cap_physical_rewards)
         self.assertEqual(defaults.physical_reward_scale, 1.0)
-        self.assertEqual(defaults.goal_reward_weight, 250.0)
+        self.assertEqual(defaults.goal_reward_weight, 75.0)
         self.assertEqual(defaults.aerial_touch_reward_weight, 12.5)
         self.assertEqual(defaults.flip_reset_reward_weight, 12.5)
         self.assertEqual(defaults.reward_plus_weights, asdict(RewardPlusWeights()))
         transform = build_ppo_transforms(defaults, PositionDiscriminator())[0]
         self.assertEqual((transform.goal_reward_weight, transform.aerial_touch_reward_weight,
-                          transform.flip_reset_reward_weight), (250.0, 12.5, 12.5))
+                          transform.flip_reset_reward_weight), (75.0, 12.5, 12.5))
+        self.assertTrue(transform.cap_physical_rewards)
         old = asdict(RewardPlusWeights.legacy())
         self.assertEqual(defaults.reward_plus_weights, {
-            name: weight * 50 for name, weight in old.items()
+            **{name: weight * 50 for name, weight in old.items() if name != "boost_gain"},
+            "boost_gain": 12.5,
         })
 
 

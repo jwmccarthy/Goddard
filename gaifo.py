@@ -146,6 +146,7 @@ RESET_MINING_FRACTION = 0.5
 RESET_MINING_MIN_CONFIDENCE = 0.6
 REWARD_PLUS_COMPONENTS = (
     "reward_plus_speed",
+    "reward_plus_boost_gain",
     "reward_plus_aerial_lift",
     "reward_plus_aerial_shot",
     "reward_plus_underside",
@@ -166,6 +167,7 @@ class RewardPlusWeights:
 
     speed_progress: float = 12.5
     boost_free_speed_progress: float = 25.0
+    boost_gain: float = 12.5
     aerial_lift: float = 50.0
     aerial_shot: float = 50.0
     underside: float = 25.0
@@ -182,7 +184,7 @@ class RewardPlusWeights:
     def legacy(cls) -> "RewardPlusWeights":
         """Restore the weights used before component defaults were raised."""
         return cls(
-            speed_progress=0.25, boost_free_speed_progress=0.5,
+            speed_progress=0.25, boost_free_speed_progress=0.5, boost_gain=0.0,
             aerial_lift=1.0, aerial_shot=1.0, underside=0.5,
             kickoff_speed=0.5, kickoff=0.5, wasted_air=0.2,
             wasted_boost=0.3, ball_ceiling=0.35, wall_touch=0.2,
@@ -1052,6 +1054,13 @@ class RewardPlus:
             self.weights.speed_progress * speed_change
             + self.weights.boost_free_speed_progress * boost_free_change
         )
+        # Favor collecting pads when low on boost, not refills from demos,
+        # discontinuous resets, or newly spawned goal states.
+        boost_level = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
+        previous_boost_level = (previous.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
+        boost_gain = self.weights.boost_gain * valid * (
+            boost_level - previous_boost_level
+        ).clamp_min(0.0)
 
         touches = current.car_ball_touches
         solo_touch = touches & touches.sum(dim=-1, keepdim=True).eq(1)
@@ -1111,6 +1120,7 @@ class RewardPlus:
         mechanics = self.mechanical_events(context, valid)
         return {
             "reward_plus_speed": speed,
+            "reward_plus_boost_gain": boost_gain,
             "reward_plus_aerial_lift": self.weights.aerial_lift * lift * combo,
             "reward_plus_aerial_shot": self.weights.aerial_shot * aerial_shot * combo,
             "reward_plus_underside": underside,
@@ -4255,8 +4265,9 @@ class SceneDiscriminatorReward:
     mode rewards the change in expert log-odds or discount-adjusted capped
     expert odds as a scene frame is added. The Transformer global head always
     compares before and after that frame, including in exponential mode.
-    Physical bonuses are zero-sum between teams; goal and touch transitions
-    remain learnable before imitation windows are valid. Per-state imitation
+    Physical bonuses are zero-sum between teams. The optional per-rollout cap
+    preserves their relative weights while limiting each bonus and their sum
+    to imitation's learner-action RMS; goals are exempt. Per-state imitation
     scores scale with the physics ticks per action; changes and one-off events
     already represent transitions and keep their original magnitudes.
     """
@@ -4278,6 +4289,7 @@ class SceneDiscriminatorReward:
         frameskip: int = REFERENCE_FRAMESKIP,
         reward_plus: bool = False,
         physical_reward_scale: float = 1.0,
+        cap_physical_rewards: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("discriminator reward batch size must be positive")
@@ -4312,6 +4324,7 @@ class SceneDiscriminatorReward:
         self.flip_reset_reward_weight = flip_reset_reward_weight
         self.reward_plus = reward_plus
         self.physical_reward_scale = physical_reward_scale
+        self.cap_physical_rewards = cap_physical_rewards
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
         self.exp_log_odds_reward = exp_log_odds_reward
@@ -4641,10 +4654,13 @@ class SceneDiscriminatorReward:
             batch, "flip_reset_event", self.flip_reset_reward_weight,
             imitation_reward,
         ) * self.physical_reward_scale
-        reward_plus_reward = (
-            sum((self._event_reward(batch, name, 1.0, imitation_reward)
-                 for name in REWARD_PLUS_COMPONENTS), th.zeros_like(imitation_reward))
+        reward_plus_components = {
+            name: self._event_reward(batch, name, 1.0, imitation_reward)
             * self.physical_reward_scale
+            for name in REWARD_PLUS_COMPONENTS
+        } if self.reward_plus else {}
+        reward_plus_reward = (
+            sum(reward_plus_components.values(), th.zeros_like(imitation_reward))
             if self.reward_plus else 0.0
         )
         physical_reward = aerial_touch_reward + flip_reset_reward + reward_plus_reward
@@ -4652,6 +4668,33 @@ class SceneDiscriminatorReward:
         learner_mask = (learner_mask.bool() if learner_mask is not None
                         else th.ones_like(valid))
         learner_count = learner_mask.sum().clamp_min(1)
+
+        def learner_rms(value: th.Tensor) -> th.Tensor:
+            return ((value.square() * learner_mask).sum() / learner_count).sqrt()
+
+        if self.cap_physical_rewards:
+            # One cap for every physical signal preserves their relative weights.
+            # Include subtotals and the sum: opposing signals can hide each other.
+            largest_physical = th.stack([
+                learner_rms(value) for value in (
+                    aerial_touch_reward, flip_reset_reward, *reward_plus_components.values(),
+                    *((reward_plus_reward,) if self.reward_plus else ()),
+                    physical_reward,
+                )
+            ]).amax()
+            cap = th.where(
+                largest_physical > 0,
+                (learner_rms(imitation_reward) / largest_physical.clamp_min(1e-12)).clamp(max=1),
+                th.ones_like(largest_physical),
+            )
+            aerial_touch_reward = aerial_touch_reward * cap
+            flip_reset_reward = flip_reset_reward * cap
+            reward_plus_components = {
+                name: value * cap for name, value in reward_plus_components.items()
+            }
+            if self.reward_plus:
+                reward_plus_reward = reward_plus_reward * cap
+            physical_reward = physical_reward * cap
         reward_components = {
             "imitation": imitation_reward,
             "goal": goal_reward,
@@ -4659,11 +4702,14 @@ class SceneDiscriminatorReward:
             "flip_reset": flip_reset_reward,
             "physical": physical_reward,
             **({"reward_plus": reward_plus_reward} if self.reward_plus else {}),
+            **reward_plus_components,
         }
         self._last_reward_scales = {
-            f"rms/{name}": ((value.square() * learner_mask).sum() / learner_count).sqrt()
+            f"rms/{name}": learner_rms(value)
             for name, value in reward_components.items()
         }
+        if self.cap_physical_rewards:
+            self._last_reward_scales["scale/physical_rms_cap"] = cap
 
         result = batch.with_fields(
             imitation_reward=imitation_reward,
@@ -5573,11 +5619,15 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     add_feature_option(
         parser, "--reward-plus",
-        help="add boost-aware speed progress, controlled aerial lifts and shots, underside setup, kickoff approach speed and first touch",
+        help="add boost-aware speed progress, boost pickups, controlled aerial lifts and shots, underside setup, kickoff approach speed and first touch",
+    )
+    add_feature_option(
+        parser, "--cap-physical-rewards", default=True,
+        help="cap each physical bonus and their sum at the imitation rollout RMS (default: enabled)",
     )
     parser.add_argument(
-        "--goal-reward-weight", type=float, default=250.0,
-        help="scale the +/-1 goal reward per actor (default: 250; 0 disables it)",
+        "--goal-reward-weight", type=float, default=75.0,
+        help="scale the +/-1 goal reward per actor (default: 75; 0 disables it)",
     )
     parser.add_argument(
         "--aerial-touch-reward-weight", type=float, default=12.5,
@@ -5701,9 +5751,13 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("discriminator_relative_positions", False)
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
-        inherited["reward_plus_weights"] = resume["config"].get(
-            "reward_plus_weights", asdict(RewardPlusWeights.legacy()),
-        )
+        inherited.setdefault("cap_physical_rewards", False)
+        inherited["reward_plus_weights"] = {
+            "boost_gain": 0.0,  # Pre-boost-gain checkpoints keep their original rewards.
+            **resume["config"].get(
+                "reward_plus_weights", asdict(RewardPlusWeights.legacy()),
+            ),
+        }
         parser.set_defaults(**inherited)
     else:
         parser.set_defaults(reward_plus_weights=asdict(RewardPlusWeights()))
@@ -6235,6 +6289,7 @@ def build_ppo_transforms(
             frameskip=args.frameskip,
             reward_plus=getattr(args, "reward_plus", False),
             physical_reward_scale=args.physical_reward_scale,
+            cap_physical_rewards=getattr(args, "cap_physical_rewards", False),
         ),
         GAE(
             gamma=gamma,
