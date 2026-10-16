@@ -170,7 +170,7 @@ class RewardPlusWeights:
     boost_free_speed_progress: float = 25.0
     boost_gain: float = 12.5
     aerial_lift: float = 50.0
-    aerial_shot: float = 50.0
+    aerial_shot: float = 75.0
     ground_pop: float = 10.0
     air_dribble_setup: float = 15.0
     kickoff_speed: float = 25.0
@@ -905,7 +905,7 @@ def _actionable_dodges(
 def advanced_touch_events(
     context: RewardContext,
 ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
-    """Reward every elevated aerial touch more at height; detect flip resets."""
+    """Reward elevated aerial touches and ball or ceiling dodge restorations."""
     current = context.current
     previous = context.previous
     touches = current.car_ball_touches
@@ -923,10 +923,10 @@ def advanced_touch_events(
         ~_actionable_dodges(context.previous_observation, len(current.raw), current.n_cars)
         & _actionable_dodges(context.current_observation, len(current.raw), current.n_cars)
     )
-    flip_reset = (
+    restored_flip = (spent_flip | native_restored) & flip_available
+    ball_reset = (
         touches
-        & (spent_flip | native_restored)
-        & flip_available
+        & restored_flip
         & ~on_surface  # A floor/wall landing can restore the dodge on a touch step.
         & car_height.gt(3.0 * BALL_RADIUS)
         & ball_to_car.square().sum(dim=-1).lt((2.0 * BALL_RADIUS) ** 2)
@@ -934,6 +934,17 @@ def advanced_touch_events(
             ball_to_car, -current.car_up, dim=-1, eps=1e-6
         ).gt(0.9)
     )
+    # CARL restores the dodge on ceiling wheel contact, too. Native dodge
+    # restoration catches brief contacts between policy observations, while
+    # on_ground covers wheel contact when the previous flip was spent.
+    ceiling_reset = (
+        restored_flip
+        & (current.car_on_ground | native_restored)
+        & car_height.gt(CEILING_AIR_HEIGHT)
+        & current.car_up[..., 2].lt(-0.7)
+        & ~current.car_demoed & ~previous.car_demoed
+    )
+    flip_reset = ball_reset | ceiling_reset
     # Wheel contact with the ball can set car_on_ground without being a landing.
     aerial = touches & car_height.gt(2.0 * BALL_RADIUS) & ~on_surface
     # A low aerial earns a nonzero bonus; the configured weight caps it at the roof.
@@ -1104,6 +1115,12 @@ class RewardPlus:
         speed_change = (
             current.car_velocity.norm(dim=-1) - previous.car_velocity.norm(dim=-1)
         ) / CAR_MAX_SPEED
+        # A signed difference pays more for gaining forward than reverse speed
+        # without paying again for coasting or an acceleration/deceleration loop.
+        forward_speed_change = (
+            (current.car_velocity * current.car_forward).sum(dim=-1)
+            - (previous.car_velocity * previous.car_forward).sum(dim=-1)
+        ) / CAR_MAX_SPEED
         boost_action = context.actions.reshape(len(current.raw), current.n_cars, -1)[
             ..., 4
         ].gt(0)
@@ -1114,7 +1131,7 @@ class RewardPlus:
         # Charge speed loss at the full rate even if boost was used to accelerate.
         boost_free_change = th.where(no_boost, speed_change, speed_change.clamp_max(0.0))
         speed = valid * (
-            self.weights.speed_progress * speed_change
+            self.weights.speed_progress * (speed_change + forward_speed_change)
             + self.weights.boost_free_speed_progress * boost_free_change
         )
         # Favor collecting pads when low on boost, not refills from demos,
@@ -5680,8 +5697,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="cap each physical bonus and their sum at the imitation rollout RMS (default: enabled)",
     )
     parser.add_argument(
-        "--goal-reward-weight", type=float, default=75.0,
-        help="scale the +/-1 goal reward per actor (default: 75; 0 disables it)",
+        "--goal-reward-weight", type=float, default=100.0,
+        help="scale the +/-1 goal reward per actor (default: 100; 0 disables it)",
     )
     parser.add_argument(
         "--aerial-touch-reward-weight", type=float, default=12.5,
@@ -5689,7 +5706,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument(
         "--flip-reset-reward-weight", type=float, default=12.5,
-        help="reward a spent or expired flip regained by elevated wheel-ball contact (default: 12.5; 0 disables it)",
+        help="reward a spent or expired flip regained by wheel contact with an elevated ball or the ceiling (default: 12.5; 0 disables it)",
     )
     parser.add_argument(
         "--physical-reward-scale", type=float, default=1.0,
@@ -5806,6 +5823,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
         inherited.setdefault("cap_physical_rewards", False)
+        if inherited.get("goal_reward_weight") == 75.0:
+            inherited["goal_reward_weight"] = 100.0
         inherited["reward_plus_weights"] = {
             "boost_gain": 0.0,  # Pre-boost-gain checkpoints keep their original rewards.
             "ground_pop": 0.0,  # Preserve rewards in pre-ground-setup checkpoints.
@@ -5815,6 +5834,9 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
             ),
         }
         inherited["reward_plus_weights"].pop("underside", None)
+        inherited["reward_plus_weights"].pop("angular_velocity", None)
+        if inherited["reward_plus_weights"].get("aerial_shot") == 50.0:
+            inherited["reward_plus_weights"]["aerial_shot"] = RewardPlusWeights().aerial_shot
         parser.set_defaults(**inherited)
     else:
         parser.set_defaults(reward_plus_weights=asdict(RewardPlusWeights()))

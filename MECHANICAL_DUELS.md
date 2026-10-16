@@ -206,18 +206,25 @@ earns a bonus; ball height scales it from half to the full configured
 `--aerial-touch-reward-weight` (default `12.5`). Distinct contacts by the same
 car during one flight compound by `1.5` per touch (1x, 1.5x, 2.25x, 3.375x,
 then capped at 4x). A held ball-touch flag does not build or collect the extra
-bonus. Flip resets count as contacts even when that flag stays set, and the same
-multiplier applies to both their bonus and the aerial-touch bonus. Floor or wall
-contact, an upside-down floor landing, demolition, or an episode end resets the
-streak; wheel contact with the ball does not.
+bonus. Ball-contact flip resets count as contacts even when that flag stays
+set, and the same multiplier applies to both their bonus and the aerial-touch
+bonus. Ceiling wheel contact can also earn a one-off flip-reset bonus when it
+restores a spent or expired dodge; without a ball touch it earns no aerial-touch
+bonus or extra combo multiplier. Floor or wall contact, an upside-down floor
+landing, demolition, or an episode end resets the streak; wheel contact with
+the ball or ceiling does not.
 
 `--reward-plus` adds fourteen bounded, zero-sum team signals alongside the
 discriminator imitation reward:
 
 - Signed speed change pays `12.5` per normalized speed gained, plus `25` when
   boost is not pressed, neither state is boosting, and the boost amount is
-  unchanged. Speed losses cost the full `37.5`, even while boosting; merely
-  holding speed pays nothing.
+  unchanged. A further signed `12.5` times the change in speed projected onto
+  the car's forward axis favors forward driving: boost-free forward gains pay
+  `50` per normalized speed gained, sideways gains `37.5`, and reverse gains
+  `25`. Base speed losses still cost the full `37.5`, even while boosting;
+  losing forward speed costs the extra directional bonus. Holding speed and
+  heading pays nothing.
 - Picking up boost pays up to `12.5` for a full refill, with the change in
   `sqrt(boost / 100)` favoring pads collected when low on boost. A small pad
   taken at zero boost pays about `4.3`. Demolitions, discontinuous resets,
@@ -229,7 +236,7 @@ discriminator imitation reward:
   Downward velocity changes are charged; repeated contact without improvement
   pays nothing. Distinct airborne touches use the same combo multiplier.
 - A solo aerial touch above the crossbar pays for improving the ball's
-  goalward velocity and aim at the opponent's goal (up to `50`), and charges a
+  goalward velocity and aim at the opponent's goal (up to `75`), and charges a
   touch that spoils a good shot. Its signed change also uses the combo multiplier.
 - A fresh solo touch started from the floor pays up to `10` for popping a
   low ball toward a reachable air-dribble position. Its upward velocity must
@@ -265,9 +272,9 @@ discriminator imitation reward:
   charged `5` per second. Passing overhead without floor contact is exempt.
 
 The goal, ordinary aerial-touch, and flip-reset bonuses are separate from
-`--reward-plus` and are not counted twice. Their new-run weights are `75`,
+`--reward-plus` and are not counted twice. Their new-run weights are `100`,
 `12.5`, and `12.5`, respectively. Each touch or reset reaches at most `50` at
-the 4x combo cap; a rare single lift or shot can reach `200` *before* the
+the 4x combo cap; a rare single lift can reach `200`, or shot `300`, *before* the
 rollout cap, and multiple mechanics can stack on one action. Relative reward
 strength is measured over all learner actions, not by single-event peaks. Set
 `--aerial-touch-reward-weight 0` to pay only for controlled aerial touches.
@@ -281,10 +288,12 @@ new-run commands rather than multiplying the physical rewards a second time.
 `--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
 flip-reset, and `--reward-plus` rewards after their component weights, but not
 imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
-new component weights; older checkpoints retain their other `--reward-plus`,
-touch/reset, and goal weights when resumed, but discard the retired underside
-weight. Checkpoints predating boost gain or
-the ground setup signals keep those weights at zero. The physical scale is also
+new component weights. On resume, saved default aerial-shot `50` and goal `75`
+weights increase to `75` and `100` respectively; distinct custom weights are
+preserved. Other `--reward-plus` and touch/reset weights remain unchanged;
+retired angular-velocity and underside weights are discarded. Checkpoints
+predating boost gain or the ground setup signals keep those weights at zero.
+The physical scale is also
 saved and can be overridden on resume with an explicit value (and a new
 `--timesteps` total above the saved step).
 New runs enable `--cap-physical-rewards`: after weighting, GAIFO compares the

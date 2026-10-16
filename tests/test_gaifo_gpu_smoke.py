@@ -27,6 +27,7 @@ from jarl.envs import DatasetResetSampler
 from jarl.store import RolloutBuffer
 from replay_layout import team_live_observation_size, team_scene_size
 from replay_resets import ReplayResetProvider
+from reward_spec import CEILING_Z
 from watch_checkpoints import EpisodeLimits, configure_match_timing
 
 
@@ -35,6 +36,52 @@ from watch_checkpoints import EpisodeLimits, configure_match_timing
     "opt-in CUDA/CARL integration smoke",
 )
 class GAIFOGpuSmokeTests(unittest.TestCase):
+    def test_carl_ceiling_contact_restores_flip_and_pays_only_once(self):
+        for frameskip in (4, 8):
+            with self.subTest(frameskip=frameskip):
+                env = CARLTorchVectorEnv(
+                    n_sim=1, n_blue=1, n_orange=1, frameskip=frameskip,
+                    normalize=True, discrete_actions=True,
+                )
+                gameplay = env.register_reward(GameplayDiagnostics(1, env.device, 900))
+                try:
+                    env.reset()
+                    position = th.tensor(
+                        [[[0., 0., CEILING_Z - 90.], [0., 1000., 17.]]],
+                        device=env.device,
+                    )
+                    rotation = th.tensor(
+                        [[[0., 1., 0., 0.], [1., 0., 0., 0.]]], device=env.device,
+                    )
+                    velocity = th.tensor(
+                        [[[0., 0., 650.], [0., 0., 0.]]], device=env.device,
+                    )
+                    internal = th.zeros(1, 2, 19, device=env.device)
+                    internal[0, 0, 1] = internal[0, 0, 10] = 2.0
+                    internal[0, 0, 3] = internal[0, 0, 8] = 1.0  # Spent flip.
+                    internal[0, 1, 0] = 1.0
+                    env.set_car(
+                        position, rotation, velocity, th.zeros_like(velocity),
+                        th.zeros(1, 2, dtype=th.int32, device=env.device),
+                        internal_state=internal,
+                    )
+                    self.assertTrue(env._state.car_has_flipped[0, 0])
+                    self.assertFalse(env._observation.ego_has_flip_or_jump[0])
+                    neutral = th.tensor(
+                        [1, 1, 1, 0, 0, 1, 0], device=env.device,
+                    ).repeat(2, 1)
+                    resets = []
+                    for _ in range(8):
+                        env.step(neutral)
+                        self.assertFalse(env._state.car_ball_touches[0, 0])
+                        self.assertEqual(gameplay.last_aerial_touch_score[0].item(), 0.0)
+                        resets.append(gameplay.last_flip_reset[0].item())
+                    self.assertEqual(resets.count(1.0), 1)
+                    self.assertEqual(sum(resets), 1.0)
+                    self.assertTrue(env._observation.ego_has_flip_or_jump[0])
+                finally:
+                    env.close()
+
     def test_replay_pov_reconstruction_matches_carl_for_each_team_size(self):
         for team_size in (1, 2, 3):
             with self.subTest(team_size=team_size):
@@ -335,6 +382,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                     self.assertIn(tag, events.Tags()["scalars"])
                     self.assertTrue(events.Scalars(tag))
                 self.assertNotIn("RewardSpec/component/underside", events.Tags()["scalars"])
+                self.assertNotIn("RewardSpec/component/angular_velocity", events.Tags()["scalars"])
                 self.assertNotIn("RewardSpec/rms/reward_plus_underside",
                                  events.Tags()["scalars"])
                 for name in ("imitation", "physical", "aerial_touch", "flip_reset",
@@ -360,6 +408,10 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             checkpoints = list((root / "checkpoints").rglob("gaifo_*.pt"))
             self.assertGreaterEqual(len(checkpoints), 2)
             saved = load_resume_checkpoint(max(checkpoints))
+            if reward_plus:
+                self.assertEqual(saved["config"]["goal_reward_weight"], 100.0)
+                self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_shot"], 75.0)
+                self.assertNotIn("angular_velocity", saved["config"]["reward_plus_weights"])
             self.assertEqual(saved["config"]["recurrent_global"], recurrent_global and not transformer)
             self.assertEqual(saved["config"].get("transformer_global", False), transformer)
             self.assertTrue(saved["config"]["flip_state_features"])

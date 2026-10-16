@@ -283,6 +283,31 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             AdvancedTouchCapture(single_gameplay)(None)["reward_plus_speed"], th.zeros(2),
         )
 
+    def test_reward_plus_speed_favors_forward_driving_without_paying_for_coasting(self):
+        current = physical_state(3)
+        previous = current.clone()
+        cars = current[:, 9:53].view(3, 2, 22)
+        old_cars = previous[:, 9:53].view(3, 2, 22)
+        cars[:, 0, 9] = old_cars[:, 0, 9] = 1.0  # Face +X.
+        cars[0, 0, 3], old_cars[0, 0, 3] = 1_000.0, 600.0  # Forward.
+        cars[1, 0, 3], old_cars[1, 0, 3] = -1_000.0, -600.0  # Reverse.
+        cars[2, 0, 4], old_cars[2, 0, 4] = 1_000.0, 600.0  # Sideways.
+
+        gameplay = GameplayDiagnostics(3, th.device("cpu"), 900, reward_plus=True)
+        capture = AdvancedTouchCapture(gameplay)
+        gameplay(physical_context(current, previous))
+        speed = capture(None)["reward_plus_speed"].view(3, 2)
+        expected = th.tensor([50.0, 25.0, 37.5]) * (400.0 / 2300.0)
+        th.testing.assert_close(speed[:, 0], expected)
+        th.testing.assert_close(speed.sum(dim=-1), th.zeros(3))
+
+        gameplay(physical_context(previous, current))
+        th.testing.assert_close(
+            capture(None)["reward_plus_speed"].view(3, 2)[:, 0], -expected,
+        )
+        gameplay(physical_context(current, current))
+        th.testing.assert_close(capture(None)["reward_plus_speed"], th.zeros(6))
+
     def test_reward_plus_boost_gain_pays_for_pad_refills_but_not_resets_or_demos(self):
         current = physical_state(8)
         previous = current.clone()
@@ -353,7 +378,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         legacy(physical_context(current, previous))
         old_bonus = AdvancedTouchCapture(legacy)(None)
         th.testing.assert_close(lift, old_bonus["reward_plus_aerial_lift"].view(7, 2) * 50)
-        th.testing.assert_close(shot, old_bonus["reward_plus_aerial_shot"].view(7, 2) * 50)
+        th.testing.assert_close(shot, old_bonus["reward_plus_aerial_shot"].view(7, 2) * 75)
         self.assertGreater(lift[0, 0], 0)
         self.assertEqual(lift[1, 0], 0)  # Excessive relative-speed increase removes lift.
         self.assertLess(lift[2, 0], 0)
@@ -583,6 +608,52 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             th.tensor([[1., -1.], [1., -1.], [0., 0.], [0., 0.], [0., 0.]]),
         )
         self.assertNotIn("reward_plus_underside", captured)
+
+    def test_ceiling_flip_reset_needs_new_dodge_and_ceiling_wheel_contact(self):
+        current = physical_state(9)
+        cars = current[:, 9:53].view(9, 2, 22)
+        cars[:, 0, 2] = CEILING_Z - 45.0
+        cars[:, 0, 14] = -1.0  # Wheels point toward the roof.
+        cars[:, 0, 16] = 1.0
+        previous = current.clone()
+        old_cars = previous[:, 9:53].view(9, 2, 22)
+        old_cars[:, 0, 16] = 0.0
+        old_cars[:, 0, 18] = 1.0
+
+        old_cars[1, 0, 18] = 0.0  # Expired rather than spent dodge.
+        cars[2, 0, 16] = 0.0  # Nearby without wheel contact is not enough.
+        old_cars[3, 0, 18] = 0.0  # Dodge was already available.
+        cars[4, 0, 2] = old_cars[4, 0, 2] = 1_600.0  # Too far below the roof.
+        cars[5, 0, 14] = 1.0  # Wheels point away from the roof.
+        cars[6, 0, 18] = 1.0  # No dodge restored despite contact.
+        cars[7, 0, 16] = 0.0  # Brief contact ended between policy observations.
+        cars[8, 0, 17] = 1.0  # Demolition cannot award a roof reset.
+
+        before = th.zeros(18, 51)
+        after = th.zeros_like(before)
+        before[[2, 14], -2:] = th.tensor([1.0, 0.005])
+        after[[2, 14], -2:] = th.tensor([1.0, 1.25])
+        before[6, -2:] = after[6, -2:] = th.tensor([1.0, 1.25])
+        context = replace(
+            physical_context(current, previous),
+            previous_observation=CARLObservation.from_tensor(before, 2),
+            current_observation=CARLObservation.from_tensor(after, 2),
+        )
+        gameplay = GameplayDiagnostics(9, th.device("cpu"), 900)
+        gameplay(context)
+        capture = AdvancedTouchCapture(gameplay)
+        events = capture(None)
+        expected = th.zeros(9, 2)
+        expected[[0, 1, 7]] = th.tensor([1.0, -1.0])
+        th.testing.assert_close(events["flip_reset_event"].view(9, 2), expected)
+        th.testing.assert_close(events["aerial_touch_score"], th.zeros(18))
+        self.assertEqual(gameplay.diagnostic_metrics()["Gameplay"]["flip_resets_per_1000_steps"],
+                         3 / 18 * 1_000)
+
+        # Holding the ceiling, or a dodge that is still available, cannot pay again.
+        gameplay(replace(context, previous=context.current,
+                         previous_observation=context.current_observation))
+        th.testing.assert_close(capture(None)["flip_reset_event"], th.zeros(18))
 
     def test_reward_plus_kickoff_speed_rewards_only_closest_challengers(self):
         for team_size in (1, 2, 3):
@@ -1237,19 +1308,21 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertFalse(defaults.reward_plus)
         self.assertTrue(defaults.cap_physical_rewards)
         self.assertEqual(defaults.physical_reward_scale, 1.0)
-        self.assertEqual(defaults.goal_reward_weight, 75.0)
+        self.assertEqual(defaults.goal_reward_weight, 100.0)
         self.assertEqual(defaults.aerial_touch_reward_weight, 12.5)
         self.assertEqual(defaults.flip_reset_reward_weight, 12.5)
         self.assertEqual(defaults.reward_plus_weights, asdict(RewardPlusWeights()))
         transform = build_ppo_transforms(defaults, PositionDiscriminator())[0]
         self.assertEqual((transform.goal_reward_weight, transform.aerial_touch_reward_weight,
-                          transform.flip_reset_reward_weight), (75.0, 12.5, 12.5))
+                          transform.flip_reset_reward_weight), (100.0, 12.5, 12.5))
         self.assertTrue(transform.cap_physical_rewards)
         old = asdict(RewardPlusWeights.legacy())
         self.assertEqual(defaults.reward_plus_weights, {
             **{name: weight * 50 for name, weight in old.items()
-               if name not in ("boost_gain", "ground_pop", "air_dribble_setup")},
+               if name not in ("boost_gain", "ground_pop", "air_dribble_setup",
+                               "aerial_shot")},
             "boost_gain": 12.5,
+            "aerial_shot": 75.0,
             "ground_pop": 10.0,
             "air_dribble_setup": 15.0,
         })
