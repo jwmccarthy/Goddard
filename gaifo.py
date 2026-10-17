@@ -169,7 +169,7 @@ class RewardPlusWeights:
     speed_progress: float = 12.5
     boost_free_speed_progress: float = 25.0
     boost_gain: float = 12.5
-    aerial_lift: float = 50.0
+    aerial_lift: float = 75.0
     aerial_shot: float = 75.0
     ground_pop: float = 10.0
     air_dribble_setup: float = 15.0
@@ -934,12 +934,11 @@ def advanced_touch_events(
             ball_to_car, -current.car_up, dim=-1, eps=1e-6
         ).gt(0.9)
     )
-    # CARL restores the dodge on ceiling wheel contact, too. Native dodge
-    # restoration catches brief contacts between policy observations, while
-    # on_ground covers wheel contact when the previous flip was spent.
+    # Pay only when the native dodge window becomes usable. A stale spent-flip
+    # flag or sustained wheel contact with the roof must not pay every step;
+    # the native transition also catches contact between policy observations.
     ceiling_reset = (
-        restored_flip
-        & (current.car_on_ground | native_restored)
+        native_restored & flip_available
         & car_height.gt(CEILING_AIR_HEIGHT)
         & current.car_up[..., 2].lt(-0.7)
         & ~current.car_demoed & ~previous.car_demoed
@@ -5697,12 +5696,12 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="cap each physical bonus and their sum at the imitation rollout RMS (default: enabled)",
     )
     parser.add_argument(
-        "--goal-reward-weight", type=float, default=100.0,
-        help="scale the +/-1 goal reward per actor (default: 100; 0 disables it)",
+        "--goal-reward-weight", type=float, default=200.0,
+        help="scale the +/-1 goal reward per actor (default: 200; 0 disables it)",
     )
     parser.add_argument(
-        "--aerial-touch-reward-weight", type=float, default=12.5,
-        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (default: 12.5; 0 disables it)",
+        "--aerial-touch-reward-weight", type=float, default=25.0,
+        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (default: 25; 0 disables it)",
     )
     parser.add_argument(
         "--flip-reset-reward-weight", type=float, default=12.5,
@@ -5823,8 +5822,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("recurrent_global", False)
         inherited.setdefault("transformer_global", False)
         inherited.setdefault("cap_physical_rewards", False)
-        if inherited.get("goal_reward_weight") == 75.0:
-            inherited["goal_reward_weight"] = 100.0
+        if inherited.get("goal_reward_weight") in (75.0, 100.0):
+            inherited["goal_reward_weight"] = 200.0
+        if inherited.get("aerial_touch_reward_weight") in (12.5, 15.0):
+            inherited["aerial_touch_reward_weight"] = 25.0
         inherited["reward_plus_weights"] = {
             "boost_gain": 0.0,  # Pre-boost-gain checkpoints keep their original rewards.
             "ground_pop": 0.0,  # Preserve rewards in pre-ground-setup checkpoints.
@@ -5835,6 +5836,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         }
         inherited["reward_plus_weights"].pop("underside", None)
         inherited["reward_plus_weights"].pop("angular_velocity", None)
+        if inherited["reward_plus_weights"].get("aerial_lift") in (50.0, 60.0):
+            inherited["reward_plus_weights"]["aerial_lift"] = RewardPlusWeights().aerial_lift
         if inherited["reward_plus_weights"].get("aerial_shot") == 50.0:
             inherited["reward_plus_weights"]["aerial_shot"] = RewardPlusWeights().aerial_shot
         parser.set_defaults(**inherited)

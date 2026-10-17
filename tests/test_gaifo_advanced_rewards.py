@@ -377,7 +377,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         )
         legacy(physical_context(current, previous))
         old_bonus = AdvancedTouchCapture(legacy)(None)
-        th.testing.assert_close(lift, old_bonus["reward_plus_aerial_lift"].view(7, 2) * 50)
+        th.testing.assert_close(lift, old_bonus["reward_plus_aerial_lift"].view(7, 2) * 75)
         th.testing.assert_close(shot, old_bonus["reward_plus_aerial_shot"].view(7, 2) * 75)
         self.assertGreater(lift[0, 0], 0)
         self.assertEqual(lift[1, 0], 0)  # Excessive relative-speed increase removes lift.
@@ -631,8 +631,9 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
 
         before = th.zeros(18, 51)
         after = th.zeros_like(before)
+        # No ceiling contact in case 2, so its native dodge cannot be restored.
+        after[[0, 2, 8, 10, 12, 14, 16], -2:] = th.tensor([1.0, 1.25])
         before[[2, 14], -2:] = th.tensor([1.0, 0.005])
-        after[[2, 14], -2:] = th.tensor([1.0, 1.25])
         before[6, -2:] = after[6, -2:] = th.tensor([1.0, 1.25])
         context = replace(
             physical_context(current, previous),
@@ -650,7 +651,12 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertEqual(gameplay.diagnostic_metrics()["Gameplay"]["flip_resets_per_1000_steps"],
                          3 / 18 * 1_000)
 
-        # Holding the ceiling, or a dodge that is still available, cannot pay again.
+        # Even if the previous raw spent flag lingers, a restored native dodge
+        # window cannot pay again on the next ceiling-contact step.
+        gameplay(replace(context, previous_observation=context.current_observation))
+        th.testing.assert_close(capture(None)["flip_reset_event"], th.zeros(18))
+
+        # Holding the ceiling with both state views updated cannot pay again.
         gameplay(replace(context, previous=context.current,
                          previous_observation=context.current_observation))
         th.testing.assert_close(capture(None)["flip_reset_event"], th.zeros(18))
@@ -1308,20 +1314,21 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertFalse(defaults.reward_plus)
         self.assertTrue(defaults.cap_physical_rewards)
         self.assertEqual(defaults.physical_reward_scale, 1.0)
-        self.assertEqual(defaults.goal_reward_weight, 100.0)
-        self.assertEqual(defaults.aerial_touch_reward_weight, 12.5)
+        self.assertEqual(defaults.goal_reward_weight, 200.0)
+        self.assertEqual(defaults.aerial_touch_reward_weight, 25.0)
         self.assertEqual(defaults.flip_reset_reward_weight, 12.5)
         self.assertEqual(defaults.reward_plus_weights, asdict(RewardPlusWeights()))
         transform = build_ppo_transforms(defaults, PositionDiscriminator())[0]
         self.assertEqual((transform.goal_reward_weight, transform.aerial_touch_reward_weight,
-                          transform.flip_reset_reward_weight), (100.0, 12.5, 12.5))
+                          transform.flip_reset_reward_weight), (200.0, 25.0, 12.5))
         self.assertTrue(transform.cap_physical_rewards)
         old = asdict(RewardPlusWeights.legacy())
         self.assertEqual(defaults.reward_plus_weights, {
             **{name: weight * 50 for name, weight in old.items()
                if name not in ("boost_gain", "ground_pop", "air_dribble_setup",
-                               "aerial_shot")},
+                               "aerial_lift", "aerial_shot")},
             "boost_gain": 12.5,
+            "aerial_lift": 75.0,
             "aerial_shot": 75.0,
             "ground_pop": 10.0,
             "air_dribble_setup": 15.0,
