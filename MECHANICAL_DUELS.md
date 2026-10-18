@@ -203,9 +203,10 @@ still credit all early actions for later rewards. Goal
 rewards and the default aerial-touch bonus are shared across teammates and
 opposed between teams. Every aerial touch above the ground-touch threshold
 earns a bonus; ball height scales it from half to the full configured
-`--aerial-touch-reward-weight` (default `25`). Distinct contacts by the same
-car during one flight compound by `1.5` per touch (1x, 1.5x, 2.25x, 3.375x,
-then capped at 4x). A held ball-touch flag does not build or collect the extra
+`--aerial-touch-reward-weight` (default `75`, the same as the controlled aerial
+lift). Distinct contacts by the same car during one flight compound by `1.5` per
+touch (1x, 1.5x, 2.25x, 3.375x, then capped at 4x). A held ball-touch flag does
+not build or collect the extra
 bonus. Ball-contact flip resets count as contacts even when that flag stays
 set, and the same multiplier applies to both their bonus and the aerial-touch
 bonus. Ceiling wheel contact can also earn an instantaneous flip-reset bonus
@@ -274,10 +275,10 @@ discriminator imitation reward:
 
 The goal, ordinary aerial-touch, and flip-reset bonuses are separate from
 `--reward-plus` and are not counted twice. Their new-run weights are `200`,
-`25`, and `12.5`, respectively. An aerial touch reaches at most `100` at the
-4x combo cap, while a flip reset reaches `50`; a rare controlled lift or shot
-can reach `300` *before* the rollout cap, and multiple mechanics can stack on
-one action. Relative reward strength is measured over all learner actions, not
+`75`, and `12.5`, respectively. An aerial touch reaches at most `300` at the
+4x combo cap, while a flip reset reaches `50`; a controlled lift or shot can
+also reach `300`, and multiple mechanics can stack on one action. Relative
+reward strength is measured over all learner actions, not
 by single-event peaks. Set `--aerial-touch-reward-weight 0` to pay only for
 controlled aerial touches.
 GAIFO's remaining eleven original `--reward-plus` signals include the former 50x
@@ -290,10 +291,10 @@ new-run commands rather than multiplying the physical rewards a second time.
 `--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
 flip-reset, and `--reward-plus` rewards after their component weights, but not
 imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
-new component weights. On resume, previous default aerial-touch (`12.5` or `15`),
-aerial-lift (`50` or `60`), aerial-shot (`50`), and goal (`75` or `100`)
-weights increase to `25`, `75`, `75`, and `200`, respectively; distinct custom
-weights are preserved. Other `--reward-plus` and touch/reset weights remain
+new component weights. On resume, previous default aerial-touch (`12.5`, `15`,
+or `25`), aerial-lift (`50` or `60`), aerial-shot (`50`), and goal (`75` or
+`100`) weights increase to `75`, `75`, `75`, and `200`, respectively; distinct
+custom weights are preserved. Other `--reward-plus` and touch/reset weights remain
 unchanged; retired angular-velocity and underside weights are discarded.
 Checkpoints predating boost gain or the ground setup signals keep those weights
 at zero. The physical scale is also saved and can be overridden on resume with

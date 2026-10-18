@@ -1315,12 +1315,12 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertTrue(defaults.cap_physical_rewards)
         self.assertEqual(defaults.physical_reward_scale, 1.0)
         self.assertEqual(defaults.goal_reward_weight, 200.0)
-        self.assertEqual(defaults.aerial_touch_reward_weight, 25.0)
+        self.assertEqual(defaults.aerial_touch_reward_weight, 75.0)
         self.assertEqual(defaults.flip_reset_reward_weight, 12.5)
         self.assertEqual(defaults.reward_plus_weights, asdict(RewardPlusWeights()))
         transform = build_ppo_transforms(defaults, PositionDiscriminator())[0]
         self.assertEqual((transform.goal_reward_weight, transform.aerial_touch_reward_weight,
-                          transform.flip_reset_reward_weight), (200.0, 25.0, 12.5))
+                          transform.flip_reset_reward_weight), (200.0, 75.0, 12.5))
         self.assertTrue(transform.cap_physical_rewards)
         old = asdict(RewardPlusWeights.legacy())
         self.assertEqual(defaults.reward_plus_weights, {

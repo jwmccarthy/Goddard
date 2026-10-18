@@ -410,7 +410,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             saved = load_resume_checkpoint(max(checkpoints))
             if reward_plus:
                 self.assertEqual(saved["config"]["goal_reward_weight"], 200.0)
-                self.assertEqual(saved["config"]["aerial_touch_reward_weight"], 25.0)
+                self.assertEqual(saved["config"]["aerial_touch_reward_weight"], 75.0)
                 self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_lift"], 75.0)
                 self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_shot"], 75.0)
                 self.assertNotIn("angular_velocity", saved["config"]["reward_plus_weights"])

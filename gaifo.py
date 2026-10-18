@@ -5700,8 +5700,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="scale the +/-1 goal reward per actor (default: 200; 0 disables it)",
     )
     parser.add_argument(
-        "--aerial-touch-reward-weight", type=float, default=25.0,
-        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (default: 25; 0 disables it)",
+        "--aerial-touch-reward-weight", type=float, default=75.0,
+        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (default: 75; 0 disables it)",
     )
     parser.add_argument(
         "--flip-reset-reward-weight", type=float, default=12.5,
@@ -5824,8 +5824,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("cap_physical_rewards", False)
         if inherited.get("goal_reward_weight") in (75.0, 100.0):
             inherited["goal_reward_weight"] = 200.0
-        if inherited.get("aerial_touch_reward_weight") in (12.5, 15.0):
-            inherited["aerial_touch_reward_weight"] = 25.0
+        if inherited.get("aerial_touch_reward_weight") in (12.5, 15.0, 25.0):
+            inherited["aerial_touch_reward_weight"] = 75.0
         inherited["reward_plus_weights"] = {
             "boost_gain": 0.0,  # Pre-boost-gain checkpoints keep their original rewards.
             "ground_pop": 0.0,  # Preserve rewards in pre-ground-setup checkpoints.

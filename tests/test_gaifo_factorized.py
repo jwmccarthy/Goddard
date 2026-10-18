@@ -728,7 +728,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 "ground_pop": 0.0, "air_dribble_setup": 0.0,
             })
             self.assertEqual(prior.goal_reward_weight, 200.0)
-            self.assertEqual(prior.aerial_touch_reward_weight, 25.0)
+            self.assertEqual(prior.aerial_touch_reward_weight, 75.0)
             self.assertFalse(prior.cap_physical_rewards)
             recent_config = payload["config"].copy()
             recent_config["goal_reward_weight"] = 100.0
@@ -750,7 +750,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 "aerial_lift": 75.0, "ground_pop": 0.0, "air_dribble_setup": 0.0,
             })
             self.assertEqual(recent.goal_reward_weight, 200.0)
-            self.assertEqual(recent.aerial_touch_reward_weight, 25.0)
+            self.assertEqual(recent.aerial_touch_reward_weight, 75.0)
             self.assertEqual(RewardPlusWeights(**recent.reward_plus_weights).ground_pop, 0.0)
             self.assertTrue(recent.cap_physical_rewards)
             custom_config = payload["config"].copy()
