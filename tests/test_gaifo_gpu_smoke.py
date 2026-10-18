@@ -412,7 +412,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertEqual(saved["config"]["goal_reward_weight"], 200.0)
                 self.assertEqual(saved["config"]["aerial_touch_reward_weight"], 75.0)
                 self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_lift"], 75.0)
-                self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_shot"], 75.0)
+                self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_shot"], 50.0)
                 self.assertNotIn("angular_velocity", saved["config"]["reward_plus_weights"])
             self.assertEqual(saved["config"]["recurrent_global"], recurrent_global and not transformer)
             self.assertEqual(saved["config"].get("transformer_global", False), transformer)

@@ -378,7 +378,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         legacy(physical_context(current, previous))
         old_bonus = AdvancedTouchCapture(legacy)(None)
         th.testing.assert_close(lift, old_bonus["reward_plus_aerial_lift"].view(7, 2) * 75)
-        th.testing.assert_close(shot, old_bonus["reward_plus_aerial_shot"].view(7, 2) * 75)
+        th.testing.assert_close(shot, old_bonus["reward_plus_aerial_shot"].view(7, 2) * 50)
         self.assertGreater(lift[0, 0], 0)
         self.assertEqual(lift[1, 0], 0)  # Excessive relative-speed increase removes lift.
         self.assertLess(lift[2, 0], 0)
@@ -443,7 +443,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         gameplay(physical_context(touched, initial, done=done))
         pop = capture(None)["reward_plus_ground_pop"].view(9, 2)
         self.assertGreater(pop[0, 0].item(), 0.0)
-        self.assertLess(pop[0, 0].item(), 10.0)
+        self.assertLess(pop[0, 0].item(), 25.0)
         th.testing.assert_close(pop[1:], th.zeros(8, 2))
         th.testing.assert_close(pop.sum(dim=-1), th.zeros(9))
         th.testing.assert_close(capture(None)["reward_plus_air_dribble_setup"], th.zeros(18))
@@ -467,7 +467,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             setup = capture(None)["reward_plus_air_dribble_setup"].view(9, 2)
             if step == 5:
                 self.assertGreater(setup[0, 0].item(), 0.0)
-                self.assertLess(setup[0, 0].item(), 15 / 120 * 4)
+                self.assertLess(setup[0, 0].item(), 25 / 120 * 4)
                 th.testing.assert_close(setup[0, 1], -setup[0, 0])
             else:
                 th.testing.assert_close(setup, th.zeros(9, 2))
@@ -554,7 +554,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                     gameplay(physical_context(following, following))
                     earned += capture(None)["reward_plus_air_dribble_setup"][0].item()
                 self.assertGreater(earned, 0.0)
-                self.assertLessEqual(earned, 15 * 1.5)
+                self.assertLessEqual(earned, 25 * 1.5)
                 gameplay(physical_context(following, following))
                 th.testing.assert_close(
                     capture(None)["reward_plus_air_dribble_setup"], th.zeros(2),
@@ -1326,12 +1326,15 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertEqual(defaults.reward_plus_weights, {
             **{name: weight * 50 for name, weight in old.items()
                if name not in ("boost_gain", "ground_pop", "air_dribble_setup",
-                               "aerial_lift", "aerial_shot")},
+                               "aerial_lift", "aerial_shot", "ball_ceiling",
+                               "inverted_ground")},
             "boost_gain": 12.5,
             "aerial_lift": 75.0,
-            "aerial_shot": 75.0,
-            "ground_pop": 10.0,
-            "air_dribble_setup": 15.0,
+            "aerial_shot": 50.0,
+            "ground_pop": 25.0,
+            "air_dribble_setup": 25.0,
+            "ball_ceiling": 25.0,
+            "inverted_ground": 10.0,
         })
 
 

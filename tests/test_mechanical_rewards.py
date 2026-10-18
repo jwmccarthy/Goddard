@@ -10,7 +10,7 @@ from carl.gymnasium.state import (
     BOOST_PAD_POSITIONS, CARLObservation, CarlEvents, CarlState, RewardContext,
 )
 
-from gaifo import GameplayDiagnostics
+from gaifo import GameplayDiagnostics, RewardPlusWeights
 from mechanical_rewards import MechanicalEventRewards
 from reward_spec import BALL_RADIUS, RewardSpec, RewardWeights
 
@@ -70,6 +70,11 @@ def only_weights(*enabled: str) -> RewardWeights:
 
 def gaifo_bonus(gameplay: GameplayDiagnostics, name: str, n_cars: int = 2) -> th.Tensor:
     return gameplay.last_reward_plus[f"reward_plus_{name}"].view(-1, n_cars)
+
+
+def gaifo_scale(name: str) -> float:
+    """GAIFO's component weight relative to BASIC's, for cross-checking events."""
+    return getattr(RewardPlusWeights(), name) / getattr(RewardWeights(), name)
 
 
 class MechanicalRewardTests(unittest.TestCase):
@@ -348,9 +353,9 @@ class MechanicalRewardTests(unittest.TestCase):
         gameplay(ctx)
         ceiling = gaifo_bonus(gameplay, "ball_ceiling")
         th.testing.assert_close(ceiling, th.tensor([
-            [-17.5, 17.5], [17.5, -17.5], [0.0, 0.0],
+            [-25.0, 25.0], [25.0, -25.0], [0.0, 0.0],
         ]))
-        th.testing.assert_close(basic(ctx) * 50, ceiling)
+        th.testing.assert_close(basic(ctx) * gaifo_scale("ball_ceiling"), ceiling)
         idle = context(bounced, bounced)
         gameplay(idle)
         th.testing.assert_close(basic(idle), th.zeros(3, 2))
@@ -437,9 +442,9 @@ class MechanicalRewardTests(unittest.TestCase):
                 ctx = context(roof, roof, done=done)
                 gameplay(ctx)
                 debit = gaifo_bonus(gameplay, "inverted_ground")
-                self.assertAlmostEqual(debit[0, 0].item(), -5 * frameskip / 120)
+                self.assertAlmostEqual(debit[0, 0].item(), -10 * frameskip / 120)
                 th.testing.assert_close(debit[1:], th.zeros(3, 2))
-                th.testing.assert_close(basic(ctx) * 50, debit)
+                th.testing.assert_close(basic(ctx) * gaifo_scale("inverted_ground"), debit)
                 th.testing.assert_close(gaifo_bonus(gameplay, "wasted_air"), th.zeros(4, 2))
 
     def test_wall_followup_stops_after_exactly_one_and_a_half_seconds(self):
@@ -486,7 +491,7 @@ class MechanicalRewardTests(unittest.TestCase):
                 )
                 gameplay(context(roof, roof, n_cars=n_cars))
                 scores = gaifo_bonus(gameplay, "inverted_ground", n_cars)
-                expected = -5 * 4 / 120
+                expected = -10 * 4 / 120
                 th.testing.assert_close(scores[0, :n_cars // 2], th.full(
                     (n_cars // 2,), expected,
                 ))

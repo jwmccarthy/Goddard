@@ -716,16 +716,19 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 name: weight for name, weight in args.reward_plus_weights.items()
                 if name not in ("boost_gain", "ground_pop", "air_dribble_setup")
             }
-            prior_config["reward_plus_weights"]["aerial_lift"] = 50.0
-            prior_config["reward_plus_weights"]["aerial_shot"] = 50.0
+            prior_config["reward_plus_weights"].update(
+                aerial_lift=50.0, aerial_shot=75.0, ball_ceiling=17.5,
+                inverted_ground=5.0, ground_pop=10.0, air_dribble_setup=15.0,
+            )
             with (patch("gaifo.load_resume_checkpoint",
                         return_value={"config": prior_config}),
                   patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
                 prior, _ = parse_args()
             self.assertEqual(prior.reward_plus_weights, {
                 **prior_config["reward_plus_weights"],
-                "boost_gain": 0.0, "aerial_lift": 75.0, "aerial_shot": 75.0,
-                "ground_pop": 0.0, "air_dribble_setup": 0.0,
+                "boost_gain": 0.0, "aerial_lift": 75.0, "aerial_shot": 50.0,
+                "ground_pop": 25.0, "air_dribble_setup": 25.0,
+                "ball_ceiling": 25.0, "inverted_ground": 10.0,
             })
             self.assertEqual(prior.goal_reward_weight, 200.0)
             self.assertEqual(prior.aerial_touch_reward_weight, 75.0)

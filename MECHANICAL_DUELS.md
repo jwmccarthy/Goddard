@@ -238,15 +238,15 @@ discriminator imitation reward:
   Downward velocity changes are charged; repeated contact without improvement
   pays nothing. Distinct airborne touches use the same combo multiplier.
 - A solo aerial touch above the crossbar pays for improving the ball's
-  goalward velocity and aim at the opponent's goal (up to `75`), and charges a
+  goalward velocity and aim at the opponent's goal (up to `50`), and charges a
   touch that spoils a good shot. Its signed change also uses the combo multiplier.
-- A fresh solo touch started from the floor pays up to `10` for popping a
+- A fresh solo touch started from the floor pays up to `25` for popping a
   low ball toward a reachable air-dribble position. Its upward velocity must
   increase by more than 300 units/s, with a projected peak above three ball
   radii; the ball must stay close, ahead of the car, and below 1,200 units/s
   relative speed. Wall touches, held contacts, and wild clears do not qualify.
-  For up to 1.5 seconds afterward, following the ball while airborne earns up
-  to `15` per second when it stays above the car, within 400 units and at a
+  For up to 1.5 seconds afterward, following the ball while airborne earns
+  up to `25` per second when it stays above the car, within 400 units and at a
   controllable relative speed. Another player's touch, a grounded ball,
   demolition, or episode end stops the follow-up. A stationary ground dribble
   earns no continuing bonus.
@@ -262,7 +262,7 @@ discriminator imitation reward:
   time spent airborne, plus up to `15` for boost spent in the air beyond eight
   boost units. Each debit occurs once when the flight ends; low wavedash hops
   earn no height debit, and touching the ball during the flight avoids both.
-- A ball bounced off the arena ceiling charges `17.5` to its last toucher(s)
+- A ball bounced off the arena ceiling charges `25` to its last toucher(s)
   within the preceding two seconds. The velocity reversal detects bounces
   between policy decisions without charging an ordinary high-ball apex.
 - A solo, goalward wall touch pays up to `10` when the car has wheel contact
@@ -271,13 +271,13 @@ discriminator imitation reward:
   units of the goalward-moving ball pays up to `15` per second; another
   player's touch ends that follow-up. Wild pinches cannot start it.
 - An upside-down car resting low on the floor with little vertical motion is
-  charged `5` per second. Passing overhead without floor contact is exempt.
+  charged `10` per second. Passing overhead without floor contact is exempt.
 
 The goal, ordinary aerial-touch, and flip-reset bonuses are separate from
 `--reward-plus` and are not counted twice. Their new-run weights are `200`,
 `75`, and `12.5`, respectively. An aerial touch reaches at most `300` at the
-4x combo cap, while a flip reset reaches `50`; a controlled lift or shot can
-also reach `300`, and multiple mechanics can stack on one action. Relative
+4x combo cap, while a flip reset reaches `50`; a controlled lift reaches `300`
+and a shot `200`, and multiple mechanics can stack on one action. Relative
 reward strength is measured over all learner actions, not
 by single-event peaks. Set `--aerial-touch-reward-weight 0` to pay only for
 controlled aerial touches.
@@ -291,11 +291,13 @@ new-run commands rather than multiplying the physical rewards a second time.
 `--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
 flip-reset, and `--reward-plus` rewards after their component weights, but not
 imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
-new component weights. On resume, previous default aerial-touch (`12.5`, `15`,
-or `25`), aerial-lift (`50` or `60`), aerial-shot (`50`), and goal (`75` or
-`100`) weights increase to `75`, `75`, `75`, and `200`, respectively; distinct
-custom weights are preserved. Other `--reward-plus` and touch/reset weights remain
-unchanged; retired angular-velocity and underside weights are discarded.
+new component weights. On resume, previous default values are raised to the
+current defaults: aerial-touch (`12.5`, `15`, or `25`) to `75`, aerial-lift
+(`50` or `60`) to `75`, aerial-shot (`75`) to `50`, goal (`75` or `100`) to
+`200`, ground-pop (`10`) to `25`, air-dribble-setup (`15`) to `25`,
+ball-ceiling (`17.5`) to `25`, and inverted-ground (`5`) to `10`; distinct
+custom weights are preserved. Other `--reward-plus` and touch/reset weights
+remain unchanged; retired angular-velocity and underside weights are discarded.
 Checkpoints predating boost gain or the ground setup signals keep those weights
 at zero. The physical scale is also saved and can be overridden on resume with
 an explicit value (and a new `--timesteps` total above the saved step).

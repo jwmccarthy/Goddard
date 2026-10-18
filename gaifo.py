@@ -170,17 +170,17 @@ class RewardPlusWeights:
     boost_free_speed_progress: float = 25.0
     boost_gain: float = 12.5
     aerial_lift: float = 75.0
-    aerial_shot: float = 75.0
-    ground_pop: float = 10.0
-    air_dribble_setup: float = 15.0
+    aerial_shot: float = 50.0
+    ground_pop: float = 25.0
+    air_dribble_setup: float = 25.0
     kickoff_speed: float = 25.0
     kickoff: float = 25.0
     wasted_air: float = 10.0
     wasted_boost: float = 15.0
-    ball_ceiling: float = 17.5
+    ball_ceiling: float = 25.0
     wall_touch: float = 10.0
     wall_control: float = 15.0
-    inverted_ground: float = 5.0
+    inverted_ground: float = 10.0
 
     @classmethod
     def legacy(cls) -> "RewardPlusWeights":
@@ -5838,8 +5838,20 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited["reward_plus_weights"].pop("angular_velocity", None)
         if inherited["reward_plus_weights"].get("aerial_lift") in (50.0, 60.0):
             inherited["reward_plus_weights"]["aerial_lift"] = RewardPlusWeights().aerial_lift
-        if inherited["reward_plus_weights"].get("aerial_shot") == 50.0:
+        if inherited["reward_plus_weights"].get("aerial_shot") == 75.0:
             inherited["reward_plus_weights"]["aerial_shot"] = RewardPlusWeights().aerial_shot
+        if inherited["reward_plus_weights"].get("ground_pop") == 10.0:
+            inherited["reward_plus_weights"]["ground_pop"] = RewardPlusWeights().ground_pop
+        if inherited["reward_plus_weights"].get("air_dribble_setup") == 15.0:
+            inherited["reward_plus_weights"]["air_dribble_setup"] = (
+                RewardPlusWeights().air_dribble_setup
+            )
+        if inherited["reward_plus_weights"].get("ball_ceiling") == 17.5:
+            inherited["reward_plus_weights"]["ball_ceiling"] = RewardPlusWeights().ball_ceiling
+        if inherited["reward_plus_weights"].get("inverted_ground") == 5.0:
+            inherited["reward_plus_weights"]["inverted_ground"] = (
+                RewardPlusWeights().inverted_ground
+            )
         parser.set_defaults(**inherited)
     else:
         parser.set_defaults(reward_plus_weights=asdict(RewardPlusWeights()))
