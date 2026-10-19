@@ -413,6 +413,51 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertGreater(lift[2, 0], lift[3, 0])
         th.testing.assert_close(lift.sum(-1), th.zeros(4))
 
+    def test_reward_plus_aerial_lift_prefers_the_ball_popping_off_the_car(self):
+        current = physical_state(2)
+        current[:, 2] = 800.0
+        cars = current[:, 9:53].view(2, 2, 22)
+        cars[:, 0, 2] = 650.0
+        cars[:, 0, 16] = 0.0  # Airborne.
+        cars[:, 0, 21] = 1.0  # Solo touch.
+        cars[:, 0, 4:6] = th.tensor([600.0, 300.0])  # Car velocity.
+        current[:, 4:6] = th.tensor([600.0, 300.0])  # Glued to the car.
+        current[1, 4] = 900.0  # Pops ahead of the car.
+        previous = current.clone()
+        previous[:, 4:6] = th.tensor([600.0, 0.0])
+
+        gameplay = GameplayDiagnostics(2, th.device("cpu"), 900, reward_plus=True)
+        gameplay(physical_context(current, previous))
+        lift = AdvancedTouchCapture(gameplay)(None)["reward_plus_aerial_lift"].view(2, 2)
+        self.assertGreater(lift[0, 0].item(), 0.0)
+        th.testing.assert_close(lift[1, 0], 2 * lift[0, 0])
+        th.testing.assert_close(lift.sum(dim=-1), th.zeros(2))
+
+    def test_reward_plus_angular_velocity_pays_only_while_airborne(self):
+        current = physical_state(6)
+        cars = current[:, 9:53].view(6, 2, 22)
+        cars[:, 0, 16] = 0.0  # Airborne.
+        cars[:, 0, 6] = 5.5   # Full angular speed.
+        cars[1, 0, 6] = 2.75
+        cars[2, 0, 6] = 11.0  # Bound unrealistic rotation.
+        cars[3, 0, 16] = 1.0  # Grounded spinning cannot pay.
+        cars[4, 0, 6] = 0.0   # No rotation.
+        cars[5, 0, 17] = 1.0  # Demolished.
+        previous = current.clone()
+        done = th.zeros(6, dtype=th.bool)
+        for frameskip in (4, 8):
+            with self.subTest(frameskip=frameskip):
+                gameplay = GameplayDiagnostics(6, th.device("cpu"), 900,
+                                               reward_plus=True, frameskip=frameskip)
+                gameplay(physical_context(current, previous, done=done))
+                angular = AdvancedTouchCapture(gameplay)(None)[
+                    "reward_plus_angular_velocity"
+                ].view(6, 2)
+                expected = th.zeros_like(angular)
+                expected[:3, 0] = th.tensor([5.0, 2.5, 5.0]) * frameskip / 120
+                expected[:3, 1] = -expected[:3, 0]
+                th.testing.assert_close(angular, expected)
+
     def test_ground_pop_needs_a_controlled_new_touch_and_air_dribble_setup(self):
         initial = physical_state(9)
         initial[:, 1] = 170.0
@@ -840,7 +885,8 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         })
         options = dict(noise_std=0, trajectory_length=2, exp_log_odds_reward=True,
                        goal_reward_weight=3, aerial_touch_reward_weight=.5,
-                       flip_reset_reward_weight=1, reward_plus=True)
+                       flip_reset_reward_weight=1, reward_plus=True,
+                       discriminator_reward_scale=1)
         baseline = SceneDiscriminatorReward(PositionDiscriminator(), **options)(
             batch, PrepareContext(),
         )
@@ -886,6 +932,37 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                     PositionDiscriminator(), **options, physical_reward_scale=invalid,
                 )
 
+    def test_discriminator_reward_scale_defaults_to_double_the_imitation(self):
+        windows = th.zeros(1, 2, 2, 51)
+        windows[0, 1, -1, 0] = math.log(2)
+        batch = TensorBatch({
+            "observation": th.zeros(1, 2, 51),
+            "scene_window": windows,
+            "scene_window_valid": th.ones(1, 2, dtype=th.bool),
+            "reward": th.zeros(1, 2),
+        })
+        raw = SceneDiscriminatorReward(
+            PositionDiscriminator(), noise_std=0, trajectory_length=2,
+            discriminator_reward_scale=1,
+        )(batch, PrepareContext())
+        scaled = SceneDiscriminatorReward(
+            PositionDiscriminator(), noise_std=0, trajectory_length=2,
+        )(batch, PrepareContext())
+        th.testing.assert_close(
+            scaled["imitation_reward"], 2 * raw["imitation_reward"],
+        )
+        th.testing.assert_close(
+            scaled["training_reward"], 2 * raw["training_reward"],
+        )
+        for invalid in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "discriminator reward scale must be finite and positive",
+            ):
+                SceneDiscriminatorReward(
+                    PositionDiscriminator(), noise_std=0, trajectory_length=2,
+                    discriminator_reward_scale=invalid,
+                )
+
     def test_reward_plus_rms_separates_canceling_components_on_learner_actions(self):
         components = {name: th.zeros(1, 4) for name in REWARD_PLUS_COMPONENTS}
         components["reward_plus_speed"] = th.tensor([[.5, -100., -.5, 100.]])
@@ -901,6 +978,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         transform = SceneDiscriminatorReward(
             ZeroDiscriminator(), noise_std=0, trajectory_length=2,
             exp_log_odds_reward=True, reward_plus=True, physical_reward_scale=2,
+            discriminator_reward_scale=1,
         )
         result = transform(batch, PrepareContext())
         th.testing.assert_close(result["reward_plus_reward"], th.zeros(1, 4))
@@ -932,6 +1010,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                     ZeroDiscriminator(), noise_std=0, trajectory_length=2,
                     exp_log_odds_reward=True, reward_plus=True,
                     goal_reward_weight=75, cap_physical_rewards=True,
+                    discriminator_reward_scale=1,
                 )
                 result = transform(batch.replace_fields(
                     reward_plus_wall_touch=opposite,
@@ -960,7 +1039,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
             ZeroDiscriminator(), noise_std=0, trajectory_length=2,
             exp_log_odds_reward=True, reward_plus=True,
             aerial_touch_reward_weight=1, flip_reset_reward_weight=1,
-            cap_physical_rewards=True,
+            cap_physical_rewards=True, discriminator_reward_scale=1,
         )
         transform(batch.with_fields(
             aerial_touch_score=-components["reward_plus_speed"],
@@ -978,7 +1057,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         transform = SceneDiscriminatorReward(
             ZeroDiscriminator(), noise_std=0, trajectory_length=2,
             exp_log_odds_reward=True, reward_plus=True, goal_reward_weight=75,
-            cap_physical_rewards=True,
+            cap_physical_rewards=True, discriminator_reward_scale=1,
         )
         result = transform(empty, PrepareContext())
         th.testing.assert_close(result["training_reward"], empty["reward"] * 75)
@@ -1018,7 +1097,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         })
         reward = SceneDiscriminatorReward(
             PositionDiscriminator(), noise_std=0.0, trajectory_length=2,
-            batch_size=1,
+            batch_size=1, discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(
             reward["imitation_reward"], th.tensor([[1.0, 0.0, -1.0, 0.0]])
@@ -1031,7 +1110,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         masked = batch.with_fields(learner_mask=th.tensor([[True, False, True, False]]))
         replayed = SceneDiscriminatorReward(
             PositionDiscriminator(), noise_std=0.0, trajectory_length=2,
-            batch_size=1,
+            batch_size=1, discriminator_reward_scale=1,
         )(masked, PrepareContext())
         th.testing.assert_close(replayed["learner_mask"], masked["learner_mask"])
         self.assertNotIn("long_imitation_reward", reward)
@@ -1050,6 +1129,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         result = SceneDiscriminatorReward(
             PositionDiscriminator(), noise_std=0, trajectory_length=2,
             batch_size=2, max_magnitude=10.0, exp_log_odds_reward=True,
+            discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(
             result["imitation_reward"], th.tensor([[1.0, 0.5, 2.0, 10.0, 0.0]]),
@@ -1072,7 +1152,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         })
         short = SceneDiscriminatorReward(
             PositionDiscriminator(), noise_std=0, trajectory_length=2,
-            exp_log_odds_reward=True,
+            exp_log_odds_reward=True, discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(short["imitation_reward"], th.tensor([[.25, .5, 0., 0.]]))
         th.testing.assert_close(short["training_reward"], th.tensor([[.25, .5, 2., 0.]]))
@@ -1097,13 +1177,13 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
 
         global_only = SceneDiscriminatorReward(
             ConstantRecurrent(), noise_std=0, trajectory_length=2,
-            exp_log_odds_reward=True,
+            exp_log_odds_reward=True, discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(global_only["imitation_reward"], th.tensor([[1., 1., 0., 0.]]))
 
         combined = SceneDiscriminatorReward(
             FactorizedRecurrent(), noise_std=0, trajectory_length=2,
-            exp_log_odds_reward=True,
+            exp_log_odds_reward=True, discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(combined["near_imitation_reward"],
                                 th.tensor([[.125, .5, 0., 0.]]))
@@ -1121,6 +1201,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
 
         transformer = SceneDiscriminatorReward(
             ConstantTransformer(), noise_std=0, trajectory_length=2,
+            discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(transformer["imitation_reward"],
                                 th.tensor([[-1., -1., 0., 0.]]))
@@ -1150,7 +1231,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                     PositionDiscriminator(), noise_std=0, trajectory_length=2,
                     exp_log_odds_reward=True, frameskip=frameskip,
                     goal_reward_weight=3, aerial_touch_reward_weight=.5,
-                    flip_reset_reward_weight=1,
+                    flip_reset_reward_weight=1, discriminator_reward_scale=1,
                 )(batch, PrepareContext())
                 th.testing.assert_close(result["imitation_reward"],
                                         th.tensor([[.25 * scale, .5 * scale]]))
@@ -1174,7 +1255,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                 delta = SceneDiscriminatorReward(
                     PositionDiscriminator(), noise_std=0, trajectory_length=2,
                     exp_log_odds_reward=True, differential=True,
-                    gamma=.9, frameskip=frameskip,
+                    gamma=.9, frameskip=frameskip, discriminator_reward_scale=1,
                 )(changed_batch, PrepareContext())
                 self.assertAlmostEqual(
                     float(delta["imitation_reward"][0, 0]),
@@ -1215,6 +1296,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
                 output = SceneDiscriminatorReward(
                     FactorizedTransformer(), noise_std=0, trajectory_length=2,
                     exp_log_odds_reward=True, frameskip=frameskip,
+                    discriminator_reward_scale=1,
                 )(batch, PrepareContext())
                 th.testing.assert_close(output["near_imitation_reward"],
                                         th.full((1, 2), .5 * frameskip / 4))
@@ -1298,8 +1380,13 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertEqual(args.aerial_touch_reward_weight, 0.25)
         self.assertEqual(args.flip_reset_reward_weight, 2.0)
         self.assertEqual(args.physical_reward_scale, 3.0)
+        self.assertEqual(args.discriminator_reward_scale, 2.0)
         self.assertEqual(
             build_ppo_transforms(args, PositionDiscriminator())[0].physical_reward_scale, 3.0,
+        )
+        self.assertEqual(
+            build_ppo_transforms(args, PositionDiscriminator())[0].discriminator_reward_scale,
+            2.0,
         )
         self.assertTrue(args.exp_log_odds_reward)
         self.assertTrue(args.recency_replay)
@@ -1314,6 +1401,7 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertFalse(defaults.reward_plus)
         self.assertTrue(defaults.cap_physical_rewards)
         self.assertEqual(defaults.physical_reward_scale, 1.0)
+        self.assertEqual(defaults.discriminator_reward_scale, 2.0)
         self.assertEqual(defaults.goal_reward_weight, 200.0)
         self.assertEqual(defaults.aerial_touch_reward_weight, 75.0)
         self.assertEqual(defaults.flip_reset_reward_weight, 12.5)
@@ -1326,11 +1414,12 @@ class AdvancedGAIFORewardTests(unittest.TestCase):
         self.assertEqual(defaults.reward_plus_weights, {
             **{name: weight * 50 for name, weight in old.items()
                if name not in ("boost_gain", "ground_pop", "air_dribble_setup",
-                               "aerial_lift", "aerial_shot", "ball_ceiling",
-                               "inverted_ground")},
+                               "aerial_lift", "aerial_shot", "angular_velocity",
+                               "ball_ceiling", "inverted_ground")},
             "boost_gain": 12.5,
             "aerial_lift": 75.0,
             "aerial_shot": 50.0,
+            "angular_velocity": 5.0,
             "ground_pop": 25.0,
             "air_dribble_setup": 25.0,
             "ball_ceiling": 25.0,

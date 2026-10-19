@@ -216,7 +216,7 @@ combo multiplier. Floor or wall contact, an upside-down floor landing,
 demolition, or an episode end resets the streak; wheel contact with the ball or
 ceiling does not.
 
-`--reward-plus` adds fourteen bounded, zero-sum team signals alongside the
+`--reward-plus` adds fifteen bounded, zero-sum team signals alongside the
 discriminator imitation reward:
 
 - Signed speed change pays `12.5` per normalized speed gained, plus `25` when
@@ -233,13 +233,19 @@ discriminator imitation reward:
   and ended episodes cannot earn a refill bonus; merely holding boost pays
   nothing.
 - A solo aerial touch pays up to `75` for increasing the ball's upward velocity,
-  scaled by ball height. A hard increase in ball-to-car relative speed reduces
-  the bonus only once the ball moves faster than 1.5 times the car's speed.
-  Downward velocity changes are charged; repeated contact without improvement
-  pays nothing. Distinct airborne touches use the same combo multiplier.
+  scaled by ball height. It prefers a ball that pops off the car over one glued
+  to the car's velocity: a ball separating at `300` units/s or more earns full
+  credit while a perfectly matched ball earns half. A hard increase in
+  ball-to-car relative speed reduces the bonus only once the ball moves faster
+  than 1.5 times the car's speed. Downward velocity changes are charged;
+  repeated contact without improvement pays nothing. Distinct airborne touches
+  use the same combo multiplier.
 - A solo aerial touch above the crossbar pays for improving the ball's
   goalward velocity and aim at the opponent's goal (up to `50`), and charges a
   touch that spoils a good shot. Its signed change also uses the combo multiplier.
+- While the car is airborne, angular speed earns up to `5` per second at
+  `5.5` radians/s, scaled by the physics frame skip. Grounded cars, stopped
+  rotation, and demolitions earn nothing, so it cannot reward spinning in place.
 - A fresh solo touch started from the floor pays up to `25` for popping a
   low ball toward a reachable air-dribble position. Its upward velocity must
   increase by more than 300 units/s, with a projected peak above three ball
@@ -288,6 +294,8 @@ are unchanged.
 `--reward-plus` remains opt-in. Remove `--physical-reward-scale 50` from
 new-run commands rather than multiplying the physical rewards a second time.
 
+`--discriminator-reward-scale` defaults to `2`, multiplying the discriminator
+imitation reward so it outweighs the goal and physical rewards by default.
 `--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
 flip-reset, and `--reward-plus` rewards after their component weights, but not
 imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
@@ -297,17 +305,19 @@ current defaults: aerial-touch (`12.5`, `15`, or `25`) to `75`, aerial-lift
 `200`, ground-pop (`10`) to `25`, air-dribble-setup (`15`) to `25`,
 ball-ceiling (`17.5`) to `25`, and inverted-ground (`5`) to `10`; distinct
 custom weights are preserved. Other `--reward-plus` and touch/reset weights
-remain unchanged; retired angular-velocity and underside weights are discarded.
+remain unchanged; the retired underside weight is discarded.
 Checkpoints predating boost gain or the ground setup signals keep those weights
-at zero. The physical scale is also saved and can be overridden on resume with
-an explicit value (and a new `--timesteps` total above the saved step).
+at zero. The physical and discriminator scales are also saved and can be
+overridden on resume with explicit values (and a new `--timesteps` total above
+the saved step).
 New runs enable `--cap-physical-rewards`: after weighting, GAIFO compares the
 per-rollout RMS of imitation with each zero-sum physical signal, the
 `reward_plus` subtotal, **and their combined reward**, counting learner actions
 only. When any physical RMS is larger, a shared multiplier reduces all physical
-signals so none exceeds imitation's RMS. It preserves their relative strengths
-and team zero-sum; goals are exempt. If a rollout has no style reward, it pays
-no physical reward.
+signals so none exceeds the unscaled imitation RMS, keeping the discriminator
+about `--discriminator-reward-scale` times stronger. It preserves their relative
+strengths and team zero-sum; goals are exempt. If a rollout has no style reward,
+it pays no physical reward.
 The multiplier can vary as the discriminator and policy learn. Disable with
 `--cap-physical-rewards false` if desired; older checkpoints inherit the
 uncapped setting unless explicitly enabled on resume.
@@ -322,7 +332,7 @@ sparse touches/resets are not overstated by peak bonuses alone.
 `--reward-plus` is off by default and is stored in GAIFO checkpoints;
 on resume, explicitly pass `--reward-plus` or `--reward-plus false` to override.
 When enabled, TensorBoard logs their signed, weighted per-car means under
-`RewardSpec/component/{speed,boost_gain,aerial_lift,aerial_shot,ground_pop,air_dribble_setup,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
+`RewardSpec/component/{speed,boost_gain,aerial_lift,aerial_shot,angular_velocity,ground_pop,air_dribble_setup,kickoff_speed,kickoff,wasted_air,wasted_boost,ball_ceiling,wall_touch,wall_control,inverted_ground}`
 and their sum under `RewardSpec/aggregate/reward_plus`. Those means precede the
 zero-sum team difference; `RewardSpec/scale/reward_plus` logs the RMS of the
 combined zero-sum bonus *before* `--physical-reward-scale` and the rollout cap.

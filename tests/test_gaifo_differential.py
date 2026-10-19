@@ -122,6 +122,7 @@ class DifferentialRewardTests(unittest.TestCase):
         reward = SceneDiscriminatorReward(
             CoordinateHeads(), noise_std=0, trajectory_length=2,
             differential=True, exp_log_odds_reward=True, max_magnitude=10, gamma=0.9,
+            discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(reward["far_imitation_reward"], th.tensor([[0., -0.2]]))
         th.testing.assert_close(reward["near_imitation_reward"], th.tensor([[0.275, 0.]]))

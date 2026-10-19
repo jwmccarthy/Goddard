@@ -370,8 +370,8 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 events.Reload()
                 for name in (
                     "component/speed", "component/boost_gain", "component/aerial_lift",
-                    "component/aerial_shot", "component/ground_pop",
-                    "component/air_dribble_setup",
+                    "component/aerial_shot", "component/angular_velocity",
+                    "component/ground_pop", "component/air_dribble_setup",
                     "component/kickoff_speed", "component/kickoff",
                     "component/wasted_air", "component/wasted_boost",
                     "component/ball_ceiling", "component/wall_touch",
@@ -382,7 +382,6 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                     self.assertIn(tag, events.Tags()["scalars"])
                     self.assertTrue(events.Scalars(tag))
                 self.assertNotIn("RewardSpec/component/underside", events.Tags()["scalars"])
-                self.assertNotIn("RewardSpec/component/angular_velocity", events.Tags()["scalars"])
                 self.assertNotIn("RewardSpec/rms/reward_plus_underside",
                                  events.Tags()["scalars"])
                 for name in ("imitation", "physical", "aerial_touch", "flip_reset",
@@ -413,7 +412,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertEqual(saved["config"]["aerial_touch_reward_weight"], 75.0)
                 self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_lift"], 75.0)
                 self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_shot"], 50.0)
-                self.assertNotIn("angular_velocity", saved["config"]["reward_plus_weights"])
+                self.assertEqual(saved["config"]["reward_plus_weights"]["angular_velocity"], 5.0)
             self.assertEqual(saved["config"]["recurrent_global"], recurrent_global and not transformer)
             self.assertEqual(saved["config"].get("transformer_global", False), transformer)
             self.assertTrue(saved["config"]["flip_state_features"])

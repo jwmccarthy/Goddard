@@ -97,6 +97,8 @@ BALL_RADIUS = 91.25
 GOAL_Y = 5124.25
 GOAL_HEIGHT = 642.775
 CAR_MAX_SPEED = 2300.0
+CAR_MAX_ANG_SPEED = 5.5
+AERIAL_POP_SPEED = 300.0
 INTERNAL_BOOL_INDICES = (0, 2, 3, 4, 5, 7, 8, 9, 11, 17)
 BALL_NEAR_DISTANCE = 1_500.0
 BALL_CLOSE_DISTANCE = 350.0
@@ -149,6 +151,7 @@ REWARD_PLUS_COMPONENTS = (
     "reward_plus_boost_gain",
     "reward_plus_aerial_lift",
     "reward_plus_aerial_shot",
+    "reward_plus_angular_velocity",
     "reward_plus_ground_pop",
     "reward_plus_air_dribble_setup",
     "reward_plus_kickoff_speed",
@@ -171,6 +174,7 @@ class RewardPlusWeights:
     boost_gain: float = 12.5
     aerial_lift: float = 75.0
     aerial_shot: float = 50.0
+    angular_velocity: float = 5.0
     ground_pop: float = 25.0
     air_dribble_setup: float = 25.0
     kickoff_speed: float = 25.0
@@ -187,7 +191,7 @@ class RewardPlusWeights:
         """Restore the weights used before component defaults were raised."""
         return cls(
             speed_progress=0.25, boost_free_speed_progress=0.5, boost_gain=0.0,
-            aerial_lift=1.0, aerial_shot=1.0, ground_pop=0.0,
+            aerial_lift=1.0, aerial_shot=1.0, angular_velocity=0.0, ground_pop=0.0,
             air_dribble_setup=0.0,
             kickoff_speed=0.5, kickoff=0.5, wasted_air=0.2,
             wasted_boost=0.3, ball_ceiling=0.35, wall_touch=0.2,
@@ -1141,6 +1145,14 @@ class RewardPlus:
             boost_level - previous_boost_level
         ).clamp_min(0.0)
 
+        # A small per-second incentive to rotate while airborne; grounded cars
+        # and demos earn nothing, so it cannot reward spinning in place.
+        angular_velocity = (
+            valid & ~current.car_on_ground
+        ) * (current.car_angular_velocity.norm(dim=-1) / CAR_MAX_ANG_SPEED).clamp(
+            0.0, 1.0,
+        ) * (self.frameskip / TICKS_PER_SECOND)
+
         touches = current.car_ball_touches
         solo_touch = touches & touches.sum(dim=-1, keepdim=True).eq(1)
         aerial = (
@@ -1163,10 +1175,16 @@ class RewardPlus:
         control = (
             1.0 - th.minimum(relative_change, excess_ball_speed) / 1200.0
         ).clamp(0.0, 1.0)
+        # Prefer a ball that pops off the car over one glued to the car's
+        # velocity: a modest separation earns full credit, a matching ball half.
+        separation = (
+            current.ball_velocity[:, None, :] - current.car_velocity
+        ).norm(dim=-1)
+        pop = 0.5 + 0.5 * (separation / AERIAL_POP_SPEED).clamp(0.0, 1.0)
         # Touches that send the ball far ahead lose lift credit; lowering it still costs.
         lift = aerial * height * (
             upward_change.clamp_max(0.0)
-            + upward_change.clamp_min(0.0) * control
+            + upward_change.clamp_min(0.0) * control * pop
             * current.ball_velocity[:, None, 2].gt(0.0)
         )
 
@@ -1191,6 +1209,9 @@ class RewardPlus:
             "reward_plus_boost_gain": boost_gain,
             "reward_plus_aerial_lift": self.weights.aerial_lift * lift * combo,
             "reward_plus_aerial_shot": self.weights.aerial_shot * aerial_shot * combo,
+            "reward_plus_angular_velocity": (
+                self.weights.angular_velocity * angular_velocity
+            ),
             "reward_plus_ground_pop": self.weights.ground_pop * ground_pop,
             "reward_plus_air_dribble_setup": (
                 self.weights.air_dribble_setup * air_dribble_setup
@@ -4359,6 +4380,7 @@ class SceneDiscriminatorReward:
         frameskip: int = REFERENCE_FRAMESKIP,
         reward_plus: bool = False,
         physical_reward_scale: float = 1.0,
+        discriminator_reward_scale: float = 2.0,
         cap_physical_rewards: bool = False,
     ) -> None:
         if batch_size < 1:
@@ -4373,6 +4395,11 @@ class SceneDiscriminatorReward:
             raise ValueError("flip reset reward weight must be non-negative")
         if not math.isfinite(physical_reward_scale) or physical_reward_scale < 0.0:
             raise ValueError("physical reward scale must be finite and non-negative")
+        if (
+            not math.isfinite(discriminator_reward_scale)
+            or discriminator_reward_scale <= 0.0
+        ):
+            raise ValueError("discriminator reward scale must be finite and positive")
         if context_length < 1:
             raise ValueError("recurrent context length must be positive")
         if not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
@@ -4394,6 +4421,7 @@ class SceneDiscriminatorReward:
         self.flip_reset_reward_weight = flip_reset_reward_weight
         self.reward_plus = reward_plus
         self.physical_reward_scale = physical_reward_scale
+        self.discriminator_reward_scale = discriminator_reward_scale
         self.cap_physical_rewards = cap_physical_rewards
         self.batch_size = batch_size
         self.max_magnitude = max_magnitude
@@ -4699,6 +4727,8 @@ class SceneDiscriminatorReward:
                 scores[..., :2] *= self.state_reward_scale
             elif not self.transformer_global:
                 scores *= self.state_reward_scale
+        # Weight the discriminator against the goal and physical shaping.
+        scores = scores * self.discriminator_reward_scale
         components = {}
         if self.factorize:
             far_reward = SPECIALIST_DISCRIMINATOR_WEIGHT * scores[..., 0]
@@ -4752,9 +4782,13 @@ class SceneDiscriminatorReward:
                     physical_reward,
                 )
             ]).amax()
+            # The discriminator is scaled up, so cap physics at its unscaled RMS
+            # to keep the discriminator about that many times stronger.
             cap = th.where(
                 largest_physical > 0,
-                (learner_rms(imitation_reward) / largest_physical.clamp_min(1e-12)).clamp(max=1),
+                (learner_rms(imitation_reward)
+                 / self.discriminator_reward_scale
+                 / largest_physical.clamp_min(1e-12)).clamp(max=1),
                 th.ones_like(largest_physical),
             )
             aerial_touch_reward = aerial_touch_reward * cap
@@ -5711,6 +5745,10 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         "--physical-reward-scale", type=float, default=1.0,
         help="multiply aerial-touch, flip-reset, and --reward-plus bonuses after their individual weights (default: 1; not goals or imitation)",
     )
+    parser.add_argument(
+        "--discriminator-reward-scale", type=float, default=2.0,
+        help="scale the discriminator imitation reward relative to the goal and physical rewards (default: 2)",
+    )
     parser.add_argument("--expert-frame-limit", type=int, default=None)
     parser.add_argument("--replay-reset-fraction", type=float, default=None)
     parser.add_argument("--discriminator-noise", type=float, default=0.01)
@@ -5826,16 +5864,18 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
             inherited["goal_reward_weight"] = 200.0
         if inherited.get("aerial_touch_reward_weight") in (12.5, 15.0, 25.0):
             inherited["aerial_touch_reward_weight"] = 75.0
+        saved_weights = resume["config"].get("reward_plus_weights")
+        if saved_weights is None:
+            saved_weights = asdict(RewardPlusWeights.legacy())
+            saved_weights.pop("angular_velocity", None)
         inherited["reward_plus_weights"] = {
             "boost_gain": 0.0,  # Pre-boost-gain checkpoints keep their original rewards.
+            "angular_velocity": RewardPlusWeights().angular_velocity,
             "ground_pop": 0.0,  # Preserve rewards in pre-ground-setup checkpoints.
             "air_dribble_setup": 0.0,
-            **resume["config"].get(
-                "reward_plus_weights", asdict(RewardPlusWeights.legacy()),
-            ),
+            **saved_weights,
         }
         inherited["reward_plus_weights"].pop("underside", None)
-        inherited["reward_plus_weights"].pop("angular_velocity", None)
         if inherited["reward_plus_weights"].get("aerial_lift") in (50.0, 60.0):
             inherited["reward_plus_weights"]["aerial_lift"] = RewardPlusWeights().aerial_lift
         if inherited["reward_plus_weights"].get("aerial_shot") == 75.0:
@@ -6028,6 +6068,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--flip-reset-reward-weight must be finite and non-negative")
     if not math.isfinite(args.physical_reward_scale) or args.physical_reward_scale < 0.0:
         raise ValueError("--physical-reward-scale must be finite and non-negative")
+    if (
+        not math.isfinite(args.discriminator_reward_scale)
+        or args.discriminator_reward_scale <= 0.0
+    ):
+        raise ValueError("--discriminator-reward-scale must be finite and positive")
     if args.history_add_size > args.history_capacity:
         raise ValueError(
             "--history-add-size must not exceed --history-capacity"
@@ -6383,6 +6428,7 @@ def build_ppo_transforms(
             frameskip=args.frameskip,
             reward_plus=getattr(args, "reward_plus", False),
             physical_reward_scale=args.physical_reward_scale,
+            discriminator_reward_scale=args.discriminator_reward_scale,
             cap_physical_rewards=getattr(args, "cap_physical_rewards", False),
         ),
         GAE(

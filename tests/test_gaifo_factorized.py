@@ -355,7 +355,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
         })
         result = SceneDiscriminatorReward(
             CoordinateHeads(), noise_std=0, trajectory_length=2,
-            batch_size=2,
+            batch_size=2, discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(result["far_imitation_reward"][0, :4],
                                 th.tensor([0., 0.5, 0., -0.5]))
@@ -394,7 +394,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
         })
         result = SceneDiscriminatorReward(
             CoordinateHeads(), noise_std=0, trajectory_length=2,
-            differential=True,
+            differential=True, discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(result["far_imitation_reward"], th.tensor([[0., 1.5]]))
         th.testing.assert_close(result["near_imitation_reward"], th.tensor([[1., 0.]]))
@@ -415,7 +415,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
         })
         result = SceneDiscriminatorReward(
             CoordinateHeads(), noise_std=0, trajectory_length=2,
-            exp_log_odds_reward=True,
+            exp_log_odds_reward=True, discriminator_reward_scale=1,
         )(batch, PrepareContext())
         th.testing.assert_close(result["far_imitation_reward"], th.tensor([[0., 0.25]]))
         th.testing.assert_close(result["near_imitation_reward"], th.tensor([[1., 0.]]))
@@ -749,7 +749,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 recent, _ = parse_args()
             self.assertEqual(recent.reward_plus_weights, {
                 **{name: weight for name, weight in recent_config["reward_plus_weights"].items()
-                   if name not in ("underside", "angular_velocity", "aerial_lift")},
+                   if name not in ("underside", "aerial_lift")},
                 "aerial_lift": 75.0, "ground_pop": 0.0, "air_dribble_setup": 0.0,
             })
             self.assertEqual(recent.goal_reward_weight, 200.0)
@@ -769,10 +769,7 @@ class FactorizedGAIFOTests(unittest.TestCase):
                 custom, _ = parse_args()
             self.assertEqual(custom.goal_reward_weight, 125.0)
             self.assertEqual(custom.aerial_touch_reward_weight, 8.0)
-            self.assertEqual(custom.reward_plus_weights, {
-                name: weight for name, weight in custom_config["reward_plus_weights"].items()
-                if name != "angular_velocity"
-            })
+            self.assertEqual(custom.reward_plus_weights, custom_config["reward_plus_weights"])
             with (patch("gaifo.load_resume_checkpoint",
                         return_value={"config": prior_config}),
                   patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
@@ -789,7 +786,9 @@ class FactorizedGAIFOTests(unittest.TestCase):
                         return_value={"config": legacy_config}),
                   patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path)])):
                 legacy, _ = parse_args()
-            self.assertEqual(legacy.reward_plus_weights, asdict(RewardPlusWeights.legacy()))
+            self.assertEqual(legacy.reward_plus_weights, {
+                **asdict(RewardPlusWeights.legacy()), "angular_velocity": 5.0,
+            })
             self.assertTrue(legacy.cap_physical_rewards)
             self.assertEqual((legacy.goal_reward_weight, legacy.aerial_touch_reward_weight,
                               legacy.flip_reset_reward_weight), (1., .5, 1.))
