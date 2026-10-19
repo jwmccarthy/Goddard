@@ -5675,8 +5675,8 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
     )
     parser.add_argument("--frameskip", type=int, default=4)
     add_feature_option(
-        parser, "--flip-state-features", default=True,
-        help="include focal flip availability and remaining dodge time in discriminator scenes",
+        parser, "--flip-state-features", default=False,
+        help="include focal flip availability and remaining dodge time in discriminator scenes (default: off; needs replay-parsed dodge state)",
     )
     add_feature_option(
         parser, "--discriminator-relative-positions", default=True,

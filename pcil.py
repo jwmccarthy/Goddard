@@ -1077,7 +1077,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, dict 
         parser, "--context-matching", default=None,
         help="match expert positives and reward references to the pre-transition ball/ego context",
     )
-    add_feature_option(parser, "--flip-state-features", default=True)
+    add_feature_option(parser, "--flip-state-features", default=False)
     add_feature_option(
         parser, "--discriminator-relative-positions", "--relative-positions",
         dest="discriminator_relative_positions",

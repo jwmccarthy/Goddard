@@ -78,7 +78,7 @@ class GAIFOTransformerTests(unittest.TestCase):
             global_model = model.global_discriminator if factorize else model
             self.assertIsInstance(global_model, CausalSceneTransformer)
             self.assertTrue(global_model.relative_positions)
-            self.assertTrue(args.flip_state_features)
+            self.assertFalse(args.flip_state_features)
             self.assertEqual(model(th.zeros(2, 8, model.scene_size)).shape,
                              (2, 3) if factorize else (2,))
             if factorize:

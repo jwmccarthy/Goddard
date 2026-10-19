@@ -348,7 +348,10 @@ the same per-car multiplier; ground touches retain their ordinary rewards.
 GAIFO, BASIC without reaction time, deep training, and the checkpoint viewer
 use CARL's native observation and a shared project action mask. The last two
 **native** observation fields report whether the focal car can jump or flip
-and how much dodge time remains.
+and how much dodge time remains. These two fields stay in the policy
+observation, but discriminator scenes exclude them by default because only the
+ego viewpoint of a parsed replay records the true dodge timer; enable them with
+`--flip-state-features`, which needs replays parsed with per-car dodge state.
 The mask permits grounded pitch and air roll, while still masking expired
 airborne dodges, including during PPO updates. New BASIC runs use frameskip 4;
 checkpoint resumes inherit their saved cadence (8 for older BASIC checkpoints).

@@ -382,7 +382,7 @@ class TeamSizeUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "--team-size must match"):
                 validate_resume_args(changed, payload)
             with patch.object(sys, "argv", ["gaifo.py", "--resume-checkpoint", str(path),
-                                            "--flip-state-features", "false"]):
+                                            "--flip-state-features"]):
                 changed, _ = parse_args()
             with self.assertRaisesRegex(ValueError, "--flip-state-features must match"):
                 validate_resume_args(changed, payload)
@@ -476,7 +476,7 @@ class TeamSizeTrainingSmoke(unittest.TestCase):
             payload = load_resume_checkpoint(max(checkpoints))
             self.assertEqual(payload["step"], 8 * 2 * n_cars * 2)
             self.assertEqual(payload["config"]["team_size"], size)
-            self.assertTrue(payload["config"]["flip_state_features"])
+            self.assertFalse(payload["config"]["flip_state_features"])
             self.assertEqual(payload["policy"]["foot.model.0.weight"].shape[1],
                              team_live_observation_size(size))
             self.assertTrue(payload["discriminator_optimizer"]["state"])

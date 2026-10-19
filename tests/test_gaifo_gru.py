@@ -80,7 +80,7 @@ class GAIFOGruTests(unittest.TestCase):
                 self.assertEqual(parsed.sequence_length, 8)
                 self.assertEqual((parsed.policy_hidden, parsed.critic_hidden), (320, 320))
                 self.assertEqual((parsed.policy_layers, parsed.critic_layers), (2, 2))
-                self.assertTrue(parsed.flip_state_features)
+                self.assertFalse(parsed.flip_state_features)
                 self.assertFalse(parsed.recurrent_global)
                 self.assertEqual(parsed.discriminator_context_length, 16)
                 self.assertEqual(parsed.discriminator_context_stride, 4)

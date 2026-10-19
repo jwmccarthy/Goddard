@@ -415,7 +415,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertEqual(saved["config"]["reward_plus_weights"]["angular_velocity"], 5.0)
             self.assertEqual(saved["config"]["recurrent_global"], recurrent_global and not transformer)
             self.assertEqual(saved["config"].get("transformer_global", False), transformer)
-            self.assertTrue(saved["config"]["flip_state_features"])
+            self.assertFalse(saved["config"]["flip_state_features"])
             self.assertEqual(saved["policy"]["foot.model.0.weight"].shape[1],
                              team_live_observation_size(1))
             self.assertEqual(saved["config"]["discriminator_context_length"],
