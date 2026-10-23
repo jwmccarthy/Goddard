@@ -384,7 +384,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                 self.assertNotIn("RewardSpec/component/underside", events.Tags()["scalars"])
                 self.assertNotIn("RewardSpec/rms/reward_plus_underside",
                                  events.Tags()["scalars"])
-                for name in ("imitation", "physical", "aerial_touch", "flip_reset",
+                for name in ("imitation", "physical", "flip_reset",
                              "reward_plus", "goal", *REWARD_PLUS_COMPONENTS):
                     tag = f"RewardSpec/rms/{name}"
                     self.assertIn(tag, events.Tags()["scalars"])
@@ -397,7 +397,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
                     point.step: point.value
                     for point in events.Scalars("RewardSpec/rms/imitation")
                 }
-                for name in ("physical", "aerial_touch", "flip_reset", "reward_plus",
+                for name in ("physical", "flip_reset", "reward_plus",
                              *REWARD_PLUS_COMPONENTS):
                     for point in events.Scalars(f"RewardSpec/rms/{name}"):
                         self.assertLessEqual(point.value, style[point.step] + 1e-4)
@@ -409,8 +409,7 @@ class GAIFOGpuSmokeTests(unittest.TestCase):
             saved = load_resume_checkpoint(max(checkpoints))
             if reward_plus:
                 self.assertEqual(saved["config"]["goal_reward_weight"], 200.0)
-                self.assertEqual(saved["config"]["aerial_touch_reward_weight"], 75.0)
-                self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_lift"], 75.0)
+                self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_lift"], 100.0)
                 self.assertEqual(saved["config"]["reward_plus_weights"]["aerial_shot"], 50.0)
                 self.assertEqual(saved["config"]["reward_plus_weights"]["angular_velocity"], 5.0)
             self.assertEqual(saved["config"]["recurrent_global"], recurrent_global and not transformer)

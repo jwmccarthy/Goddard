@@ -172,7 +172,7 @@ class RewardPlusWeights:
     speed_progress: float = 12.5
     boost_free_speed_progress: float = 25.0
     boost_gain: float = 12.5
-    aerial_lift: float = 75.0
+    aerial_lift: float = 100.0
     aerial_shot: float = 50.0
     angular_velocity: float = 5.0
     ground_pop: float = 25.0
@@ -4369,7 +4369,6 @@ class SceneDiscriminatorReward:
         noise_std: float,
         trajectory_length: int,
         goal_reward_weight: float = 1.0,
-        aerial_touch_reward_weight: float = 0.0,
         flip_reset_reward_weight: float = 0.0,
         batch_size: int = 16_384,
         max_magnitude: float = 10.0,
@@ -4389,8 +4388,6 @@ class SceneDiscriminatorReward:
             raise ValueError("reward max magnitude must be positive")
         if not math.isfinite(goal_reward_weight) or goal_reward_weight < 0.0:
             raise ValueError("goal reward weight must be non-negative")
-        if not math.isfinite(aerial_touch_reward_weight) or aerial_touch_reward_weight < 0.0:
-            raise ValueError("aerial touch reward weight must be non-negative")
         if not math.isfinite(flip_reset_reward_weight) or flip_reset_reward_weight < 0.0:
             raise ValueError("flip reset reward weight must be non-negative")
         if not math.isfinite(physical_reward_scale) or physical_reward_scale < 0.0:
@@ -4417,7 +4414,6 @@ class SceneDiscriminatorReward:
         self.noise_std = noise_std
         self.trajectory_length = trajectory_length
         self.goal_reward_weight = goal_reward_weight
-        self.aerial_touch_reward_weight = aerial_touch_reward_weight
         self.flip_reset_reward_weight = flip_reset_reward_weight
         self.reward_plus = reward_plus
         self.physical_reward_scale = physical_reward_scale
@@ -4746,10 +4742,6 @@ class SceneDiscriminatorReward:
         goal_reward = batch["reward"].to(dtype) * self.goal_reward_weight
         if goal_reward.shape != imitation_reward.shape:
             raise ValueError("goal rewards must match the actor rollout shape")
-        aerial_touch_reward = self._event_reward(
-            batch, "aerial_touch_score", self.aerial_touch_reward_weight,
-            imitation_reward,
-        ) * self.physical_reward_scale
         flip_reset_reward = self._event_reward(
             batch, "flip_reset_event", self.flip_reset_reward_weight,
             imitation_reward,
@@ -4763,7 +4755,7 @@ class SceneDiscriminatorReward:
             sum(reward_plus_components.values(), th.zeros_like(imitation_reward))
             if self.reward_plus else 0.0
         )
-        physical_reward = aerial_touch_reward + flip_reset_reward + reward_plus_reward
+        physical_reward = flip_reset_reward + reward_plus_reward
         learner_mask = batch.get("learner_mask")
         learner_mask = (learner_mask.bool() if learner_mask is not None
                         else th.ones_like(valid))
@@ -4777,7 +4769,7 @@ class SceneDiscriminatorReward:
             # Include subtotals and the sum: opposing signals can hide each other.
             largest_physical = th.stack([
                 learner_rms(value) for value in (
-                    aerial_touch_reward, flip_reset_reward, *reward_plus_components.values(),
+                    flip_reset_reward, *reward_plus_components.values(),
                     *((reward_plus_reward,) if self.reward_plus else ()),
                     physical_reward,
                 )
@@ -4791,7 +4783,6 @@ class SceneDiscriminatorReward:
                  / largest_physical.clamp_min(1e-12)).clamp(max=1),
                 th.ones_like(largest_physical),
             )
-            aerial_touch_reward = aerial_touch_reward * cap
             flip_reset_reward = flip_reset_reward * cap
             reward_plus_components = {
                 name: value * cap for name, value in reward_plus_components.items()
@@ -4802,7 +4793,6 @@ class SceneDiscriminatorReward:
         reward_components = {
             "imitation": imitation_reward,
             "goal": goal_reward,
-            "aerial_touch": aerial_touch_reward,
             "flip_reset": flip_reset_reward,
             "physical": physical_reward,
             **({"reward_plus": reward_plus_reward} if self.reward_plus else {}),
@@ -4819,7 +4809,6 @@ class SceneDiscriminatorReward:
             imitation_reward=imitation_reward,
             **components,
             goal_reward=goal_reward,
-            aerial_touch_reward=aerial_touch_reward,
             flip_reset_reward=flip_reset_reward,
             **({"reward_plus_reward": reward_plus_reward} if self.reward_plus else {}),
             training_reward=imitation_reward + goal_reward + physical_reward,
@@ -5734,10 +5723,6 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         help="scale the +/-1 goal reward per actor (default: 200; 0 disables it)",
     )
     parser.add_argument(
-        "--aerial-touch-reward-weight", type=float, default=75.0,
-        help="reward all aerial touches, scaling from half this weight at low height to full at the ceiling (default: 75; 0 disables it)",
-    )
-    parser.add_argument(
         "--flip-reset-reward-weight", type=float, default=12.5,
         help="reward a spent or expired flip regained by wheel contact with an elevated ball or the ceiling (default: 12.5; 0 disables it)",
     )
@@ -5862,8 +5847,6 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
         inherited.setdefault("cap_physical_rewards", False)
         if inherited.get("goal_reward_weight") in (75.0, 100.0):
             inherited["goal_reward_weight"] = 200.0
-        if inherited.get("aerial_touch_reward_weight") in (12.5, 15.0, 25.0):
-            inherited["aerial_touch_reward_weight"] = 75.0
         saved_weights = resume["config"].get("reward_plus_weights")
         if saved_weights is None:
             saved_weights = asdict(RewardPlusWeights.legacy())
@@ -5876,7 +5859,7 @@ def parse_args() -> tuple[argparse.Namespace, dict | None]:
             **saved_weights,
         }
         inherited["reward_plus_weights"].pop("underside", None)
-        if inherited["reward_plus_weights"].get("aerial_lift") in (50.0, 60.0):
+        if inherited["reward_plus_weights"].get("aerial_lift") in (50.0, 60.0, 75.0):
             inherited["reward_plus_weights"]["aerial_lift"] = RewardPlusWeights().aerial_lift
         if inherited["reward_plus_weights"].get("aerial_shot") == 75.0:
             inherited["reward_plus_weights"]["aerial_shot"] = RewardPlusWeights().aerial_shot
@@ -6056,11 +6039,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--reward-max-magnitude must be positive")
     if not math.isfinite(args.goal_reward_weight) or args.goal_reward_weight < 0.0:
         raise ValueError("--goal-reward-weight must be finite and non-negative")
-    if (
-        not math.isfinite(args.aerial_touch_reward_weight)
-        or args.aerial_touch_reward_weight < 0.0
-    ):
-        raise ValueError("--aerial-touch-reward-weight must be finite and non-negative")
     if (
         not math.isfinite(args.flip_reset_reward_weight)
         or args.flip_reset_reward_weight < 0.0
@@ -6417,7 +6395,6 @@ def build_ppo_transforms(
             noise_std=args.discriminator_noise,
             trajectory_length=args.trajectory_length,
             goal_reward_weight=args.goal_reward_weight,
-            aerial_touch_reward_weight=args.aerial_touch_reward_weight,
             flip_reset_reward_weight=args.flip_reset_reward_weight,
             batch_size=args.discriminator_microbatch,
             max_magnitude=args.reward_max_magnitude,

@@ -165,8 +165,7 @@ under current weights before calculating the learning loss.
 
 Feature switches use positive names: `--differential` enables it, while
 `--differential false` disables it. Omitting the switch retains its default or
-checkpoint setting. Spell out option names: `--aerial-touch-reward` no longer
-abbreviates `--aerial-touch-reward-weight`. `--no-touch-timeout` still specifies
+checkpoint setting. `--no-touch-timeout` still specifies
 the no-touch timeout in seconds.
 
 Transformer defaults to a 128-frame context, 256 simulations, a 2,048-window
@@ -199,22 +198,19 @@ has them; fresh kickoffs and replay gaps wait for real episode history. Early
 mixed windows train the short-window discriminator; rewards from heads that
 use that borrowed context are scaled by the fraction of frames produced by
 the policy. Contextual global heads use generated episode frames. PPO can
-still credit all early actions for later rewards. Goal
-rewards and the default aerial-touch bonus are shared across teammates and
-opposed between teams. Every aerial touch above the ground-touch threshold
-earns a bonus; ball height scales it from half to the full configured
-`--aerial-touch-reward-weight` (default `75`, the same as the controlled aerial
-lift). Distinct contacts by the same car during one flight compound by `1.5` per
-touch (1x, 1.5x, 2.25x, 3.375x, then capped at 4x). A held ball-touch flag does
-not build or collect the extra
-bonus. Ball-contact flip resets count as contacts even when that flag stays
-set, and the same multiplier applies to both their bonus and the aerial-touch
-bonus. Ceiling wheel contact can also earn an instantaneous flip-reset bonus
-when it makes a spent or expired dodge usable again; holding roof contact cannot
-pay on later steps. Without a ball touch it earns no aerial-touch bonus or extra
-combo multiplier. Floor or wall contact, an upside-down floor landing,
-demolition, or an episode end resets the streak; wheel contact with the ball or
-ceiling does not.
+still credit all early actions for later rewards. Goal rewards and the
+flip-reset bonus are shared across teammates and opposed between teams. There is
+no per-touch aerial bonus: aerial reward is the controlled lift and shot under
+`--reward-plus`, so resting the ball on the car cannot farm a per-touch payout.
+Distinct airborne contacts by the same car during one flight compound by `1.5`
+per touch (1x, 1.5x, 2.25x, 3.375x, then capped at 4x). A held ball-touch flag
+does not build or collect the extra bonus. Ball-contact flip resets count as
+contacts even when that flag stays set, and the same multiplier applies to the
+flip-reset bonus and to the controlled aerial lift and shot. Ceiling wheel
+contact can also earn an instantaneous flip-reset bonus when it makes a spent or
+expired dodge usable again; holding roof contact cannot pay on later steps.
+Floor or wall contact, an upside-down floor landing, demolition, or an episode
+end resets the streak; wheel contact with the ball or ceiling does not.
 
 `--reward-plus` adds fifteen bounded, zero-sum team signals alongside the
 discriminator imitation reward:
@@ -232,7 +228,7 @@ discriminator imitation reward:
   taken at zero boost pays about `4.3`. Demolitions, discontinuous resets,
   and ended episodes cannot earn a refill bonus; merely holding boost pays
   nothing.
-- A solo aerial touch pays up to `75` for increasing the ball's upward velocity,
+- A solo aerial touch pays up to `100` for increasing the ball's upward velocity,
   scaled by ball height. It prefers a ball that pops off the car over one glued
   to the car's velocity: a ball separating at `300` units/s or more earns full
   credit while a perfectly matched ball earns half. A hard increase in
@@ -279,14 +275,11 @@ discriminator imitation reward:
 - An upside-down car resting low on the floor with little vertical motion is
   charged `10` per second. Passing overhead without floor contact is exempt.
 
-The goal, ordinary aerial-touch, and flip-reset bonuses are separate from
-`--reward-plus` and are not counted twice. Their new-run weights are `200`,
-`75`, and `12.5`, respectively. An aerial touch reaches at most `300` at the
-4x combo cap, while a flip reset reaches `50`; a controlled lift reaches `300`
+The goal and flip-reset bonuses are separate from `--reward-plus` and are not
+counted twice. Their new-run weights are `200` and `12.5`, respectively. A flip
+reset reaches `50` at the 4x combo cap, while a controlled lift reaches `400`
 and a shot `200`, and multiple mechanics can stack on one action. Relative
-reward strength is measured over all learner actions, not
-by single-event peaks. Set `--aerial-touch-reward-weight 0` to pay only for
-controlled aerial touches.
+reward strength is measured over all learner actions, not by single-event peaks.
 GAIFO's remaining eleven original `--reward-plus` signals include the former 50x
 physical multiplier in their new-run weights, including penalties; boost gain,
 ground pops, and air-dribble setups are weighted separately. BASIC's weights
@@ -296,12 +289,12 @@ new-run commands rather than multiplying the physical rewards a second time.
 
 `--discriminator-reward-scale` defaults to `2`, multiplying the discriminator
 imitation reward so it outweighs the goal and physical rewards by default.
-`--physical-reward-scale` still defaults to `1` and multiplies aerial-touch,
-flip-reset, and `--reward-plus` rewards after their component weights, but not
-imitation or goals. Use `0` to disable physical rewards. Checkpoints save the
+`--physical-reward-scale` still defaults to `1` and multiplies flip-reset and
+`--reward-plus` rewards after their component weights, but not imitation or
+goals. Use `0` to disable physical rewards. Checkpoints save the
 new component weights. On resume, previous default values are raised to the
-current defaults: aerial-touch (`12.5`, `15`, or `25`) to `75`, aerial-lift
-(`50` or `60`) to `75`, aerial-shot (`75`) to `50`, goal (`75` or `100`) to
+current defaults: aerial-lift (`50`, `60`, or `75`) to `100`, aerial-shot
+(`75`) to `50`, goal (`75` or `100`) to
 `200`, ground-pop (`10`) to `25`, air-dribble-setup (`15`) to `25`,
 ball-ceiling (`17.5`) to `25`, and inverted-ground (`5`) to `10`; distinct
 custom weights are preserved. Other `--reward-plus` and touch/reset weights
@@ -322,7 +315,7 @@ The multiplier can vary as the discriminator and policy learn. Disable with
 `--cap-physical-rewards false` if desired; older checkpoints inherit the
 uncapped setting unless explicitly enabled on resume.
 TensorBoard logs per-rollout, learner-action RMS values under
-`RewardSpec/rms/{imitation,physical,goal,aerial_touch,flip_reset,reward_plus}`
+`RewardSpec/rms/{imitation,physical,goal,flip_reset,reward_plus}`
 (`reward_plus` appears when enabled) and each individual
 `RewardSpec/rms/reward_plus_*` signal, after weighting and any cap. Compare
 `physical` and each signal with `imitation` to check the balance;

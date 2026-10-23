@@ -650,7 +650,7 @@ class PCILTests(unittest.TestCase):
                 "--discriminator-update-interval", "2", "--discriminator-noise", ".02",
                 "--discriminator-lr", ".0002", "--discriminator-lr-end", ".0001",
                 "--ppo-lr-end", ".0001", "--entropy-end", "0",
-                "--aerial-touch-reward-weight", ".5", "--flip-reset-reward-weight", "1",
+                "--flip-reset-reward-weight", "1",
                 "--recency-replay", "--history-reservoir-fraction", ".4",
                 "--history-capacity", "16", "--history-add-size", "8",
             ]
@@ -665,7 +665,7 @@ class PCILTests(unittest.TestCase):
                 "frame_embedding", "temporal_hidden", "recency_replay",
                 "history_reservoir_fraction", "history_capacity", "history_add_size",
                 "replay_reset_fraction", "flip_state_features",
-                "aerial_touch_reward_weight", "flip_reset_reward_weight", "ppo_lr_end",
+                "flip_reset_reward_weight", "ppo_lr_end",
                 "entropy_end", "team_size", "n_sim", "rollout", "ppo_batch",
             ):
                 self.assertEqual(getattr(args, same), getattr(gaifo, same), same)

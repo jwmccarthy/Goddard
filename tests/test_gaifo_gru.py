@@ -98,14 +98,12 @@ class GAIFOGruTests(unittest.TestCase):
             "gaifo.py", "--replay-dir", "parsed_replays",
             "--flip-state-features", "false",
             "--exp-log-odds-reward", "true", "--recency-replay", "false",
-            "--aerial-touch-reward-weight", "1.0",
         ]):
             parsed, _ = parse_args()
         self.assertFalse(parsed.flip_state_features)
         self.assertFalse(hasattr(parsed, "curated_skill_sampling"))
         self.assertTrue(parsed.exp_log_odds_reward)
         self.assertFalse(parsed.recency_replay)
-        self.assertEqual(parsed.aerial_touch_reward_weight, 1.0)
         self.assertEqual(parsed.replay_reset_fraction, 0.70)
 
         for flags in (("--no-gru",), ("--no-exp-log-odds-reward",),
