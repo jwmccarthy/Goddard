@@ -24,6 +24,7 @@ REQUEST_TIMEOUT = 30
 
 @dataclass(slots=True)
 class ReplayPage:
+
     replays: list[dict[str, Any]]
     next_url: str | None
 
@@ -38,6 +39,7 @@ def _retry_delay(response: requests.Response, attempt: int) -> float:
 
 
 class BallchasingClient:
+
     def __init__(
         self,
         token: str,

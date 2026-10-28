@@ -26,6 +26,7 @@ REGIONS = (
 
 @dataclass(frozen=True)
 class Root:
+
     group_id: str
     mode: str
     event: str
@@ -33,6 +34,7 @@ class Root:
 
 @dataclass(frozen=True)
 class ReplaySelection:
+
     replay: dict[str, Any]
     mode: str
     region: str

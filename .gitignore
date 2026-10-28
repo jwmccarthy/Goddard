@@ -13,4 +13,5 @@ runs/
 *.7z
 
 # Replay datasets can contain tens of thousands of large files.
-replays/data/
+replays/raw/
+replays/parsed_replays/
