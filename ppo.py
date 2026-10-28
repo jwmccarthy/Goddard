@@ -31,6 +31,7 @@ def mlp(input_size: int, output_size: int, hidden_size: int, layers: int, gain: 
 
 
 class Agent(nn.Module):
+    
     def __init__(self, observation_size, action_sizes, action_codec, hidden_size=256, layers=2):
         super().__init__()
         self.action_sizes = tuple(int(size) for size in action_sizes)
