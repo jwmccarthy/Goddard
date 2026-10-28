@@ -1,21 +1,18 @@
 import os
 import re
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-try:
-    from ballchasing_replays.ballchasing_api import API_URL, BallchasingClient
-except ModuleNotFoundError:
-    from ballchasing_api import API_URL, BallchasingClient
-
+from replays import RAW_DIR
+from replays.api import API_URL, BallchasingClient
 
 UUID_PATTERN = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
     re.IGNORECASE,
 )
 UNSAFE_COMPONENT = re.compile(r"[^a-z0-9]+")
+
 REGIONS = (
     (re.compile(r"\b(?:eu|europe)\b", re.IGNORECASE), "EU"),
     (re.compile(r"\b(?:mena|middle east(?: and north africa)?)\b", re.IGNORECASE), "MENA"),
@@ -50,33 +47,39 @@ ROOT = Root("1v1-events-q0z69hlqmt", "1v1", "RLCS 2026 1v1 Events")
 
 def sanitize(value: Any, fallback: str = "unknown", limit: int = 48) -> str:
     component = UNSAFE_COMPONENT.sub(
-        "-", "" if value is None else str(value).lower()
+        "-",
+        "" if value is None else str(value).lower(),
     ).strip("-")
+
     component = component[:limit].rstrip("-")
+
     return component or fallback
 
 
 def replay_uuid(path: Path) -> str | None:
     match = UUID_PATTERN.search(path.stem)
+
     return match.group(1).lower() if match else None
 
 
 def infer_region(path: tuple[str, ...]) -> str:
     text = " ".join(path)
+
     for pattern, region in REGIONS:
         if pattern.search(text):
             return region
+
     return "INTL"
 
 
-def list_group_children(
-    client: BallchasingClient, group_id: str
-) -> list[dict[str, Any]]:
-    page = client._get(f"{API_URL}/groups", group=group_id, count=200)
+def list_group_children(client: BallchasingClient, group_id: str) -> list[dict[str, Any]]:
+    page = client.get(f"{API_URL}/groups", group=group_id, count=200)
     children = list(page.replays)
+
     while page.next_url:
-        page = client._get(page.next_url)
+        page = client.get(page.next_url)
         children.extend(page.replays)
+
     return sorted(children, key=lambda group: (group.get("name", ""), group["id"]))
 
 
@@ -86,19 +89,26 @@ def descendant_leaves(
 ) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
     visited = {root.group_id}
 
-    def walk(group: dict[str, Any], path: tuple[str, ...]) -> Iterator[
-        tuple[dict[str, Any], tuple[str, ...]]
-    ]:
+    def walk(
+        group: dict[str, Any],
+        path: tuple[str, ...],
+    ) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
         group_id = group["id"]
+
         if group_id in visited:
             return
+
         visited.add(group_id)
+
         next_path = path + (group.get("name") or group_id,)
         children = list_group_children(client, group_id)
+
         if not children:
             if group.get("direct_replays", 0):
                 yield group, next_path
+
             return
+
         for child in children:
             yield from walk(child, next_path)
 
@@ -115,11 +125,17 @@ def select_replays(
     for leaf, path in descendant_leaves(client, ROOT):
         if not any("playoff" in component.lower() for component in path):
             continue
+
         entries = client.find_replay_entries(
-            group=leaf["id"], count=200, sort_by="replay-date", sort_dir="asc"
+            group=leaf["id"],
+            count=200,
+            sort_by="replay-date",
+            sort_dir="asc",
         )
         entries.sort(key=lambda replay: (replay.get("date", ""), replay["id"].lower()))
+
         discovered += len(entries)
+
         for game_number, replay in enumerate(entries, 1):
             occurrences.append(
                 ReplaySelection(
@@ -133,7 +149,6 @@ def select_replays(
                 )
             )
 
-    # A replay can appear below overlapping or accidentally duplicated groups.
     occurrences.sort(
         key=lambda item: (
             item.replay["id"].lower(),
@@ -145,24 +160,34 @@ def select_replays(
             item.game_number,
         )
     )
+
     selected: dict[str, ReplaySelection] = {}
+
     for occurrence in occurrences:
         selected.setdefault(occurrence.replay["id"].lower(), occurrence)
+
     return selected, discovered
 
 
 def replay_filename(selection: ReplaySelection) -> str:
     replay = selection.replay
     replay_id = replay["id"].lower()
+
     date = str(replay.get("date", ""))[:10]
+
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         date = "unknown-date"
+
     event_path = "-".join(sanitize(part, limit=24) for part in selection.event_path)
     event_path = sanitize(event_path, "unknown-event", 50)
+
     series = sanitize(selection.series, "unknown-series", 36)
+
     blue = sanitize(replay.get("blue", {}).get("name"), "blue", 24)
     orange = sanitize(replay.get("orange", {}).get("name"), "orange", 24)
+
     matchup = f"{blue}-vs-{orange}"
+
     prefix = "__".join(
         (
             date,
@@ -174,32 +199,38 @@ def replay_filename(selection: ReplaySelection) -> str:
             f"g{selection.game_number:02d}",
         )
     )
+
     return f"{prefix}__{replay_id}.replay"
 
 
-def rename_downloaded(
-    replay_dir: Path, selections: dict[str, ReplaySelection]
-) -> None:
+def rename_downloaded(replay_dir: Path, selections: dict[str, ReplaySelection]) -> None:
     reserved = {path.name for path in replay_dir.glob("*.replay")}
+
     for replay_id in sorted(selections):
         source = replay_dir / f"{replay_id}.replay"
+
         if not source.exists():
             continue
+
         filename = replay_filename(selections[replay_id])
         target = replay_dir / filename
         collision = 2
+
         while target.name in reserved and target != source:
             stem = filename[: -len(f"__{replay_id}.replay")]
             target = replay_dir / f"{stem}__c{collision}__{replay_id}.replay"
             collision += 1
+
         source.rename(target)
+
         reserved.discard(source.name)
         reserved.add(target.name)
 
 
 def main() -> None:
-    replay_dir = Path(__file__).parent / "replays"
+    replay_dir = RAW_DIR
     replay_dir.mkdir(parents=True, exist_ok=True)
+
     existing = {
         replay_id
         for path in replay_dir.glob("*.replay")
@@ -208,10 +239,10 @@ def main() -> None:
 
     client = BallchasingClient(os.environ["BALLCHASING_TOKEN"])
     selected, discovered = select_replays(client)
+
     new_ids = sorted(set(selected) - existing)
-    print(
-        f"1v1: discovered={discovered} deduped={len(selected)} new={len(new_ids)}"
-    )
+
+    print(f"1v1: discovered={discovered} deduped={len(selected)} new={len(new_ids)}")
 
     try:
         client.download_replays(new_ids, replay_dir)

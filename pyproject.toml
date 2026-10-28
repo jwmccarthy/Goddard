@@ -1,12 +1,11 @@
 [project]
 name = "goddard"
 version = "0.1.0"
-description = ""
+description = "Lean GPU-resident PPO and GAIFO for CARL"
 requires-python = ">=3.11"
 dependencies = [
     "carl==0.1.0",
     "dotenv>=0.9.9",
-    "jarl==0.1.0",
     "numba>=0.67.0",
     "numpy>=1.24",
     "pandas>=2.3.3",
@@ -22,11 +21,20 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-carl = { git = "https://github.com/jwmccarthy/CARL.git", rev = "a025b6eed364bf14743e6f2bfaf038d0f0f46b8f" }
-jarl = { git = "https://github.com/jwmccarthy/JARL.git", rev = "0275061d0d6657c77638a7bd47db64ae6a14c440" }
+carl = { git = "https://github.com/jwmccarthy/CARL.git", branch = "master" }
 torch = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
