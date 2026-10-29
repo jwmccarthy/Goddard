@@ -30,11 +30,3 @@ The arena is CARL's collision mesh (not a textured stadium). It defaults to
 `CARL_ARENA_OBJ` or `--mesh /path/to/arena.obj`
 
 Change the port with `--port`.
-The server binds only to loopback and serves the web directory plus that
-single mesh, not checkpoints or the rest of the repository.
-
-Run the tests:
-
-```bash
-uv run --no-sync python -m unittest vis.test_server vis.test_playback
-```
