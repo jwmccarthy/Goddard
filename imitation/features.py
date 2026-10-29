@@ -4,10 +4,28 @@ from replays.layout import BALL_SIZE
 
 POSITION_SCALE = (4108.0, 6000.0, 2076.0)
 BLUE_START = BALL_SIZE
-BALL_NEAR_DISTANCE = 1500.0
+BALL_NEAR_DISTANCE = 1000.0
 REFERENCE_FRAMESKIP = 4
 SPECIALIST_WEIGHT = 0.5
 GLOBAL_WEIGHT = 0.5
+DISCRIMINATOR_WARMUP = 2
+
+
+def balanced_proximity_weights(near, labels):
+    expert = labels.bool()
+    generated = ~expert
+    masks = [((~near) & generated, (~near) & expert), (near & generated, near & expert)]
+    populated = [band for band, (gen, exp) in enumerate(masks) if gen.any() and exp.any()]
+    weights = labels.new_zeros((len(labels), 2))
+
+    for band, (gen, exp) in enumerate(masks):
+        if band not in populated:
+            continue
+
+        for mask in (gen, exp):
+            weights[mask, band] = len(labels) / (2 * len(populated) * mask.sum())
+
+    return weights
 
 
 def relative_scene_positions(ball, cars):
@@ -16,9 +34,9 @@ def relative_scene_positions(ball, cars):
     return torch.cat(
         (
             ball[..., None, :3] - positions,
-            positions - positions[..., :1, :],
+            positions - positions[..., :1, :]
         ),
-        dim=-1,
+        dim=-1
     )
 
 

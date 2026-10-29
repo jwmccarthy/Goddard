@@ -33,7 +33,7 @@ class ViewerHandler(SimpleHTTPRequestHandler):
                 with self.match.condition:
                     self.match.condition.wait_for(
                         lambda: self.match.revision != revision or self.match.stopped.is_set(),
-                        timeout=5,
+                        timeout=5
                     )
                     revision, data = self.match.revision, self.match.data
 

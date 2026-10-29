@@ -9,41 +9,54 @@ class SceneRollout:
         self.scene_size = scene_size
         self.scenes = observation.new_empty((steps, agents, scene_size))
         self.successors = torch.empty_like(self.scenes)
+        self.dones = torch.empty((steps, agents), dtype=torch.bool, device=observation.device)
         self.ages = torch.empty((steps, agents), dtype=torch.long, device=observation.device)
         self.age = torch.zeros(agents, dtype=torch.long, device=observation.device)
-        self.history = observation[None, :, :scene_size].expand(length - 2, -1, -1).clone()
+        self.history = observation[None, :, :scene_size].expand(length - 1, -1, -1).clone()
         self.timeline = None
         self.valid_indices = None
+        self.differential_indices = None
 
     def record(self, step, observation, next_observation, final_observation, done):
         self.scenes[step].copy_(observation[:, : self.scene_size])
         successor = torch.where(
             done[:, None],
             final_observation[:, : self.scene_size],
-            next_observation[:, : self.scene_size],
+            next_observation[:, : self.scene_size]
         )
         self.successors[step].copy_(successor)
         self.ages[step].copy_(self.age)
+        self.dones[step].copy_(done)
         self.age.add_(1).masked_fill_(done, 0)
 
     def prepare(self):
         self.timeline = torch.cat((self.history, self.scenes))
         self.valid_indices = (self.ages.flatten() >= self.length - 2).nonzero().flatten()
+        self.differential_indices = (self.ages.flatten() >= self.length - 1).nonzero().flatten()
 
-        if self.length > 2:
-            self.history.copy_(self.timeline[-(self.length - 2) :])
+        if self.length > 1:
+            self.history.copy_(self.timeline[-(self.length - 1) :])
 
     def windows(self, indices):
         agents = self.scenes.shape[1]
         step = indices // agents
         agent = indices % agents
-        end = step + self.length - 2
+        end = step + self.length - 1
         start = end - self.ages[step, agent]
         offsets = torch.arange(2 - self.length, 1, device=indices.device)
         frames = torch.maximum(end[:, None] + offsets, start[:, None])
         prefix = self.timeline[frames, agent[:, None]]
 
         return torch.cat((prefix, self.successors[step, agent, None]), dim=1)
+
+    def previous_windows(self, indices):
+        agents = self.scenes.shape[1]
+        step = indices // agents
+        agent = indices % agents
+        end = step + self.length - 1
+        offsets = torch.arange(1 - self.length, 1, device=indices.device)
+
+        return self.timeline[end[:, None] + offsets, agent[:, None]]
 
 
 def split_generated(valid, heldout_sim, heldout_size, n_cars):
@@ -67,7 +80,7 @@ def split_generated(valid, heldout_sim, heldout_size, n_cars):
         return (
             (flat_valid & ~heldout_mask).nonzero().flatten(),
             heldout_mask.nonzero().flatten(),
-            heldout_sim,
+            heldout_sim
         )
 
     per_sim = valid.view(steps, n_sim, n_cars).sum(dim=(0, 2))
@@ -82,7 +95,7 @@ def split_generated(valid, heldout_sim, heldout_size, n_cars):
         int(
             torch.searchsorted(
                 cumulative,
-                torch.tensor(heldout_size, device=cumulative.device),
+                torch.tensor(heldout_size, device=cumulative.device)
             ).item()
         )
         + 1
@@ -98,5 +111,5 @@ def split_generated(valid, heldout_sim, heldout_size, n_cars):
     return (
         (flat_valid & ~heldout_mask).nonzero().flatten(),
         heldout_mask.nonzero().flatten(),
-        heldout_sim,
+        heldout_sim
     )

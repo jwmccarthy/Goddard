@@ -1,61 +1,44 @@
 import torch
 from torch import nn
-from torch.nn import functional as F
 
+from imitation import features
 from imitation.evaluation import evaluate_discriminator, sample_discriminator_validation
-from imitation.features import GLOBAL_WEIGHT, SPECIALIST_WEIGHT, nearest_ball_distance
-
-
-def balanced_proximity_weights(near, labels):
-    expert = labels.bool()
-    generated = ~expert
-    masks = [
-        ((~near) & generated, (~near) & expert),
-        (near & generated, near & expert),
-    ]
-    populated = [band for band, (gen, exp) in enumerate(masks) if gen.any() and exp.any()]
-    weights = labels.new_zeros((len(labels), 2))
-
-    for band, (gen, exp) in enumerate(masks):
-        if band not in populated:
-            continue
-
-        for mask in (gen, exp):
-            weights[mask, band] = len(labels) / (2 * len(populated) * mask.sum())
-
-    return weights
+from imitation.features import DISCRIMINATOR_WARMUP, GLOBAL_WEIGHT, SPECIALIST_WEIGHT
+from imitation.features import balanced_proximity_weights as balanced_proximity_weights
+from training.tensors import autocast
 
 
 def discriminator_loss(discriminator, windows, labels, near, weights=None, return_metrics=False):
-    logits = discriminator(windows)
+    logits = discriminator(windows).float()
+    logits = logits[:, min(DISCRIMINATOR_WARMUP, logits.shape[1] - 1):]
     metrics = {}
+    targets = labels * 2 - 1
+
+    def errors(values, targets):
+        # Batches contain equal expert/policy counts; sum the two class means.
+        return 2 * (values - targets).square()
 
     if not discriminator.factorized:
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        loss = errors(logits, targets[:, None]).mean()
         selected = logits
     else:
         if weights is None:
             weights = balanced_proximity_weights(near, labels)
 
-        targets = labels[:, None].expand(-1, 2)
-        errors = F.binary_cross_entropy_with_logits(
-            logits[:, :2],
-            targets,
-            reduction="none",
-        )
-        head_losses = (errors * weights).mean(dim=0)
+        head_errors = errors(logits[:, :, :2], targets[:, None, None]).mean(dim=1)
+        head_losses = (head_errors * weights).mean(dim=0)
         specialist_loss = SPECIALIST_WEIGHT * head_losses.sum()
-        global_loss = F.binary_cross_entropy_with_logits(logits[:, 2], labels)
+        global_loss = errors(logits[:, :, 2], targets[:, None]).mean()
         loss = specialist_loss + GLOBAL_WEIGHT * global_loss
         selected = (
-            SPECIALIST_WEIGHT * torch.where(near, logits[:, 1], logits[:, 0])
-            + GLOBAL_WEIGHT * logits[:, 2]
+            SPECIALIST_WEIGHT * torch.where(near[:, None], logits[:, :, 1], logits[:, :, 0])
+            + GLOBAL_WEIGHT * logits[:, :, 2]
         )
         metrics.update(
             far_loss=head_losses[0].detach(),
             near_loss=head_losses[1].detach(),
             global_loss=global_loss.detach(),
-            near_ball_fraction=near.float().mean(),
+            near_ball_fraction=near.float().mean()
         )
 
     if not return_metrics:
@@ -65,48 +48,126 @@ def discriminator_loss(discriminator, windows, labels, near, weights=None, retur
     generated, expert = selected.detach().split(count)
     metrics.update(
         loss=loss.detach(),
-        agent_score=generated.neg().sigmoid().mean(),
-        expert_score=expert.neg().sigmoid().mean(),
+        agent_score=generated.mean(),
+        expert_score=expert.mean(),
         agent_accuracy=(generated <= 0).float().mean(),
-        expert_accuracy=(expert > 0).float().mean(),
+        expert_accuracy=(expert > 0).float().mean()
     )
 
     return loss, metrics
+
+
+def gradient_penalty_weights(near, factorized):
+    weights = torch.ones((len(near), 1), device=near.device)
+
+    if factorized:
+        bands = torch.stack((~near, near), dim=1).float()
+        counts = bands.sum(0)
+        weights = torch.cat((
+            SPECIALIST_WEIGHT * bands * len(near) / counts.clamp_min(1)
+            / (counts > 0).sum().clamp_min(1),
+            GLOBAL_WEIGHT * weights
+        ), dim=1)
+
+    return weights
+
+
+def expert_gradient_penalty(discriminator, expert, weights, steps):
+    # cuDNN GRUs do not support the second derivatives required by this penalty.
+    with (
+        torch.autocast(expert.device.type, enabled=False),
+        torch.backends.cudnn.flags(enabled=False)
+    ):
+        penalty = expert.new_zeros((), dtype=torch.float32)
+
+        for head in range(weights.shape[1]):
+            active = weights[:, head] != 0
+
+            if not active.any():
+                continue
+
+            windows = expert[active].detach().float().requires_grad_(True)
+            scores = (
+                discriminator.head_score(windows, head)
+                if discriminator.factorized else discriminator(windows)
+            )
+            batch = torch.arange(len(windows), device=expert.device)
+            selected = scores[batch, steps[active]]
+            gradient, = torch.autograd.grad(selected.sum(), windows, create_graph=True)
+            norm = gradient.flatten(1).square().sum(1)
+            # Keep the original batch denominator after removing zero-weight samples.
+            penalty = penalty + (norm * weights[active, head]).sum() / len(expert)
+
+    return penalty
 
 
 def train_discriminator_batch(discriminator, optimizer, generated, expert, args):
     count = len(generated)
     windows = torch.cat((generated, expert))
     labels = torch.cat((windows.new_zeros(count), windows.new_ones(count)))
-    near = nearest_ball_distance(windows) <= args.near_distance
+    near = features.nearest_ball_distance(windows) <= args.near_distance
     weights = balanced_proximity_weights(near, labels) if discriminator.factorized else None
+    penalty_weights = gradient_penalty_weights(near[count:], discriminator.factorized)
+    # Uniform timestep sampling estimates the per-step penalty without a full Jacobian.
+    penalty_steps = torch.randint(
+        min(DISCRIMINATOR_WARMUP, expert.shape[1] - 1),
+        expert.shape[1],
+        (count,),
+        device=expert.device
+    )
+    penalty_indices = (
+        torch.arange(count, device=expert.device)
+        if args.discriminator_gradient_penalty_samples is None
+        else torch.randperm(count, device=expert.device)[:args.discriminator_gradient_penalty_samples]
+    )
     metrics = {}
     optimizer.zero_grad(set_to_none=True)
 
-    for start in range(0, count, args.discriminator_microbatch_size):
-        stop = min(start + args.discriminator_microbatch_size, count)
+    for start in range(0, count, args.discriminator_update_microbatch_size):
+        stop = min(start + args.discriminator_update_microbatch_size, count)
         indices = torch.cat(
             (
                 torch.arange(start, stop, device=windows.device),
-                torch.arange(count + start, count + stop, device=windows.device),
+                torch.arange(count + start, count + stop, device=windows.device)
             )
         )
         if windows.is_cuda:
             torch.compiler.cudagraph_mark_step_begin()
 
-        loss, chunk_metrics = discriminator_loss(
-            discriminator,
-            windows[indices],
-            labels[indices],
-            near[indices],
-            weights[indices] if weights is not None else None,
-            return_metrics=True,
-        )
+        with autocast(windows.device, args.bf16):
+            loss, chunk_metrics = discriminator_loss(
+                discriminator,
+                windows[indices],
+                labels[indices],
+                near[indices],
+                weights[indices] if weights is not None else None,
+                return_metrics=True
+            )
         fraction = (stop - start) / count
         (loss * fraction).backward()
 
+        if args.discriminator_gradient_penalty:
+            selected = penalty_indices[(penalty_indices >= start) & (penalty_indices < stop)]
+
+            if len(selected):
+                penalty = expert_gradient_penalty(
+                    discriminator, expert[selected], penalty_weights[selected], penalty_steps[selected]
+                )
+                penalty_fraction = len(selected) / len(penalty_indices)
+                penalty_loss = 0.5 * args.discriminator_gradient_penalty * penalty
+                (penalty_loss * penalty_fraction).backward()
+                metrics["gradient_penalty"] = (
+                    metrics.get("gradient_penalty", 0.0) + penalty.detach() * penalty_fraction
+                )
+
         for name, value in chunk_metrics.items():
             metrics[name] = metrics.get(name, 0.0) + value * fraction
+
+    if "gradient_penalty" in metrics:
+        metrics["classification_loss"] = metrics["loss"]
+        metrics["loss"] = (
+            metrics["loss"] + 0.5 * args.discriminator_gradient_penalty * metrics["gradient_penalty"]
+        )
 
     nn.utils.clip_grad_norm_(discriminator.parameters(), args.max_grad_norm)
     optimizer.step()
@@ -125,7 +186,7 @@ def update_discriminator(
     train_indices,
     heldout_indices,
     args,
-    scheduled=True,
+    scheduled=True
 ):
     validation = sample_discriminator_validation(
         discriminator, experts, scenes, heldout_indices, args
@@ -137,14 +198,10 @@ def update_discriminator(
         {
             "discriminator/updated": 0.0,
             "discriminator/minibatches": 0.0,
-            "discriminator/scheduled": float(scheduled),
+            "discriminator/scheduled": float(scheduled)
         }
     )
-    train = (
-        scheduled
-        and len(train_indices)
-        and metrics["discriminator/heldout_accuracy"] < args.discriminator_accuracy_target
-    )
+    train = scheduled and len(train_indices)
 
     if train:
         totals = {}

@@ -1,14 +1,6 @@
 from datetime import datetime
 
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from rich import progress as rich_progress
 
 
 def run_directory(args, algorithm):
@@ -20,14 +12,14 @@ def run_directory(args, algorithm):
 
 
 def progress_bar(description, total):
-    progress = Progress(
-        TextColumn("[bold]{task.description}"),
-        BarColumn(bar_width=None),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TextColumn("{task.fields[rate]}", justify="right"),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
+    progress = rich_progress.Progress(
+        rich_progress.TextColumn("[bold]{task.description}"),
+        rich_progress.BarColumn(bar_width=None),
+        rich_progress.TaskProgressColumn(),
+        rich_progress.MofNCompleteColumn(),
+        rich_progress.TextColumn("{task.fields[rate]}", justify="right"),
+        rich_progress.TimeElapsedColumn(),
+        rich_progress.TimeRemainingColumn()
     )
     task = progress.add_task(description, total=total, rate="")
     progress.start()
@@ -44,5 +36,5 @@ def log_metrics(writer, step, metrics, progress=None, task=None):
         progress.update(
             task,
             completed=min(step, progress.tasks[task].total),
-            rate="" if rate is None else f"{rate:,.0f} it/s",
+            rate="" if rate is None else f"{rate:,.0f} it/s"
         )

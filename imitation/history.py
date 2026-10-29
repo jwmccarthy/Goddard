@@ -23,7 +23,7 @@ class HistoricalReplayBuffer:
             order = torch.randperm(
                 len(windows),
                 device=windows.device,
-                generator=self.generator,
+                generator=self.generator
             )
             windows = windows[order[:count]]
 
@@ -51,7 +51,7 @@ class HistoricalReplayBuffer:
         order = torch.randperm(
             self.size,
             device=self.device,
-            generator=self.generator,
+            generator=self.generator
         )[:count]
         positions = (self.start + order) % self.capacity
 

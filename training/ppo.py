@@ -15,7 +15,7 @@ def ppo_loss(
     clip_coef,
     ent_coef,
     vf_coef,
-    clip_value_loss,
+    clip_value_loss
 ):
     _, log_probs, entropy, values = agent.get_action_and_value(observations, actions)
     log_ratio = log_probs - old_log_probs
@@ -23,7 +23,7 @@ def ppo_loss(
     advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
     policy_loss = torch.maximum(
         -advantages * ratio,
-        -advantages * ratio.clamp(1 - clip_coef, 1 + clip_coef),
+        -advantages * ratio.clamp(1 - clip_coef, 1 + clip_coef)
     ).mean()
     value_error = (values - returns).square()
 
@@ -89,7 +89,7 @@ def update_ppo(agent, optimizer, loss_function, rollout, args):
                     args.clip_coef,
                     args.ent_coef,
                     args.vf_coef,
-                    args.clip_value_loss,
+                    args.clip_value_loss
                 )
 
             loss.backward()

@@ -1579,7 +1579,7 @@ function warnOnce( message ) {
 const LINEAR_SRGB_TO_LINEAR_DISPLAY_P3 = /*@__PURE__*/ new Matrix3().set(
 	0.8224621, 0.177538, 0.0,
 	0.0331941, 0.9668058, 0.0,
-	0.0170827, 0.0723974, 0.9105199,
+	0.0170827, 0.0723974, 0.9105199
 );
 
 const LINEAR_DISPLAY_P3_TO_LINEAR_SRGB = /*@__PURE__*/ new Matrix3().set(
@@ -1597,26 +1597,26 @@ const COLOR_SPACES = {
 		transfer: LinearTransfer,
 		primaries: Rec709Primaries,
 		toReference: ( color ) => color,
-		fromReference: ( color ) => color,
+		fromReference: ( color ) => color
 	},
 	[ SRGBColorSpace ]: {
 		transfer: SRGBTransfer,
 		primaries: Rec709Primaries,
 		toReference: ( color ) => color.convertSRGBToLinear(),
-		fromReference: ( color ) => color.convertLinearToSRGB(),
+		fromReference: ( color ) => color.convertLinearToSRGB()
 	},
 	[ LinearDisplayP3ColorSpace ]: {
 		transfer: LinearTransfer,
 		primaries: P3Primaries,
 		toReference: ( color ) => color.applyMatrix3( LINEAR_DISPLAY_P3_TO_LINEAR_SRGB ),
-		fromReference: ( color ) => color.applyMatrix3( LINEAR_SRGB_TO_LINEAR_DISPLAY_P3 ),
+		fromReference: ( color ) => color.applyMatrix3( LINEAR_SRGB_TO_LINEAR_DISPLAY_P3 )
 	},
 	[ DisplayP3ColorSpace ]: {
 		transfer: SRGBTransfer,
 		primaries: P3Primaries,
 		toReference: ( color ) => color.convertSRGBToLinear().applyMatrix3( LINEAR_DISPLAY_P3_TO_LINEAR_SRGB ),
-		fromReference: ( color ) => color.applyMatrix3( LINEAR_SRGB_TO_LINEAR_DISPLAY_P3 ).convertLinearToSRGB(),
-	},
+		fromReference: ( color ) => color.applyMatrix3( LINEAR_SRGB_TO_LINEAR_DISPLAY_P3 ).convertLinearToSRGB()
+	}
 };
 
 const SUPPORTED_WORKING_COLOR_SPACES = new Set( [ LinearSRGBColorSpace, LinearDisplayP3ColorSpace ] );
@@ -1684,7 +1684,7 @@ const ColorManagement = {
 
 		return COLOR_SPACES[ colorSpace ].transfer;
 
-	},
+	}
 
 };
 
@@ -3819,7 +3819,7 @@ class Quaternion {
 			sqrt1u1 * Math.cos( u2 ),
 			sqrtu1 * Math.sin( u3 ),
 			sqrtu1 * Math.cos( u3 ),
-			sqrt1u1 * Math.sin( u2 ),
+			sqrt1u1 * Math.sin( u2 )
 		);
 
 	}
@@ -9867,7 +9867,7 @@ function fromHalfFloat( val ) {
 
 const DataUtils = {
 	toHalfFloat: toHalfFloat,
-	fromHalfFloat: fromHalfFloat,
+	fromHalfFloat: fromHalfFloat
 };
 
 const _vector$9 = /*@__PURE__*/ new Vector3();
@@ -12980,7 +12980,7 @@ class WebGLCubeRenderTarget extends WebGLRenderTarget {
 		const shader = {
 
 			uniforms: {
-				tEquirect: { value: null },
+				tEquirect: { value: null }
 			},
 
 			vertexShader: /* glsl */`
@@ -14731,7 +14731,7 @@ const ShaderLib = {
 	equirect: {
 
 		uniforms: {
-			tEquirect: { value: null },
+			tEquirect: { value: null }
 		},
 
 		vertexShader: ShaderChunk.equirect_vert,
@@ -14764,7 +14764,7 @@ const ShaderLib = {
 			{
 				color: { value: /*@__PURE__*/ new Color( 0x00000 ) },
 				opacity: { value: 1.0 }
-			},
+			}
 		] ),
 
 		vertexShader: ShaderChunk.shadow_vert,
@@ -14821,7 +14821,7 @@ ShaderLib.physical = {
 			specularIntensityMapTransform: { value: /*@__PURE__*/ new Matrix3() },
 			anisotropyVector: { value: /*@__PURE__*/ new Vector2() },
 			anisotropyMap: { value: null },
-			anisotropyMapTransform: { value: /*@__PURE__*/ new Matrix3() },
+			anisotropyMapTransform: { value: /*@__PURE__*/ new Matrix3() }
 		}
 	] ),
 
@@ -16578,7 +16578,7 @@ class PMREMGenerator {
 			name: 'PMREM.Background',
 			side: BackSide,
 			depthWrite: false,
-			depthTest: false,
+			depthTest: false
 		} );
 
 		const backgroundBox = new Mesh( new BoxGeometry(), backgroundMaterial );
@@ -16938,7 +16938,7 @@ function _getBlurShader( lodMax, width, height ) {
 			'n': MAX_SAMPLES,
 			'CUBEUV_TEXEL_WIDTH': 1.0 / width,
 			'CUBEUV_TEXEL_HEIGHT': 1.0 / height,
-			'CUBEUV_MAX_MIP': `${lodMax}.0`,
+			'CUBEUV_MAX_MIP': `${lodMax}.0`
 		},
 
 		uniforms: {
@@ -28470,7 +28470,7 @@ class WebGLRenderer {
 			premultipliedAlpha = true,
 			preserveDrawingBuffer = false,
 			powerPreference = 'default',
-			failIfMajorPerformanceCaveat = false,
+			failIfMajorPerformanceCaveat = false
 		} = parameters;
 
 		this.isWebGLRenderer = true;
@@ -28638,7 +28638,7 @@ class WebGLRenderer {
 				premultipliedAlpha,
 				preserveDrawingBuffer,
 				powerPreference,
-				failIfMajorPerformanceCaveat,
+				failIfMajorPerformanceCaveat
 			};
 
 			// OffscreenCanvas does not have setAttribute, see #22811
@@ -31851,7 +31851,7 @@ class LOD extends Object3D {
 				value: []
 			},
 			isLOD: {
-				value: true,
+				value: true
 			}
 		} );
 
@@ -32870,7 +32870,7 @@ class MultiDrawRenderList {
 
 				start: - 1,
 				count: - 1,
-				z: - 1,
+				z: - 1
 
 			} );
 
@@ -33170,7 +33170,7 @@ class BatchedMesh extends Mesh {
 			vertexStart: - 1,
 			vertexCount: - 1,
 			indexStart: - 1,
-			indexCount: - 1,
+			indexCount: - 1
 		};
 
 		let lastRange = null;
@@ -36610,7 +36610,7 @@ class CapsuleGeometry extends LatheGeometry {
 			radius: radius,
 			length: length,
 			capSegments: capSegments,
-			radialSegments: radialSegments,
+			radialSegments: radialSegments
 		};
 
 	}
@@ -37500,7 +37500,7 @@ class EdgesGeometry extends BufferGeometry {
 
 							index0: indexArr[ j ],
 							index1: indexArr[ jNext ],
-							normal: _normal.clone(),
+							normal: _normal.clone()
 
 						};
 
@@ -43482,7 +43482,7 @@ class FileLoader extends Loader {
 		loading[ url ].push( {
 			onLoad: onLoad,
 			onProgress: onProgress,
-			onError: onError,
+			onError: onError
 		} );
 
 		// create request
@@ -48865,7 +48865,7 @@ PropertyBinding.prototype.GetterByBindingType = [
 	PropertyBinding.prototype._getValue_direct,
 	PropertyBinding.prototype._getValue_array,
 	PropertyBinding.prototype._getValue_arrayElement,
-	PropertyBinding.prototype._getValue_toArray,
+	PropertyBinding.prototype._getValue_toArray
 
 ];
 
@@ -48875,7 +48875,7 @@ PropertyBinding.prototype.SetterByBindingTypeAndVersioning = [
 		// Direct
 		PropertyBinding.prototype._setValue_direct,
 		PropertyBinding.prototype._setValue_direct_setNeedsUpdate,
-		PropertyBinding.prototype._setValue_direct_setMatrixWorldNeedsUpdate,
+		PropertyBinding.prototype._setValue_direct_setMatrixWorldNeedsUpdate
 
 	], [
 
@@ -48883,21 +48883,21 @@ PropertyBinding.prototype.SetterByBindingTypeAndVersioning = [
 
 		PropertyBinding.prototype._setValue_array,
 		PropertyBinding.prototype._setValue_array_setNeedsUpdate,
-		PropertyBinding.prototype._setValue_array_setMatrixWorldNeedsUpdate,
+		PropertyBinding.prototype._setValue_array_setMatrixWorldNeedsUpdate
 
 	], [
 
 		// ArrayElement
 		PropertyBinding.prototype._setValue_arrayElement,
 		PropertyBinding.prototype._setValue_arrayElement_setNeedsUpdate,
-		PropertyBinding.prototype._setValue_arrayElement_setMatrixWorldNeedsUpdate,
+		PropertyBinding.prototype._setValue_arrayElement_setMatrixWorldNeedsUpdate
 
 	], [
 
 		// HasToFromArray
 		PropertyBinding.prototype._setValue_fromArray,
 		PropertyBinding.prototype._setValue_fromArray_setNeedsUpdate,
-		PropertyBinding.prototype._setValue_fromArray_setMatrixWorldNeedsUpdate,
+		PropertyBinding.prototype._setValue_fromArray_setMatrixWorldNeedsUpdate
 
 	]
 
@@ -53022,7 +53022,7 @@ class ShapePath {
 if ( typeof __THREE_DEVTOOLS__ !== 'undefined' ) {
 
 	__THREE_DEVTOOLS__.dispatchEvent( new CustomEvent( 'register', { detail: {
-		revision: REVISION,
+		revision: REVISION
 	} } ) );
 
 }

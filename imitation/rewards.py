@@ -1,121 +1,123 @@
-import math
-
 import torch
+from torch.nn import functional as F
 
-from imitation.features import (
-    GLOBAL_WEIGHT,
-    REFERENCE_FRAMESKIP,
-    SPECIALIST_WEIGHT,
-    nearest_ball_distance,
-)
+from imitation import features
 from rewards import REWARD_PLUS_COMPONENTS
 from training.tensors import autocast
 
 
-def standardize_scores(scores, near, max_magnitude):
-    result = torch.zeros_like(scores)
-
-    if scores.shape[1] == 1:
-        values = scores[:, 0]
-        std = values.std(unbiased=False)
-
-        if std > 1e-8:
-            result[:, 0] = ((values - values.mean()) / std).clamp(-max_magnitude, max_magnitude)
-
-        return result
-
-    for head, active in enumerate((~near, near, torch.ones_like(near))):
-        values = scores[active, head]
-
-        if not len(values):
-            continue
-
-        std = values.std(unbiased=False)
-
-        if std > 1e-8:
-            result[active, head] = ((values - values.mean()) / std).clamp(
-                -max_magnitude,
-                max_magnitude,
-            )
-
-    return result
-
-
-def discriminator_rewards(logits, near, args, previous=None):
+def discriminator_rewards(logits, near, args):
     if not len(logits):
         return logits.new_empty(0)
 
-    max_magnitude = args.reward_max_magnitude
+    if args.differential:
+        if args.multiply_discriminator_reward and logits.shape[-1] == 3:
+            potential = F.logsigmoid(2 * torch.atanh(logits.clamp(-0.95, 0.95)))
+        else:
+            potential = 0.5 * logits.clamp(-1, 1)
 
-    if args.exp_log_odds_reward:
-        scores = logits.clamp_max(math.log(max_magnitude)).exp()
+        if potential.shape[-1] == 3:
+            gates = near[:, None] if near.ndim == 1 else near
+            specialist = torch.where(gates, potential[:, :, 1], potential[:, :, 0])
+            potential = features.SPECIALIST_WEIGHT * specialist + features.GLOBAL_WEIGHT * potential[:, :, 2]
+        else:
+            potential = potential[:, :, 0]
 
-        if args.differential:
-            change = scores - args.reward_gamma * previous.clamp_max(math.log(max_magnitude)).exp()
-            scores = change.clamp(-max_magnitude, max_magnitude)
-    elif args.differential:
-        scores = (logits - previous).clamp(-max_magnitude, max_magnitude)
+        return (potential[:, -1] - potential[:, -2]) * args.discriminator_reward_scale
     else:
-        scores = logits.clamp(-max_magnitude, max_magnitude)
-
-        if not args.log_odds_reward:
-            scores = standardize_scores(scores, near, max_magnitude)
-
-    if not args.differential:
-        scores = scores * (args.frameskip / REFERENCE_FRAMESKIP)
-
-    scores = scores * args.discriminator_reward_scale
+        scores = (1 - 0.25 * (logits[:, -1] - 1).square()).clamp(0, 1)
 
     if scores.shape[1] == 3:
-        return (
-            SPECIALIST_WEIGHT * torch.where(near, scores[:, 1], scores[:, 0])
-            + GLOBAL_WEIGHT * scores[:, 2]
+        specialist = torch.where(near, scores[:, 1], scores[:, 0])
+        scores = (
+            specialist * scores[:, 2]
+            if args.multiply_discriminator_reward
+            else features.SPECIALIST_WEIGHT * specialist + features.GLOBAL_WEIGHT * scores[:, 2]
         )
+    else:
+        scores = scores[:, 0]
 
-    return scores[:, 0]
+    scores = scores * (args.frameskip / features.REFERENCE_FRAMESKIP)
+
+    return scores * args.discriminator_reward_scale
+
+
+def window_verdicts(discriminator, windows, args):
+    with autocast(windows.device, args.bf16):
+        scores = discriminator(windows)[:, -1].float()
+
+    scores = scores.unsqueeze(-1) if not discriminator.factorized else scores
+    near = features.nearest_ball_distance(windows) <= args.near_distance
+
+    return scores, near
 
 
 @torch.no_grad()
 def imitation_rewards(discriminator, scenes, rollout, gameplay, args):
     valid = scenes.valid_indices
     device = rollout.rewards.device
-    heads = 3 if discriminator.factorized else 1
-    logits = torch.empty((len(valid), heads), device=device)
-    previous = torch.empty_like(logits) if args.differential else None
-    near = torch.empty(len(valid), dtype=torch.bool, device=device)
-
-    for start in range(0, len(valid), args.discriminator_microbatch_size):
-        stop = min(start + args.discriminator_microbatch_size, len(valid))
-        windows = scenes.windows(valid[start:stop])
-
-        with autocast(device, args.bf16):
-            values = discriminator(windows)
-            logits[start:stop] = values[:, None] if values.ndim == 1 else values
-
-            if previous is not None:
-                values = discriminator(windows[:, :-1])
-                previous[start:stop] = values[:, None] if values.ndim == 1 else values
-
-        near[start:stop] = nearest_ball_distance(windows) <= args.near_distance
-
-    imitation = discriminator_rewards(logits, near, args, previous)
-
     numel = rollout.rewards.numel()
+    heads = 3 if discriminator.factorized else 1
+    logits = torch.empty((numel, heads), device=device)
+    near = torch.empty(numel, dtype=torch.bool, device=device)
+
+    for start in range(0, len(valid), args.discriminator_inference_microbatch_size):
+        stop = min(start + args.discriminator_inference_microbatch_size, len(valid))
+        selected = valid[start:stop]
+        logits[selected], near[selected] = window_verdicts(discriminator, scenes.windows(selected), args)
+
+    if args.differential:
+        valid = scenes.differential_indices
+        previous_indices = valid - rollout.rewards.shape[1]
+        interior = previous_indices >= 0
+        previous = torch.empty((len(valid), heads), device=device)
+        previous_near = torch.empty(len(valid), dtype=torch.bool, device=device)
+        previous[interior] = logits[previous_indices[interior]]
+        previous_near[interior] = near[previous_indices[interior]]
+        boundary = (~interior).nonzero().flatten()
+
+        for start in range(0, len(boundary), args.discriminator_inference_microbatch_size):
+            selected = boundary[start:start + args.discriminator_inference_microbatch_size]
+            windows = scenes.previous_windows(valid[selected])
+            previous[selected], previous_near[selected] = window_verdicts(discriminator, windows, args)
+
+        pairs = torch.stack((previous, logits[valid]), dim=1)
+        gates = torch.stack((previous_near, near[valid]), dim=1)
+    else:
+        pairs = logits[valid, None]
+        gates = near[valid]
+
+    imitation = discriminator_rewards(pairs, gates, args)
     imitation_reward = torch.zeros(numel, device=device)
     imitation_reward[valid] = imitation
 
-    environment_reward = rollout.rewards.flatten() * args.environment_reward_coef
-    goal_reward = environment_reward * args.goal_reward_weight
-    flip_reset_reward = (
-        gameplay.flip_buffer.flatten() * args.flip_reset_reward_weight * args.physical_reward_scale
-    )
-    reward_plus_components = {
-        name: gameplay.buffers[name].flatten() * args.physical_reward_scale
-        for name in REWARD_PLUS_COMPONENTS
-    }
+    return apply_imitation_rewards(imitation_reward, rollout, gameplay, args)
+
+
+def apply_imitation_rewards(imitation_reward, rollout, gameplay, args):
+    imitation_reward = imitation_reward.flatten()
+    numel = imitation_reward.numel()
+    device = imitation_reward.device
+
+    if args.reward_plus:
+        environment_reward = rollout.rewards.flatten() * args.environment_reward_coef
+        goal_reward = environment_reward * args.goal_reward_weight
+        flip_reset_reward = (
+            gameplay.flip_buffer.flatten() * args.flip_reset_reward_weight * args.physical_reward_scale
+        )
+        reward_plus_components = {
+            name: gameplay.buffers[name].flatten() * args.physical_reward_scale
+            for name in REWARD_PLUS_COMPONENTS
+        }
+    else:
+        goal_reward = torch.zeros_like(imitation_reward)
+        flip_reset_reward = torch.zeros_like(imitation_reward)
+        reward_plus_components = {
+            name: torch.zeros_like(imitation_reward) for name in REWARD_PLUS_COMPONENTS
+        }
     reward_plus_reward = sum(
         reward_plus_components.values(),
-        torch.zeros(numel, device=device),
+        torch.zeros(numel, device=device)
     )
     physical_reward = flip_reset_reward + reward_plus_reward
 
@@ -130,7 +132,7 @@ def imitation_rewards(discriminator, scenes, rollout, gameplay, args):
                     flip_reset_reward,
                     *reward_plus_components.values(),
                     reward_plus_reward,
-                    physical_reward,
+                    physical_reward
                 )
             ]
         ).amax()
@@ -141,7 +143,7 @@ def imitation_rewards(discriminator, scenes, rollout, gameplay, args):
                 / args.discriminator_reward_scale
                 / largest_physical.clamp_min(1e-12)
             ).clamp(max=1),
-            torch.ones_like(largest_physical),
+            torch.ones_like(largest_physical)
         )
         flip_reset_reward = flip_reset_reward * cap
         reward_plus_components = {
@@ -163,7 +165,7 @@ def imitation_rewards(discriminator, scenes, rollout, gameplay, args):
         "reward_plus_reward": learner_rms(reward_plus_reward).item(),
         "rms/imitation": learner_rms(imitation_reward).item(),
         "rms/goal": learner_rms(goal_reward).item(),
-        "rms/physical": learner_rms(physical_reward).item(),
+        "rms/physical": learner_rms(physical_reward).item()
     }
 
     if cap is not None:

@@ -6,46 +6,18 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from imitation.dataset import ExpertDataset as ExpertDataset
-from imitation.evaluation import discriminator_scores as discriminator_scores
-from imitation.evaluation import evaluate_discriminator as evaluate_discriminator
-from imitation.evaluation import sample_discriminator_validation as sample_discriminator_validation
-from imitation.features import BALL_NEAR_DISTANCE as BALL_NEAR_DISTANCE
-from imitation.features import BLUE_START as BLUE_START
-from imitation.features import GLOBAL_WEIGHT as GLOBAL_WEIGHT
-from imitation.features import POSITION_SCALE as POSITION_SCALE
-from imitation.features import REFERENCE_FRAMESKIP as REFERENCE_FRAMESKIP
-from imitation.features import SPECIALIST_WEIGHT as SPECIALIST_WEIGHT
-from imitation.features import ball_distances as ball_distances
-from imitation.features import nearest_ball_distance as nearest_ball_distance
-from imitation.features import relative_scene_positions as relative_scene_positions
-from imitation.history import HistoricalReplayBuffer as HistoricalReplayBuffer
-from imitation.models import EgoBallSceneDiscriminator as EgoBallSceneDiscriminator
-from imitation.models import FactorizedSceneDiscriminator as FactorizedSceneDiscriminator
-from imitation.models import SceneDiscriminator as SceneDiscriminator
-from imitation.models import build_discriminator as build_discriminator
-from imitation.rewards import discriminator_rewards as discriminator_rewards
-from imitation.rewards import imitation_rewards as imitation_rewards
-from imitation.rewards import standardize_scores as standardize_scores
-from imitation.rollout import SceneRollout as SceneRollout
-from imitation.rollout import split_generated as split_generated
-from imitation.update import balanced_proximity_weights as balanced_proximity_weights
-from imitation.update import discriminator_loss as discriminator_loss
-from imitation.update import train_discriminator_batch as train_discriminator_batch
-from imitation.update import update_discriminator as update_discriminator
-from replays import PARSED_DIR as PARSED_DIR
-from replays.layout import BALL_SIZE as BALL_SIZE
-from replays.layout import CAR_SIZE as CAR_SIZE
-from replays.layout import team_replay_row_size as team_replay_row_size
+from imitation.dataset import ExpertDataset
+from imitation.features import REFERENCE_FRAMESKIP
+from imitation.history import HistoricalReplayBuffer
+from imitation.models import build_discriminator
+from imitation.recurrent import EpisodeRollout, ExpertStreams, RecurrentHistory, update_recurrent
+from imitation.rewards import apply_imitation_rewards, imitation_rewards
+from imitation.rollout import SceneRollout, split_generated
+from imitation.update import update_discriminator
 from replays.layout import team_scene_size
 from replays.resets import ReplayResetProvider
-from rewards import BALL_MAX_SPEED as BALL_MAX_SPEED
-from rewards import CAR_MAX_SPEED as CAR_MAX_SPEED
-from rewards import REWARD_PLUS_COMPONENTS as REWARD_PLUS_COMPONENTS
 from rewards import GameplayDiagnostics
-from training.arguments import add_gaifo_arguments as add_gaifo_arguments
-from training.arguments import add_ppo_arguments
-from training.arguments import resolve_gaifo_defaults as resolve_gaifo_defaults
+from training.arguments import add_gaifo_arguments, add_ppo_arguments, resolve_gaifo_defaults
 from training.checkpoints import load_checkpoint, save_checkpoint
 from training.logging import log_metrics, progress_bar, run_directory
 from training.ppo import update_ppo
@@ -56,18 +28,6 @@ from training.tensors import autocast, plain_tensor
 
 def train(args):
     resolve_gaifo_defaults(args)
-
-    if not 0.0 <= args.replay_reset_fraction <= 1.0:
-        raise ValueError("replay reset fraction must be in [0, 1]")
-
-    if args.exp_log_odds_reward and args.log_odds_reward:
-        raise ValueError("choose --exp-log-odds-reward or --log-odds-reward, not both")
-
-    if not 0.0 <= args.history_mix_fraction < 1.0:
-        raise ValueError("history mix fraction must be in [0, 1)")
-
-    if args.history_add_size > args.history_capacity:
-        raise ValueError("history add size must not exceed history capacity")
 
     args.reward_gamma = args.gamma ** (args.frameskip / REFERENCE_FRAMESKIP)
 
@@ -80,7 +40,7 @@ def train(args):
         args.rollout,
         args.frameskip,
         reward_plus=args.reward_plus,
-        no_touch_timeout_steps=math.ceil(args.no_touch_timeout * 120 / args.frameskip),
+        no_touch_timeout_steps=math.ceil(args.no_touch_timeout * 120 / args.frameskip)
     )
     env.register_reward(gameplay)
     writer = None
@@ -90,7 +50,7 @@ def train(args):
         discriminator_optimizer = torch.optim.Adam(
             discriminator.parameters(),
             lr=args.discriminator_learning_rate,
-            fused=True,
+            fused=True
         )
         experts = ExpertDataset(
             args.replay_dir,
@@ -101,17 +61,19 @@ def train(args):
             seed=args.seed,
             heldout_size=args.discriminator_heldout_size,
             near_distance=args.near_distance,
-            load_reset_data=args.replay_reset_fraction > 0,
+            load_reset_data=args.replay_reset_fraction > 0
         )
         replay_resets = ReplayResetProvider(experts, args.replay_reset_fraction, args.seed)
         env.reset_state_provider = replay_resets
-        history = HistoricalReplayBuffer(
-            args.history_capacity,
-            args.trajectory_length,
-            team_scene_size(args.team_size),
-            env.device,
-            seed=args.seed,
-        )
+        history = None
+        if not args.episode_memory:
+            history = HistoricalReplayBuffer(
+                args.history_capacity,
+                args.trajectory_length,
+                team_scene_size(args.team_size),
+                env.device,
+                seed=args.seed
+            )
         step = iteration = 0
         last_discriminator_update = None
 
@@ -131,9 +93,22 @@ def train(args):
             observation,
             args.rollout,
             args.trajectory_length,
-            team_scene_size(args.team_size),
+            team_scene_size(args.team_size)
         )
         heldout_sim = None
+        episode = streams = validation_streams = None
+
+        if args.episode_memory:
+            episode = EpisodeRollout(scenes, discriminator, args)
+            streams = ExpertStreams(experts, discriminator,
+                                    max(1, args.discriminator_batch_size // args.trajectory_length),
+                                    args.trajectory_length)
+            if len(experts.heldout_episodes) and args.discriminator_heldout_size:
+                validation_streams = ExpertStreams(
+                    experts, discriminator, max(1, args.discriminator_heldout_size // args.trajectory_length),
+                    args.trajectory_length, heldout=True
+                )
+            history = RecurrentHistory(args.history_capacity // args.trajectory_length, args.seed, env.device)
 
         while step < args.timesteps:
             started = time.perf_counter()
@@ -152,38 +127,49 @@ def train(args):
                 observation,
                 args,
                 scenes,
-                capture=gameplay.capture,
+                capture=gameplay.capture
             )
             scenes.prepare()
-            valid = scenes.ages >= scenes.length - 2
+            valid = scenes.ages >= (2 if args.episode_memory else scenes.length - 2)
             train_indices, heldout_indices, heldout_sim = split_generated(
                 valid,
                 heldout_sim,
                 args.discriminator_heldout_size,
-                env.n_cars,
+                env.n_cars
             )
             metrics = {"environment_reward": rollout.rewards.mean().item()}
             scheduled = (
                 last_discriminator_update is None
                 or iteration - last_discriminator_update >= args.discriminator_every
             )
-            discriminator_metrics = update_discriminator(
-                discriminator,
-                discriminator_optimizer,
-                experts,
-                scenes,
-                history,
-                train_indices,
-                heldout_indices,
-                args,
-                scheduled=scheduled,
-            )
+            if episode is not None:
+                episode.prepare(discriminator, args)
+                discriminator_metrics = update_recurrent(
+                    discriminator, discriminator_optimizer, episode, streams, validation_streams,
+                    history, heldout_sim, env.n_cars, args, scheduled
+                )
+            else:
+                discriminator_metrics = update_discriminator(
+                    discriminator,
+                    discriminator_optimizer,
+                    experts,
+                    scenes,
+                    history,
+                    train_indices,
+                    heldout_indices,
+                    args,
+                    scheduled=scheduled
+                )
             metrics.update(discriminator_metrics)
 
             if discriminator_metrics["discriminator/updated"]:
                 last_discriminator_update = iteration
 
-            metrics.update(imitation_rewards(discriminator, scenes, rollout, gameplay, args))
+            if episode is not None:
+                values = episode.rewards(discriminator, args)
+                metrics.update(apply_imitation_rewards(values, rollout, gameplay, args))
+            else:
+                metrics.update(imitation_rewards(discriminator, scenes, rollout, gameplay, args))
             metrics.update(gameplay.diagnostic_metrics())
             metrics.update(replay_resets.diagnostic_metrics())
 
@@ -217,7 +203,7 @@ def train(args):
                     iteration=iteration,
                     last_discriminator_update=last_discriminator_update,
                     discriminator=discriminator.state_dict(),
-                    discriminator_optimizer=discriminator_optimizer.state_dict(),
+                    discriminator_optimizer=discriminator_optimizer.state_dict()
                 )
     finally:
         progress.stop()
@@ -229,7 +215,7 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Lean windowed GAIFO with PPO for CARL.")
+    parser = argparse.ArgumentParser(description="AMP-style GAIFO with PPO for CARL.")
     add_ppo_arguments(parser, gaifo=True)
     add_gaifo_arguments(parser)
     args = parser.parse_args()

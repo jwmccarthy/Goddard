@@ -31,7 +31,7 @@ class Rollout:
             values=torch.empty(shape, device=device),
             timeout_values=torch.empty(shape, device=device),
             advantages=torch.empty(shape, device=device),
-            returns=torch.empty(shape, device=device),
+            returns=torch.empty(shape, device=device)
         )
 
 

@@ -1208,7 +1208,7 @@ class OrbitControls extends EventDispatcher {
 			const newEvent = {
 				clientX: event.clientX,
 				clientY: event.clientY,
-				deltaY: event.deltaY,
+				deltaY: event.deltaY
 			}
 
 			switch ( mode ) {

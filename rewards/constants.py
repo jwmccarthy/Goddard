@@ -25,5 +25,5 @@ REWARD_PLUS_COMPONENTS = (
     "ball_ceiling",
     "wall_touch",
     "wall_control",
-    "inverted_ground",
+    "inverted_ground"
 )

@@ -12,14 +12,7 @@ from rlgym_tools.rocket_league.replays.convert import replay_to_rlgym
 from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay, process_replay
 from rlgym_tools.rocket_league.replays.replay_frame import ReplayFrame
 
-from replays import PARSED_DIR, RAW_DIR
-from replays.layout import (
-    EVENT_SIZE,
-    INTERNAL_SIZE,
-    TEAM_SIZES,
-    team_car_count,
-    team_observation_size,
-)
+from replays import PARSED_DIR, RAW_DIR, layout
 
 NORM_POS = np.array([4108.0, 6000.0, 2076.0])
 NORM_BALL_VEL = 6000.0
@@ -50,12 +43,12 @@ BOOST_PAD_POSITIONS = np.asarray(CARL_BOOST_PAD_POSITIONS, dtype=np.float32)
 # fmt: off
 CARL_TO_RLGYM_PAD = np.array((
     15, 18, 29, 30, 3, 4, 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12,
-    13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33,
+    13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33
 ))
 
 MIRRORED_PAD = np.array((
     1, 0, 5, 4, 3, 2, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23,
-    22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6,
+    22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6
 ))
 # fmt: on
 
@@ -81,7 +74,7 @@ def load_replay(path: Path) -> ParsedReplay | None:
 
 
 def valid_replay(replay: ParsedReplay, team_size: int = 1) -> bool:
-    n_cars = team_car_count(team_size)
+    n_cars = layout.team_car_count(team_size)
 
     players = {str(player["unique_id"]): player for player in replay.metadata.get("players", [])}
     active = [players.get(str(player_id)) for player_id in replay.player_dfs]
@@ -108,7 +101,7 @@ def active_frames(replay: ParsedReplay) -> list[list[tuple[ReplayFrame, dict]]]:
                 period["goal_frame"]
                 if period.get("goal_frame") is not None
                 else period["end_frame"]
-            ],
+            ]
         )
         for period in periods
     ]
@@ -130,7 +123,7 @@ def compose_ball(ball: PhysicsObject) -> np.ndarray:
         (
             ball.position / NORM_POS,
             ball.linear_velocity / NORM_BALL_VEL,
-            ball.angular_velocity / NORM_BALL_ANG,
+            ball.angular_velocity / NORM_BALL_ANG
         )
     )
 
@@ -149,8 +142,8 @@ def compose_car(car: Car, physics: PhysicsObject) -> np.ndarray:
                 car.is_demoed,
                 car.has_flipped,
                 car.has_double_jumped,
-                car.is_boosting,
-            ),
+                car.is_boosting
+            )
         )
     )
 
@@ -174,9 +167,9 @@ def compose_internal(car: Car) -> np.ndarray:
             car.autoflip_direction,
             *car.flip_torque,
             car.is_boosting,
-            car.boost_active_time,
+            car.boost_active_time
         ),
-        dtype=np.float32,
+        dtype=np.float32
     )
 
 
@@ -211,19 +204,19 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
 
     boost_features = (
         state.boost_pad_timers[pad_indices] <= 0,
-        np.linalg.norm(BOOST_PAD_POSITIONS - ego_physics.position, axis=-1) / NORM_BOOST_DIST,
+        np.linalg.norm(BOOST_PAD_POSITIONS - ego_physics.position, axis=-1) / NORM_BOOST_DIST
     )
 
     ball_relative = (
         (ball.position - ego_physics.position) / NORM_POS_REL,
-        (ball.linear_velocity - ego_physics.linear_velocity) / NORM_BALL_VEL_REL,
+        (ball.linear_velocity - ego_physics.linear_velocity) / NORM_BALL_VEL_REL
     )
 
     car_relative = [
         np.concatenate(
             (
                 (physics.position - ego_physics.position) / NORM_POS_REL,
-                (physics.linear_velocity - ego_physics.linear_velocity) / NORM_CAR_VEL_REL,
+                (physics.linear_velocity - ego_physics.linear_velocity) / NORM_CAR_VEL_REL
             )
         )
         for physics in car_physics[1:]
@@ -231,7 +224,7 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
 
     goals = (
         (OWN_GOAL - ball.position) / NORM_POS_REL,
-        (OPP_GOAL - ball.position) / NORM_POS_REL,
+        (OPP_GOAL - ball.position) / NORM_POS_REL
     )
 
     other_cars = [car for car_id, car in state.cars.items() if car_id != ego_id]
@@ -241,9 +234,9 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
             ego.ball_touches > 0,
             any(car.ball_touches > 0 for car in other_cars),
             ego.bump_victim_id is not None
-            or any(car.bump_victim_id == ego_id for car in other_cars),
+            or any(car.bump_victim_id == ego_id for car in other_cars)
         ),
-        dtype=np.float32,
+        dtype=np.float32
     )
 
     car_observations = [
@@ -259,7 +252,7 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
             *car_relative,
             *goals,
             compose_internal(ego),
-            events,
+            events
         )
     )
 
@@ -268,7 +261,7 @@ def interpolate(
     rows: np.ndarray,
     ticks: np.ndarray,
     invalid: np.ndarray,
-    columns: slice,
+    columns: slice
 ) -> None:
     indices = np.flatnonzero(invalid) + 1
 
@@ -302,9 +295,9 @@ def repair_frozen(rows, ticks, start, velocity_scale, angular_scale):
 def observation_car_count(rows: np.ndarray) -> int:
     width = rows.shape[-1]
 
-    for team_size in TEAM_SIZES:
-        if width == team_observation_size(team_size) + INTERNAL_SIZE + EVENT_SIZE:
-            return team_car_count(team_size)
+    for team_size in layout.TEAM_SIZES:
+        if width == layout.team_observation_size(team_size) + layout.INTERNAL_SIZE + layout.EVENT_SIZE:
+            return layout.team_car_count(team_size)
 
     raise ValueError("replay observations must contain two, four, or six cars")
 
@@ -327,7 +320,7 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
 
     resampled = np.stack(
         [np.interp(target_ticks, ticks, rows[:, column]) for column in range(rows.shape[1])],
-        axis=-1,
+        axis=-1
     )
 
     right = np.searchsorted(ticks, target_ticks).clip(0, len(ticks) - 1)
@@ -336,7 +329,7 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
     nearest = np.where(
         target_ticks - ticks[left] <= ticks[right] - target_ticks,
         left,
-        right,
+        right
     )
 
     for index in range(n_cars):
@@ -357,15 +350,15 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
     boost_start = 9 + 21 * n_cars
     discrete.extend(range(boost_start, boost_start + len(BOOST_PAD_POSITIONS)))
 
-    internal_start = team_observation_size(n_cars // 2)
+    internal_start = layout.team_observation_size(n_cars // 2)
     discrete.extend(internal_start + field for field in INTERNAL_DISCRETE_FIELDS)
 
     resampled[:, discrete] = rows[nearest][:, discrete]
-    resampled[:, -EVENT_SIZE:] = 0
+    resampled[:, -layout.EVENT_SIZE:] = 0
 
-    for source, event in np.argwhere(rows[:, -EVENT_SIZE:] > 0.5):
+    for source, event in np.argwhere(rows[:, -layout.EVENT_SIZE:] > 0.5):
         target = np.abs(target_ticks - ticks[source]).argmin()
-        resampled[target, -EVENT_SIZE + event] = 1
+        resampled[target, -layout.EVENT_SIZE + event] = 1
 
     return resampled.astype(np.float32, copy=False)
 
@@ -376,7 +369,7 @@ def mark_discontinuities(rows: np.ndarray, frame_skip: int) -> np.ndarray:
     if len(rows) < 2:
         return np.pad(rows, ((0, 0), (0, 1)))
 
-    touches = rows[:-1, -EVENT_SIZE:].any(axis=-1) | rows[1:, -EVENT_SIZE:].any(axis=-1)
+    touches = rows[:-1, -layout.EVENT_SIZE:].any(axis=-1) | rows[1:, -layout.EVENT_SIZE:].any(axis=-1)
 
     discontinuity = np.zeros(len(rows) - 1, dtype=bool)
 
@@ -401,9 +394,9 @@ def mark_discontinuities(rows: np.ndarray, frame_skip: int) -> np.ndarray:
     return np.concatenate(
         (
             rows,
-            np.pad(discontinuity[:, None], ((1, 0), (0, 0))),
+            np.pad(discontinuity[:, None], ((1, 0), (0, 0)))
         ),
-        axis=-1,
+        axis=-1
     )
 
 
@@ -413,9 +406,9 @@ def parse_replay(
     output_dir: Path,
     frame_skip: int,
     pov_players: tuple[str, ...] | None = None,
-    team_size: int = 1,
+    team_size: int = 1
 ) -> int:
-    n_cars = team_car_count(team_size)
+    n_cars = layout.team_car_count(team_size)
     metadata_players = replay.metadata.get("players", [])
 
     selected = None
@@ -497,7 +490,7 @@ def parse_replay(
                     )
                     for _, errors in samples
                 ],
-                dtype=np.float32,
+                dtype=np.float32
             )
 
             rows = np.concatenate((rows, corrections[:, None]), axis=-1)
@@ -540,7 +533,7 @@ def parse_path(job: tuple[str, str, int, tuple[str, ...] | None, int]) -> tuple[
                 temporary,
                 frame_skip,
                 pov_players,
-                team_size,
+                team_size
             )
 
             if not written:
@@ -574,9 +567,9 @@ def parse(
     frame_skip: int = 4,
     workers: int = 1,
     pov_manifest: str | Path | None = None,
-    team_size: int = 1,
+    team_size: int = 1
 ) -> None:
-    team_car_count(team_size)
+    layout.team_car_count(team_size)
 
     if frame_skip < 1:
         raise ValueError("frame skip must be positive")
@@ -599,7 +592,7 @@ def parse(
             str(output_dir),
             frame_skip,
             manifest.get(path.stem.lower()),
-            team_size,
+            team_size
         )
         for path in paths
     ]
@@ -628,7 +621,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=PARSED_DIR)
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--team-size", type=int, choices=TEAM_SIZES, default=1)
+    parser.add_argument("--team-size", type=int, choices=layout.TEAM_SIZES, default=1)
     parser.add_argument("--pov-manifest", type=Path)
     args = parser.parse_args()
 
@@ -638,7 +631,7 @@ def main() -> None:
         frame_skip=args.frameskip,
         workers=args.workers,
         pov_manifest=args.pov_manifest,
-        team_size=args.team_size,
+        team_size=args.team_size
     )
 
 

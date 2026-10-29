@@ -9,7 +9,7 @@ from replays.api import API_URL, BallchasingClient
 
 UUID_PATTERN = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
-    re.IGNORECASE,
+    re.IGNORECASE
 )
 UNSAFE_COMPONENT = re.compile(r"[^a-z0-9]+")
 
@@ -20,7 +20,7 @@ REGIONS = (
     (re.compile(r"\b(?:sam|south america)\b", re.IGNORECASE), "SAM"),
     (re.compile(r"\b(?:oce|oceania)\b", re.IGNORECASE), "OCE"),
     (re.compile(r"\b(?:apac|asia-pacific)\b", re.IGNORECASE), "APAC"),
-    (re.compile(r"\b(?:ssa|sub-saharan africa)\b", re.IGNORECASE), "SSA"),
+    (re.compile(r"\b(?:ssa|sub-saharan africa)\b", re.IGNORECASE), "SSA")
 )
 
 
@@ -50,7 +50,7 @@ ROOT = Root("1v1-events-q0z69hlqmt", "1v1", "RLCS 2026 1v1 Events")
 def sanitize(value: Any, fallback: str = "unknown", limit: int = 48) -> str:
     component = UNSAFE_COMPONENT.sub(
         "-",
-        "" if value is None else str(value).lower(),
+        "" if value is None else str(value).lower()
     ).strip("-")
 
     component = component[:limit].rstrip("-")
@@ -87,13 +87,13 @@ def list_group_children(client: BallchasingClient, group_id: str) -> list[dict[s
 
 def descendant_leaves(
     client: BallchasingClient,
-    root: Root,
+    root: Root
 ) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
     visited = {root.group_id}
 
     def walk(
         group: dict[str, Any],
-        path: tuple[str, ...],
+        path: tuple[str, ...]
     ) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
         group_id = group["id"]
 
@@ -119,7 +119,7 @@ def descendant_leaves(
 
 
 def select_replays(
-    client: BallchasingClient,
+    client: BallchasingClient
 ) -> tuple[dict[str, ReplaySelection], int]:
     occurrences: list[ReplaySelection] = []
     discovered = 0
@@ -132,7 +132,7 @@ def select_replays(
             group=leaf["id"],
             count=200,
             sort_by="replay-date",
-            sort_dir="asc",
+            sort_dir="asc"
         )
         entries.sort(key=lambda replay: (replay.get("date", ""), replay["id"].lower()))
 
@@ -147,7 +147,7 @@ def select_replays(
                     event_path=path[:-1] or path,
                     series=path[-1],
                     leaf_id=leaf["id"],
-                    game_number=game_number,
+                    game_number=game_number
                 )
             )
 
@@ -159,7 +159,7 @@ def select_replays(
             item.event_path,
             item.series,
             item.leaf_id,
-            item.game_number,
+            item.game_number
         )
     )
 
@@ -198,7 +198,7 @@ def replay_filename(selection: ReplaySelection) -> str:
             event_path,
             series,
             matchup,
-            f"g{selection.game_number:02d}",
+            f"g{selection.game_number:02d}"
         )
     )
 
@@ -251,7 +251,7 @@ def main() -> None:
     finally:
         rename_downloaded(
             replay_dir,
-            {replay_id: selected[replay_id] for replay_id in new_ids},
+            {replay_id: selected[replay_id] for replay_id in new_ids}
         )
 
 

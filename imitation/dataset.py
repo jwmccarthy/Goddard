@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -20,12 +21,20 @@ class ExpertDataset:
         seed=0,
         heldout_size=0,
         near_distance=BALL_NEAR_DISTANCE,
-        load_reset_data=True,
+        load_reset_data=True
     ):
         scene_size = team_scene_size(team_size)
-        chunks, starts, segments = [], [], []
+        chunks, starts, segments, episodes = [], [], [], []
         offset = 0
         paths = sorted(Path(directory).rglob("*.npy"))
+        manifest = Path(directory) / "pro_files.json"
+        if manifest.is_file():
+            allowed = set(json.loads(manifest.read_text())["files"])
+            available = {path.relative_to(directory).as_posix(): path for path in paths}
+            missing = allowed - available.keys()
+            if missing:
+                raise ValueError(f"pro replay allowlist references missing files: {sorted(missing)[:3]}")
+            paths = [available[name] for name in sorted(allowed)]
         groups = {}
         internals, reset_indices, keys = [], [], []
 
@@ -69,6 +78,8 @@ class ExpertDataset:
                 chunks.append(scene)
                 starts.append(candidates[valid] + offset)
                 segments.append(len(starts) - 1)
+                edges = np.diff(np.concatenate(([False], ~bad, [False])).astype(np.int8))
+                episodes.append(np.stack((np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)), 1) + offset)
                 offset += count
 
             if frame_limit and offset >= frame_limit:
@@ -89,6 +100,14 @@ class ExpertDataset:
 
         sizes = [len(starts[index]) for index in segments]
         heldout = self._heldout_segments(sizes, heldout_size, seed)
+        self.train_episodes = torch.as_tensor(
+            np.concatenate([episodes[index] for index in segments if index not in heldout]),
+            device=device
+        )
+        self.heldout_episodes = torch.as_tensor(
+            np.concatenate([episodes[index] for index in segments if index in heldout])
+            if heldout else np.empty((0, 2), np.int64), device=device
+        )
         self.internal_states = None
         self.reset_indices = torch.empty(0, dtype=torch.long, device=device)
 
@@ -102,17 +121,17 @@ class ExpertDataset:
             self.internal_states = torch.as_tensor(np.concatenate(internals), device=device)
             self.reset_indices = torch.as_tensor(
                 np.concatenate(training_resets) if training_resets else np.empty(0, np.int64),
-                device=device,
+                device=device
             )
 
         self.train_starts = torch.as_tensor(
             np.concatenate([starts[index] for index in segments if index not in heldout]),
-            device=device,
+            device=device
         )
         heldout_starts = [starts[index] for index in segments if index in heldout]
         self.heldout_starts = torch.as_tensor(
             np.concatenate(heldout_starts) if heldout_starts else np.empty(0, np.int64),
-            device=device,
+            device=device
         )
         self.train_generator = torch.Generator(device=device).manual_seed(seed)
         self.heldout_generator = torch.Generator(device=device).manual_seed(seed + 1)
@@ -163,7 +182,7 @@ class ExpertDataset:
             len(starts),
             (count,),
             device=self.frames.device,
-            generator=generator,
+            generator=generator
         )
         indices = starts[choices, None] + self.offsets
 

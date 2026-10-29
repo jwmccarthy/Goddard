@@ -8,9 +8,6 @@ from rewards.events import wall_contact
 class MechanicalEventRewards:
 
     def __init__(self, frameskip: int) -> None:
-        if frameskip < 1:
-            raise ValueError("frame skip must be positive")
-
         self.frameskip = frameskip
         self.shape = None
 
@@ -34,7 +31,7 @@ class MechanicalEventRewards:
             (shape[0],),
             2 * TICKS_PER_SECOND + self.frameskip,
             dtype=torch.int32,
-            device=device,
+            device=device
         )
         self.wall_ticks = torch.zeros_like(self.air_ticks)
 
@@ -42,7 +39,7 @@ class MechanicalEventRewards:
     def __call__(
         self,
         context: RewardContext,
-        valid: torch.Tensor,
+        valid: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         self._ensure_state(context)
 
@@ -64,14 +61,14 @@ class MechanicalEventRewards:
             active,
             torch.maximum(
                 self.air_peak,
-                torch.maximum(previous.car_position[..., 2], current.car_position[..., 2]),
+                torch.maximum(previous.car_position[..., 2], current.car_position[..., 2])
             ),
-            0.0,
+            0.0
         )
         boost_spent = torch.where(
             active,
             self.air_boost_spent + (previous.car_boost - current.car_boost).clamp_min(0.0),
-            0.0,
+            0.0
         )
 
         touched = active & (self.air_touched | touches)
@@ -101,13 +98,13 @@ class MechanicalEventRewards:
         prior_owner = torch.where(
             prior_touches.any(dim=-1, keepdim=True),
             prior_touches,
-            self.last_toucher & valid,
+            self.last_toucher & valid
         )
 
         age = torch.where(
             prior_touches.any(dim=-1),
             0,
-            (self.touch_age + self.frameskip).clamp_max(2 * TICKS_PER_SECOND + self.frameskip),
+            (self.touch_age + self.frameskip).clamp_max(2 * TICKS_PER_SECOND + self.frameskip)
         )
 
         ceiling_hit = (
@@ -132,7 +129,7 @@ class MechanicalEventRewards:
             torch.where(
                 touches.any(dim=-1, keepdim=True),
                 touches,
-                prior_owner & ~ceiling_hit[:, None],
+                prior_owner & ~ceiling_hit[:, None]
             )
             & valid
         )
@@ -140,7 +137,7 @@ class MechanicalEventRewards:
         self.touch_age = torch.where(
             context.events.done | ~valid.any(dim=-1),
             2 * TICKS_PER_SECOND + self.frameskip,
-            torch.where(touches.any(dim=-1), 0, age),
+            torch.where(touches.any(dim=-1), 0, age)
         )
 
         ball_near_wall = current.ball_position[:, 0].abs().gt(3500.0) | current.ball_position[
@@ -154,7 +151,7 @@ class MechanicalEventRewards:
             & wall_contact(
                 current.car_on_ground,
                 current.car_position,
-                current.car_up[..., 2],
+                current.car_up[..., 2]
             )
             & ball_near_wall[:, None]
             & distance.lt(280.0)
@@ -187,7 +184,7 @@ class MechanicalEventRewards:
         self.wall_ticks = torch.where(
             wall_touch.gt(0.0),
             int(1.5 * TICKS_PER_SECOND),
-            (self.wall_ticks - self.frameskip).clamp_min(0),
+            (self.wall_ticks - self.frameskip).clamp_min(0)
         )
         self.wall_ticks = torch.where(valid & ~other_touch, self.wall_ticks, 0)
 
@@ -199,5 +196,5 @@ class MechanicalEventRewards:
             "ball_ceiling": ball_ceiling,
             "wall_touch": wall_touch,
             "wall_control": wall_control,
-            "inverted_ground": inverted_ground,
+            "inverted_ground": inverted_ground
         }

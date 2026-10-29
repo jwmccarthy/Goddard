@@ -52,9 +52,6 @@ def replay_internal_states(rows, scenes, team_size, counterparts):
 class ReplayResetProvider:
 
     def __init__(self, experts, fraction=0.70, seed=0):
-        if not 0.0 <= fraction <= 1.0:
-            raise ValueError("replay reset fraction must be in [0, 1]")
-
         if fraction > 0 and not len(experts.reset_indices):
             raise ValueError("no valid training replay frames available for resets")
 
@@ -92,7 +89,7 @@ class ReplayResetProvider:
             len(self.experts.reset_indices),
             (len(simulations),),
             device=reset_mask.device,
-            generator=self.generator,
+            generator=self.generator
         )
         indices = self.experts.reset_indices[choices]
         self.last_reset_indices[simulations] = indices
@@ -105,7 +102,7 @@ class ReplayResetProvider:
             ball=CARLBall.from_tensor(scenes[:, :BALL_SIZE]),
             cars=CARLCars.from_tensor(cars, self.experts.n_cars),
             car_internal_state=self.experts.internal_states[indices],
-            normalized=True,
+            normalized=True
         )
 
     def diagnostic_metrics(self):

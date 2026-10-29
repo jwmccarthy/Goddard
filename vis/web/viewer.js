@@ -38,7 +38,7 @@ async function start() {
   scene.add(world);
   const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(8192, 10240),
-    new THREE.MeshStandardMaterial({ color: 0x173c3b }),
+    new THREE.MeshStandardMaterial({ color: 0x173c3b })
   );
   floor.position.z = -2;
   world.add(floor);
@@ -47,7 +47,7 @@ async function start() {
   const frames = [];
   const ball = new THREE.Mesh(
     new THREE.SphereGeometry(91.25, 24, 16),
-    new THREE.MeshStandardMaterial({ color: 0xf0eee4 }),
+    new THREE.MeshStandardMaterial({ color: 0xf0eee4 })
   );
   ball.position.set(0, 0, 93.15);
   world.add(ball);
@@ -116,7 +116,7 @@ async function start() {
       const before = frames[0];
       const after = frames[1] ?? before;
       const alpha = before.episode !== after.episode ? 1 : THREE.MathUtils.clamp(
-        (time - before.received) / Math.max(after.received - before.received, 1), 0, 1,
+        (time - before.received) / Math.max(after.received - before.received, 1), 0, 1
       );
       position(ball, before.ball, after.ball, alpha);
       after.cars.forEach((state) => {
@@ -135,7 +135,7 @@ async function start() {
         if (!pads[index]) {
           const pad = new THREE.Mesh(
             new THREE.CircleGeometry(location[2] > 72 ? 100 : 45, 16),
-            new THREE.MeshBasicMaterial({ color: 0xffc857, side: THREE.DoubleSide }),
+            new THREE.MeshBasicMaterial({ color: 0xffc857, side: THREE.DoubleSide })
           );
           pad.position.set(location[0], location[1], 4);
           pads[index] = pad;
@@ -156,7 +156,7 @@ async function start() {
 
   const arena = await new OBJLoader().loadAsync('/arena.obj');
   const surface = new THREE.MeshBasicMaterial({
-    color: 0x6c9cbb, side: THREE.DoubleSide, transparent: true, opacity: 0.08, depthWrite: false,
+    color: 0x6c9cbb, side: THREE.DoubleSide, transparent: true, opacity: 0.08, depthWrite: false
   });
   const edges = new THREE.LineBasicMaterial({ color: 0x648da9, transparent: true, opacity: 0.25 });
   // Match CARL's OBJ loader: the asset stores its X/Y axes swapped.

@@ -44,7 +44,7 @@ class BallchasingClient:
         self,
         token: str,
         list_rate: float = LIST_RATE,
-        download_rate: float = DOWNLOAD_RATE,
+        download_rate: float = DOWNLOAD_RATE
     ) -> None:
         self.headers = {"Authorization": token}
 
@@ -61,7 +61,7 @@ class BallchasingClient:
     @retry(
         retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
         stop=stop_after_attempt(API_RETRIES),
-        reraise=True,
+        reraise=True
     )
     def get(self, url: str, **params: Any) -> ReplayPage:
         time.sleep(self.list_interval)
@@ -72,7 +72,7 @@ class BallchasingClient:
             response = self.session.get(
                 url,
                 params=params,
-                timeout=REQUEST_TIMEOUT,
+                timeout=REQUEST_TIMEOUT
             )
 
             if response.status_code != 429:
@@ -86,7 +86,7 @@ class BallchasingClient:
 
         return ReplayPage(
             replays=content["list"],
-            next_url=content.get("next"),
+            next_url=content.get("next")
         )
 
     def _download_session(self) -> requests.Session:
@@ -110,7 +110,7 @@ class BallchasingClient:
     @retry(
         retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
         stop=stop_after_attempt(API_RETRIES),
-        reraise=True,
+        reraise=True
     )
     def _download(self, replay_id: str, output_dir: Path) -> bool:
         for attempt in range(API_RETRIES):
@@ -118,7 +118,7 @@ class BallchasingClient:
 
             response = self._download_session().get(
                 f"{API_URL}/replays/{replay_id}/file",
-                timeout=REQUEST_TIMEOUT,
+                timeout=REQUEST_TIMEOUT
             )
 
             if response.status_code != 429:
@@ -180,9 +180,9 @@ class BallchasingClient:
             Progress(
                 TextColumn("{task.description}"),
                 BarColumn(),
-                TextColumn("{task.completed:,.0f}/{task.total:,.0f}"),
+                TextColumn("{task.completed:,.0f}/{task.total:,.0f}")
             ) as progress,
-            ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor,
+            ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor
         ):
             task = progress.add_task("Downloading replays", total=len(replay_ids))
 

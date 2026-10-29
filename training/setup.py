@@ -21,7 +21,7 @@ def build_env(args, reward_funcs=None):
         no_touch_timeout_seconds=args.no_touch_timeout,
         normalize=True,
         discrete_actions=True,
-        reward_funcs=reward_funcs,
+        reward_funcs=reward_funcs
     )
 
 
@@ -44,7 +44,7 @@ def prepare(args, reward_funcs=None):
             env.single_action_space.nvec,
             env.action_codec,
             args.hidden_size,
-            args.layers,
+            args.layers
         ).to(env.device)
         optimizer = torch.optim.Adam(
             agent.parameters(), lr=args.learning_rate, eps=args.adam_eps, fused=True
@@ -54,7 +54,7 @@ def prepare(args, reward_funcs=None):
             env.n_envs,
             env.single_observation_space.shape[0],
             len(env.single_action_space.nvec),
-            env.device,
+            env.device
         )
     except BaseException:
         env.close()

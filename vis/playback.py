@@ -29,7 +29,7 @@ def load_policy(checkpoint, seed):
             env.single_action_space.nvec,
             env.action_codec,
             config["hidden_size"],
-            config["layers"],
+            config["layers"]
         ).to(env.device)
         agent.load_state_dict(payload["agent"], strict=True)
         agent.eval()
@@ -47,7 +47,7 @@ def snapshot(env):
     ball = Physics(
         tuple(state.ball_position[0].tolist()),
         velocity=tuple(state.ball_velocity[0].tolist()),
-        angular_velocity=tuple(state.ball_angular_velocity[0].tolist()),
+        angular_velocity=tuple(state.ball_angular_velocity[0].tolist())
     )
     cars = tuple(
         Car(
@@ -58,11 +58,11 @@ def snapshot(env):
                 tuple(state.car_forward[0, index].tolist()),
                 tuple(state.car_up[0, index].tolist()),
                 tuple(state.car_velocity[0, index].tolist()),
-                tuple(state.car_angular_velocity[0, index].tolist()),
+                tuple(state.car_angular_velocity[0, index].tolist())
             ),
             boost=float(state.car_boost[0, index]),
             on_ground=bool(state.car_on_ground[0, index]),
-            demoed=bool(state.car_demoed[0, index]),
+            demoed=bool(state.car_demoed[0, index])
         )
         for index in range(env.n_cars)
     )
@@ -113,7 +113,7 @@ class Match:
                     "episode": episode,
                     "ball":    asdict(ball),
                     "cars":    [asdict(car) for car in cars],
-                    "pads":    pads,
+                    "pads":    pads
                 }, allow_nan=False, separators=(",", ":"))
 
                 with self.condition:

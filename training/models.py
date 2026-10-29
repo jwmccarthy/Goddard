@@ -44,7 +44,7 @@ class Agent(nn.Module):
                 F.pad(head, (0, width - size), value=-1e9)
                 for head, size in zip(logits.split(self.action_sizes, dim=-1), self.action_sizes)
             ],
-            dim=-2,
+            dim=-2
         )
         log_probabilities = logits.log_softmax(-1)
 

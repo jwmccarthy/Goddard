@@ -17,7 +17,7 @@ dependencies = [
     "scipy>=1.17.1",
     "tenacity>=9.1.4",
     "tensorboard>=2.0",
-    "torch>=2.7",
+    "torch>=2.7"
 ]
 
 [tool.uv.sources]

@@ -49,50 +49,54 @@ def add_gaifo_arguments(parser):
     group.add_argument("--expert-frame-limit", type=int)
     group.add_argument("--replay-reset-fraction", type=float, default=0.70)
     group.add_argument("--trajectory-length", type=int, default=8)
+    group.add_argument("--episode-memory", action=argparse.BooleanOptionalAction, default=False,
+                       help="persistent discriminator memory; trajectory-length is the TBPTT chunk length")
     group.add_argument("--frame-embedding", type=int, default=128)
     group.add_argument("--temporal-hidden", type=int, default=128)
     group.add_argument("--discriminator-hidden", type=int, default=128)
     group.add_argument("--discriminator-batch-size", type=int)
-    group.add_argument("--discriminator-microbatch-size", type=int, default=1_024)
+    group.add_argument(
+        "--discriminator-update-microbatch-size",
+        "--discriminator-microbatch-size",
+        dest="discriminator_update_microbatch_size",
+        type=int,
+        default=8_192,
+        help="windows per source per backward pass; gradients accumulate within an update batch"
+    )
+    group.add_argument("--discriminator-inference-microbatch-size", type=int, default=65_536)
     group.add_argument(
         "--discriminator-epochs",
         "--discriminator-updates",
         dest="discriminator_updates",
         type=int,
         default=1,
-        help="epochs over generated rollout windows per scheduled discriminator update",
+        help="epochs over generated rollout windows per scheduled discriminator update"
     )
-    group.add_argument("--discriminator-every", type=int, default=4)
+    group.add_argument("--discriminator-every", type=int, default=1)
+    group.add_argument("--discriminator-gradient-penalty", type=float, default=10.0)
+    group.add_argument(
+        "--discriminator-gradient-penalty-samples",
+        type=int,
+        help="expert windows sampled per optimizer batch for the penalty; default: all"
+    )
     group.add_argument("--discriminator-learning-rate", type=float, default=3e-4)
     group.add_argument("--discriminator-heldout-size", type=int)
-    group.add_argument("--discriminator-accuracy-target", type=float, default=0.80)
     group.add_argument("--history-capacity", type=int, default=262_144)
     group.add_argument("--history-add-size", type=int, default=16_384)
     group.add_argument("--history-mix-fraction", type=float, default=0.5)
     group.add_argument("--factorize", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--near-distance", type=float, default=BALL_NEAR_DISTANCE)
-    group.add_argument(
-        "--log-odds-reward",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="use raw capped log-odds without per-band standardization",
-    )
-    group.add_argument(
-        "--exp-log-odds-reward",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    group.add_argument("--differential", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--reward-plus", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--goal-reward-weight", type=float, default=200.0)
     group.add_argument("--flip-reset-reward-weight", type=float, default=12.5)
     group.add_argument("--physical-reward-scale", type=float, default=1.0)
     group.add_argument("--discriminator-reward-scale", type=float, default=2.0)
-    group.add_argument("--reward-max-magnitude", type=float, default=10.0)
+    group.add_argument("--multiply-discriminator-reward", action="store_true")
+    group.add_argument("--differential", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument(
         "--cap-physical-rewards",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=True
     )
     group.add_argument("--imitation-reward-coef", type=float, default=1.0)
     group.add_argument("--environment-reward-coef", type=float, default=1.0)
@@ -101,11 +105,14 @@ def add_gaifo_arguments(parser):
         "--ppo-lr-end",
         dest="learning_rate_end",
         type=float,
-        default=argparse.SUPPRESS,
+        default=argparse.SUPPRESS
     )
 
 
 def resolve_gaifo_defaults(args):
+    args.discriminator_architecture = "gru-episode-v1" if args.episode_memory else "gru-sequence"
+    args.discriminator_objective = "amp"
+
     if args.n_sim is None:
         args.n_sim = {1: 16_384, 2: 4_096, 3: 2_048}[args.team_size]
 

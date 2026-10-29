@@ -8,7 +8,7 @@ from rewards.constants import BALL_RADIUS, CEILING_Z, TICKS_PER_SECOND
 def wall_contact(
     on_ground: torch.Tensor,
     position: torch.Tensor,
-    up_z: torch.Tensor,
+    up_z: torch.Tensor
 ) -> torch.Tensor:
     x, y, z = position[..., 0].abs(), position[..., 1].abs(), position[..., 2]
     near_wall = (x > 3900.0) | (y > 4900.0) | ((x > 3000.0) & (y > 4300.0))
@@ -19,7 +19,7 @@ def wall_contact(
 def arena_surface_contact(
     on_ground: torch.Tensor,
     position: torch.Tensor,
-    up_z: torch.Tensor,
+    up_z: torch.Tensor
 ) -> torch.Tensor:
     floor = position[..., 2].lt(2 * BALL_RADIUS) & up_z.gt(0.5)
 
@@ -37,7 +37,7 @@ class AerialTouchCombo:
         self,
         context: RewardContext,
         aerial: torch.Tensor,
-        flip_reset: torch.Tensor,
+        flip_reset: torch.Tensor
     ) -> torch.Tensor:
         current = context.current
         shape = (len(current.raw), current.n_cars)
@@ -53,7 +53,7 @@ class AerialTouchCombo:
         on_surface = arena_surface_contact(
             current.car_on_ground,
             current.car_position,
-            current.car_up[..., 2],
+            current.car_up[..., 2]
         )
 
         roof_landing = (
@@ -75,7 +75,7 @@ class AerialTouchCombo:
         self.last_touch = torch.where(
             reset | context.events.done[:, None],
             False,
-            current.car_ball_touches,
+            current.car_ball_touches
         )
 
         return torch.where(new_contact, multiplier, 1.0)
@@ -85,7 +85,7 @@ class AerialTouchCombo:
 def actionable_dodges(
     observation,
     n_sim: int,
-    n_cars: int,
+    n_cars: int
 ) -> torch.Tensor:
     return (
         observation.ego_has_flip_or_jump
@@ -94,7 +94,7 @@ def actionable_dodges(
 
 
 def advanced_touch_events(
-    context: RewardContext,
+    context: RewardContext
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     current = context.current
     previous = context.previous
@@ -110,17 +110,17 @@ def advanced_touch_events(
     on_surface = arena_surface_contact(
         current.car_on_ground,
         current.car_position,
-        current.car_up[..., 2],
+        current.car_up[..., 2]
     )
 
     native_restored = ~actionable_dodges(
         context.previous_observation,
         len(current.raw),
-        current.n_cars,
+        current.n_cars
     ) & actionable_dodges(
         context.current_observation,
         len(current.raw),
-        current.n_cars,
+        current.n_cars
     )
 
     restored_flip = (spent_flip | native_restored) & flip_available

@@ -4,20 +4,7 @@ import torch
 from carl.gymnasium.state import RewardContext
 from torch.nn import functional as F
 
-from rewards.constants import (
-    AERIAL_POP_SPEED,
-    BALL_GRAVITY,
-    BALL_MAX_SPEED,
-    BALL_RADIUS,
-    CAR_MAX_ANG_SPEED,
-    CAR_MAX_SPEED,
-    CEILING_Z,
-    GOAL_HEIGHT,
-    GOAL_Y,
-    KICKOFF_MAX_STEPS,
-    REFERENCE_FRAMESKIP,
-    TICKS_PER_SECOND,
-)
+from rewards import constants
 from rewards.events import AerialTouchCombo
 from rewards.mechanics import MechanicalEventRewards
 
@@ -51,7 +38,7 @@ class RewardPlus:
         n_cars: int,
         device: torch.device,
         frameskip: int,
-        weights: RewardPlusWeights | None = None,
+        weights: RewardPlusWeights | None = None
     ) -> None:
         self.frameskip = frameskip
         self.team_size = n_cars // 2
@@ -66,7 +53,7 @@ class RewardPlus:
     @staticmethod
     def _shot_quality(
         velocity: torch.Tensor,
-        toward_goal: torch.Tensor,
+        toward_goal: torch.Tensor
     ) -> torch.Tensor:
         goalward_speed = (velocity[:, None, :] * toward_goal).sum(dim=-1)
 
@@ -74,7 +61,7 @@ class RewardPlus:
             velocity[:, None, :],
             toward_goal,
             dim=-1,
-            eps=1e-6,
+            eps=1e-6
         )
 
         return ((goalward_speed - 400.0) / 1200.0).clamp(0.0, 1.0) * (
@@ -84,14 +71,14 @@ class RewardPlus:
     def _kickoff_rewards(
         self,
         context: RewardContext,
-        valid: torch.Tensor,
+        valid: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         previous = context.previous
 
         spawn = (
-            previous.ball_position[:, :2].norm(dim=-1).lt(2.0 * BALL_RADIUS)
+            previous.ball_position[:, :2].norm(dim=-1).lt(2.0 * constants.BALL_RADIUS)
             & previous.ball_velocity.norm(dim=-1).lt(250.0)
-            & (previous.ball_position[:, 2] - BALL_RADIUS).abs().lt(60.0)
+            & (previous.ball_position[:, 2] - constants.BALL_RADIUS).abs().lt(60.0)
             & previous.car_position[:, 0, 1].lt(-2_000.0)
             & previous.car_position[:, self.team_size, 1].gt(2_000.0)
             & previous.car_position[..., 2].lt(120.0).all(dim=-1)
@@ -102,7 +89,7 @@ class RewardPlus:
         self.kickoff_pending = torch.where(
             first_step,
             spawn,
-            self.kickoff_pending,
+            self.kickoff_pending
         )
 
         target = previous.ball_position[:, None, :2]
@@ -114,7 +101,7 @@ class RewardPlus:
             F.one_hot(closest, self.team_size)
             .reshape(
                 -1,
-                previous.n_cars,
+                previous.n_cars
             )
             .bool()
         )
@@ -122,10 +109,10 @@ class RewardPlus:
         self.kickoff_challenger = torch.where(
             first_step[:, None],
             challengers & spawn[:, None],
-            self.kickoff_challenger,
+            self.kickoff_challenger
         )
 
-        self.kickoff_pending &= context.episode_ticks.le(KICKOFF_MAX_STEPS * REFERENCE_FRAMESKIP)
+        self.kickoff_pending &= context.episode_ticks.le(constants.KICKOFF_MAX_STEPS * constants.REFERENCE_FRAMESKIP)
 
         current_distance = (context.current.car_position[..., :2] - target).norm(dim=-1)
 
@@ -155,7 +142,7 @@ class RewardPlus:
     def _ground_air_dribble_rewards(
         self,
         context: RewardContext,
-        valid: torch.Tensor,
+        valid: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         current, previous = context.current, context.previous
 
@@ -166,7 +153,7 @@ class RewardPlus:
 
         control = (1.0 - relative_speed / 1200.0).clamp(0.0, 1.0)
 
-        goal_side = (current.team_sign[None, :] * car_to_ball[..., 1]).gt(-BALL_RADIUS)
+        goal_side = (current.team_sign[None, :] * car_to_ball[..., 1]).gt(-constants.BALL_RADIUS)
 
         not_backwards = (current.team_sign[None, :] * current.ball_velocity[:, None, 1]).gt(-200.0)
 
@@ -180,14 +167,14 @@ class RewardPlus:
             previous.car_on_ground
             & previous.car_position[..., 2].lt(120.0)
             & previous.car_up[..., 2].gt(0.65)
-            & current.car_position[..., 2].lt(2.0 * BALL_RADIUS)
+            & current.car_position[..., 2].lt(2.0 * constants.BALL_RADIUS)
             & current.car_up[..., 2].gt(0.5)
         )
 
         rise = current.ball_velocity[:, None, 2] - previous.ball_velocity[:, None, 2]
 
         peak = current.ball_position[:, 2] + current.ball_velocity[:, 2].clamp_min(0.0).square() / (
-            2.0 * BALL_GRAVITY
+            2.0 * constants.BALL_GRAVITY
         )
 
         pop = (
@@ -195,8 +182,8 @@ class RewardPlus:
                 valid
                 & fresh_solo_touch
                 & floor_start
-                & previous.ball_position[:, None, 2].lt(3.0 * BALL_RADIUS)
-                & peak[:, None].gt(3.0 * BALL_RADIUS)
+                & previous.ball_position[:, None, 2].lt(3.0 * constants.BALL_RADIUS)
+                & peak[:, None].gt(3.0 * constants.BALL_RADIUS)
                 & distance.lt(280.0)
                 & goal_side
                 & not_backwards
@@ -214,7 +201,7 @@ class RewardPlus:
 
         remaining_seconds = (
             self.ground_setup_ticks.clamp_max(self.frameskip).to(current.raw.dtype)
-            / TICKS_PER_SECOND
+            / constants.TICKS_PER_SECOND
         )
 
         setup = (
@@ -224,7 +211,7 @@ class RewardPlus:
                 & ~other_touch
                 & ~current.car_on_ground
                 & current.car_position[..., 2].gt(120.0)
-                & current.ball_position[:, None, 2].gt(2.5 * BALL_RADIUS)
+                & current.ball_position[:, None, 2].gt(2.5 * constants.BALL_RADIUS)
                 & car_to_ball[..., 2].gt(0.0)
                 & goal_side
                 & not_backwards
@@ -236,13 +223,13 @@ class RewardPlus:
 
         remaining = torch.where(
             pop.gt(0.0),
-            int(1.5 * TICKS_PER_SECOND),
-            (self.ground_setup_ticks - self.frameskip).clamp_min(0),
+            int(1.5 * constants.TICKS_PER_SECOND),
+            (self.ground_setup_ticks - self.frameskip).clamp_min(0)
         )
 
         ball_landed = (
             (self.ground_setup_ticks > 0)
-            & current.ball_position[:, None, 2].le(2.0 * BALL_RADIUS)
+            & current.ball_position[:, None, 2].le(2.0 * constants.BALL_RADIUS)
             & (
                 current.ball_velocity[:, None, 2].le(0.0)
                 | previous.ball_velocity[:, None, 2].lt(0.0)
@@ -252,7 +239,7 @@ class RewardPlus:
         self.ground_setup_ticks = torch.where(
             valid & ~other_touch & ~ball_landed,
             remaining,
-            0,
+            0
         )
 
         return pop, setup
@@ -261,7 +248,7 @@ class RewardPlus:
         self,
         context: RewardContext,
         aerial_touches: torch.Tensor,
-        combo: torch.Tensor,
+        combo: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         current, previous = context.current, context.previous
 
@@ -269,12 +256,12 @@ class RewardPlus:
 
         car_displacement = (current.car_position - previous.car_position).norm(dim=-1)
 
-        max_car_displacement = CAR_MAX_SPEED * self.frameskip / 120.0 + 150.0
+        max_car_displacement = constants.CAR_MAX_SPEED * self.frameskip / 120.0 + 150.0
 
         continuous = (
             ~previous.car_demoed
             & ball_displacement[:, None].le(
-                BALL_MAX_SPEED * self.frameskip / 120.0 + 2.0 * BALL_RADIUS
+                constants.BALL_MAX_SPEED * self.frameskip / 120.0 + 2.0 * constants.BALL_RADIUS
             )
             & (car_displacement.le(max_car_displacement) | current.car_demoed)
         )
@@ -288,17 +275,17 @@ class RewardPlus:
 
         speed_change = (
             current.car_velocity.norm(dim=-1) - previous.car_velocity.norm(dim=-1)
-        ) / CAR_MAX_SPEED
+        ) / constants.CAR_MAX_SPEED
 
         forward_speed_change = (
             (current.car_velocity * current.car_forward).sum(dim=-1)
             - (previous.car_velocity * previous.car_forward).sum(dim=-1)
-        ) / CAR_MAX_SPEED
+        ) / constants.CAR_MAX_SPEED
 
         boost_action = context.actions.reshape(
             len(current.raw),
             current.n_cars,
-            -1,
+            -1
         )[..., 4].gt(0)
 
         no_boost = (
@@ -311,7 +298,7 @@ class RewardPlus:
         boost_free_change = torch.where(
             no_boost,
             speed_change,
-            speed_change.clamp_max(0.0),
+            speed_change.clamp_max(0.0)
         )
 
         speed = valid * (
@@ -328,8 +315,8 @@ class RewardPlus:
 
         angular_velocity = (
             (valid & ~current.car_on_ground)
-            * (current.car_angular_velocity.norm(dim=-1) / CAR_MAX_ANG_SPEED).clamp(0.0, 1.0)
-            * (self.frameskip / TICKS_PER_SECOND)
+            * (current.car_angular_velocity.norm(dim=-1) / constants.CAR_MAX_ANG_SPEED).clamp(0.0, 1.0)
+            * (self.frameskip / constants.TICKS_PER_SECOND)
         )
 
         touches = current.car_ball_touches
@@ -339,11 +326,11 @@ class RewardPlus:
             valid
             & solo_touch
             & aerial_touches
-            & current.ball_position[:, None, 2].gt(2.0 * BALL_RADIUS)
+            & current.ball_position[:, None, 2].gt(2.0 * constants.BALL_RADIUS)
         )
 
         height = (
-            (current.ball_position[:, None, 2] - BALL_RADIUS) / (CEILING_Z - BALL_RADIUS)
+            (current.ball_position[:, None, 2] - constants.BALL_RADIUS) / (constants.CEILING_Z - constants.BALL_RADIUS)
         ).clamp(0.0, 1.0)
 
         upward_change = (
@@ -364,7 +351,7 @@ class RewardPlus:
 
         separation = (current.ball_velocity[:, None, :] - current.car_velocity).norm(dim=-1)
 
-        pop = 0.5 + 0.5 * (separation / AERIAL_POP_SPEED).clamp(0.0, 1.0)
+        pop = 0.5 + 0.5 * (separation / constants.AERIAL_POP_SPEED).clamp(0.0, 1.0)
 
         lift = (
             aerial
@@ -379,23 +366,23 @@ class RewardPlus:
         )
 
         opponent_goal = torch.zeros_like(current.car_position)
-        opponent_goal[..., 1] = current.team_sign[None, :] * GOAL_Y
-        opponent_goal[..., 2] = GOAL_HEIGHT / 2.0
+        opponent_goal[..., 1] = current.team_sign[None, :] * constants.GOAL_Y
+        opponent_goal[..., 2] = constants.GOAL_HEIGHT / 2.0
 
         toward_goal = F.normalize(
             opponent_goal - current.ball_position[:, None, :],
             dim=-1,
-            eps=1e-6,
+            eps=1e-6
         )
 
-        aerial_shot = (aerial & current.ball_position[:, None, 2].gt(GOAL_HEIGHT)) * (
+        aerial_shot = (aerial & current.ball_position[:, None, 2].gt(constants.GOAL_HEIGHT)) * (
             self._shot_quality(current.ball_velocity, toward_goal)
             - self._shot_quality(previous.ball_velocity, toward_goal)
         )
 
         ground_pop, air_dribble_setup = self._ground_air_dribble_rewards(
             context,
-            valid,
+            valid
         )
         kickoff_speed, kickoff_touch = self._kickoff_rewards(context, valid)
         mechanics = self.mechanical_events(context, valid)
@@ -410,5 +397,5 @@ class RewardPlus:
             "air_dribble_setup": self.weights.air_dribble_setup * air_dribble_setup,
             "kickoff_speed": kickoff_speed,
             "kickoff": kickoff_touch,
-            **{name: getattr(self.weights, name) * value for name, value in mechanics.items()},
+            **{name: getattr(self.weights, name) * value for name, value in mechanics.items()}
         }

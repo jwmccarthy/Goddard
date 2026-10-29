@@ -17,7 +17,7 @@ def save_checkpoint(path, algorithm, args, agent, optimizer, step, **extra):
         "cuda_rng": torch.cuda.get_rng_state_all(),
         "numpy_rng": np.random.get_state(),
         "python_rng": random.getstate(),
-        **extra,
+        **extra
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,13 +36,25 @@ def load_checkpoint(path, algorithm, args, agent, optimizer):
     keys = ["team_size", "hidden_size", "layers", "frameskip", "gamma"]
 
     if algorithm == "gaifo":
+        architecture = payload["config"].get("discriminator_architecture", "gru")
+
+        if architecture != args.discriminator_architecture:
+            raise ValueError(
+                "discriminator architecture differs; start a new run when changing memory mode"
+            )
+
+        objective = payload["config"].get("discriminator_objective", "bce")
+
+        if objective != args.discriminator_objective:
+            raise ValueError("discriminator objective differs; start a new run when switching to AMP")
+
         keys += [
             "trajectory_length",
             "frame_embedding",
             "temporal_hidden",
             "discriminator_hidden",
             "factorize",
-            "near_distance",
+            "near_distance"
         ]
 
     for key in keys:

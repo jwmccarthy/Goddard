@@ -16,7 +16,7 @@ class GameplayDiagnostics:
         steps: int,
         frameskip: int,
         reward_plus: bool = False,
-        no_touch_timeout_steps: int = 0,
+        no_touch_timeout_steps: int = 0
     ) -> None:
         self.n_cars = n_cars
         self.team_size = n_cars // 2
@@ -42,7 +42,7 @@ class GameplayDiagnostics:
                 "goals_for",
                 "goals_against",
                 "episodes",
-                "timeouts",
+                "timeouts"
             )
         }
         self.buffers = {
@@ -113,7 +113,7 @@ class GameplayDiagnostics:
                 "flip_resets",
                 "demos",
                 "goals_for",
-                "goals_against",
+                "goals_against"
             ):
                 metrics[f"gameplay/{name}_per_1000_steps"] = self.counts[name].item() / steps * 1000
 
@@ -138,7 +138,7 @@ class GameplayDiagnostics:
                 "demos",
                 "demoed",
                 "goals_for",
-                "goals_against",
+                "goals_against"
             ):
                 self.counts[name].zero_()
 
