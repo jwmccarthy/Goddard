@@ -5,26 +5,24 @@ from carl.gymnasium.state import RewardContext
 from torch.nn import functional as F
 
 from rewards import constants
-from rewards.events import AerialTouchCombo
 from rewards.mechanics import MechanicalEventRewards
 
 
 @dataclass(frozen=True)
 class RewardPlusWeights:
 
+    goal: float = 200.0
+    flip_reset: float = 12.5
+    demo: float = 5.0
     speed_progress: float = 12.5
     boost_free_speed_progress: float = 25.0
     boost_gain: float = 12.5
     aerial_lift: float = 100.0
     aerial_shot: float = 50.0
-    angular_velocity: float = 5.0
     ground_pop: float = 25.0
     air_dribble_setup: float = 25.0
     kickoff_speed: float = 25.0
     kickoff: float = 25.0
-    wasted_air: float = 10.0
-    wasted_boost: float = 15.0
-    ball_ceiling: float = 25.0
     wall_touch: float = 10.0
     wall_control: float = 15.0
     inverted_ground: float = 10.0
@@ -43,7 +41,6 @@ class RewardPlus:
         self.frameskip = frameskip
         self.team_size = n_cars // 2
         self.weights = weights if weights is not None else RewardPlusWeights()
-        self.aerial_combo = AerialTouchCombo()
         self.mechanical_events = MechanicalEventRewards(frameskip)
 
         self.kickoff_pending = torch.zeros(n_sim, dtype=torch.bool, device=device)
@@ -121,7 +118,7 @@ class RewardPlus:
 
         speed = (
             self.weights.kickoff_speed
-            * (current_approach - previous_approach)
+            * (current_approach - previous_approach).clamp_min(0.0)
             * (self.kickoff_pending[:, None] & self.kickoff_challenger & valid)
         )
 
@@ -247,8 +244,7 @@ class RewardPlus:
     def components(
         self,
         context: RewardContext,
-        aerial_touches: torch.Tensor,
-        combo: torch.Tensor
+        aerial_touches: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         current, previous = context.current, context.previous
 
@@ -302,8 +298,8 @@ class RewardPlus:
         )
 
         speed = valid * (
-            self.weights.speed_progress * (speed_change + forward_speed_change)
-            + self.weights.boost_free_speed_progress * boost_free_change
+            self.weights.speed_progress * (speed_change + forward_speed_change).clamp_min(0.0)
+            + self.weights.boost_free_speed_progress * boost_free_change.clamp_min(0.0)
         )
 
         boost_level = (current.car_boost / 100.0).clamp(0.0, 1.0).sqrt()
@@ -311,12 +307,6 @@ class RewardPlus:
 
         boost_gain = (
             self.weights.boost_gain * valid * (boost_level - previous_boost_level).clamp_min(0.0)
-        )
-
-        angular_velocity = (
-            (valid & ~current.car_on_ground)
-            * (current.car_angular_velocity.norm(dim=-1) / constants.CAR_MAX_ANG_SPEED).clamp(0.0, 1.0)
-            * (self.frameskip / constants.TICKS_PER_SECOND)
         )
 
         touches = current.car_ball_touches
@@ -356,13 +346,10 @@ class RewardPlus:
         lift = (
             aerial
             * height
-            * (
-                upward_change.clamp_max(0.0)
-                + upward_change.clamp_min(0.0)
-                * control
-                * pop
-                * current.ball_velocity[:, None, 2].gt(0.0)
-            )
+            * upward_change.clamp_min(0.0)
+            * control
+            * pop
+            * current.ball_velocity[:, None, 2].gt(0.0)
         )
 
         opponent_goal = torch.zeros_like(current.car_position)
@@ -378,7 +365,7 @@ class RewardPlus:
         aerial_shot = (aerial & current.ball_position[:, None, 2].gt(constants.GOAL_HEIGHT)) * (
             self._shot_quality(current.ball_velocity, toward_goal)
             - self._shot_quality(previous.ball_velocity, toward_goal)
-        )
+        ).clamp_min(0.0)
 
         ground_pop, air_dribble_setup = self._ground_air_dribble_rewards(
             context,
@@ -390,9 +377,8 @@ class RewardPlus:
         return {
             "speed": speed,
             "boost_gain": boost_gain,
-            "aerial_lift": self.weights.aerial_lift * lift * combo,
-            "aerial_shot": self.weights.aerial_shot * aerial_shot * combo,
-            "angular_velocity": self.weights.angular_velocity * angular_velocity,
+            "aerial_lift": self.weights.aerial_lift * lift,
+            "aerial_shot": self.weights.aerial_shot * aerial_shot,
             "ground_pop": self.weights.ground_pop * ground_pop,
             "air_dribble_setup": self.weights.air_dribble_setup * air_dribble_setup,
             "kickoff_speed": kickoff_speed,

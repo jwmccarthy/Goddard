@@ -1,115 +1,122 @@
 import torch
 
+from imitation.windows import decision_history_length
 
-class SceneRollout:
 
-    def __init__(self, observation, steps, length, scene_size):
+class TransitionRollout:
+
+    def __init__(self, observation, steps, scene_size, window_length=2, potential_shaping=False,
+                 decision_stride=1):
         agents = len(observation)
-        self.length = length
         self.scene_size = scene_size
+        self.window_length = window_length
+        self.decision_stride = decision_stride
+        self.history_length = decision_history_length(window_length, decision_stride)
         self.scenes = observation.new_empty((steps, agents, scene_size))
         self.successors = torch.empty_like(self.scenes)
-        self.dones = torch.empty((steps, agents), dtype=torch.bool, device=observation.device)
-        self.ages = torch.empty((steps, agents), dtype=torch.long, device=observation.device)
-        self.age = torch.zeros(agents, dtype=torch.long, device=observation.device)
-        self.history = observation[None, :, :scene_size].expand(length - 1, -1, -1).clone()
-        self.timeline = None
-        self.valid_indices = None
-        self.differential_indices = None
+        self.dones = torch.zeros((steps, agents), dtype=torch.bool, device=observation.device)
+        self.terminated = torch.zeros_like(self.dones)
+        self.potential_shaping = potential_shaping
+        prefix_length = self.history_length - 2 + int(potential_shaping)
+        self.prefix = observation.new_full((prefix_length, agents, scene_size), float("nan"))
+        self.prefix_dones = torch.zeros((prefix_length, agents), dtype=torch.bool, device=observation.device)
+        self.started = False
+        self.cached_frames = None
+        self.cached_dones = None
 
-    def record(self, step, observation, next_observation, final_observation, done):
+    def record(self, step, observation, next_observation, final_observation, done, terminated=None):
+        if step == 0:
+            self.cached_frames = None
+            self.cached_dones = None
+            if self.started and len(self.prefix):
+                self.prefix = torch.cat((self.prefix, self.scenes), dim=0)[-len(self.prefix):].clone()
+                self.prefix_dones = torch.cat((self.prefix_dones, self.dones), dim=0)[-len(self.prefix_dones):].clone()
+            self.started = True
         self.scenes[step].copy_(observation[:, : self.scene_size])
+        self.dones[step].copy_(done)
+        if terminated is None:
+            self.terminated[step].zero_()
+        else:
+            self.terminated[step].copy_(terminated)
         successor = torch.where(
             done[:, None],
             final_observation[:, : self.scene_size],
             next_observation[:, : self.scene_size]
         )
         self.successors[step].copy_(successor)
-        self.ages[step].copy_(self.age)
-        self.dones[step].copy_(done)
-        self.age.add_(1).masked_fill_(done, 0)
 
-    def prepare(self):
-        self.timeline = torch.cat((self.history, self.scenes))
-        self.valid_indices = (self.ages.flatten() >= self.length - 2).nonzero().flatten()
-        self.differential_indices = (self.ages.flatten() >= self.length - 1).nonzero().flatten()
-
-        if self.length > 1:
-            self.history.copy_(self.timeline[-(self.length - 1) :])
-
-    def windows(self, indices):
+    def window_indices(self, indices):
         agents = self.scenes.shape[1]
-        step = indices // agents
-        agent = indices % agents
-        end = step + self.length - 1
-        start = end - self.ages[step, agent]
-        offsets = torch.arange(2 - self.length, 1, device=indices.device)
-        frames = torch.maximum(end[:, None] + offsets, start[:, None])
-        prefix = self.timeline[frames, agent[:, None]]
+        step, agent = indices // agents, indices % agents
+        if self.cached_dones is None:
+            self.cached_dones = torch.cat((self.prefix_dones, self.dones), dim=0)
+        dones = self.cached_dones
+        offsets = torch.arange(self.history_length - 1, device=indices.device)
+        times = step[:, None] + offsets + int(self.potential_shaping)
+        previous_done = dones[times, agent[:, None]]
+        previous_done[:, -1] = False
+        last_reset = torch.where(previous_done, offsets + 1, 0).amax(dim=1)
+        # Check resets over the full interval, including unsampled decisions.
+        selected = slice(None, None, self.decision_stride)
+        history_indices = times[:, selected] * agents + agent[:, None]
+        successor_indices = (len(self.prefix) + len(self.scenes)) * agents + indices
+        all_indices = torch.cat((history_indices, successor_indices[:, None]), dim=1)
+        padding = offsets[None, selected] < last_reset[:, None]
+        padding = torch.cat((padding, torch.zeros_like(padding[:, :1])), dim=1)
+        return all_indices, padding
 
-        return torch.cat((prefix, self.successors[step, agent, None]), dim=1)
+    def previous_window_indices(self, indices):
+        if not self.potential_shaping:
+            raise ValueError("previous windows require potential shaping history")
+
+        agents = self.scenes.shape[1]
+        step, agent = indices // agents, indices % agents
+        if self.cached_dones is None:
+            self.cached_dones = torch.cat((self.prefix_dones, self.dones), dim=0)
+
+        offsets = torch.arange(self.history_length, device=indices.device)
+        times = step[:, None] + offsets
+        previous_done = self.cached_dones[times, agent[:, None]].clone()
+        previous_done[:, -1] = False
+        last_reset = torch.where(previous_done, offsets + 1, 0).amax(dim=1)
+        selected = slice(None, None, self.decision_stride)
+        return (times[:, selected] * agents + agent[:, None],
+                offsets[None, selected] < last_reset[:, None])
 
     def previous_windows(self, indices):
-        agents = self.scenes.shape[1]
-        step = indices // agents
-        agent = indices % agents
-        end = step + self.length - 1
-        offsets = torch.arange(1 - self.length, 1, device=indices.device)
+        window_indices, padding = self.previous_window_indices(indices)
+        return self.all_frames()[window_indices].masked_fill(padding[..., None], float("nan"))
 
-        return self.timeline[end[:, None] + offsets, agent[:, None]]
+    def all_frames(self):
+        if self.cached_frames is None:
+            self.cached_frames = torch.cat((self.prefix, self.scenes, self.successors), dim=0).flatten(0, 1)
+        return self.cached_frames
+
+    def transitions(self, indices):
+        window_indices, padding = self.window_indices(indices)
+        frames = self.all_frames()[window_indices]
+        return frames.masked_fill(padding[..., None], float("nan"))
+
+    def endpoints(self, indices):
+        return torch.stack((self.scenes.flatten(0, 1)[indices], self.successors.flatten(0, 1)[indices]), dim=1)
 
 
-def split_generated(valid, heldout_sim, heldout_size, n_cars):
-    steps, agents = valid.shape
+def split_generated(transitions, heldout_sim, heldout_size, n_cars, terminated=None):
+    steps, agents = transitions.shape
     n_sim = agents // n_cars
-    flat_valid = valid.flatten()
-    valid_indices = flat_valid.nonzero().flatten()
+    indices = torch.arange(steps * agents, device=transitions.device)
+    if terminated is not None:
+        indices = indices[~terminated.flatten()]
 
     if heldout_size == 0 or n_sim < 2:
-        return valid_indices, valid_indices[:0], heldout_sim
+        return indices, indices[:0], heldout_sim
 
-    if heldout_sim is not None:
-        mask = (
-            heldout_sim.view(1, n_sim, 1)
-            .expand(steps, n_sim, n_cars)
-            .reshape(steps, agents)
-            .flatten()
-        )
-        heldout_mask = mask & flat_valid
+    if heldout_sim is None:
+        per_sim = steps * n_cars
+        count = min((heldout_size + per_sim - 1) // per_sim, n_sim - 1)
+        selected = torch.randperm(n_sim, device=transitions.device)[:count]
+        heldout_sim = torch.zeros(n_sim, dtype=torch.bool, device=transitions.device)
+        heldout_sim[selected] = True
 
-        return (
-            (flat_valid & ~heldout_mask).nonzero().flatten(),
-            heldout_mask.nonzero().flatten(),
-            heldout_sim
-        )
-
-    per_sim = valid.view(steps, n_sim, n_cars).sum(dim=(0, 2))
-    candidates = (per_sim > 0).nonzero().flatten()
-
-    if len(candidates) < 2:
-        return valid_indices, valid_indices[:0], heldout_sim
-
-    candidates = candidates[torch.randperm(len(candidates), device=candidates.device)]
-    cumulative = per_sim[candidates].cumsum(0)
-    count = (
-        int(
-            torch.searchsorted(
-                cumulative,
-                torch.tensor(heldout_size, device=cumulative.device)
-            ).item()
-        )
-        + 1
-    )
-    count = min(count, len(candidates) - 1)
-    heldout_sim = torch.zeros(n_sim, dtype=torch.bool, device=valid.device)
-    heldout_sim[candidates[:count]] = True
-    mask = (
-        heldout_sim.view(1, n_sim, 1).expand(steps, n_sim, n_cars).reshape(steps, agents).flatten()
-    )
-    heldout_mask = mask & flat_valid
-
-    return (
-        (flat_valid & ~heldout_mask).nonzero().flatten(),
-        heldout_mask.nonzero().flatten(),
-        heldout_sim
-    )
+    heldout = heldout_sim[(indices % agents) // n_cars]
+    return indices[~heldout], indices[heldout], heldout_sim

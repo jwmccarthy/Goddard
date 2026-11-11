@@ -86,11 +86,11 @@ def valid_replay(replay: ParsedReplay, team_size: int = 1) -> bool:
         and sum(bool(player["is_orange"]) for player in active) == team_size
         and np.isfinite(delta).all()
         and np.isfinite(replay.game_df["time"]).all()
-        and 25 < 1 / delta.mean() < 35
+        and 0 < delta.mean() < 1 / 25
     )
 
 
-def active_frames(replay: ParsedReplay) -> list[list[tuple[ReplayFrame, dict]]]:
+def active_frames(replay: ParsedReplay, include_goals: bool = False) -> list[list[tuple[ReplayFrame, dict]]]:
     times = replay.game_df["time"].to_numpy() * 120.0
     periods = replay.analyzer["gameplay_periods"]
 
@@ -111,7 +111,8 @@ def active_frames(replay: ParsedReplay) -> list[list[tuple[ReplayFrame, dict]]]:
         tick = frame.state.tick_count
 
         for index, (start, end) in enumerate(bounds):
-            if start <= tick < end:
+            goal = include_goals and periods[index].get("goal_frame") is not None
+            if start <= tick < end or (goal and tick == end):
                 segments[index].append((frame, errors))
                 break
 
@@ -406,7 +407,9 @@ def parse_replay(
     output_dir: Path,
     frame_skip: int,
     pov_players: tuple[str, ...] | None = None,
-    team_size: int = 1
+    team_size: int = 1,
+    include_goals: bool = False,
+    segment_consumer=None
 ) -> int:
     n_cars = layout.team_car_count(team_size)
     metadata_players = replay.metadata.get("players", [])
@@ -421,7 +424,7 @@ def parse_replay(
         if missing:
             raise ValueError(f"requested POV IDs not present in replay: {sorted(missing)}")
 
-    segments = active_frames(replay)
+    segments = active_frames(replay, include_goals=include_goals)
 
     if not segments or not any(segments):
         return 0
@@ -494,20 +497,47 @@ def parse_replay(
             )
 
             rows = np.concatenate((rows, corrections[:, None]), axis=-1)
+            terminal = bool(include_goals and getattr(samples[-1][0].state, "goal_scored", False))
+            terminal_row = rows[-1].copy() if terminal else None
             rows = resample(ticks, rows, frame_skip)
+            if terminal and ticks[-1] - ticks[0] > (len(rows) - 1) * frame_skip + 1e-4:
+                rows = np.concatenate((rows, terminal_row[None]), axis=0)
+            elif terminal:
+                rows[-1] = terminal_row
             rows = mark_discontinuities(rows, frame_skip)
 
             if not np.isfinite(rows).all():
                 continue
 
-            np.save(output_dir / f"{ego_id}-{period}-{name}.npy", rows)
+            metadata = {}
+            if include_goals:
+                scoring_team = samples[-1][0].state.scoring_team if terminal else None
+                if terminal and scoring_team not in (0, 1):
+                    raise ValueError("goal frame has no valid scoring team")
+                metadata = {
+                    "goal_terminal": terminal,
+                    "terminal_reason": "goal" if terminal else "unknown",
+                    "goal_outcome": ("scored" if scoring_team == ego.team_num else "conceded") if terminal else None
+                }
+            if segment_consumer is not None:
+                # Selection happens before any dense files are written. The
+                # consumer sees complete original segments, never phase clips.
+                player = next(p for p in metadata_players if str(p["unique_id"]) == str(ego_id))
+                segment_consumer(rows, {**metadata, "ego_id": str(ego_id), "period": period,
+                                        "online_id": str(player.get("online_id")), "is_orange": bool(ego.team_num)})
+            else:
+                path = output_dir / f"{ego_id}-{period}-{name}.npy"
+                np.save(path, rows)
+                if include_goals:
+                    path.with_suffix(".json").write_text(json.dumps(metadata) + "\n")
             written += 1
 
     return written
 
 
-def parse_path(job: tuple[str, str, int, tuple[str, ...] | None, int]) -> tuple[str, str]:
-    replay_path, output_path, frame_skip, pov_players, team_size = job
+def parse_path(job) -> tuple[str, str]:
+    replay_path, output_path, frame_skip, pov_players, team_size, *options = job
+    include_goals = options[0] if options else False
 
     path = Path(replay_path)
     output_dir = Path(output_path)
@@ -533,7 +563,8 @@ def parse_path(job: tuple[str, str, int, tuple[str, ...] | None, int]) -> tuple[
                 temporary,
                 frame_skip,
                 pov_players,
-                team_size
+                team_size,
+                include_goals
             )
 
             if not written:
@@ -567,7 +598,8 @@ def parse(
     frame_skip: int = 4,
     workers: int = 1,
     pov_manifest: str | Path | None = None,
-    team_size: int = 1
+    team_size: int = 1,
+    include_goals: bool = False
 ) -> None:
     layout.team_car_count(team_size)
 
@@ -580,6 +612,16 @@ def parse(
     replay_dir = Path(replay_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if include_goals:
+        metadata_path = output_dir / "dac_metadata.json"
+        metadata = {"format": "goal-terminal-v1", "frameskip": frame_skip, "team_size": team_size}
+        if metadata_path.exists():
+            if json.loads(metadata_path.read_text()) != metadata:
+                raise ValueError("goal-aware output directory has incompatible metadata")
+        elif any(output_dir.rglob("*.npy")):
+            raise ValueError("goal-aware parsing requires an empty or compatible output directory")
+        else:
+            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
     manifest_path = Path(pov_manifest) if pov_manifest else replay_dir / "pov_players.json"
     manifest = load_pov_manifest(manifest_path)
@@ -592,7 +634,8 @@ def parse(
             str(output_dir),
             frame_skip,
             manifest.get(path.stem.lower()),
-            team_size
+            team_size,
+            include_goals
         )
         for path in paths
     ]
@@ -623,6 +666,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--team-size", type=int, choices=layout.TEAM_SIZES, default=1)
     parser.add_argument("--pov-manifest", type=Path)
+    parser.add_argument("--include-goals", action="store_true",
+                        help="include goal frames and write terminal metadata alongside parsed files")
     args = parser.parse_args()
 
     parse(
@@ -631,7 +676,8 @@ def main() -> None:
         frame_skip=args.frameskip,
         workers=args.workers,
         pov_manifest=args.pov_manifest,
-        team_size=args.team_size
+        team_size=args.team_size,
+        include_goals=args.include_goals
     )
 
 

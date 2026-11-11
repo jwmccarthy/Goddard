@@ -1,8 +1,7 @@
 import torch
 from carl.gymnasium.state import RewardContext
 
-from rewards.constants import REWARD_PLUS_COMPONENTS
-from rewards.events import AerialTouchCombo, advanced_touch_events
+from rewards.events import advanced_touch_events
 from rewards.shaping import RewardPlus
 
 
@@ -13,23 +12,19 @@ class GameplayDiagnostics:
         n_sim: int,
         n_cars: int,
         device: torch.device,
-        steps: int,
         frameskip: int,
         reward_plus: bool = False,
-        no_touch_timeout_steps: int = 0
+        no_touch_timeout_steps: int = 0,
+        goal_weight: float = 1.0
     ) -> None:
         self.n_cars = n_cars
         self.team_size = n_cars // 2
         self.no_touch_timeout_steps = no_touch_timeout_steps
         self.device = device
-        self.aerial_combo = AerialTouchCombo()
+        self.goal_weight = goal_weight
         self.reward_plus = RewardPlus(n_sim, n_cars, device, frameskip) if reward_plus else None
         self.touch_steps = torch.zeros(n_sim, dtype=torch.long, device=device)
-        self.last_components = {}
-        self.last_flip_reset = torch.zeros(n_sim * n_cars, device=device)
-        self.component_sums = {
-            name: torch.zeros((), device=device) for name in REWARD_PLUS_COMPONENTS
-        }
+        self.component_sums = {}
         self.counts = {
             name: torch.zeros((), device=device)
             for name in (
@@ -45,11 +40,6 @@ class GameplayDiagnostics:
                 "timeouts"
             )
         }
-        self.buffers = {
-            name: torch.zeros((steps, n_sim * n_cars), device=device)
-            for name in REWARD_PLUS_COMPONENTS
-        }
-        self.flip_buffer = torch.zeros((steps, n_sim * n_cars), device=device)
 
     def _team_difference(self, events: torch.Tensor) -> torch.Tensor:
         scores = events.reshape(-1, 2, self.team_size).sum(dim=-1, keepdim=True)
@@ -63,16 +53,11 @@ class GameplayDiagnostics:
         score_for_actor = context.events.score_delta[:, None] * current.team_sign
 
         _, aerial, flip_reset = advanced_touch_events(context)
-        combo = self.aerial_combo(context, aerial, flip_reset)
-        self.last_flip_reset = self._team_difference(flip_reset.to(aerial.dtype) * combo)
-
         if self.reward_plus is not None:
-            components = self.reward_plus.components(context, aerial, combo)
-            self.last_components = {
-                name: self._team_difference(value) for name, value in components.items()
-            }
-
+            components = self.reward_plus.components(context, aerial)
             for name, value in components.items():
+                if name not in self.component_sums:
+                    self.component_sums[name] = torch.zeros((), device=self.device)
                 self.component_sums[name] += value.sum()
 
         demoed = current.car_demoed & ~previous.car_demoed
@@ -94,13 +79,24 @@ class GameplayDiagnostics:
         self.counts["episodes"] += context.events.done.sum() * self.n_cars
         self.counts["timeouts"] += timeout.sum() * self.n_cars
 
-        return score_for_actor
+        if self.reward_plus is None:
+            return self.goal_weight * score_for_actor
 
-    def capture(self, step: int) -> None:
-        self.flip_buffer[step].copy_(self.last_flip_reset)
+        weights = self.reward_plus.weights
+        kickoff = components["kickoff"] + components["kickoff_speed"]
+        shaping = sum((value for name, value in components.items()
+                       if name not in ("kickoff", "kickoff_speed")), torch.zeros_like(score_for_actor))
+        demo_reward = self._team_difference(-demoed.float()).reshape_as(score_for_actor)
+        goal_reward = weights.goal * score_for_actor
+        flip_reward = weights.flip_reset * flip_reset.float()
+        total = shaping + self._team_difference(kickoff).reshape_as(score_for_actor)
 
-        for name, value in self.last_components.items():
-            self.buffers[name][step].copy_(value)
+        for name, value in (("goal", goal_reward), ("flip_reset", flip_reward), ("demo", demo_reward * weights.demo)):
+            if name not in self.component_sums:
+                self.component_sums[name] = torch.zeros((), device=self.device)
+            self.component_sums[name] += value.abs().sum()
+
+        return total + goal_reward + flip_reward + weights.demo * demo_reward
 
     def diagnostic_metrics(self) -> dict[str, float]:
         metrics = {}

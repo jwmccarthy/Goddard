@@ -1,178 +1,59 @@
 import torch
 
-from imitation import features
-
-
-@torch.no_grad()
-def discriminator_scores(discriminator, windows, batch_size):
-    was_training = discriminator.training
-    discriminator.eval()
-
-    try:
-        parts = []
-
-        for start in range(0, len(windows), batch_size):
-            stop = min(start + batch_size, len(windows))
-            logits = discriminator(windows[start:stop])
-            parts.append(logits.unsqueeze(-1) if not discriminator.factorized else logits)
-
-        return torch.cat(parts)
-    finally:
-        discriminator.train(was_training)
+from imitation.features import GLOBAL_WEIGHT, SPECIALIST_WEIGHT
+from imitation.windows import balanced_window_batch
+from training.tensors import require_finite
 
 
 @torch.no_grad()
 def sample_discriminator_validation(discriminator, experts, scenes, heldout_indices, args):
-    count = min(
-        args.discriminator_heldout_size,
-        len(heldout_indices),
-        len(experts.heldout_starts)
-    )
-
-    if count == 0:
+    count = min(args.discriminator_heldout_size, len(heldout_indices), len(experts.heldout_starts))
+    if not count:
         return None
-
     choices = torch.randperm(len(heldout_indices), device=heldout_indices.device)[:count]
-    generated = scenes.windows(heldout_indices[choices])
-    expert = experts.sample_heldout(count)
-    windows = torch.cat((generated, expert))
-    near_windows = None
-
-    if discriminator.factorized:
-        heldout_generated = scenes.windows(heldout_indices)
-        near_generated = heldout_generated[
-            features.nearest_ball_distance(heldout_generated) <= args.near_distance
-        ]
-        near_count = min(
-            len(near_generated),
-            experts.near_total(heldout=True),
-            args.discriminator_heldout_size
-        )
-
-        if near_count:
-            order = torch.randperm(len(near_generated), device=windows.device)[:near_count]
-            near_windows = torch.cat(
-                (near_generated[order], experts.sample_near(near_count, heldout=True))
-            )
-
-    return windows, near_windows
+    return balanced_window_batch(scenes.transitions(heldout_indices[choices]), experts.sample_heldout(count),
+                                 absorbing=hasattr(discriminator, "absorbing"))
 
 
 @torch.no_grad()
 def evaluate_discriminator(discriminator, experts, scenes, heldout_indices, args, validation=None):
     if validation is None:
-        validation = sample_discriminator_validation(
-            discriminator, experts, scenes, heldout_indices, args
-        )
-
-    if validation is None:
-        metrics = {
-            f"discriminator/{name}": 0.0
-            for name in (
-                "loss",
-                "agent_score",
-                "expert_score",
-                "agent_accuracy",
-                "expert_accuracy",
-                "heldout_accuracy"
-            )
-        }
-
-        if discriminator.factorized:
-            metrics.update(
-                {
-                    f"discriminator/{name}_heldout_accuracy": 0.0
-                    for name in ("far", "near", "global")
-                }
-            )
-
-        return metrics
-
-    windows, near_windows = validation
-    count = len(windows) // 2
-    labels = torch.cat(
-        (
-            torch.zeros(count, device=windows.device),
-            torch.ones(count, device=windows.device)
-        )
-    )
-    near = features.nearest_ball_distance(windows) <= args.near_distance
-    sequence = discriminator_scores(
-        discriminator,
-        windows,
-        args.discriminator_inference_microbatch_size
-    )
-    logits = sequence[:, -1]
-    correct = (logits > 0) == labels[:, None].bool()
+        return {}
+    parts = []
+    for chunk in validation.split(args.discriminator_inference_microbatch_size):
+        scores = discriminator(chunk).float()
+        parts.append(scores if discriminator.factorized else scores[:, None])
+    logits = torch.cat(parts)
+    require_finite(logits, "discriminator validation logits")
+    count = len(logits) // 2
+    labels = torch.cat((torch.ones(count, device=logits.device), torch.zeros(count, device=logits.device)))
+    correct = (logits >= 0) == labels[:, None].bool()
     metrics = {}
-    measured = []
-
+    padded = torch.isnan(validation[..., 0]).any(dim=1)
+    metrics["discriminator/generated_padded_fraction"] = padded[:count].float().mean().item()
+    metrics["discriminator/expert_padded_fraction"] = padded[count:].float().mean().item()
     if discriminator.factorized:
-        specialist = torch.where(near, logits[:, 1], logits[:, 0])
-        selected = features.GLOBAL_WEIGHT * logits[:, 2] + features.SPECIALIST_WEIGHT * specialist
-        masks = {
-            "far": ~near,
-            "near": near,
-            "global": torch.ones_like(near)
-        }
-
-        for index, (name, mask) in enumerate(masks.items()):
-            generated_mask = mask[:count]
-            expert_mask = mask[count:]
-
-            if generated_mask.any() and expert_mask.any():
-                generated_accuracy = correct[:count, index][generated_mask].float().mean()
-                expert_accuracy = correct[count:, index][expert_mask].float().mean()
-                accuracy = 0.5 * (generated_accuracy + expert_accuracy).item()
-                measured.append(accuracy)
-            else:
-                accuracy = 0.0
-
-            metrics[f"discriminator/{name}_heldout_accuracy"] = accuracy
-
-        if near_windows is not None:
-            near_count = len(near_windows) // 2
-            near_logits = discriminator_scores(
-                discriminator,
-                near_windows,
-                args.discriminator_inference_microbatch_size
-            )[:, -1]
-            near_generated_logits, near_expert_logits = near_logits.split(near_count)
-            near_accuracy = 0.5 * (
-                (near_generated_logits[:, 1] <= 0).float().mean()
-                + (near_expert_logits[:, 1] > 0).float().mean()
-            )
-            metrics["discriminator/near_heldout_accuracy"] = near_accuracy.item()
-            measured.append(near_accuracy.item())
-
-        heldout_accuracy = min(measured) if measured else 0.0
+        scores = SPECIALIST_WEIGHT * logits[:, 0] + GLOBAL_WEIGHT * logits[:, 1]
+        for index, name in enumerate(("ego", "global")):
+            metrics[f"discriminator/{name}_heldout_accuracy"] = correct[:, index].float().mean().item()
     else:
-        selected = logits[:, 0]
-        heldout_accuracy = correct[:, 0].float().mean().item()
-
-    generated_selected = selected[:count]
-    expert_selected = selected[count:]
-    targets = labels * 2 - 1
-    trained = sequence[:, min(features.DISCRIMINATOR_WARMUP, sequence.shape[1] - 1):]
-    errors = 2 * (trained - targets[:, None, None]).square().mean(dim=1)
-
-    if discriminator.factorized:
-        weights = features.balanced_proximity_weights(near, labels)
-        loss = features.SPECIALIST_WEIGHT * (errors[:, :2] * weights).mean(0).sum()
-        loss = loss + features.GLOBAL_WEIGHT * errors[:, 2].mean()
-    else:
-        loss = errors.mean()
-
-    metrics.update(
-        {
-            "discriminator/heldout_accuracy": heldout_accuracy,
-            "discriminator/loss": loss.item(),
-            "discriminator/agent_score": generated_selected.mean().item(),
-            "discriminator/expert_score": expert_selected.mean().item(),
-            "discriminator/agent_accuracy": (generated_selected <= 0).float().mean().item(),
-            "discriminator/expert_accuracy": (expert_selected > 0).float().mean().item(),
-            "discriminator/near_ball_fraction": near.float().mean().item()
-        }
-    )
-
+        scores = logits[:, 0]
+        if getattr(discriminator, "head_name", None) == "ego":
+            metrics["discriminator/ego_heldout_accuracy"] = correct[:, 0].float().mean().item()
+    if hasattr(discriminator, "absorbing"):
+        last = validation[:, -1, -1] > 0.5
+        previous = validation[:, -2, -1] > 0.5
+        categories = (("live", ~last), ("terminal", last & ~previous), ("absorbing", last & previous))
+        names = (("ego", "global") if discriminator.factorized else
+                 (getattr(discriminator, "head_name", "global"),))
+        for category, mask in categories:
+            for source, source_mask in (("generated", labels.bool()), ("expert", ~labels.bool())):
+                selected = mask & source_mask
+                metrics[f"discriminator/{category}_{source}_count"] = selected.sum().item()
+                if selected.any():
+                    for index, name in enumerate(names):
+                        metrics[f"discriminator/{name}_{category}_{source}_accuracy"] = (
+                            correct[selected, index].float().mean().item()
+                        )
+    metrics["discriminator/heldout_accuracy"] = ((scores >= 0) == labels.bool()).float().mean().item()
     return metrics

@@ -9,7 +9,6 @@ from rewards.constants import GOAL_HEIGHT as GOAL_HEIGHT
 from rewards.constants import GOAL_Y as GOAL_Y
 from rewards.constants import KICKOFF_MAX_STEPS as KICKOFF_MAX_STEPS
 from rewards.constants import REFERENCE_FRAMESKIP as REFERENCE_FRAMESKIP
-from rewards.constants import REWARD_PLUS_COMPONENTS as REWARD_PLUS_COMPONENTS
 from rewards.constants import TICKS_PER_SECOND as TICKS_PER_SECOND
 from rewards.diagnostics import GameplayDiagnostics as GameplayDiagnostics
 from rewards.events import AerialTouchCombo as AerialTouchCombo

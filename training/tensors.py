@@ -7,3 +7,8 @@ def plain_tensor(tensor):
 
 def autocast(device, enabled):
     return torch.autocast(device.type, dtype=torch.bfloat16, enabled=enabled)
+
+
+def require_finite(tensor, name):
+    if not torch.isfinite(tensor).all().item():
+        raise FloatingPointError(f"non-finite {name}; training stopped before corrupting a checkpoint")

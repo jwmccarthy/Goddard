@@ -1,9 +1,11 @@
 import random
+import warnings
 
 import numpy as np
 import torch
 
-from training.models import Agent
+from training.latents import LatentObservationEnv
+from training.models import Agent, critic_hidden_size, critic_layers, policy_window_length
 from training.ppo import ppo_loss
 from training.rollout import Rollout, compute_gae
 
@@ -11,7 +13,7 @@ from training.rollout import Rollout, compute_gae
 def build_env(args, reward_funcs=None):
     from carl.gymnasium import CARLTorchVectorEnv
 
-    return CARLTorchVectorEnv(
+    env = CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=args.team_size,
         n_orange=args.team_size,
@@ -21,8 +23,15 @@ def build_env(args, reward_funcs=None):
         no_touch_timeout_seconds=args.no_touch_timeout,
         normalize=True,
         discrete_actions=True,
-        reward_funcs=reward_funcs
+        reward_funcs=reward_funcs,
     )
+    if getattr(args, "info", False):
+        try:
+            return LatentObservationEnv(env, args.info_codes)
+        except BaseException:
+            env.close()
+            raise
+    return env
 
 
 def prepare(args, reward_funcs=None):
@@ -44,7 +53,15 @@ def prepare(args, reward_funcs=None):
             env.single_action_space.nvec,
             env.action_codec,
             args.hidden_size,
-            args.layers
+            args.layers,
+            gru_critic=getattr(args, "gru_critic", False),
+            gru_policy=getattr(args, "gru_policy", False),
+            info_codes=args.info_codes if getattr(args, "info", False) else 0,
+            policy_window_length=policy_window_length(args),
+            critic_hidden_size=critic_hidden_size(args),
+            critic_layers=critic_layers(args),
+            mlp_policy=getattr(args, "mlp_policy", False),
+            mlp_critic=getattr(args, "mlp_critic", False)
         ).to(env.device)
         optimizer = torch.optim.Adam(
             agent.parameters(), lr=args.learning_rate, eps=args.adam_eps, fused=True
@@ -71,7 +88,10 @@ def compile_functions(agent, args):
     if args.compile:
         mode = "reduce-overhead" if args.cuda_graphs else "default"
         policy = torch.compile(policy, fullgraph=True, mode=mode)
-        loss_function = torch.compile(loss_function, fullgraph=True, mode=mode)
+        if getattr(args, "gru_critic", False) or getattr(args, "gru_policy", False):
+            warnings.warn("GRU PPO loss runs uncompiled; PyTorch does not support full-graph GRU compilation", stacklevel=2)
+        else:
+            loss_function = torch.compile(loss_function, fullgraph=True, mode=mode)
         gae_function = torch.compile(gae_function, fullgraph=True)
 
     return policy, loss_function, gae_function

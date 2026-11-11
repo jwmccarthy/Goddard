@@ -7,6 +7,7 @@ checkpoints/
 rlbot_bot/*.pt*
 !rlbot_bot/policy_latest.pt
 runs/
+.autoresearch/
 .opencode
 
 # Local replay and project backups are archives, not source files.
@@ -15,3 +16,6 @@ runs/
 # Replay datasets can contain tens of thousands of large files.
 replays/raw/
 replays/parsed_replays/
+replays/ssl_duels/
+replays/ssl_duels_recent/
+replays/aerial_stratified*/

@@ -1,10 +1,12 @@
 import argparse
+import math
 import time
 
-import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from replays.resets import ReplayResetDataset, ReplayResetProvider
+from rewards import GameplayDiagnostics
 from training.arguments import add_ppo_arguments
 from training.checkpoints import load_checkpoint, save_checkpoint
 from training.logging import log_metrics, progress_bar, run_directory
@@ -16,10 +18,23 @@ from training.tensors import autocast, plain_tensor
 
 def train(args):
     env, agent, optimizer, rollout = prepare(args)
+    gameplay = GameplayDiagnostics(
+        args.n_sim,
+        env.n_cars,
+        env.device,
+        args.frameskip,
+        reward_plus=True,
+        no_touch_timeout_steps=math.ceil(args.no_touch_timeout * 120 / args.frameskip)
+    )
+    env.register_reward(gameplay)
+    args.reward_objective = "reward-plus-v3"
     progress, task = progress_bar("PPO", args.timesteps)
     writer = None
 
     try:
+        replay_data = ReplayResetDataset(args.replay_dir, args.team_size, env.device)
+        replay_resets = ReplayResetProvider(replay_data, fraction=0.70, seed=args.seed)
+        env.reset_state_provider = replay_resets
         step = 0
 
         if args.resume:
@@ -38,7 +53,7 @@ def train(args):
             optimizer.param_groups[0]["lr"] = args.learning_rate + fraction * (
                 args.learning_rate_end - args.learning_rate
             )
-            observation, episode_returns = collect(env, agent, policy, rollout, observation, args)
+            observation, _ = collect(env, agent, policy, rollout, observation, args)
 
             with torch.no_grad(), autocast(env.device, args.bf16):
                 next_value = agent.get_value(observation)
@@ -52,9 +67,8 @@ def train(args):
                 time.perf_counter() - started
             )
             metrics["reward"] = rollout.rewards.mean().item()
-
-            if episode_returns:
-                metrics["episode_return"] = float(np.mean(episode_returns))
+            metrics.update(gameplay.diagnostic_metrics())
+            metrics.update(replay_resets.diagnostic_metrics())
 
             log_metrics(writer, step, metrics, progress, task)
 

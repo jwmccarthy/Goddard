@@ -1,45 +1,96 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from imitation.features import BLUE_START, relative_scene_positions
+from imitation.features import relative_scene_positions
 from replays.layout import BALL_SIZE, CAR_SIZE
-from rewards import BALL_MAX_SPEED, CAR_MAX_SPEED
 
 
-class SequenceHead(nn.Module):
+def relative_window(frames):
+    padding = torch.isnan(frames[..., 0])
+    first = (~padding).to(torch.int64).argmax(dim=1)
+    reference = frames[torch.arange(len(frames), device=frames.device), first][:, None, :]
+    positions = torch.arange(frames.shape[1], device=frames.device)[None, :]
+    keep_absolute = padding | (positions == first[:, None])
 
-    def __init__(self, input_size, hidden_size):
+    return torch.where(keep_absolute[..., None], frames, frames - reference)
+
+
+class WindowHead(nn.Module):
+
+    def __init__(self, input_size, hidden_size, width, window_length, gru=False, output_size=1, mlp=False):
         super().__init__()
-        self.gru = nn.GRU(input_size, hidden_size, batch_first=True)
-        self.head = nn.Linear(hidden_size, 1)
+        if gru and mlp:
+            raise ValueError("GRU and MLP window heads are mutually exclusive")
 
-    def forward(self, frames):
-        output, _ = self.gru(frames)
-        return self.head(output).squeeze(-1)
+        self.projection = nn.Linear(input_size, width)
+        self.window_length = window_length
+        self.gru = nn.GRU(width, width, batch_first=True) if gru else None
+        self.mlp = (nn.Sequential(
+            nn.Linear(window_length * (width + 1), hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, width),
+            nn.ReLU(),
+        ) if mlp else None)
+        if not gru and not mlp:
+            self.position = nn.Parameter(torch.zeros(1, window_length, width))
+            self.transformer = nn.TransformerEncoderLayer(
+                d_model=width,
+                nhead=4 if width % 4 == 0 else 1,
+                dim_feedforward=hidden_size,
+                dropout=0.0,
+                batch_first=True,
+                activation="gelu"
+            )
+        self.output = nn.Linear(width, output_size)
 
-    def recurrent(self, frames, hidden, reset):
-        hidden = hidden.unsqueeze(0).to(frames.dtype)
-        boundaries = reset.any(0).nonzero().flatten().tolist()
-        boundaries = sorted(set([0, *boundaries, frames.shape[1]]))
-        parts = []
+    def forward(self, frames, padding=None):
+        return self.forward_encoded(self.projection(frames), padding)
 
-        for start, stop in zip(boundaries[:-1], boundaries[1:]):
-            hidden = hidden.masked_fill(reset[:, start][None, :, None], 0)
-            output, hidden = self.gru(frames[:, start:stop], hidden)
-            parts.append(output)
+    def forward_encoded(self, encoded, padding=None):
+        if self.mlp is not None:
+            if encoded.shape[1] > self.window_length:
+                raise ValueError("window exceeds configured discriminator window length")
 
-        output = torch.cat(parts, dim=1)
-        return self.head(output).squeeze(-1), output
+            if padding is None:
+                padding = torch.zeros(encoded.shape[:2], dtype=torch.bool, device=encoded.device)
+
+            encoded = encoded.masked_fill(padding[..., None], 0)
+            features = torch.cat((encoded, (~padding)[..., None].to(encoded.dtype)), dim=-1)
+            features = F.pad(features, (0, 0, self.window_length - encoded.shape[1], 0))
+            return self.output(self.mlp(features.flatten(1))).squeeze(-1)
+
+        if self.gru is not None:
+            if padding is None:
+                return self.output(self.gru(encoded)[0][:, -1]).squeeze(-1)
+            prefix = padding.sum(dim=1, keepdim=True)
+            length = encoded.shape[1] - prefix[:, 0]
+            positions = (torch.arange(encoded.shape[1], device=encoded.device)[None] +
+                         prefix) % encoded.shape[1]
+            ordered = encoded.gather(1, positions[..., None].expand_as(encoded))
+            output = self.gru(ordered)[0]
+            last = output[torch.arange(len(output), device=output.device), length - 1]
+            return self.output(last).squeeze(-1)
+        encoded = encoded + self.position[:, :encoded.shape[1]]
+        if encoded.is_cuda and torch.is_grad_enabled() and padding is not None:
+            # The CUDA memory-efficient masked attention backward can return
+            # enormous finite gradients for otherwise ordinary bfloat16 inputs.
+            with sdpa_kernel(SDPBackend.MATH):
+                return self.output(self.transformer(encoded, src_key_padding_mask=padding)[:, -1]).squeeze(-1)
+        return self.output(self.transformer(encoded, src_key_padding_mask=padding)[:, -1]).squeeze(-1)
 
 
 class SceneDiscriminator(nn.Module):
 
     factorized = False
 
-    def __init__(self, frame_embedding, temporal_hidden, hidden_size, n_cars):
+    def __init__(self, frame_embedding, hidden_size, n_cars, window_length=16, gru=False, mlp=False, relative=False):
         super().__init__()
 
         self.n_cars = n_cars
+        self.relative = relative
+        self.supports_frame_cache = not relative
         self.ball_encoder = nn.Sequential(
             nn.Linear(BALL_SIZE, hidden_size),
             nn.ReLU(),
@@ -52,7 +103,7 @@ class SceneDiscriminator(nn.Module):
             nn.Linear(hidden_size, frame_embedding),
             nn.ReLU()
         )
-        self.head = SequenceHead(frame_embedding * (n_cars + 1), temporal_hidden)
+        self.head = WindowHead(frame_embedding * (n_cars + 1), hidden_size, frame_embedding, window_length, gru, mlp=mlp)
 
     def _encode(self, scenes):
         batch, length = scenes.shape[:2]
@@ -74,128 +125,118 @@ class SceneDiscriminator(nn.Module):
 
         return torch.cat((ball_features, car_features), dim=-1)
 
-    def forward(self, windows):
-        return self.head(self._encode(windows))
+    def forward(self, transitions):
+        padding = torch.isnan(transitions[..., 0])
+        if self.relative:
+            transitions = relative_window(transitions)
+        return self.head(self._encode(torch.nan_to_num(transitions)), padding)
 
-    def recurrent(self, scenes, hidden, reset):
-        scores, states = self.head.recurrent(self._encode(scenes), hidden[:, 0], reset)
-        return scores, states.unsqueeze(2)
+    def encode_frames(self, frames):
+        return (self.head.projection(self._encode(torch.nan_to_num(frames))),)
+
+    def score_encoded(self, encoded, padding):
+        return self.head.forward_encoded(encoded[0], padding)
 
 
-class EgoBallSceneDiscriminator(nn.Module):
+class EgoSceneDiscriminator(nn.Module):
 
-    def __init__(self, frame_embedding, temporal_hidden, hidden_size):
+    factorized = False
+    head_name = "ego"
+
+    def __init__(self, frame_embedding, hidden_size, n_cars, window_length=16, gru=False, mlp=False, relative=False):
         super().__init__()
-
+        self.n_cars = n_cars
+        self.relative = relative
+        self.supports_frame_cache = not relative
         self.encoder = nn.Sequential(
-            nn.Linear(BALL_SIZE + CAR_SIZE + 6, hidden_size),
+            nn.Linear(CAR_SIZE + 3 + 3 * (n_cars // 2), hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, frame_embedding),
             nn.ReLU()
         )
-        self.head = SequenceHead(frame_embedding, temporal_hidden)
+        self.head = WindowHead(frame_embedding, hidden_size, frame_embedding, window_length, gru, mlp=mlp)
 
-    def _encode(self, windows):
-        ball = windows[..., :BALL_SIZE]
-        ego = windows[..., BLUE_START : BLUE_START + CAR_SIZE]
-        relative_position = ball[..., :3] - ego[..., :3]
-        relative_velocity = ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
-        inputs = torch.cat((ball, ego, relative_position, relative_velocity), dim=-1)
+    def _encode(self, transitions):
+        cars = transitions[..., BALL_SIZE : BALL_SIZE + self.n_cars * CAR_SIZE].unflatten(
+            -1, (self.n_cars, CAR_SIZE)
+        )
+        ego = cars[..., 0, :]
+        ball_position = transitions[..., :3] - ego[..., :3]
+        opponent_positions = (cars[..., self.n_cars // 2:, :3] - ego[..., None, :3]).flatten(-2)
+        inputs = torch.cat((ego, ball_position, opponent_positions), dim=-1)
         return self.encoder(inputs)
 
-    def forward(self, windows):
-        return self.head(self._encode(windows))
+    def forward(self, transitions):
+        padding = torch.isnan(transitions[..., 0])
+        if self.relative:
+            transitions = relative_window(transitions)
+        return self.head(self._encode(torch.nan_to_num(transitions)), padding)
 
-    def recurrent(self, scenes, hidden, reset):
-        scores, states = self.head.recurrent(self._encode(scenes), hidden[:, 0], reset)
-        return scores, states.unsqueeze(2)
+    def encode_frames(self, frames):
+        return (self.head.projection(self._encode(torch.nan_to_num(frames))),)
+
+    def score_encoded(self, encoded, padding):
+        return self.head.forward_encoded(encoded[0], padding)
 
 
 class FactorizedSceneDiscriminator(nn.Module):
 
     factorized = True
 
-    def __init__(self, frame_embedding, temporal_hidden, hidden_size, n_cars):
+    def __init__(self, frame_embedding, hidden_size, n_cars, window_length=16, gru=False, mlp=False, relative=False):
         super().__init__()
 
         self.n_cars = n_cars
-        self.car_encoder = nn.Sequential(
-            nn.Linear(CAR_SIZE + 6, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, frame_embedding),
-            nn.ReLU()
-        )
-        self.car_head = SequenceHead(frame_embedding, temporal_hidden)
-        self.near_discriminator = EgoBallSceneDiscriminator(
+        self.relative = relative
+        self.supports_frame_cache = not relative
+        self.ego_discriminator = EgoSceneDiscriminator(
             frame_embedding,
-            temporal_hidden,
-            hidden_size
+            hidden_size,
+            n_cars,
+            window_length,
+            gru,
+            mlp,
+            relative
         )
         self.global_discriminator = SceneDiscriminator(
             frame_embedding,
-            temporal_hidden,
             hidden_size,
-            n_cars
+            n_cars,
+            window_length,
+            gru,
+            mlp,
+            relative
         )
 
-    def far_logits(self, windows):
-        ball = windows[..., :BALL_SIZE]
-        ego = windows[..., BLUE_START : BLUE_START + CAR_SIZE]
-        relative_position = ball[..., :3] - ego[..., :3]
-        relative_velocity = ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
-        initial_context = torch.cat(
-            (relative_position[:, 0], relative_velocity[:, 0]),
-            dim=-1
+    def head_score(self, transitions, head):
+        models = (self.ego_discriminator, self.global_discriminator)
+        return models[head](transitions)
+
+    def forward(self, transitions):
+        return torch.stack([self.head_score(transitions, head) for head in range(2)], dim=-1)
+
+    def encode_frames(self, frames):
+        frames = torch.nan_to_num(frames)
+        return (
+            self.ego_discriminator.head.projection(self.ego_discriminator._encode(frames)),
+            self.global_discriminator.head.projection(self.global_discriminator._encode(frames))
         )
-        car_input = torch.cat(
-            (ego, initial_context[:, None].expand(-1, windows.shape[1], -1)),
-            dim=-1
-        )
-        return self.car_head(self.car_encoder(car_input))
 
-    def specialist_logits(self, windows):
-        return torch.stack((self.far_logits(windows), self.near_discriminator(windows)), dim=-1)
-
-    def head_scores(self, windows):
-        return tuple(self.head_score(windows, head) for head in range(3))
-
-    def head_score(self, windows, head):
-        models = (self.far_logits, self.near_discriminator, self.global_discriminator)
-        return models[head](windows)
-
-    def forward(self, windows):
-        return torch.stack(self.head_scores(windows), dim=-1)
-
-    def recurrent_head(self, scenes, hidden, reset, head):
-        if head == 0:
-            ball = scenes[..., :BALL_SIZE]
-            ego = scenes[..., BLUE_START : BLUE_START + CAR_SIZE]
-            context = torch.cat((
-                ball[..., :3] - ego[..., :3],
-                ball[..., 3:6] - ego[..., 3:6] * (CAR_MAX_SPEED / BALL_MAX_SPEED)
-            ), dim=-1)
-            frames = self.car_encoder(torch.cat((ego, context), dim=-1))
-            return self.car_head.recurrent(frames, hidden, reset)
-
-        model = self.near_discriminator if head == 1 else self.global_discriminator
-        scores, states = model.recurrent(scenes, hidden[:, None], reset)
-        return scores, states[:, :, 0]
-
-    def recurrent(self, scenes, hidden, reset):
-        outputs = [
-            self.recurrent_head(scenes, hidden[:, head], reset, head) for head in range(3)
-        ]
-        return torch.stack([out[0] for out in outputs], -1), torch.stack(
-            [out[1] for out in outputs], 2
-        )
+    def score_encoded(self, encoded, padding):
+        heads = (self.ego_discriminator.head, self.global_discriminator.head)
+        return torch.stack([head.forward_encoded(frame, padding) for head, frame in zip(heads, encoded)], dim=-1)
 
 
 def build_discriminator(args, n_cars):
-    model = FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator
+    model = (EgoSceneDiscriminator if getattr(args, "ego_only", False) else
+             FactorizedSceneDiscriminator if args.factorize else SceneDiscriminator)
 
     return model(
         args.frame_embedding,
-        args.temporal_hidden,
         args.discriminator_hidden,
-        n_cars
+        n_cars,
+        args.discriminator_window_length,
+        args.gru,
+        getattr(args, "mlp_discriminator", False),
+        getattr(args, "discriminator_relative", False)
     )

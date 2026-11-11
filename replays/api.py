@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Lock, local
 from typing import Any, Iterator
 from urllib.parse import parse_qs, urlparse
+from uuid import UUID
 
 import requests
 from dotenv import load_dotenv
@@ -63,7 +64,9 @@ class BallchasingClient:
         stop=stop_after_attempt(API_RETRIES),
         reraise=True
     )
-    def get(self, url: str, **params: Any) -> ReplayPage:
+    def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        if url != API_URL and not url.startswith(f"{API_URL}/"):
+            raise ValueError("refusing to send Ballchasing credentials to another endpoint")
         time.sleep(self.list_interval)
 
         params = {key.replace("_", "-"): value for key, value in params.items()}
@@ -75,14 +78,17 @@ class BallchasingClient:
                 timeout=REQUEST_TIMEOUT
             )
 
-            if response.status_code != 429:
+            if response.status_code not in (429, 500, 502, 503, 504):
                 break
 
             time.sleep(_retry_delay(response, attempt))
 
         response.raise_for_status()
 
-        content = response.json()
+        return response.json()
+
+    def get(self, url: str, **params: Any) -> ReplayPage:
+        content = self.get_json(url, **params)
 
         return ReplayPage(
             replays=content["list"],
@@ -112,7 +118,8 @@ class BallchasingClient:
         stop=stop_after_attempt(API_RETRIES),
         reraise=True
     )
-    def _download(self, replay_id: str, output_dir: Path) -> bool:
+    def download_replay(self, replay_id: str, output_dir: Path) -> bool:
+        replay_id = str(UUID(replay_id))
         for attempt in range(API_RETRIES):
             self._wait_for_download_slot()
 
@@ -121,7 +128,7 @@ class BallchasingClient:
                 timeout=REQUEST_TIMEOUT
             )
 
-            if response.status_code != 429:
+            if response.status_code not in (429, 500, 502, 503, 504):
                 break
 
             time.sleep(_retry_delay(response, attempt))
@@ -132,7 +139,9 @@ class BallchasingClient:
         response.raise_for_status()
 
         path = output_dir / f"{replay_id}.replay"
-        path.write_bytes(response.content)
+        temporary = path.with_suffix(".replay.part")
+        temporary.write_bytes(response.content)
+        temporary.replace(path)
 
         return True
 
@@ -187,7 +196,7 @@ class BallchasingClient:
             task = progress.add_task("Downloading replays", total=len(replay_ids))
 
             futures = [
-                executor.submit(self._download, replay_id, output_dir) for replay_id in replay_ids
+                executor.submit(self.download_replay, replay_id, output_dir) for replay_id in replay_ids
             ]
 
             for future in as_completed(futures):

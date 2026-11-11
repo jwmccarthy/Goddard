@@ -25,7 +25,7 @@ wheels = [
 [[package]]
 name = "carl"
 version = "0.1.0"
-source = { git = "https://github.com/jwmccarthy/CARL.git?branch=master#2bb3fe831fc60efe2704f64cc3b168cfa7cb02f9" }
+source = { git = "https://github.com/jwmccarthy/CARL.git?branch=master#97fff41c0d05ada447c2921d524501cd85523e94" }
 dependencies = [
     { name = "gymnasium" },
     { name = "numpy" },
