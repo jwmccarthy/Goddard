@@ -1,13 +1,25 @@
+from __future__ import annotations
+
 import math
+from typing import Protocol
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from imitation.models import WindowHead
+
+class ActionCodec(Protocol):
+
+    def mask(self, observations: torch.Tensor) -> torch.Tensor: ...
 
 
-def mlp(input_size: int, output_size: int, hidden_size: int, layers: int, gain: float):
+def mlp(
+    input_size:  int,
+    output_size: int,
+    hidden_size: int,
+    layers:      int,
+    gain:        float
+) -> nn.Sequential:
     modules = []
 
     for _ in range(layers):
@@ -15,6 +27,7 @@ def mlp(input_size: int, output_size: int, hidden_size: int, layers: int, gain: 
         nn.init.orthogonal_(linear.weight, math.sqrt(2))
         nn.init.zeros_(linear.bias)
         modules.extend((linear, nn.ReLU()))
+
         input_size = hidden_size
 
     linear = nn.Linear(input_size, output_size)
@@ -24,146 +37,275 @@ def mlp(input_size: int, output_size: int, hidden_size: int, layers: int, gain: 
     return nn.Sequential(*modules, linear)
 
 
-def policy_window_length(config):
-    """Read independent history, preserving the old coupling for legacy checkpoints."""
-    values = config if isinstance(config, dict) else vars(config)
-    return values.get("policy_window_length", values.get("discriminator_window_length", 1))
+class HistoryMLPCritic(nn.Module):
 
-
-def critic_hidden_size(config):
-    """Old GRU critics had a fixed width of 64; new configs store an explicit width."""
-    values = config if isinstance(config, dict) else vars(config)
-    if "critic_hidden_size" in values:
-        width = values["critic_hidden_size"]
-        return values["hidden_size"] if width is None else width
-    return 64 if values.get("gru_critic", values.get("gru", False)) else values["hidden_size"]
-
-
-def critic_layers(config):
-    """MLP critic depth; legacy checkpoints used the recorded shared layer count."""
-    values = config if isinstance(config, dict) else vars(config)
-    depth = values.get("critic_layers")
-    return values["layers"] if depth is None else depth
-
-
-class ObservationWindowMLP(nn.Module):
-    """Ordered raw observation window, with explicit valid-frame indicators."""
-
-    def __init__(self, observation_size, output_size, hidden_size, layers, window_length, gain):
+    def __init__(
+        self,
+        observation_size: int,
+        length:           int,
+        n_cars:           int,
+        relative:         bool,
+        hidden_size:      int,
+        layers:           int
+    ) -> None:
         super().__init__()
-        self.window_length = window_length
-        self.network = mlp((observation_size + 1) * window_length, output_size, hidden_size, layers, gain)
+        self.observation_size = observation_size
+        self.length = length
+        self.relative = relative
 
-    def forward(self, observations):
-        if observations.ndim != 3 or not 0 < observations.shape[1] <= self.window_length:
-            raise ValueError("windowed MLP requires a batch of observation histories within its configured window")
-        padding = torch.isnan(observations[..., 0])
-        frames = torch.nan_to_num(observations).masked_fill(padding[..., None], 0)
-        features = torch.cat((frames, (~padding)[..., None].to(frames.dtype)), dim=-1)
-        features = F.pad(features, (0, 0, self.window_length - observations.shape[1], 0))
-        return self.network(features.flatten(1))
+        physics = torch.zeros(observation_size, dtype=torch.bool)
+        physics[:9] = True
+
+        for car in range(n_cars):
+            start = 9 + 21 * car
+            physics[start : start + 15] = True
+
+        self.register_buffer("physics", physics, persistent=False)
+
+        self.network = mlp(
+            length * (observation_size + 1),
+            1,
+            hidden_size,
+            layers,
+            1.0
+        )
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        frames = history.reshape(-1, self.length, self.observation_size + 1)
+
+        observations, valid = (frames[..., :-1], frames[..., -1:])
+
+        if self.relative:
+            # Current frame stays absolute; only earlier raw scene physics becomes
+            # a temporal delta. Fuel, flags, derived inputs and controller state stay absolute.
+            relative = observations - observations[:, -1:]
+            earlier = (
+                torch.arange(self.length, device=history.device)
+                < self.length - 1
+            )
+
+            observations = torch.where(
+                earlier[None, :, None] & self.physics,
+                relative,
+                observations
+            )
+
+        encoded = torch.cat((observations * valid, valid), -1).flatten(1)
+
+        return self.network(encoded)
 
 
 class Agent(nn.Module):
 
-    def __init__(self, observation_size, action_sizes, action_codec, hidden_size=384, layers=3,
-                 critic_window_length=1, gru_critic=False, gru_policy=False, info_codes=0, *,
-                 policy_window_length=None, critic_hidden_size=None, mlp_policy=False, mlp_critic=False,
-                 critic_layers=None):
+    def __init__(
+        self,
+        observation_size:     int,
+        action_sizes:         tuple[int, ...],
+        action_codec:         ActionCodec,
+        hidden_size:          int = 384,
+        layers:               int = 3,
+        *,
+        mlp_critic:           bool = False,
+        critic_window_length: int = 4,
+        critic_relative:      bool = False,
+        n_cars:               int | None = None,
+        joint_actions:        bool = False
+    ) -> None:
         super().__init__()
-        if (gru_policy and mlp_policy) or (gru_critic and mlp_critic):
-            raise ValueError("GRU and windowed MLP are mutually exclusive for each actor/critic head")
-        length = critic_window_length if policy_window_length is None else policy_window_length
-        if length < 1:
-            raise ValueError("policy window length must be at least 1")
-        self.policy_window_length = length
-        self.critic_window_length = length  # Compatibility alias; both windowed heads share this history.
-        self.critic_hidden_size = hidden_size if critic_hidden_size is None else critic_hidden_size
-        if self.critic_hidden_size < 1:
-            raise ValueError("critic hidden size must be positive")
-        self.critic_layers = layers if critic_layers is None else critic_layers
-        if self.critic_layers < 0:
-            raise ValueError("critic layers must be nonnegative")
         self.action_sizes = tuple(int(size) for size in action_sizes)
         self.action_codec = action_codec
-        self.info_codes = info_codes
-        self.gru_policy = gru_policy
-        self.mlp_policy = mlp_policy
-        self.mlp_critic = mlp_critic
-        self.actor_uses_history = gru_policy or mlp_policy
-        self.critic_uses_history = gru_critic or mlp_critic
-        if gru_policy:
-            self.actor = WindowHead(observation_size, hidden_size, hidden_size, length,
-                                    gru=True, output_size=sum(self.action_sizes))
-            nn.init.orthogonal_(self.actor.output.weight, 0.01)
-            nn.init.zeros_(self.actor.output.bias)
-        elif mlp_policy:
-            self.actor = ObservationWindowMLP(observation_size, sum(self.action_sizes), hidden_size, layers, length, .01)
-        else:
-            self.actor = mlp(observation_size, sum(self.action_sizes), hidden_size, layers, 0.01)
-        self.gru_critic = gru_critic
-        if gru_critic:
-            self.critic = WindowHead(observation_size, self.critic_hidden_size, self.critic_hidden_size, length, gru=True)
-        elif mlp_critic:
-            self.critic = ObservationWindowMLP(observation_size, 1, self.critic_hidden_size,
-                                               self.critic_layers, length, 1.)
-        else:
-            self.critic = mlp(observation_size, 1, self.critic_hidden_size, self.critic_layers, 1.)
+        self.joint_actions = joint_actions
 
-    def get_value(self, observations):
-        if self.gru_critic:
-            padding = torch.isnan(observations[..., 0])
-            return self.critic(torch.nan_to_num(observations), padding).float()
-        if self.mlp_critic:
-            return self.critic(observations).squeeze(-1).float()
-        if observations.ndim == 3:
-            observations = observations[:, -1]
-        return self.critic(observations).squeeze(-1).float()
+        if joint_actions:
+            axes = (torch.arange(size) for size in self.action_sizes)
+            table = torch.cartesian_prod(*axes)
+            offsets = torch.tensor((0, *self.action_sizes[:-1])).cumsum(0)
 
-    def get_value_encoded(self, encoded, padding):
-        return self.critic.forward_encoded(encoded, padding).float()
+            strides = torch.tensor(
+                [
+                    math.prod(self.action_sizes[index + 1 :])
+                    for index in range(len(self.action_sizes))
+                ]
+            )
 
-    def get_action_and_log_prob(self, observations, actions=None, sample=True):
-        if self.gru_policy:
-            padding = torch.isnan(observations[..., 0])
-            logits = self.actor(torch.nan_to_num(observations), padding).float()
-            mask_observations = observations[:, -1]
-        elif self.mlp_policy:
-            logits = self.actor(observations).float()
-            mask_observations = observations[:, -1]
-        else:
-            logits = self.actor(observations).float()
-            mask_observations = observations
-        if self.info_codes:
-            mask_observations = mask_observations[..., :-self.info_codes]
-        mask = self.action_codec.mask(mask_observations)
-        logits = logits.masked_fill(~mask, -1e9)
-        width = max(self.action_sizes)
-        logits = torch.stack(
-            [
-                F.pad(head, (0, width - size), value=-1e9)
-                for head, size in zip(logits.split(self.action_sizes, dim=-1), self.action_sizes)
-            ],
-            dim=-2
+            self.register_buffer("action_table", table, persistent=False)
+
+            self.register_buffer(
+                "action_mask_indices",
+                table + offsets,
+                persistent=False
+            )
+
+            self.register_buffer("action_strides", strides, persistent=False)
+
+        output_size = (
+            math.prod(self.action_sizes)
+            if joint_actions else sum(self.action_sizes)
         )
-        log_probabilities = logits.log_softmax(-1)
+        self.actor = mlp(
+            observation_size,
+            output_size,
+            hidden_size,
+            layers,
+            0.01
+        )
 
-        if actions is None:
-            if sample:
-                noise = torch.empty_like(logits).exponential_().log()
-                actions = (logits - noise).argmax(-1)
+        self.mlp_critic = mlp_critic
+
+        if mlp_critic:
+            self.critic = HistoryMLPCritic(
+                observation_size,
+                critic_window_length,
+                n_cars,
+                critic_relative,
+                hidden_size,
+                layers
+            )
+        else:
+            self.critic = mlp(observation_size, 1, hidden_size, layers, 1.0)
+
+    def get_value(
+        self,
+        observations:        torch.Tensor,
+        critic_observations: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.mlp_critic and critic_observations is None:
+            raise ValueError("history critic requires causal critic observations")
+
+        inputs = critic_observations if self.mlp_critic else observations
+
+        return self.critic(inputs).squeeze(-1).float()
+
+    def get_action_and_log_prob(
+        self,
+        observations:     torch.Tensor,
+        actions:          torch.Tensor | None = None,
+        sample:           bool = True,
+        entropy_per_head: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = self.actor(observations).float()
+
+        return self.sample_action_logits(
+            logits,
+            observations,
+            actions,
+            sample,
+            entropy_per_head
+        )
+
+    def sample_action_logits(
+        self,
+        logits:           torch.Tensor,
+        observations:     torch.Tensor,
+        actions:          torch.Tensor | None = None,
+        sample:           bool = True,
+        entropy_per_head: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask = self.action_codec.mask(observations)
+
+        if self.joint_actions:
+            # A combination is legal exactly when every constituent control is legal.
+            legal = mask[..., self.action_mask_indices[:, 0]]
+
+            for head in range(1, len(self.action_sizes)):
+                legal = legal & mask[..., self.action_mask_indices[:, head]]
+
+            logits = logits.masked_fill(~legal, -1e9)
+            log_probabilities = logits.log_softmax(-1)
+
+            if actions is None:
+                if sample:
+                    noise = torch.empty_like(logits).exponential_().log()
+                    indices = (logits - noise).argmax(-1)
+                else:
+                    indices = logits.argmax(-1)
+
+                actions = self.action_table[indices]
             else:
-                actions = logits.argmax(-1)
+                indices = (actions.long() * self.action_strides).sum(-1)
 
-        log_prob = log_probabilities.gather(-1, actions.long().unsqueeze(-1))
-        entropy = -(log_probabilities.exp() * log_probabilities).sum((-1, -2))
+            log_prob = log_probabilities.gather(
+                -1,
+                indices.unsqueeze(-1)
+            ).squeeze(-1)
+            entropy = -(log_probabilities.exp() * log_probabilities).sum(-1)
 
-        return actions, log_prob.squeeze(-1).sum(-1), entropy
+            if entropy_per_head:
+                entropy = entropy.unsqueeze(-1)
 
-    def get_action(self, observations, sample=True):
+            return (actions, log_prob, entropy)
+
+        return sample_actions(
+            logits,
+            self.action_sizes,
+            mask,
+            actions,
+            sample,
+            entropy_per_head
+        )
+
+    def get_action(
+        self,
+        observations: torch.Tensor,
+        sample:       bool = True
+    ) -> torch.Tensor:
         return self.get_action_and_log_prob(observations, sample=sample)[0]
 
-    def get_action_and_value(self, observations, actions=None):
-        actor_observations = observations[:, -1] if observations.ndim == 3 and not self.actor_uses_history else observations
-        actions, log_prob, entropy = self.get_action_and_log_prob(actor_observations, actions)
-        return actions, log_prob, entropy, self.get_value(observations)
+    def get_action_and_value(
+        self,
+        observations:        torch.Tensor,
+        actions:             torch.Tensor | None = None,
+        entropy_per_head:    bool = False,
+        critic_observations: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        actions, log_prob, entropy = self.get_action_and_log_prob(
+            observations,
+            actions,
+            entropy_per_head=entropy_per_head
+        )
+
+        return (
+            actions,
+            log_prob,
+            entropy,
+            self.get_value(observations, critic_observations)
+        )
+
+
+def sample_actions(
+    logits:           torch.Tensor,
+    action_sizes:     tuple[int, ...],
+    mask:             torch.Tensor,
+    actions:          torch.Tensor | None = None,
+    sample:           bool = True,
+    entropy_per_head: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    logits = logits.masked_fill(~mask, -1e9)
+    width = max(action_sizes)
+    logits = torch.stack(
+        [
+            F.pad(head, (0, width - size), value=-1e9)
+            for head, size in zip(
+                logits.split(action_sizes, dim=-1),
+                action_sizes
+            )
+        ],
+        dim=-2
+    )
+
+    log_probabilities = logits.log_softmax(-1)
+
+    if actions is None:
+        if sample:
+            noise = torch.empty_like(logits).exponential_().log()
+            actions = (logits - noise).argmax(-1)
+        else:
+            actions = logits.argmax(-1)
+
+    log_prob = log_probabilities.gather(-1, actions.long().unsqueeze(-1))
+    entropy = -(log_probabilities.exp() * log_probabilities).sum(-1)
+
+    if not entropy_per_head:
+        entropy = entropy.sum(-1)
+
+    return (actions, log_prob.squeeze(-1).sum(-1), entropy)

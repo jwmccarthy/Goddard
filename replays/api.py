@@ -1,5 +1,6 @@
+import hashlib
+import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
@@ -9,8 +10,9 @@ from uuid import UUID
 
 import requests
 from dotenv import load_dotenv
-from rich.progress import BarColumn, Progress, TextColumn
 from tenacity import retry, retry_if_exception_type, stop_after_attempt
+
+from replays.utils import write_json
 
 load_dotenv()
 
@@ -19,14 +21,13 @@ API_URL = "https://ballchasing.com/api"
 API_RETRIES = 5
 LIST_RATE = 16.0
 DOWNLOAD_RATE = 2.0
-DOWNLOAD_WORKERS = 4
 REQUEST_TIMEOUT = 30
 
 
 @dataclass(slots=True)
 class ReplayPage:
 
-    replays: list[dict[str, Any]]
+    replays:  list[dict[str, Any]]
     next_url: str | None
 
 
@@ -43,11 +44,13 @@ class BallchasingClient:
 
     def __init__(
         self,
-        token: str,
-        list_rate: float = LIST_RATE,
+        token:         str,
+        list_rate:     float = LIST_RATE,
         download_rate: float = DOWNLOAD_RATE
     ) -> None:
-        self.headers = {"Authorization": token}
+        self.headers = {
+            "Authorization": token,
+        }
 
         self.session = requests.Session()
         self.session.headers.update(self.headers)
@@ -67,9 +70,13 @@ class BallchasingClient:
     def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         if url != API_URL and not url.startswith(f"{API_URL}/"):
             raise ValueError("refusing to send Ballchasing credentials to another endpoint")
+
         time.sleep(self.list_interval)
 
-        params = {key.replace("_", "-"): value for key, value in params.items()}
+        params = {
+            key.replace("_", "-"): value
+            for key, value in params.items()
+        }
 
         for attempt in range(API_RETRIES):
             response = self.session.get(
@@ -120,6 +127,7 @@ class BallchasingClient:
     )
     def download_replay(self, replay_id: str, output_dir: Path) -> bool:
         replay_id = str(UUID(replay_id))
+
         for attempt in range(API_RETRIES):
             self._wait_for_download_slot()
 
@@ -145,7 +153,10 @@ class BallchasingClient:
 
         return True
 
-    def iter_replay_pages(self, **params: Any) -> Iterator[list[dict[str, Any]]]:
+    def iter_replay_pages(
+        self,
+        **params: Any
+    ) -> Iterator[list[dict[str, Any]]]:
         page = self.get(f"{API_URL}/replays", **params)
 
         while True:
@@ -159,51 +170,42 @@ class BallchasingClient:
             missing = {
                 key: value
                 for key, value in params.items()
-                if key.replace("_", "-") not in next_params
+                if key.replace("_", "-")
+                not in next_params
             }
 
             page = self.get(page.next_url, **missing)
 
     def find_replay_entries(self, **params: Any) -> list[dict[str, Any]]:
-        replays = []
+        replays: list[dict[str, Any]] = []
 
         for page in self.iter_replay_pages(**params):
             replays.extend(page)
 
         return replays
 
-    def download_replays(self, replay_ids: list[str], output_dir: str | Path) -> None:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
 
-        replay_ids = [
-            replay_id
-            for replay_id in replay_ids
-            if not (output_dir / f"{replay_id}.replay").exists()
-        ]
+class CachedClient(BallchasingClient):
+    """Credential-free response cache for resumable downloads."""
 
-        self._next_download_at = time.monotonic()
-        unavailable = 0
+    def __init__(self, token: str, directory: str | Path) -> None:
+        super().__init__(token, list_rate=2.0, download_rate=2.0)
 
-        with (
-            Progress(
-                TextColumn("{task.description}"),
-                BarColumn(),
-                TextColumn("{task.completed:,.0f}/{task.total:,.0f}")
-            ) as progress,
-            ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor
-        ):
-            task = progress.add_task("Downloading replays", total=len(replay_ids))
+        self.cache = Path(directory)
+        self.cache.mkdir(parents=True, exist_ok=True)
 
-            futures = [
-                executor.submit(self.download_replay, replay_id, output_dir) for replay_id in replay_ids
-            ]
+    def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        if url != API_URL and not url.startswith(API_URL + "/"):
+            raise ValueError("refusing foreign API URL")
 
-            for future in as_completed(futures):
-                if not future.result():
-                    unavailable += 1
+        key = json.dumps([url, params], sort_keys=True)
 
-                progress.advance(task)
+        path = self.cache / (hashlib.sha256(key.encode()).hexdigest() + ".json")
 
-        if unavailable:
-            print(f"Unavailable replay files: {unavailable}")
+        if path.exists():
+            return json.loads(path.read_text())
+
+        result = super().get_json(url, **params)
+        write_json(path, result)
+
+        return result

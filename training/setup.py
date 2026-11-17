@@ -1,19 +1,27 @@
+from __future__ import annotations
+
 import random
-import warnings
+from argparse import Namespace
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import torch
 
-from training.latents import LatentObservationEnv
-from training.models import Agent, critic_hidden_size, critic_layers, policy_window_length
+from training.models import Agent
 from training.ppo import ppo_loss
 from training.rollout import Rollout, compute_gae
 
-
-def build_env(args, reward_funcs=None):
+if TYPE_CHECKING:
     from carl.gymnasium import CARLTorchVectorEnv
 
-    env = CARLTorchVectorEnv(
+
+def build_env(
+    args:         Namespace,
+    reward_funcs: Callable[..., torch.Tensor] | None = None
+) -> CARLTorchVectorEnv:
+    from carl.gymnasium import CARLTorchVectorEnv
+
+    return CARLTorchVectorEnv(
         n_sim=args.n_sim,
         n_blue=args.team_size,
         n_orange=args.team_size,
@@ -24,17 +32,14 @@ def build_env(args, reward_funcs=None):
         normalize=True,
         discrete_actions=True,
         reward_funcs=reward_funcs,
+        previous_controls=args.previous_controls,
+        masked_resets=True,
+        defer_episode_reporting=True
     )
-    if getattr(args, "info", False):
-        try:
-            return LatentObservationEnv(env, args.info_codes)
-        except BaseException:
-            env.close()
-            raise
-    return env
 
-
-def prepare(args, reward_funcs=None):
+def prepare(
+    args: Namespace
+) -> tuple[CARLTorchVectorEnv, Agent, torch.optim.Optimizer, Rollout]:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -42,10 +47,8 @@ def prepare(args, reward_funcs=None):
     if not torch.cuda.is_available():
         raise RuntimeError("CARL training requires CUDA")
 
-    if args.bf16 and not torch.cuda.is_bf16_supported():
-        raise ValueError("this GPU does not support bf16; use --no-bf16")
-
-    env = build_env(args, reward_funcs)
+    torch.set_float32_matmul_precision("high")
+    env = build_env(args)
 
     try:
         agent = Agent(
@@ -54,18 +57,20 @@ def prepare(args, reward_funcs=None):
             env.action_codec,
             args.hidden_size,
             args.layers,
-            gru_critic=getattr(args, "gru_critic", False),
-            gru_policy=getattr(args, "gru_policy", False),
-            info_codes=args.info_codes if getattr(args, "info", False) else 0,
-            policy_window_length=policy_window_length(args),
-            critic_hidden_size=critic_hidden_size(args),
-            critic_layers=critic_layers(args),
-            mlp_policy=getattr(args, "mlp_policy", False),
-            mlp_critic=getattr(args, "mlp_critic", False)
+            mlp_critic=args.mlp_critic,
+            critic_window_length=args.critic_window_length,
+            critic_relative=args.critic_relative,
+            n_cars=env.n_cars,
+            joint_actions=args.joint_actions
         ).to(env.device)
+
         optimizer = torch.optim.Adam(
-            agent.parameters(), lr=args.learning_rate, eps=args.adam_eps, fused=True
+            agent.parameters(),
+            lr=args.learning_rate,
+            eps=args.adam_eps,
+            fused=True
         )
+
         rollout = Rollout.allocate(
             args.rollout,
             env.n_envs,
@@ -73,6 +78,12 @@ def prepare(args, reward_funcs=None):
             len(env.single_action_space.nvec),
             env.device
         )
+
+        if args.mlp_critic:
+            rollout.enable_critic_history(
+                args.critic_window_length,
+                args.critic_decision_stride
+            )
     except BaseException:
         env.close()
         raise
@@ -80,18 +91,66 @@ def prepare(args, reward_funcs=None):
     return env, agent, optimizer, rollout
 
 
-def compile_functions(agent, args):
+def compilation_mode(*, cuda_graphs: bool = True) -> str:
+    return "max-autotune" if cuda_graphs else "max-autotune-no-cudagraphs"
+
+
+def compile_functions(
+    agent: Agent,
+    args:  Namespace
+) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
     policy = agent.get_action_and_value
     loss_function = ppo_loss
     gae_function = compute_gae
 
     if args.compile:
-        mode = "reduce-overhead" if args.cuda_graphs else "default"
+        configure_compilation_warnings()
+        mode = compilation_mode()
         policy = torch.compile(policy, fullgraph=True, mode=mode)
-        if getattr(args, "gru_critic", False) or getattr(args, "gru_policy", False):
-            warnings.warn("GRU PPO loss runs uncompiled; PyTorch does not support full-graph GRU compilation", stacklevel=2)
-        else:
-            loss_function = torch.compile(loss_function, fullgraph=True, mode=mode)
+
+        loss_function = torch.compile(loss_function, fullgraph=True, mode=mode)
+
         gae_function = torch.compile(gae_function, fullgraph=True)
 
     return policy, loss_function, gae_function
+
+
+def configure_compilation_warnings() -> None:
+    import logging
+    import warnings
+
+    from torch._inductor import config
+
+    config.autotune_num_choices_displayed = 0
+    config.max_autotune_report_choices_stats = False
+    logger = logging.getLogger("torch._inductor.select_algorithm")
+
+    if _autotune_log_filter not in logger.filters:
+        logger.addFilter(_autotune_log_filter)
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"TypedStorage is deprecated\..*",
+        category=UserWarning,
+        module=r"torch\._inductor\.select_algorithm"
+    )
+
+    # This is Inductor choosing a correct split reduction, not a graph break,
+    # recompile or numerical error. Keep all other compiler warnings visible.
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            r"(?s).*Online softmax is disabled on the fly since Inductor "
+            r"decides to.*split the reduction.*"
+        ),
+        category=UserWarning,
+        module=r"torch\._inductor\.lowering"
+    )
+
+
+def _autotune_log_filter(record: Any) -> bool:
+    # Inductor logs rejected candidates as errors while continuing the search.
+    return not (
+        "Ignoring this choice." in record.getMessage()
+        or record.msg == "Exception %s for benchmark choice %s"
+    )

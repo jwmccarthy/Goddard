@@ -1,258 +1,206 @@
+"""Download Ballchasing group trees described by a JSON config."""
+
+import argparse
+import json
+import logging
 import os
 import re
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
-from replays import RAW_DIR
-from replays.api import API_URL, BallchasingClient
-
-UUID_PATTERN = re.compile(
-    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
-    re.IGNORECASE
-)
-UNSAFE_COMPONENT = re.compile(r"[^a-z0-9]+")
-
-REGIONS = (
-    (re.compile(r"\b(?:eu|europe)\b", re.IGNORECASE), "EU"),
-    (re.compile(r"\b(?:mena|middle east(?: and north africa)?)\b", re.IGNORECASE), "MENA"),
-    (re.compile(r"\b(?:na|north america)\b", re.IGNORECASE), "NA"),
-    (re.compile(r"\b(?:sam|south america)\b", re.IGNORECASE), "SAM"),
-    (re.compile(r"\b(?:oce|oceania)\b", re.IGNORECASE), "OCE"),
-    (re.compile(r"\b(?:apac|asia-pacific)\b", re.IGNORECASE), "APAC"),
-    (re.compile(r"\b(?:ssa|sub-saharan africa)\b", re.IGNORECASE), "SSA")
-)
+from replays.api import API_URL, CachedClient
+from replays.utils import file_sha256, write_json
+from training.logging import configure_logging
 
 
-@dataclass(frozen=True)
-class Root:
-
+def group_children(
+    client:   CachedClient,
     group_id: str
-    mode: str
-    event: str
-
-
-@dataclass(frozen=True)
-class ReplaySelection:
-
-    replay: dict[str, Any]
-    mode: str
-    region: str
-    event_path: tuple[str, ...]
-    series: str
-    leaf_id: str
-    game_number: int
-
-
-ROOT = Root("1v1-events-q0z69hlqmt", "1v1", "RLCS 2026 1v1 Events")
-
-
-def sanitize(value: Any, fallback: str = "unknown", limit: int = 48) -> str:
-    component = UNSAFE_COMPONENT.sub(
-        "-",
-        "" if value is None else str(value).lower()
-    ).strip("-")
-
-    component = component[:limit].rstrip("-")
-
-    return component or fallback
-
-
-def replay_uuid(path: Path) -> str | None:
-    match = UUID_PATTERN.search(path.stem)
-
-    return match.group(1).lower() if match else None
-
-
-def infer_region(path: tuple[str, ...]) -> str:
-    text = " ".join(path)
-
-    for pattern, region in REGIONS:
-        if pattern.search(text):
-            return region
-
-    return "INTL"
-
-
-def list_group_children(client: BallchasingClient, group_id: str) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]]:
     page = client.get(f"{API_URL}/groups", group=group_id, count=200)
+
     children = list(page.replays)
 
     while page.next_url:
         page = client.get(page.next_url)
         children.extend(page.replays)
 
-    return sorted(children, key=lambda group: (group.get("name", ""), group["id"]))
+    return sorted(
+        children,
+        key=lambda group: (group.get("name", ""), group["id"])
+    )
 
 
-def descendant_leaves(
-    client: BallchasingClient,
-    root: Root
-) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
-    visited = {root.group_id}
+def discover(
+    client:         CachedClient,
+    root:           dict[str, Any],
+    include_groups: str | None = None
+) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    visited: set[str] = set()
+    pattern = (
+        re.compile(include_groups, re.IGNORECASE)
+        if include_groups
+        else None
+    )
 
-    def walk(
-        group: dict[str, Any],
-        path: tuple[str, ...]
-    ) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
-        group_id = group["id"]
-
-        if group_id in visited:
+    def walk(group: dict[str, Any], path: list[str], selected: bool) -> None:
+        if group["id"] in visited:
             return
 
-        visited.add(group_id)
+        visited.add(group["id"])
+        name = group.get("name", group["id"])
+        path = path + [name]
+        selected = selected or pattern is None or bool(pattern.search(name))
+        direct = group.get("direct_replays", 0)
 
-        next_path = path + (group.get("name") or group_id,)
-        children = list_group_children(client, group_id)
-
-        if not children:
-            if group.get("direct_replays", 0):
-                yield group, next_path
-
-            return
-
-        for child in children:
-            yield from walk(child, next_path)
-
-    for child in list_group_children(client, root.group_id):
-        yield from walk(child, (root.event,))
-
-
-def select_replays(
-    client: BallchasingClient
-) -> tuple[dict[str, ReplaySelection], int]:
-    occurrences: list[ReplaySelection] = []
-    discovered = 0
-
-    for leaf, path in descendant_leaves(client, ROOT):
-        if not any("playoff" in component.lower() for component in path):
-            continue
-
-        entries = client.find_replay_entries(
-            group=leaf["id"],
-            count=200,
-            sort_by="replay-date",
-            sort_dir="asc"
-        )
-        entries.sort(key=lambda replay: (replay.get("date", ""), replay["id"].lower()))
-
-        discovered += len(entries)
-
-        for game_number, replay in enumerate(entries, 1):
-            occurrences.append(
-                ReplaySelection(
-                    replay=replay,
-                    mode=ROOT.mode,
-                    region=infer_region(path),
-                    event_path=path[:-1] or path,
-                    series=path[-1],
-                    leaf_id=leaf["id"],
-                    game_number=game_number
+        if direct and selected:
+            for item in client.find_replay_entries(
+                group=group["id"],
+                count=200,
+                sort_by="replay-date",
+                sort_dir="asc"
+            ):
+                uid = item["id"].lower()
+                record = entries.setdefault(
+                    uid,
+                    {
+                        "id":          uid,
+                        "metadata":    item,
+                        "occurrences": [],
+                    }
                 )
-            )
 
-    occurrences.sort(
-        key=lambda item: (
-            item.replay["id"].lower(),
-            item.mode,
-            item.region,
-            item.event_path,
-            item.series,
-            item.leaf_id,
-            item.game_number
+                record["occurrences"].append(
+                    {
+                        "group_id": group["id"],
+                        "path":     path,
+                    }
+                )
+
+        if (
+            direct
+            and group.get("total_replays", group.get("indirect_replays"))
+            == direct
+        ):
+            return
+
+        for child in group_children(client, group["id"]):
+            walk(child, path, selected)
+
+    group = client.get_json(f"{API_URL}/groups/{root['group_id']}")
+    walk(group, [], False)
+
+    return entries
+
+
+def download(config: dict[str, Any], output: Path, workers: int) -> None:
+    output = output.resolve()
+    raw = output / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    client = CachedClient(os.environ["BALLCHASING_TOKEN"], output / "provenance/api_cache")
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    records = {
+        record["id"]: record
+        for record in manifest.get("records", [])
+    }
+
+    errors: dict[str, str] = {}
+
+    for root in config["roots"]:
+        entries = discover(client, root, config.get("include_groups"))
+
+        write_json(output / "provenance" / f"{root['group_id']}.json", entries)
+        pending = [uid for uid in entries if not (raw / f"{uid}.replay").exists()]
+        logging.info(
+            "%s: %s downloads.",
+            root["group_id"],
+            f"{len(pending):,}"
         )
-    )
 
-    selected: dict[str, ReplaySelection] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(client.download_replay, uid, raw): uid
+                for uid in pending
+            }
 
-    for occurrence in occurrences:
-        selected.setdefault(occurrence.replay["id"].lower(), occurrence)
+            for future in as_completed(futures):
+                uid = futures[future]
 
-    return selected, discovered
+                try:
+                    if not future.result():
+                        errors[uid] = "not_found"
+                except Exception as error:
+                    errors[uid] = str(error)
 
+        for uid, item in entries.items():
+            path = raw / f"{uid}.replay"
 
-def replay_filename(selection: ReplaySelection) -> str:
-    replay = selection.replay
-    replay_id = replay["id"].lower()
+            if not path.is_file():
+                continue
 
-    date = str(replay.get("date", ""))[:10]
+            sha = file_sha256(path)
+            previous = records.get(uid, {})
 
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-        date = "unknown-date"
+            if (
+                previous.get("raw_sha256", sha)
+                != sha
+            ):
+                raise ValueError(f"raw replay checksum changed: {uid}")
 
-    event_path = "-".join(sanitize(part, limit=24) for part in selection.event_path)
-    event_path = sanitize(event_path, "unknown-event", 50)
+            old_provenance = previous.get("provenance", {})
+            occurrences = list(old_provenance.get("occurrences", []))
 
-    series = sanitize(selection.series, "unknown-series", 36)
+            for occurrence in item["occurrences"]:
+                if occurrence not in occurrences:
+                    occurrences.append(occurrence)
 
-    blue = sanitize(replay.get("blue", {}).get("name"), "blue", 24)
-    orange = sanitize(replay.get("orange", {}).get("name"), "orange", 24)
+            provenance = {
+                "id":          uid,
+                "metadata":    item["metadata"],
+                "occurrences": occurrences,
+            }
 
-    matchup = f"{blue}-vs-{orange}"
+            records[uid] = {
+                **previous,
+                **root.get("metadata", {}),
+                "id":         uid,
+                "raw":        str(path),
+                "raw_sha256": sha,
+                "team_size":  config["team_size"],
+                "provenance": provenance,
+            }
 
-    prefix = "__".join(
-        (
-            date,
-            selection.mode,
-            selection.region.lower(),
-            event_path,
-            series,
-            matchup,
-            f"g{selection.game_number:02d}"
+        write_json(
+            manifest_path,
+            {
+                "config":  config,
+                "records": sorted(
+                    records.values(),
+                    key=lambda record: record["id"]
+                ),
+            }
         )
-    )
 
-    return f"{prefix}__{replay_id}.replay"
+    write_json(output / "provenance/download-errors.json", errors)
 
-
-def rename_downloaded(replay_dir: Path, selections: dict[str, ReplaySelection]) -> None:
-    reserved = {path.name for path in replay_dir.glob("*.replay")}
-
-    for replay_id in sorted(selections):
-        source = replay_dir / f"{replay_id}.replay"
-
-        if not source.exists():
-            continue
-
-        filename = replay_filename(selections[replay_id])
-        target = replay_dir / filename
-        collision = 2
-
-        while target.name in reserved and target != source:
-            stem = filename[: -len(f"__{replay_id}.replay")]
-            target = replay_dir / f"{stem}__c{collision}__{replay_id}.replay"
-            collision += 1
-
-        source.rename(target)
-
-        reserved.discard(source.name)
-        reserved.add(target.name)
+    if errors:
+        raise RuntimeError(f"{len(errors)} downloads failed; see provenance/download-errors.json")
 
 
 def main() -> None:
-    replay_dir = RAW_DIR
-    replay_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
 
-    existing = {
-        replay_id
-        for path in replay_dir.glob("*.replay")
-        if (replay_id := replay_uuid(path)) is not None
-    }
+    parser.add_argument("--output-dir", type=Path, required=True)
 
-    client = BallchasingClient(os.environ["BALLCHASING_TOKEN"])
-    selected, discovered = select_replays(client)
+    parser.add_argument("--workers", type=int, default=4)
 
-    new_ids = sorted(set(selected) - existing)
-
-    print(f"1v1: discovered={discovered} deduped={len(selected)} new={len(new_ids)}")
-
-    try:
-        client.download_replays(new_ids, replay_dir)
-    finally:
-        rename_downloaded(
-            replay_dir,
-            {replay_id: selected[replay_id] for replay_id in new_ids}
-        )
+    args = parser.parse_args()
+    download(json.loads(args.config.read_text()), args.output_dir, args.workers)
 
 
 if __name__ == "__main__":

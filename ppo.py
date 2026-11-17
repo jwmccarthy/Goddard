@@ -1,90 +1,71 @@
-import argparse
-import math
 import time
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
 
-from replays.resets import ReplayResetDataset, ReplayResetProvider
-from rewards import GameplayDiagnostics
-from training.arguments import add_ppo_arguments
-from training.checkpoints import load_checkpoint, save_checkpoint
-from training.logging import log_metrics, progress_bar, run_directory
+from training.arguments import parse_arguments
+from training.logging import configure_logging
 from training.ppo import update_ppo
 from training.rollout import collect
-from training.setup import compile_functions, prepare
-from training.tensors import autocast, plain_tensor
+from training.runtime import TrainingRun
+from training.schedules import schedule_learning_rate, scheduled_gamma
+from training.tensors import autocast
 
 
-def train(args):
-    env, agent, optimizer, rollout = prepare(args)
-    gameplay = GameplayDiagnostics(
-        args.n_sim,
-        env.n_cars,
-        env.device,
-        args.frameskip,
-        reward_plus=True,
-        no_touch_timeout_steps=math.ceil(args.no_touch_timeout * 120 / args.frameskip)
-    )
-    env.register_reward(gameplay)
-    args.reward_objective = "reward-plus-v3"
-    progress, task = progress_bar("PPO", args.timesteps)
-    writer = None
+def train(run: TrainingRun) -> None:
+    args = run.args
+    observation = run.start()
+    env, agent, rollout = run.env, run.agent, run.rollout
 
-    try:
-        replay_data = ReplayResetDataset(args.replay_dir, args.team_size, env.device)
-        replay_resets = ReplayResetProvider(replay_data, fraction=0.70, seed=args.seed)
-        env.reset_state_provider = replay_resets
-        step = 0
+    gamma_tensor = None
 
-        if args.resume:
-            step = load_checkpoint(args.resume, "ppo", args, agent, optimizer)["step"]
+    if args.gamma_end is not None:
+        gamma_tensor = torch.empty((), device=env.device)
 
-        policy, loss_function, gae_function = compile_functions(agent, args)
-        directory = run_directory(args, "ppo")
-        writer = SummaryWriter(directory)
-        writer.add_text("configuration", str(vars(args)))
-        observation = plain_tensor(env.reset())
-        iteration = 0
+    while run.step < args.timesteps:
+        started = time.perf_counter()
+        gamma = scheduled_gamma(args, run.step)
+        gae_gamma = gamma
 
-        while step < args.timesteps:
-            started = time.perf_counter()
-            fraction = min(step / args.timesteps, 1.0)
-            optimizer.param_groups[0]["lr"] = args.learning_rate + fraction * (
-                args.learning_rate_end - args.learning_rate
+        if gamma_tensor is not None:
+            gae_gamma = gamma_tensor.fill_(gamma)
+
+        schedule_learning_rate(run.optimizer, args, run.step)
+
+        observation = collect(
+            env,
+            agent,
+            run.policy,
+            rollout,
+            observation,
+            args,
+            run.pool
+        )
+
+        with torch.no_grad(), autocast(env.device, args.bf16):
+            next_value = agent.get_value(
+                observation,
+                rollout.critic_context(observation)
             )
-            observation, _ = collect(env, agent, policy, rollout, observation, args)
 
-            with torch.no_grad(), autocast(env.device, args.bf16):
-                next_value = agent.get_value(observation)
+        run.gae(rollout, next_value, gae_gamma, args.gae_lambda)
 
-            gae_function(rollout, next_value, args.gamma, args.gae_lambda)
-            metrics = update_ppo(agent, optimizer, loss_function, rollout, args)
-            step += rollout.rewards.numel()
-            iteration += 1
-            torch.cuda.synchronize(env.device)
-            metrics["transitions_per_second"] = rollout.rewards.numel() / (
-                time.perf_counter() - started
-            )
-            metrics["reward"] = rollout.rewards.mean().item()
-            metrics.update(gameplay.diagnostic_metrics())
-            metrics.update(replay_resets.diagnostic_metrics())
+        metrics = update_ppo(agent, run.optimizer, run.loss, rollout, args)
 
-            log_metrics(writer, step, metrics, progress, task)
+        metrics["ppo/gamma"] = gamma
 
-            if iteration % args.save_every == 0 or step >= args.timesteps:
-                save_checkpoint(directory / "latest.pt", "ppo", args, agent, optimizer, step)
-    finally:
-        progress.stop()
+        learner_rewards = (
+            rollout.rewards
+            if rollout.learner_mask is None
+            else rollout.rewards[rollout.learner_mask]
+        )
 
-        if writer is not None:
-            writer.close()
+        mean_reward = learner_rewards.mean().item()
+        metrics["reward_per_tick"] = mean_reward / args.frameskip
 
-        env.close()
+        if run.finish(metrics, started):
+            run.save()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Lean, GPU-resident PPO for CARL.")
-    add_ppo_arguments(parser)
-    args = parser.parse_args()
-    train(args)
+    configure_logging()
+    TrainingRun(parse_arguments("ppo"), "ppo").execute(train)

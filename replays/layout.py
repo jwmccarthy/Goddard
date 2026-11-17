@@ -3,14 +3,12 @@ TEAM_SIZES = (1, 2, 3)
 BALL_SIZE = 9
 CAR_SIZE = 21
 INTERNAL_SIZE = 19
+PARSED_FRAMESKIP = 4
 
 EVENT_SIZE = 4
 
 
 def team_car_count(team_size: int) -> int:
-    if team_size not in TEAM_SIZES:
-        raise ValueError("team size must be 1, 2, or 3")
-
     return 2 * team_size
 
 

@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,11 +9,14 @@ import numpy as np
 from carl.gymnasium.state import BOOST_PAD_POSITIONS as CARL_BOOST_PAD_POSITIONS
 from rich.progress import Progress
 from rlgym.rocket_league.api import Car, PhysicsObject
+from rlgym_tools.rocket_league.replays import parsed_replay
 from rlgym_tools.rocket_league.replays.convert import replay_to_rlgym
-from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay, process_replay
+from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay
 from rlgym_tools.rocket_league.replays.replay_frame import ReplayFrame
 
-from replays import PARSED_DIR, RAW_DIR, layout
+from replays import layout
+from replays.utils import file_sha256, write_json
+from training.logging import configure_logging
 
 NORM_POS = np.array([4108.0, 6000.0, 2076.0])
 NORM_BALL_VEL = 6000.0
@@ -40,17 +44,16 @@ OPP_GOAL = np.array([0.0, 5120.0, 321.3875])
 
 BOOST_PAD_POSITIONS = np.asarray(CARL_BOOST_PAD_POSITIONS, dtype=np.float32)
 
-# fmt: off
+# Boost pad indices in CARL order, then their opposite-team counterparts.
 CARL_TO_RLGYM_PAD = np.array((
-    15, 18, 29, 30, 3, 4, 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12,
+    15, 18, 29, 30,  3,  4,  0,  1,  2,  5,  6,  7,  8,  9, 10, 11, 12,
     13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33
 ))
 
 MIRRORED_PAD = np.array((
-    1, 0, 5, 4, 3, 2, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23,
-    22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6
+     1,  0,  5,  4,  3,  2, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23,
+    22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10,  9,  8,  7,  6
 ))
-# fmt: on
 
 BLUE_PADS = CARL_TO_RLGYM_PAD
 ORANGE_PADS = CARL_TO_RLGYM_PAD[MIRRORED_PAD]
@@ -60,7 +63,11 @@ def load_replay(path: Path) -> ParsedReplay | None:
     try:
         if path.suffix == ".replay":
             with TemporaryDirectory() as temporary:
-                result = process_replay(str(path), temporary, skip_existing=False)
+                result = parsed_replay.process_replay(
+                    str(path),
+                    temporary,
+                    skip_existing=False
+                )
 
                 if result.returncode:
                     return None
@@ -73,47 +80,31 @@ def load_replay(path: Path) -> ParsedReplay | None:
         return None
 
 
-def valid_replay(replay: ParsedReplay, team_size: int = 1) -> bool:
-    n_cars = layout.team_car_count(team_size)
-
-    players = {str(player["unique_id"]): player for player in replay.metadata.get("players", [])}
-    active = [players.get(str(player_id)) for player_id in replay.player_dfs]
-    delta = replay.game_df["delta"].to_numpy()
-
-    return (
-        len(active) == n_cars
-        and all(player is not None for player in active)
-        and sum(bool(player["is_orange"]) for player in active) == team_size
-        and np.isfinite(delta).all()
-        and np.isfinite(replay.game_df["time"]).all()
-        and 0 < delta.mean() < 1 / 25
-    )
-
-
-def active_frames(replay: ParsedReplay, include_goals: bool = False) -> list[list[tuple[ReplayFrame, dict]]]:
+def active_frames(replay: ParsedReplay) -> list[list[tuple[ReplayFrame, dict]]]:
     times = replay.game_df["time"].to_numpy() * 120.0
     periods = replay.analyzer["gameplay_periods"]
 
-    bounds = [
-        (
-            times[period["start_frame"]],
-            times[
-                period["goal_frame"]
-                if period.get("goal_frame") is not None
-                else period["end_frame"]
-            ]
-        )
-        for period in periods
-    ]
+    bounds = []
+
+    for period in periods:
+        end = period.get("goal_frame")
+
+        if end is None:
+            end = period["end_frame"]
+
+        bounds.append((times[period["start_frame"]], times[end]))
+
     segments: list[list[tuple[ReplayFrame, dict]]] = [[] for _ in bounds]
 
     for frame, errors in replay_to_rlgym(replay, calculate_error=True):
         tick = frame.state.tick_count
 
         for index, (start, end) in enumerate(bounds):
-            goal = include_goals and periods[index].get("goal_frame") is not None
+            goal = periods[index].get("goal_frame") is not None
+
             if start <= tick < end or (goal and tick == end):
                 segments[index].append((frame, errors))
+
                 break
 
     return segments
@@ -205,7 +196,8 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
 
     boost_features = (
         state.boost_pad_timers[pad_indices] <= 0,
-        np.linalg.norm(BOOST_PAD_POSITIONS - ego_physics.position, axis=-1) / NORM_BOOST_DIST
+        np.linalg.norm(BOOST_PAD_POSITIONS - ego_physics.position, axis=-1)
+        / NORM_BOOST_DIST
     )
 
     ball_relative = (
@@ -241,7 +233,8 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
     )
 
     car_observations = [
-        compose_car(state.cars[car_id], physics) for car_id, physics in zip(car_ids, car_physics)
+        compose_car(state.cars[car_id], physics)
+        for car_id, physics in zip(car_ids, car_physics)
     ]
 
     return np.concatenate(
@@ -259,8 +252,8 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
 
 
 def interpolate(
-    rows: np.ndarray,
-    ticks: np.ndarray,
+    rows:    np.ndarray,
+    ticks:   np.ndarray,
     invalid: np.ndarray,
     columns: slice
 ) -> None:
@@ -272,11 +265,18 @@ def interpolate(
         rows[:, column] = np.interp(ticks, ticks[valid], rows[valid, column])
 
 
-def repair_frozen(rows, ticks, start, velocity_scale, angular_scale):
+def repair_frozen(
+    rows:           np.ndarray,
+    ticks:          np.ndarray,
+    start:          int,
+    velocity_scale: float,
+    angular_scale:  float | None
+) -> None:
     position = rows[:, start : start + 3]
     velocity = rows[:, start + 3 : start + 6] * velocity_scale
 
     repeated = np.all(np.diff(position, axis=0) == 0, axis=-1)
+
     repeated &= np.linalg.norm(velocity[1:], axis=-1) > 1
 
     interpolate(rows, ticks, repeated, slice(start, start + 3))
@@ -288,6 +288,7 @@ def repair_frozen(rows, ticks, start, velocity_scale, angular_scale):
     angular = rows[:, start + 6 : start + 9] * angular_scale
 
     repeated = np.all(np.diff(basis, axis=0) == 0, axis=-1)
+
     repeated &= np.linalg.norm(angular[1:], axis=-1) > 1e-3
 
     interpolate(rows, ticks, repeated, slice(start + 9, start + 15))
@@ -297,13 +298,20 @@ def observation_car_count(rows: np.ndarray) -> int:
     width = rows.shape[-1]
 
     for team_size in layout.TEAM_SIZES:
-        if width == layout.team_observation_size(team_size) + layout.INTERNAL_SIZE + layout.EVENT_SIZE:
+        scene = layout.team_observation_size(team_size)
+        expected = scene + layout.INTERNAL_SIZE + layout.EVENT_SIZE
+
+        if width == expected:
             return layout.team_car_count(team_size)
 
     raise ValueError("replay observations must contain two, four, or six cars")
 
 
-def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray:
+def resample(
+    ticks:      np.ndarray,
+    rows:       np.ndarray,
+    frame_skip: int
+) -> np.ndarray:
     n_cars = observation_car_count(rows)
 
     ticks, unique = np.unique(ticks, return_index=True)
@@ -317,14 +325,19 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
     for index in range(n_cars):
         repair_frozen(rows, ticks, 9 + 21 * index, NORM_CAR_VEL, NORM_CAR_ANG)
 
-    target_ticks = ticks[0] + np.arange(int((ticks[-1] - ticks[0]) // frame_skip) + 1) * frame_skip
+    sample_count = int((ticks[-1] - ticks[0]) // frame_skip) + 1
+    target_ticks = ticks[0] + np.arange(sample_count) * frame_skip
 
     resampled = np.stack(
-        [np.interp(target_ticks, ticks, rows[:, column]) for column in range(rows.shape[1])],
+        [
+            np.interp(target_ticks, ticks, rows[:, column])
+            for column in range(rows.shape[1])
+        ],
         axis=-1
     )
 
     right = np.searchsorted(ticks, target_ticks).clip(0, len(ticks) - 1)
+
     left = (right - 1).clip(0, len(ticks) - 1)
 
     nearest = np.where(
@@ -340,6 +353,7 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
 
         up = resampled[:, car + 12 : car + 15]
         up -= np.sum(up * forward, axis=-1, keepdims=True) * forward
+
         up /= np.linalg.norm(up, axis=-1, keepdims=True).clip(1e-8)
 
     discrete = []
@@ -355,9 +369,9 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
     discrete.extend(internal_start + field for field in INTERNAL_DISCRETE_FIELDS)
 
     resampled[:, discrete] = rows[nearest][:, discrete]
-    resampled[:, -layout.EVENT_SIZE:] = 0
+    resampled[:, -layout.EVENT_SIZE :] = 0
 
-    for source, event in np.argwhere(rows[:, -layout.EVENT_SIZE:] > 0.5):
+    for source, event in np.argwhere(rows[:, -layout.EVENT_SIZE :] > 0.5):
         target = np.abs(target_ticks - ticks[source]).argmin()
         resampled[target, -layout.EVENT_SIZE + event] = 1
 
@@ -370,7 +384,8 @@ def mark_discontinuities(rows: np.ndarray, frame_skip: int) -> np.ndarray:
     if len(rows) < 2:
         return np.pad(rows, ((0, 0), (0, 1)))
 
-    touches = rows[:-1, -layout.EVENT_SIZE:].any(axis=-1) | rows[1:, -layout.EVENT_SIZE:].any(axis=-1)
+    frame_touches = rows[:, -layout.EVENT_SIZE :].any(axis=-1)
+    touches = frame_touches[:-1] | frame_touches[1:]
 
     discontinuity = np.zeros(len(rows) - 1, dtype=bool)
 
@@ -383,7 +398,8 @@ def mark_discontinuities(rows: np.ndarray, frame_skip: int) -> np.ndarray:
         velocity = rows[:, start + 3 : start + 6] * velocity_scale
 
         expected = (velocity[:-1] + velocity[1:]) * (frame_skip / 240.0)
-        residual = np.linalg.norm(np.diff(position, axis=0) - expected, axis=-1) / 100
+        position_error = np.diff(position, axis=0) - expected
+        residual = np.linalg.norm(position_error, axis=-1) / 100
         speed_change = np.linalg.norm(np.diff(velocity, axis=0), axis=-1) / 100
 
         discontinuity |= (
@@ -393,38 +409,19 @@ def mark_discontinuities(rows: np.ndarray, frame_skip: int) -> np.ndarray:
         )
 
     return np.concatenate(
-        (
-            rows,
-            np.pad(discontinuity[:, None], ((1, 0), (0, 0)))
-        ),
+        (rows, np.pad(discontinuity[:, None], ((1, 0), (0, 0)))),
         axis=-1
     )
 
 
 def parse_replay(
-    replay: ParsedReplay,
-    name: str,
+    replay:     ParsedReplay,
+    name:       str,
     output_dir: Path,
-    frame_skip: int,
-    pov_players: tuple[str, ...] | None = None,
-    team_size: int = 1,
-    include_goals: bool = False,
-    segment_consumer=None
+    team_size:  int = 1
 ) -> int:
     n_cars = layout.team_car_count(team_size)
-    metadata_players = replay.metadata.get("players", [])
-
-    selected = None
-
-    if pov_players is not None:
-        selected = {str(player_id).lower() for player_id in pov_players}
-        available = {str(player.get("online_id")).lower() for player in metadata_players}
-        missing = selected - available
-
-        if missing:
-            raise ValueError(f"requested POV IDs not present in replay: {sorted(missing)}")
-
-    segments = active_frames(replay, include_goals=include_goals)
+    segments = active_frames(replay)
 
     if not segments or not any(segments):
         return 0
@@ -438,19 +435,6 @@ def parse_replay(
         raise ValueError(f"replay does not have {team_size} cars per team")
 
     ego_ids = list(first.state.cars)
-
-    if selected is not None:
-        cars_by_id = {str(car_id): car_id for car_id in first.state.cars}
-
-        ego_ids = [
-            cars_by_id[str(player["unique_id"])]
-            for player in metadata_players
-            if str(player.get("online_id")).lower() in selected
-            and str(player["unique_id"]) in cars_by_id
-        ]
-
-        if len(ego_ids) != len(selected):
-            raise ValueError("requested POV IDs must map to exactly one active car each")
 
     written = 0
 
@@ -468,216 +452,209 @@ def parse_replay(
         )
 
         for period, samples in enumerate(segments):
-            if not samples:
+            result = parse_period(samples, car_ids, team_size, ego.team_num)
+
+            if result is None:
                 continue
 
-            if any(
-                any(car_id not in frame.state.cars for car_id in car_ids) for frame, _ in samples
-            ):
-                continue
-
-            ticks = np.asarray([frame.state.tick_count for frame, _ in samples])
-
-            if not np.isfinite(ticks).all() or np.any(np.diff(ticks) <= 0):
-                continue
-
-            rows = np.stack([build_observation(frame, car_ids) for frame, _ in samples]).astype(
-                np.float32, copy=False
-            )
-
-            corrections = np.asarray(
-                [
-                    any(
-                        large_correction(errors.get(car_id))
-                        for car_id in (car_ids if n_cars > 2 else car_ids[:1])
-                    )
-                    for _, errors in samples
-                ],
-                dtype=np.float32
-            )
-
-            rows = np.concatenate((rows, corrections[:, None]), axis=-1)
-            terminal = bool(include_goals and getattr(samples[-1][0].state, "goal_scored", False))
-            terminal_row = rows[-1].copy() if terminal else None
-            rows = resample(ticks, rows, frame_skip)
-            if terminal and ticks[-1] - ticks[0] > (len(rows) - 1) * frame_skip + 1e-4:
-                rows = np.concatenate((rows, terminal_row[None]), axis=0)
-            elif terminal:
-                rows[-1] = terminal_row
-            rows = mark_discontinuities(rows, frame_skip)
-
-            if not np.isfinite(rows).all():
-                continue
-
-            metadata = {}
-            if include_goals:
-                scoring_team = samples[-1][0].state.scoring_team if terminal else None
-                if terminal and scoring_team not in (0, 1):
-                    raise ValueError("goal frame has no valid scoring team")
-                metadata = {
-                    "goal_terminal": terminal,
-                    "terminal_reason": "goal" if terminal else "unknown",
-                    "goal_outcome": ("scored" if scoring_team == ego.team_num else "conceded") if terminal else None
-                }
-            if segment_consumer is not None:
-                # Selection happens before any dense files are written. The
-                # consumer sees complete original segments, never phase clips.
-                player = next(p for p in metadata_players if str(p["unique_id"]) == str(ego_id))
-                segment_consumer(rows, {**metadata, "ego_id": str(ego_id), "period": period,
-                                        "online_id": str(player.get("online_id")), "is_orange": bool(ego.team_num)})
-            else:
-                path = output_dir / f"{ego_id}-{period}-{name}.npy"
-                np.save(path, rows)
-                if include_goals:
-                    path.with_suffix(".json").write_text(json.dumps(metadata) + "\n")
+            rows, metadata = result
+            path = output_dir / f"{ego_id}-{period}-{name}.npy"
+            np.save(path, rows)
+            path.with_suffix(".json").write_text(json.dumps(metadata) + "\n")
             written += 1
 
     return written
 
 
-def parse_path(job) -> tuple[str, str]:
-    replay_path, output_path, frame_skip, pov_players, team_size, *options = job
-    include_goals = options[0] if options else False
+def parse_period(
+    samples:   list[tuple[ReplayFrame, dict]],
+    car_ids:   list[str],
+    team_size: int,
+    ego_team:  int
+) -> tuple[np.ndarray, dict] | None:
+    if not samples or any(
+        any(car_id not in frame.state.cars for car_id in car_ids) for frame, _ in samples
+    ):
+        return None
 
-    path = Path(replay_path)
+    ticks = np.asarray([frame.state.tick_count for frame, _ in samples])
+
+    if not np.isfinite(ticks).all() or np.any(np.diff(ticks) <= 0):
+        return None
+
+    observations = [build_observation(frame, car_ids) for frame, _ in samples]
+    rows = np.stack(observations).astype(np.float32, copy=False)
+
+    corrections = np.asarray(
+        [
+            any(
+                large_correction(errors.get(car_id))
+                for car_id in (car_ids if team_size > 1 else car_ids[:1])
+            )
+            for _, errors in samples
+        ],
+        dtype=np.float32
+    )
+
+    rows = np.concatenate((rows, corrections[:, None]), axis=-1)
+
+    last = samples[-1][0].state
+    terminal = bool(getattr(last, "goal_scored", False))
+
+    rows = resample_period(ticks, rows, terminal)
+
+    if not np.isfinite(rows).all():
+        return None
+
+    scoring_team = last.scoring_team if terminal else None
+
+    if terminal and scoring_team not in (0, 1):
+        raise ValueError("goal frame has no valid scoring team")
+
+    outcome = None
+
+    if terminal:
+        outcome = "scored" if scoring_team == ego_team else "conceded"
+
+    metadata = {
+        "frameskip":       layout.PARSED_FRAMESKIP,
+        "team_size":       team_size,
+        "goal_terminal":   terminal,
+        "terminal_reason": "goal" if terminal else "unknown",
+        "goal_outcome":    outcome,
+    }
+
+    return (rows, metadata)
+
+
+def resample_period(
+    ticks:    np.ndarray,
+    rows:     np.ndarray,
+    terminal: bool
+) -> np.ndarray:
+    frameskip = layout.PARSED_FRAMESKIP
+    terminal_row = rows[-1].copy() if terminal else None
+    rows = resample(ticks, rows, frameskip)
+
+    if terminal and ticks[-1] - ticks[0] > (len(rows) - 1) * frameskip + 1e-4:
+        rows = np.concatenate((rows, terminal_row[None]), axis=0)
+    elif terminal:
+        rows[-1] = terminal_row
+
+    return mark_discontinuities(rows, frameskip)
+
+
+def parse_path(job: tuple[dict[str, str | int], Path]) -> tuple[str, str]:
+    record, output_path = job
+    path = Path(record["raw"])
+    uid = record["id"]
     output_dir = Path(output_path)
-
-    if any(output_dir.glob(f"*-*-{path.stem}.npy")):
-        return path.name, "skipped"
+    report_path = output_dir / "reports" / f"{uid}.json"
+    parsed = output_dir / "parsed"
 
     try:
+        checksum = file_sha256(path)
+
+        if report_path.exists():
+            report = json.loads(report_path.read_text())
+
+            if report["identity"]["raw_sha256"] != checksum:
+                raise ValueError("raw replay changed")
+
+            if report["status"] == "done":
+                for item in report["files"]:
+                    if file_sha256(output_dir / item["file"]) != item["sha256"]:
+                        raise ValueError("parsed replay changed")
+
+                return (path.name, "skipped")
+
         replay = load_replay(path)
 
         if replay is None:
-            return path.name, "failed to load"
-
-        if not valid_replay(replay, team_size):
-            return path.name, "filtered"
+            return (path.name, "failed to load")
 
         with TemporaryDirectory(dir=output_dir) as temporary:
             temporary = Path(temporary)
 
             written = parse_replay(
                 replay,
-                path.stem,
+                uid,
                 temporary,
-                frame_skip,
-                pov_players,
-                team_size,
-                include_goals
+                record.get("team_size", 1)
             )
 
             if not written:
-                return path.name, "filtered"
+                return (path.name, "failed (no structurally valid observation periods)")
 
-            for output in temporary.iterdir():
-                output.replace(output_dir / output.name)
+            files = []
 
-        return path.name, "done"
+            for output in sorted(temporary.iterdir()):
+                destination = parsed / output.name
+                files.append(
+                    {
+                        "file":   str(destination.relative_to(output_dir)),
+                        "sha256": file_sha256(output),
+                    }
+                )
+
+                output.replace(destination)
+
+            write_json(
+                report_path,
+                {
+                    "id":       uid,
+                    "status":   "done",
+                    "identity": {
+                        "raw_sha256": checksum,
+                    },
+                    "files":    files,
+                }
+            )
+
+        return (path.name, "done")
 
     except Exception as error:
-        return path.name, f"failed ({type(error).__name__}: {error})"
+        return (path.name, f"failed ({type(error).__name__}: {error})")
 
 
-def load_pov_manifest(path: Path) -> dict[str, tuple[str, ...]]:
-    if not path.is_file():
-        return {}
-
-    content = json.loads(path.read_text())
-
-    return {
-        str(key).lower(): tuple(value)
-        for key, value in content.items()
-        if isinstance(value, list) and value
-    }
-
-
-def parse(
-    replay_dir: str | Path = RAW_DIR,
-    output_dir: str | Path = PARSED_DIR,
-    frame_skip: int = 4,
-    workers: int = 1,
-    pov_manifest: str | Path | None = None,
-    team_size: int = 1,
-    include_goals: bool = False
-) -> None:
-    layout.team_car_count(team_size)
-
-    if frame_skip < 1:
-        raise ValueError("frame skip must be positive")
-
-    if workers < 1:
-        raise ValueError("workers must be positive")
-
-    replay_dir = Path(replay_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if include_goals:
-        metadata_path = output_dir / "dac_metadata.json"
-        metadata = {"format": "goal-terminal-v1", "frameskip": frame_skip, "team_size": team_size}
-        if metadata_path.exists():
-            if json.loads(metadata_path.read_text()) != metadata:
-                raise ValueError("goal-aware output directory has incompatible metadata")
-        elif any(output_dir.rglob("*.npy")):
-            raise ValueError("goal-aware parsing requires an empty or compatible output directory")
-        else:
-            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
-
-    manifest_path = Path(pov_manifest) if pov_manifest else replay_dir / "pov_players.json"
-    manifest = load_pov_manifest(manifest_path)
-
-    paths = sorted(replay_dir.glob("*.replay"))
-
-    jobs = [
-        (
-            str(path),
-            str(output_dir),
-            frame_skip,
-            manifest.get(path.stem.lower()),
-            team_size,
-            include_goals
-        )
-        for path in paths
-    ]
+def parse(manifest: Path, output_dir: Path, workers: int = 4) -> None:
+    (output_dir / "parsed").mkdir(parents=True, exist_ok=True)
+    records = json.loads(manifest.read_text())["records"]
+    jobs = [(record, output_dir) for record in records]
 
     failures = []
 
     with Progress() as progress:
-        task = progress.add_task("Replays", total=len(paths))
+        task = progress.add_task("Replays", total=len(records))
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
             for name, status in executor.map(parse_path, jobs, chunksize=1):
                 if status.startswith("failed"):
                     failures.append(f"{name}: {status}")
-                    progress.console.print(failures[-1])
+                    logging.error(failures[-1])
 
                 progress.update(task, description=f"{status}: {name}")
                 progress.advance(task)
 
     if failures:
-        raise RuntimeError(f"{len(failures)} of {len(paths)} replays failed; first: {failures[0]}")
+        raise RuntimeError(f"{len(failures)} replays failed; first: {failures[0]}")
 
 
 def main() -> None:
+    configure_logging()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--replay-dir", type=Path, default=RAW_DIR)
-    parser.add_argument("--output-dir", type=Path, default=PARSED_DIR)
-    parser.add_argument("--frameskip", type=int, default=4)
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--team-size", type=int, choices=layout.TEAM_SIZES, default=1)
-    parser.add_argument("--pov-manifest", type=Path)
-    parser.add_argument("--include-goals", action="store_true",
-                        help="include goal frames and write terminal metadata alongside parsed files")
+    parser.add_argument("--manifest", type=Path, required=True)
+
+    parser.add_argument("--output-dir", type=Path, required=True)
+
+    parser.add_argument("--workers", type=int, default=4)
+
     args = parser.parse_args()
 
     parse(
-        replay_dir=args.replay_dir,
+        manifest=args.manifest,
         output_dir=args.output_dir,
-        frame_skip=args.frameskip,
-        workers=args.workers,
-        pov_manifest=args.pov_manifest,
-        team_size=args.team_size,
-        include_goals=args.include_goals
+        workers=args.workers
     )
 
 

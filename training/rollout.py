@@ -1,49 +1,117 @@
+from __future__ import annotations
+
+from argparse import Namespace
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from training.critic_history import rollout_critic_inputs, timeout_critic_inputs
 from training.tensors import autocast, plain_tensor
+
+if TYPE_CHECKING:
+    from carl.gymnasium import CARLTorchVectorEnv
+
+    from training.critic_history import ObservationHistory
+    from training.imitation import TransitionPairs
+    from training.models import Agent
+    from training.self_play import OpponentPool
+
+Policy = Callable[
+    ..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+]
 
 
 @dataclass
 class Rollout:
 
-    observations: torch.Tensor
-    actions: torch.Tensor
-    log_probs: torch.Tensor
-    rewards: torch.Tensor
-    dones: torch.Tensor
-    values: torch.Tensor
-    timeout_values: torch.Tensor
-    advantages: torch.Tensor
-    returns: torch.Tensor
-    critic_prefix: torch.Tensor = None
+    observations:         torch.Tensor
+    actions:              torch.Tensor
+    log_probs:            torch.Tensor
+    rewards:              torch.Tensor
+    dones:                torch.Tensor
+    values:               torch.Tensor
+    timeout_values:       torch.Tensor
+    advantages:           torch.Tensor
+    returns:              torch.Tensor
+    learner_mask:         torch.Tensor | None = None
+    critic_history:       ObservationHistory | None = None
+    critic_prefix:        torch.Tensor | None = None
+    critic_prefix_valid:  torch.Tensor | None = None
+    critic_frames:        torch.Tensor | None = None
+    critic_boundaries:    torch.Tensor | None = None
+    timeout_observations: torch.Tensor | None = None
+    truncations:          torch.Tensor | None = None
 
-    def critic_windows(self, indices):
-        # Legacy critic_* names refer to the ONE dense history shared with the actor.
-        length = self.critic_prefix.shape[0] + 1
-        agents = self.observations.shape[1]
-        step, agent = indices // agents, indices % agents
-        history = self.critic_window_history
-        offsets = torch.arange(length, device=indices.device)
-        times = step[:, None] + offsets
-        frames = history[times, agent[:, None]]
-        prior_dones = self.critic_window_dones[times, agent[:, None]]
-        prior_dones[:, -1] = False
-        reset = torch.where(prior_dones, offsets + 1, 0).amax(dim=1)
-        return frames.masked_fill((offsets[None] < reset[:, None])[..., None], float("nan"))
+    def enable_deferred_timeouts(self) -> None:
+        if self.timeout_observations is None:
+            self.timeout_observations = torch.empty_like(self.observations)
+            self.truncations = torch.empty_like(self.dones)
 
-    def prepare_critic_windows(self):
-        self.critic_window_history = torch.cat((self.critic_prefix, self.observations), dim=0)
-        self.critic_window_dones = torch.cat((self.critic_prefix_dones, self.dones), dim=0)
+    def record_timeout(
+        self,
+        step:        int,
+        observation: torch.Tensor,
+        truncated:   torch.Tensor
+    ) -> None:
+        self.timeout_observations[step].copy_(observation)
+        self.truncations[step].copy_(truncated)
+
+    def enable_critic_history(self, length: int, stride: int) -> None:
+        from training.critic_history import ObservationHistory
+
+        history = ObservationHistory(self.observations[0], length, stride)
+        # Prefix and rollout observations share one allocation: minibatches no
+        # longer concatenate/copy the entire observation rollout on first use.
+        shape = (history.lag + len(self.observations), *self.observations.shape[1:])
+
+        self.critic_frames = self.observations.new_empty(shape)
+        self.critic_prefix = self.critic_frames[: history.lag]
+        self.observations = self.critic_frames[history.lag :]
+        self.critic_prefix_valid = history.valid
+        self.critic_boundaries = torch.zeros(
+            shape[:2],
+            dtype=torch.bool,
+            device=self.dones.device
+        )
+
+        self.dones = self.critic_boundaries[history.lag :]
+        self.critic_history = history
+
+    def critic_context(self, observation: torch.Tensor) -> torch.Tensor | None:
+        if self.critic_history is None:
+            return None
+
+        return self.critic_history.window(observation)
+
+    def critic_inputs(self, indices: torch.Tensor) -> torch.Tensor | None:
+        return (
+            None
+            if self.critic_history is None
+            else rollout_critic_inputs(self, indices)
+        )
 
     @classmethod
-    def allocate(cls, steps, agents, observation_size, action_size, device):
+    def allocate(
+        cls,
+        steps:            int,
+        agents:           int,
+        observation_size: int,
+        action_size:      int,
+        device:           torch.device
+    ) -> "Rollout":
         shape = (steps, agents)
 
         return cls(
-            observations=torch.empty((*shape, observation_size), device=device),
-            actions=torch.empty((*shape, action_size), dtype=torch.long, device=device),
+            observations=torch.empty(
+                (*shape, observation_size),
+                device=device
+            ),
+            actions=torch.empty(
+                (*shape, action_size),
+                dtype=torch.long,
+                device=device
+            ),
             log_probs=torch.empty(shape, device=device),
             rewards=torch.empty(shape, device=device),
             dones=torch.empty(shape, dtype=torch.bool, device=device),
@@ -55,96 +123,134 @@ class Rollout:
 
 
 @torch.no_grad()
-def collect(env, agent, policy, rollout, observation, args, scenes=None):
-    episode_returns = []
+def collect(
+    env:           CARLTorchVectorEnv,
+    agent:         Agent,
+    policy:        Policy,
+    rollout:       Rollout,
+    observation:   torch.Tensor,
+    args:          Namespace,
+    opponent_pool: OpponentPool | None = None,
+    transitions:   TransitionPairs | None = None
+) -> torch.Tensor:
     rollout.timeout_values.zero_()
-    actor_history = getattr(agent, "actor_uses_history", agent.gru_policy)
-    critic_history = getattr(agent, "critic_uses_history", agent.gru_critic)
-    use_history = actor_history or critic_history
-    history_length = agent.policy_window_length if use_history else 1
-    if use_history:
-        if not hasattr(rollout, "critic_history"):
-            rollout.critic_history = observation.new_full(
-                (history_length - 1, *observation.shape), float("nan")
-            )
-        rollout.critic_prefix = rollout.critic_history.clone()
-        rollout.critic_prefix_dones = torch.zeros(
-            rollout.critic_prefix.shape[:2], dtype=torch.bool, device=observation.device
-        )
-        if agent.gru_critic:
-            with autocast(env.device, args.bf16):
-                encoded_history = agent.critic.projection(torch.nan_to_num(rollout.critic_history))
+    rollout.enable_deferred_timeouts()
+
+    history = rollout.critic_history
+
+    if history is not None:
+        rollout.critic_prefix.copy_(history.frames)
+        rollout.critic_prefix_valid.copy_(history.valid)
+
+    if opponent_pool is None:
+        rollout.learner_mask = None
+
+    if opponent_pool is not None and rollout.learner_mask is None:
+        rollout.learner_mask = torch.empty_like(rollout.dones)
 
     for step in range(args.rollout):
         torch.compiler.cudagraph_mark_step_begin()
         rollout.observations[step].copy_(observation)
 
         with autocast(env.device, args.bf16):
-            if use_history:
-                window = torch.cat((rollout.critic_history, observation[None]), dim=0).transpose(0, 1)
-                if not agent.gru_policy and not agent.gru_critic:
-                    actions, log_prob, _, values = policy(window)
-                else:
-                    actions, log_prob, _ = agent.get_action_and_log_prob(window if actor_history else observation)
-                    if agent.gru_critic:
-                        encoded_current = agent.critic.projection(observation)
-                        encoded_window = torch.cat((encoded_history, encoded_current[None]), dim=0).transpose(0, 1)
-                        values = agent.get_value_encoded(encoded_window, torch.isnan(window[..., 0]))
-                    else:
-                        values = agent.get_value(window if critic_history else observation)
-            else:
+            if history is None:
                 actions, log_prob, _, values = policy(observation)
+            else:
+                actions, log_prob, _, values = policy(
+                    observation,
+                    critic_observations=history.window(observation)
+                )
 
         rollout.actions[step].copy_(actions)
+
+        if opponent_pool is not None:
+            rollout.learner_mask[step].copy_(opponent_pool.learner_mask())
+
+            with autocast(env.device, args.bf16):
+                opponent_pool.apply_actions(observation, rollout.actions[step])
+
         rollout.log_probs[step].copy_(log_prob)
         rollout.values[step].copy_(values)
-
-        next_observation, reward, terminated, truncated, info = env.step(rollout.actions[step])
+        result = env.step(rollout.actions[step])
+        next_observation, reward, terminated, truncated, info = result
         next_observation = plain_tensor(next_observation)
-        done = terminated | truncated
-        final_observation = plain_tensor(info.get("final_obs", next_observation))
 
-        if "final_obs" in info:
-            with autocast(env.device, args.bf16):
-                if agent.gru_critic:
-                    final_window = torch.cat((window[:, 1:], final_observation[:, None]), dim=1)
-                    encoded_final = agent.critic.projection(final_observation)
-                    final_encoded = torch.cat((encoded_window[:, 1:], encoded_final[:, None]), dim=1)
-                    final_values = agent.get_value_encoded(final_encoded, torch.isnan(final_window[..., 0]))
-                elif critic_history:
-                    final_window = torch.cat((window[:, 1:], final_observation[:, None]), dim=1)
-                    final_values = agent.get_value(final_window)
-                else:
-                    final_values = agent.get_value(final_observation)
+        if transitions is not None:
+            transitions.record(
+                step,
+                observation,
+                next_observation,
+                plain_tensor(info["final_obs"]),
+                terminated | truncated,
+                terminated,
+                score_delta=transition_score_delta(env)
+            )
 
-            rollout.timeout_values[step].copy_(final_values * truncated)
+        if history is not None:
+            history.advance(observation)
+
+        rollout.record_timeout(step, plain_tensor(info["final_obs"]), truncated)
 
         rollout.rewards[step].copy_(reward)
-        rollout.dones[step].copy_(done)
+        rollout.dones[step].copy_(terminated | truncated)
 
-        if scenes is not None:
-            scenes.record(
-                step, rollout.observations[step], next_observation, final_observation, done, terminated
+        if history is not None:
+            history.clear(terminated | truncated)
+
+        if opponent_pool is not None:
+            opponent_pool.resample(
+                (terminated | truncated).reshape(-1, opponent_pool.n_cars)
+                .any(-1)
             )
 
-        if use_history:
-            rollout.critic_history = window[:, 1:].transpose(0, 1).masked_fill(
-                done[None, :, None], float("nan")
-            )
-            if agent.gru_critic:
-                encoded_history = encoded_window[:, 1:].transpose(0, 1)
-
-        episode_returns.extend(info.get("reward", ()))
         observation = next_observation
 
-    if agent.gru_critic:
-        rollout.critic_encoded_history = encoded_history
+    evaluate_timeouts(agent, rollout, env.device, args)
+    env.drain_episode_reports()
 
-    return observation, episode_returns
+    return observation
+
+
+def transition_score_delta(env: CARLTorchVectorEnv) -> torch.Tensor:
+    score = env.events.score_delta
+
+    return (score[:, None] * env._team_sign).reshape(-1)
 
 
 @torch.no_grad()
-def compute_gae(rollout, next_value, gamma, gae_lambda):
+def evaluate_timeouts(
+    agent:   Agent,
+    rollout: Rollout,
+    device:  torch.device,
+    args:    Namespace
+) -> None:
+    """Compact once at the rollout boundary and evaluate only true timeouts."""
+    indices = rollout.truncations.flatten().nonzero().flatten()
+    observations = rollout.timeout_observations.flatten(0, 1)
+    values = rollout.timeout_values.flatten()
+    batch_size = args.minibatch_size
+
+    for batch in indices.split(batch_size):
+        if not len(batch):
+            continue
+
+        final = observations[batch]
+
+        with autocast(device, args.bf16):
+            context = timeout_critic_inputs(rollout, batch, final)
+
+            result = agent.get_value(final, context)
+
+        values[batch] = result.to(values.dtype)
+
+
+@torch.no_grad()
+def compute_gae(
+    rollout:    Rollout,
+    next_value: torch.Tensor,
+    gamma:      float,
+    gae_lambda: float
+) -> None:
     advantage = torch.zeros_like(next_value)
 
     for step in reversed(range(rollout.rewards.shape[0])):

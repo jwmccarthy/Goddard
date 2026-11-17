@@ -1,30 +1,37 @@
+from __future__ import annotations
+
 import json
 import logging
 import queue
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import torch
 from carl.gymnasium.state import CarlState
 
-from replays import PARSED_DIR
-from training.models import Agent, critic_hidden_size, critic_layers, policy_window_length
+from training.models import Agent
+from training.replay_resets import ReplayResetSampler
 from training.setup import build_env
 from training.tensors import plain_tensor
 from vis.controls import control_values
-from vis.resets import ReplayResetSampler
 from vis.scene import Car, Physics
 
+if TYPE_CHECKING:
+    from carl.gymnasium import CARLResetState, CARLTorchVectorEnv
 
-def load_policy(checkpoint, seed):
+
+def load_policy(
+    checkpoint: Path,
+    seed:       int
+) -> tuple[CARLTorchVectorEnv, Agent, dict[str, Any], int]:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
 
-    if payload.get("format") != "goddard-leanrl-v1":
-        raise ValueError("expected a goddard-leanrl-v1 checkpoint")
+    config = dict(payload["config"], n_sim=1, seed=seed, resume=None)
 
-    config = dict(payload["config"], n_sim=1, seed=seed)
     env = build_env(SimpleNamespace(**config))
 
     try:
@@ -34,37 +41,43 @@ def load_policy(checkpoint, seed):
             env.action_codec,
             config["hidden_size"],
             config["layers"],
-            gru_critic=config.get("gru_critic", config.get("gru", False)),
-            gru_policy=config.get("gru_policy", False),
-            info_codes=config.get("info_codes", 8) if config.get("info", False) else 0,
-            policy_window_length=policy_window_length(config),
-            critic_hidden_size=critic_hidden_size(config),
-            critic_layers=critic_layers(config),
-            mlp_policy=config.get("mlp_policy", False),
-            mlp_critic=config.get("mlp_critic", False)
+            joint_actions=config["joint_actions"]
         ).to(env.device)
+
         actor = {
             key.removeprefix("actor."): value
-            for key, value in payload["agent"].items() if key.startswith("actor.")
+            for key, value in payload["agent"].items()
+            if key.startswith("actor.")
         }
+
         agent.actor.load_state_dict(actor, strict=True)
         agent.eval()
     except BaseException:
         env.close()
         raise
 
-    return env, agent, config, payload["step"]
+    return (env, agent, config, payload["step"])
 
 
-def snapshot(env, blue_cars=None):
+def snapshot(
+    env:       CARLTorchVectorEnv,
+    blue_cars: int | None = None
+) -> tuple[Physics, tuple[Car, ...], tuple[tuple[tuple[float, ...], bool], ...]]:
     # CARL's torch wrapper has no public physical-state accessor yet.
     raw = torch.from_dlpack(env._env.get_state()).cpu().clone()
-    state = CarlState.from_raw(raw, env.n_cars, env._boost_pad_positions, env._team_sign)
+    state = CarlState.from_raw(
+        raw,
+        env.n_cars,
+        env._boost_pad_positions,
+        env._team_sign
+    )
+
     ball = Physics(
         tuple(state.ball_position[0].tolist()),
         velocity=tuple(state.ball_velocity[0].tolist()),
         angular_velocity=tuple(state.ball_angular_velocity[0].tolist())
     )
+
     blue_cars = env.n_cars // 2 if blue_cars is None else blue_cars
     cars = tuple(
         Car(
@@ -79,26 +92,37 @@ def snapshot(env, blue_cars=None):
             ),
             boost=float(state.car_boost[0, index]),
             on_ground=bool(state.car_on_ground[0, index]),
-            demoed=bool(state.car_demoed[0, index])
+            demoed=bool(state.car_demoed[0, index]),
+            boosting=bool(state.car_is_boosting[0, index])
         )
         for index in range(env.n_cars)
     )
+
     pads = tuple(
         (tuple(position), active)
         for position, active in zip(
-            env._boost_pad_positions.cpu().tolist(), state.boost_pad_active[0].tolist()
+            env._boost_pad_positions.cpu().tolist(),
+            state.boost_pad_active[0].tolist()
         )
     )
 
-    return ball, cars, pads
+    return (ball, cars, pads)
 
 
 class Match:
 
-    def __init__(self, checkpoint, seed=0, replay_dir=None, replay_seed=None, sample=False):
+    def __init__(
+        self,
+        checkpoint:  Path,
+        seed:        int = 0,
+        replay_dir:  Path | None = None,
+        replay_seed: int | None = None,
+        sample:      bool = False
+    ) -> None:
         torch.manual_seed(seed)
 
         self.env, self.agent, self.config, step = load_policy(checkpoint, seed)
+
         if replay_dir is not None:
             self.config["replay_dir"] = replay_dir
 
@@ -113,50 +137,62 @@ class Match:
         self.replay_seed = replay_seed
         self.thread = threading.Thread(target=self.run, daemon=True)
 
-        print(f"Loaded checkpoint at step {step:,}.", flush=True)
+        logging.info("Checkpoint: %s steps.", f"{step:,}")
 
-    def start(self):
+    def start(self) -> None:
         self.thread.start()
 
-    def close(self):
+    def close(self) -> None:
         self.stopped.set()
+
         with self.condition:
             self.condition.notify_all()
-        self.thread.join()
 
-    def request_reset(self, mode):
+        if self.thread.ident is not None:
+            self.thread.join()
+        else:
+            self.env.close()
+
+    def request_reset(self, mode: str) -> None:
         if mode not in ("replay", "kickoff"):
             raise ValueError(f"unknown reset mode: {mode}")
+
         self.reset_requests.put(mode)
 
-    def reset(self, mode):
+    def reset(self, mode: str) -> torch.Tensor:
         state = None
 
         if mode == "replay":
             if self.replay_resets is None:
                 self.replay_resets = ReplayResetSampler(
-                    self.config.get("replay_dir", PARSED_DIR), self.config["team_size"],
-                    excluded_replays=self.config.get("discriminator_heldout_replays", ()), seed=self.replay_seed
+                    self.config["replay_dir"],
+                    self.config["team_size"],
+                    seed=self.replay_seed
                 )
+
             state = self.replay_resets.sample(self.env.device)
 
         provider = self.env.reset_state_provider
 
+        def replay_state(mask: torch.Tensor) -> CARLResetState:
+            if self.env.masked_resets:
+                # The viewer has one simulation, so the sampled row is also
+                # the full batch required by CARL's masked-reset API.
+                return replace(state, simulation_indices=None, reset_mask=mask)
+
+            return state
+
         try:
-            self.env.reset_state_provider = (lambda mask: state) if state is not None else None
+            self.env.reset_state_provider = replay_state if state is not None else None
+
             return plain_tensor(self.env.reset())
         finally:
             self.env.reset_state_provider = provider
 
     @torch.inference_mode()
-    def run(self):
+    def run(self) -> None:
         try:
             observation = plain_tensor(self.env.reset())
-            if self.agent.actor_uses_history:
-                history = observation.new_full(
-                    (len(observation), self.agent.policy_window_length - 1, observation.shape[-1]),
-                    float("nan")
-                )
             timestep = self.config["frameskip"] / 120.0
             deadline = time.monotonic()
             episode = 0
@@ -173,25 +209,29 @@ class Match:
                     except (OSError, ValueError):
                         logging.exception("Could not reset viewer to %s", mode)
                     else:
-                        if self.agent.actor_uses_history:
-                            history.fill_(float("nan"))
                         episode += 1
                         deadline = time.monotonic()
 
-                if self.agent.actor_uses_history:
-                    window = torch.cat((history, observation[:, None]), dim=1)
-                    actions = self.agent.get_action(window, sample=self.sample)
-                else:
-                    actions = self.agent.get_action(observation, sample=self.sample)
+                actions = self.agent.get_action(
+                    observation,
+                    sample=self.sample
+                )
 
                 ball, cars, pads = snapshot(self.env)
-                data = json.dumps({
-                    "episode": episode,
-                    "ball":    asdict(ball),
-                    "cars":    [asdict(car) for car in cars],
-                    "pads":    pads,
-                    "controls": control_values(actions, self.env.discrete_actions),
-                }, allow_nan=False, separators=(",", ":"))
+                data = json.dumps(
+                    {
+                        "episode":  episode,
+                        "ball":     asdict(ball),
+                        "cars":     [asdict(car) for car in cars],
+                        "pads":     pads,
+                        "controls": control_values(
+                            actions,
+                            self.env.discrete_actions
+                        ),
+                    },
+                    allow_nan=False,
+                    separators=(",", ":")
+                )
 
                 with self.condition:
                     self.data = data
@@ -200,8 +240,6 @@ class Match:
 
                 observation, _, terminated, truncated, _ = self.env.step(actions)
                 observation = plain_tensor(observation)
-                if self.agent.actor_uses_history:
-                    history = window[:, 1:].masked_fill((terminated | truncated)[:, None, None], float("nan"))
                 episode += int((terminated | truncated).any().item())
                 deadline = max(deadline + timestep, time.monotonic())
 
@@ -209,9 +247,10 @@ class Match:
 
         except Exception:
             logging.exception("Checkpoint playback stopped")
-            
+
         finally:
             self.env.close()
             self.stopped.set()
+
             with self.condition:
                 self.condition.notify_all()

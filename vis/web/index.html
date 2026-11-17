@@ -6,26 +6,48 @@
     <title>Goddard</title>
     <link rel="stylesheet" href="/style.css">
     <script type="importmap">
-      {"imports": {"three": "/vendor/three.module.js"}}
+      {
+        "imports": {
+          "three": "/vendor/three.module.js"
+        }
+      }
     </script>
   </head>
   <body>
     <main id="viewport" aria-label="Match viewer">
-      <section id="training-info" aria-label="Training exercise" hidden>
-        <ol id="training-stages" aria-label="Exercise stages"></ol>
-      </section>
       <section id="controls-info" aria-label="Car controls" hidden>
         <div class="control-axes">
-          <div class="control-axis" data-axis="horizontal"><span>STEER / YAW</span><div><i></i></div></div>
-          <div class="control-axis" data-axis="vertical"><span>PITCH</span><div><i></i></div></div>
-          <div class="control-axis" data-axis="throttle"><span>THROTTLE</span><div><i></i></div></div>
-          <div class="control-axis" data-axis="roll"><span>ROLL</span><div><i></i></div></div>
+          <div class="control-axis" data-axis="horizontal">
+            <span>STEER / YAW</span>
+            <div><i></i></div>
+          </div>
+          <div class="control-axis" data-axis="vertical">
+            <span>PITCH</span>
+            <div><i></i></div>
+          </div>
+          <div class="control-axis" data-axis="throttle">
+            <span>THROTTLE</span>
+            <div><i></i></div>
+          </div>
+          <div class="control-axis" data-axis="roll">
+            <span>ROLL</span>
+            <div><i></i></div>
+          </div>
         </div>
         <div class="control-buttons">
-          <span data-button="jump">JUMP</span><span data-button="boost">BOOST</span><span data-button="slide">SLIDE</span>
+          <span data-button="jump">JUMP</span>
+          <span data-button="boost">BOOST</span>
+          <span data-button="slide">SLIDE</span>
         </div>
       </section>
-      <div id="boost-gauge" role="meter" aria-label="Boost" aria-valuemin="0" aria-valuemax="100" hidden>
+      <div
+        id="boost-gauge"
+        role="meter"
+        aria-label="Boost"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        hidden
+      >
         <div class="boost-gauge-center">
           <span id="boost-value">0</span>
         </div>
