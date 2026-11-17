@@ -138,52 +138,15 @@ class PackMatch:
 
         payload = None
         config = {}
-        attention_checkpoint = False
 
         if checkpoint is not None:
             payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
             config = payload.get("config", {})
-            attention_checkpoint = payload.get("format") == "carl-training-pack-ppo-v1"
+            if payload.get("format") != "carl-training-pack-ppo-v1":
+                raise ValueError("expected a CARL training-pack PPO checkpoint")
+            from examples.training_packs.playback import checkpoint_pack
 
-            if attention_checkpoint:
-                from examples.training_packs.playback import checkpoint_pack
-
-                self.pack = checkpoint_pack(payload)
-            else:
-                import carl
-
-                from training.wall_flip_reset import wall_flip_reset_pack
-
-                objective = config.get("pack_objective")
-
-                if (payload.get("format") != "goddard-leanrl-v1" or payload.get("algorithm") != "pack-ppo"
-                        or objective not in ("wall-flip-reset-v1", "wall-flip-reset-v2",
-                                             "wall-flip-reset-v3", "wall-flip-reset-v4", "wall-flip-reset-v5",
-                                             "wall-flip-reset-v6", "wall-flip-reset-v7", "wall-flip-reset-v8",
-                                             "wall-flip-reset-v9", "wall-flip-reset-v10", "wall-flip-reset-v11", "wall-flip-reset-v12", "wall-flip-reset-v13")):
-                    raise ValueError("expected a compatible wall-flip-reset pack-ppo checkpoint")
-
-                observation_size = (carl.OBS_BALL + carl.OBS_PER_CAR + carl.OBS_BOOST_PADS
-                                    + carl.OBS_RELATIVE_EGO_BALL + carl.OBS_RELATIVE_GOALS + carl.OBS_EGO_DODGE)
-                stages = payload["agent"]["actor.0.weight"].shape[1] - observation_size - 1
-
-                from training.legacy_wall_flip_reset import wall_flip_reset_pack as legacy_pack
-
-                self.pack = wall_flip_reset_pack() if objective in ("wall-flip-reset-v11", "wall-flip-reset-v12", "wall-flip-reset-v13") else legacy_pack(
-                    include_ground_setup=objective != "wall-flip-reset-v1",
-                    include_ceiling_failure=objective in ("wall-flip-reset-v3", "wall-flip-reset-v4", "wall-flip-reset-v5", "wall-flip-reset-v6", "wall-flip-reset-v7", "wall-flip-reset-v8", "wall-flip-reset-v9", "wall-flip-reset-v10", "wall-flip-reset-v11"),
-                    airborne_setup=objective in ("wall-flip-reset-v4", "wall-flip-reset-v5", "wall-flip-reset-v6", "wall-flip-reset-v7", "wall-flip-reset-v8", "wall-flip-reset-v9", "wall-flip-reset-v10", "wall-flip-reset-v11"),
-                    extra_air_touches=(objective in ("wall-flip-reset-v4", "wall-flip-reset-v5", "wall-flip-reset-v6", "wall-flip-reset-v7", "wall-flip-reset-v8", "wall-flip-reset-v9", "wall-flip-reset-v10", "wall-flip-reset-v11") or
-                                       (objective == "wall-flip-reset-v3" and stages == 10)),
-                    require_takeoff=objective in ("wall-flip-reset-v5", "wall-flip-reset-v6", "wall-flip-reset-v7", "wall-flip-reset-v8", "wall-flip-reset-v9", "wall-flip-reset-v10", "wall-flip-reset-v11"),
-                    front_air_touches=objective in ("wall-flip-reset-v6", "wall-flip-reset-v7", "wall-flip-reset-v8", "wall-flip-reset-v9", "wall-flip-reset-v10", "wall-flip-reset-v11"),
-                    minimum_air_touch_gain=(200 if objective in ("wall-flip-reset-v8", "wall-flip-reset-v9") else
-                                            100 if objective in ("wall-flip-reset-v7", "wall-flip-reset-v10", "wall-flip-reset-v11") else None),
-                    repeat_air_touches=objective in ("wall-flip-reset-v8", "wall-flip-reset-v9", "wall-flip-reset-v10"),
-                    max_extra_air_touches=3 if objective == "wall-flip-reset-v10" else None,
-                )
-                if objective == "wall-flip-reset-v11" and stages == 8:
-                    del self.pack.exercises[0].stages[6:8]
+            self.pack = checkpoint_pack(payload)
         else:
             self.pack = load_pack(path)
 
@@ -202,36 +165,12 @@ class PackMatch:
         )
 
         self.agent = None
-        self.observations = None
 
         if payload is not None:
             try:
-                if attention_checkpoint:
-                    from examples.training_packs.playback import checkpoint_policy
+                from examples.training_packs.playback import checkpoint_policy
 
-                    self.agent = checkpoint_policy(payload, self.runtime, self.env.single_observation_space.shape[0])
-                else:
-                    from training.models import Agent
-                    from training.pack_ppo import PackActionCodec, PackObservationEnv
-
-                    base_size = self.env.single_observation_space.shape[0]
-                    if objective == "wall-flip-reset-v12":
-                        observation_size = base_size
-                    else:
-                        self.observations = PackObservationEnv(self.env, self.runtime, include_repeat_count=objective == "wall-flip-reset-v10")
-                        observation_size = base_size + compiled.kind.shape[1] + 1 + (objective == "wall-flip-reset-v10")
-                    action_codec = (PackActionCodec(self.env.action_codec, base_size)
-                                    if objective in ("wall-flip-reset-v4", "wall-flip-reset-v5", "wall-flip-reset-v6", "wall-flip-reset-v7", "wall-flip-reset-v8", "wall-flip-reset-v9", "wall-flip-reset-v10", "wall-flip-reset-v11", "wall-flip-reset-v13") else self.env.action_codec)
-                    self.agent = Agent(
-                        observation_size, self.env.single_action_space.nvec, action_codec,
-                        config["hidden_size"], config["layers"],
-                    ).to(self.env.device)
-                    actor = {
-                        key.removeprefix("actor."): value
-                        for key, value in payload["agent"].items() if key.startswith("actor.")
-                    }
-                    self.agent.actor.load_state_dict(actor, strict=True)
-                    self.agent.eval()
+                self.agent = checkpoint_policy(payload, self.runtime, self.env.single_observation_space.shape[0])
             except BaseException:
                 self.env.close()
                 raise
@@ -342,10 +281,7 @@ class PackMatch:
                     deadline = time.monotonic()
 
                 if self.agent is not None:
-                    policy_observation = (self.observations.observation(
-                        observation, self.runtime.stage_index, self.runtime.ticks_remaining,
-                    ) if self.observations is not None else observation)
-                    actions = self.agent.get_action(policy_observation, sample=self.sample)
+                    actions = self.agent.get_action(observation, sample=self.sample)
 
                 from vis.controls import control_values
                 controls = control_values(actions, self.env.discrete_actions) if self.agent is not None else None

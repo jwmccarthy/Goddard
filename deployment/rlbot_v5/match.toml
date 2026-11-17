@@ -1,0 +1,22 @@
+#:schema https://rlbot.org/schemas/match.json
+[rlbot]
+# Launch Rocket League yourself before running play.bat. Works with either launcher.
+launcher = "NoLaunch"
+auto_start_agents = true
+wait_for_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+skip_replays = true
+existing_match_behavior = "Restart"
+enable_rendering = false
+enable_state_setting = false
+
+[[cars]]
+type = "Human"
+team = "Blue"
+
+[[cars]]
+config_file = "bot.toml"
+team = "Orange"

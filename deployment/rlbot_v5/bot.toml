@@ -1,0 +1,14 @@
+#:schema https://rlbot.org/schemas/agent.json
+[settings]
+name = "Goddard GAIfO (Experimental)"
+loadout_file = "loadout.toml"
+root_dir = ""
+run_command = "cmd.exe /d /c launch.bat"
+run_command_linux = "venv/bin/python bot.py"
+agent_id = "jack/goddard_gaifo_experimental"
+
+[details]
+description = "1v1 PPO/GAIfO actor. CARL observation adapter; CPU inference."
+developer = "Jack"
+language = "Python"
+tags = ["1v1"]

@@ -3,28 +3,32 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import torch
 from carl.gymnasium.state import CarlState
 
-from replays import PARSED_DIR
-from training.models import Agent, critic_hidden_size, critic_layers, policy_window_length
+from replays import REPLAYS_DIR
+from training.models import Agent
+from training.replay_resets import ReplayResetSampler
 from training.setup import build_env
 from training.tensors import plain_tensor
 from vis.controls import control_values
-from vis.resets import ReplayResetSampler
 from vis.scene import Car, Physics
 
 
 def load_policy(checkpoint, seed):
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
 
-    if payload.get("format") != "goddard-leanrl-v1":
-        raise ValueError("expected a goddard-leanrl-v1 checkpoint")
+    if payload.get("format") != "goddard-leanrl-v1" or payload.get("algorithm") not in (
+        "ppo",
+        "gaifo",
+    ):
+        raise ValueError("expected a goddard-leanrl-v1 PPO or GAIfO checkpoint")
 
-    config = dict(payload["config"], n_sim=1, seed=seed)
+    config = dict(payload["config"], n_sim=1, seed=seed, resume=None)
+    config.setdefault("observation_schema", "base-v1")
     env = build_env(SimpleNamespace(**config))
 
     try:
@@ -34,18 +38,12 @@ def load_policy(checkpoint, seed):
             env.action_codec,
             config["hidden_size"],
             config["layers"],
-            gru_critic=config.get("gru_critic", config.get("gru", False)),
-            gru_policy=config.get("gru_policy", False),
-            info_codes=config.get("info_codes", 8) if config.get("info", False) else 0,
-            policy_window_length=policy_window_length(config),
-            critic_hidden_size=critic_hidden_size(config),
-            critic_layers=critic_layers(config),
-            mlp_policy=config.get("mlp_policy", False),
-            mlp_critic=config.get("mlp_critic", False)
+            joint_actions=config.get("joint_actions", False),
         ).to(env.device)
         actor = {
             key.removeprefix("actor."): value
-            for key, value in payload["agent"].items() if key.startswith("actor.")
+            for key, value in payload["agent"].items()
+            if key.startswith("actor.")
         }
         agent.actor.load_state_dict(actor, strict=True)
         agent.eval()
@@ -63,7 +61,7 @@ def snapshot(env, blue_cars=None):
     ball = Physics(
         tuple(state.ball_position[0].tolist()),
         velocity=tuple(state.ball_velocity[0].tolist()),
-        angular_velocity=tuple(state.ball_angular_velocity[0].tolist())
+        angular_velocity=tuple(state.ball_angular_velocity[0].tolist()),
     )
     blue_cars = env.n_cars // 2 if blue_cars is None else blue_cars
     cars = tuple(
@@ -75,11 +73,12 @@ def snapshot(env, blue_cars=None):
                 tuple(state.car_forward[0, index].tolist()),
                 tuple(state.car_up[0, index].tolist()),
                 tuple(state.car_velocity[0, index].tolist()),
-                tuple(state.car_angular_velocity[0, index].tolist())
+                tuple(state.car_angular_velocity[0, index].tolist()),
             ),
             boost=float(state.car_boost[0, index]),
             on_ground=bool(state.car_on_ground[0, index]),
-            demoed=bool(state.car_demoed[0, index])
+            demoed=bool(state.car_demoed[0, index]),
+            boosting=bool(state.car_is_boosting[0, index]),
         )
         for index in range(env.n_cars)
     )
@@ -94,7 +93,6 @@ def snapshot(env, blue_cars=None):
 
 
 class Match:
-
     def __init__(self, checkpoint, seed=0, replay_dir=None, replay_seed=None, sample=False):
         torch.manual_seed(seed)
 
@@ -135,15 +133,23 @@ class Match:
         if mode == "replay":
             if self.replay_resets is None:
                 self.replay_resets = ReplayResetSampler(
-                    self.config.get("replay_dir", PARSED_DIR), self.config["team_size"],
-                    excluded_replays=self.config.get("discriminator_heldout_replays", ()), seed=self.replay_seed
+                    self.config.get("replay_dir", REPLAYS_DIR / "rlcs"),
+                    self.config["team_size"],
+                    seed=self.replay_seed,
                 )
             state = self.replay_resets.sample(self.env.device)
 
         provider = self.env.reset_state_provider
 
+        def replay_state(mask):
+            if getattr(self.env, "masked_resets", False):
+                # The viewer has one simulation, so the sampled row is also
+                # the full batch required by CARL's masked-reset API.
+                return replace(state, simulation_indices=None, reset_mask=mask)
+            return state
+
         try:
-            self.env.reset_state_provider = (lambda mask: state) if state is not None else None
+            self.env.reset_state_provider = replay_state if state is not None else None
             return plain_tensor(self.env.reset())
         finally:
             self.env.reset_state_provider = provider
@@ -152,11 +158,6 @@ class Match:
     def run(self):
         try:
             observation = plain_tensor(self.env.reset())
-            if self.agent.actor_uses_history:
-                history = observation.new_full(
-                    (len(observation), self.agent.policy_window_length - 1, observation.shape[-1]),
-                    float("nan")
-                )
             timestep = self.config["frameskip"] / 120.0
             deadline = time.monotonic()
             episode = 0
@@ -173,25 +174,23 @@ class Match:
                     except (OSError, ValueError):
                         logging.exception("Could not reset viewer to %s", mode)
                     else:
-                        if self.agent.actor_uses_history:
-                            history.fill_(float("nan"))
                         episode += 1
                         deadline = time.monotonic()
 
-                if self.agent.actor_uses_history:
-                    window = torch.cat((history, observation[:, None]), dim=1)
-                    actions = self.agent.get_action(window, sample=self.sample)
-                else:
-                    actions = self.agent.get_action(observation, sample=self.sample)
+                actions = self.agent.get_action(observation, sample=self.sample)
 
                 ball, cars, pads = snapshot(self.env)
-                data = json.dumps({
-                    "episode": episode,
-                    "ball":    asdict(ball),
-                    "cars":    [asdict(car) for car in cars],
-                    "pads":    pads,
-                    "controls": control_values(actions, self.env.discrete_actions),
-                }, allow_nan=False, separators=(",", ":"))
+                data = json.dumps(
+                    {
+                        "episode": episode,
+                        "ball": asdict(ball),
+                        "cars": [asdict(car) for car in cars],
+                        "pads": pads,
+                        "controls": control_values(actions, self.env.discrete_actions),
+                    },
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
 
                 with self.condition:
                     self.data = data
@@ -200,8 +199,6 @@ class Match:
 
                 observation, _, terminated, truncated, _ = self.env.step(actions)
                 observation = plain_tensor(observation)
-                if self.agent.actor_uses_history:
-                    history = window[:, 1:].masked_fill((terminated | truncated)[:, None, None], float("nan"))
                 episode += int((terminated | truncated).any().item())
                 deadline = max(deadline + timestep, time.monotonic())
 
@@ -209,7 +206,7 @@ class Match:
 
         except Exception:
             logging.exception("Checkpoint playback stopped")
-            
+
         finally:
             self.env.close()
             self.stopped.set()

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Replay labeler</title>
+  <link rel="stylesheet" href="/labeler.css">
+  <script type="importmap">{"imports":{"three":"/vendor/three.module.js"}}</script>
+</head>
+<body data-playback="local">
+  <aside id="sidebar" aria-label="Parsed replays">
+    <input id="search" type="search" placeholder="Find replay" aria-label="Find replay" autocomplete="off">
+    <nav id="files" aria-label="Replay files"></nav>
+    <footer><span id="file-count"></span><button id="more" title="More files" aria-label="More files" data-icon="more" hidden></button></footer>
+    <details id="done">
+      <summary>Done <span id="done-count"></span></summary>
+      <nav id="done-files" aria-label="Done replay files"></nav>
+      <footer><button id="done-more" title="More done files" aria-label="More done files" data-icon="more" hidden></button></footer>
+    </details>
+  </aside>
+  <main id="workspace">
+    <section id="viewer-pane" aria-label="Replay viewer">
+      <div id="viewport">
+        <div id="controls-info" hidden></div>
+        <div id="boost-gauge" hidden><span id="boost-value"></span></div>
+      </div>
+      <header id="viewer-header"><span id="filename"></span><span id="status" role="status"></span><button id="save" disabled title="Save labels (Ctrl+S)">Save</button></header>
+      <div id="viewer-tools">
+        <select id="camera" aria-label="Camera" title="Camera"><option value="overview">Overview</option></select>
+        <div id="car-colors" aria-label="Viewer colors"></div>
+      </div>
+      <div id="empty-view">Choose a replay</div>
+    </section>
+    <div id="divider" role="separator" aria-label="Resize timeline" aria-orientation="horizontal" tabindex="0"></div>
+    <section id="editor" aria-label="Skill timeline">
+      <div id="transport">
+        <button id="back" aria-label="Previous frame" title="Previous frame (←)" data-icon="back" disabled></button>
+        <button id="play" aria-label="Play" title="Play / pause (Space)" data-icon="play" disabled></button>
+        <button id="forward" aria-label="Next frame" title="Next frame (→)" data-icon="forward" disabled></button>
+        <output id="time">0:00.00</output><output id="frame" title="Source frame">0</output>
+        <select id="speed" aria-label="Playback speed" title="Playback speed"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+        <span class="spacer"></span>
+        <select id="clip-performer" aria-label="Selected clip performer" title="Reassign selected clip" hidden disabled>
+          <option value="" disabled>Unassigned</option><option value="blue">Blue</option><option value="orange">Orange</option><option value="both">Both</option>
+        </select>
+        <div id="performer" role="group" aria-label="Timeline performer layer">
+          <button data-performer="blue" aria-label="Blue" aria-pressed="true" title="Blue · view and label blue clips" disabled><i class="performer-dot blue"></i></button>
+          <button data-performer="orange" aria-label="Orange" aria-pressed="false" title="Orange · view and label orange clips" disabled><i class="performer-dot orange"></i></button>
+          <button data-performer="both" aria-label="Both" aria-pressed="false" title="Both · draw a separate window for each car" disabled><i class="performer-dot both"></i></button>
+          <button data-performer="unassigned" aria-label="Unassigned" aria-pressed="false" title="Unassigned · assign earlier clips to a performer" hidden disabled><i class="performer-dot unassigned"></i></button>
+        </div>
+        <button id="undo" aria-label="Undo" title="Undo (Ctrl+Z)" data-icon="undo" disabled></button>
+        <button id="redo" aria-label="Redo" title="Redo (Ctrl+Shift+Z)" data-icon="redo" disabled></button>
+        <button id="delete" aria-label="Delete selected clip" title="Delete selected clip (Delete)" data-icon="trash" disabled></button>
+        <input id="zoom" type="range" min="1" max="20" step="0.25" value="1" aria-label="Timeline zoom" title="Timeline zoom">
+      </div>
+      <div id="timeline-scroll">
+        <div id="tracks">
+          <div id="ruler-row" class="track-row"><div class="track-label"><button id="add-skill" title="Add skill" aria-label="Add skill" data-icon="plus" disabled></button></div><div id="ruler" class="lane" aria-label="Scrub replay"></div></div>
+          <div id="skill-rows"></div>
+          <div id="playhead"><i></i></div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/labeler.js"></script>
+</body>
+</html>

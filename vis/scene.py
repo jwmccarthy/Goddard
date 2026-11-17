@@ -18,3 +18,5 @@ class Car:
     boost:     float = 100.0
     on_ground: bool = True
     demoed:    bool = False
+    boosting:  bool | None = None
+    jumping:   bool | None = None

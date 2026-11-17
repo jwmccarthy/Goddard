@@ -4,7 +4,8 @@ def control_values(actions, discrete=True):
     result = []
     for horizontal, vertical, throttle, slide, boost, roll, jump in values:
         if discrete:
-            axis = lambda value: -1 if value == 1 else 1 if value == 2 else 0
+            def axis(value):
+                return -1 if value == 1 else 1 if value == 2 else 0
             horizontal, vertical, throttle, roll = map(axis, (horizontal, vertical, throttle, roll))
         result.append({"horizontal": horizontal, "vertical": vertical, "throttle": throttle,
                        "roll": roll, "slide": slide >= 0.5, "boost": boost >= 0.5,

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -6,6 +7,7 @@ from pathlib import Path
 
 WEB_ROOT = Path(__file__).with_name("web")
 DEFAULT_MESH = Path(__file__).resolve().parents[2] / "CARL/assets/arena.obj"
+DEFAULT_EXPERT_DEMOS = Path(__file__).resolve().parents[1] / "replays/rlcs/maneuvers/aerial-v1.json"
 
 
 class ViewerHandler(SimpleHTTPRequestHandler):
@@ -16,11 +18,22 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
 
     def do_GET(self):
+        if self.path.split("?", 1)[0] == "/expert/clips":
+            if self.match is None or not hasattr(self.match, "demo_list"):
+                self.send_error(404, "No expert demonstrations loaded")
+                return
+            data = json.dumps(self.match.demo_list()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path.split("?", 1)[0] != "/state":
             return super().do_GET()
 
         if self.match is None or self.match.stopped.is_set():
-            self.send_error(503, "No checkpoint is running")
+            self.send_error(503, "No playback is running")
             return
 
         self.send_response(200)
@@ -44,6 +57,24 @@ class ViewerHandler(SimpleHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if self.path.split("?", 1)[0] == "/expert/control":
+            if self.match is None or self.match.stopped.is_set() or not hasattr(self.match, "request_control"):
+                self.send_error(400, "Expert playback is unavailable")
+                return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 4096:
+                    raise ValueError("invalid control message size")
+                command = json.loads(self.rfile.read(size))
+                if not isinstance(command, dict):
+                    raise ValueError("expected a JSON object")
+                self.match.request_control(command.get("action"), command.get("value"))
+            except (ValueError, TypeError):
+                self.send_error(400, "Invalid expert playback command")
+                return
+            self.send_response(202)
+            self.end_headers()
+            return
         modes = {"/reset/replay": "replay", "/reset/kickoff": "kickoff",
                  "/reset/pack": "pack", "/reset/next": "next", "/reset/previous": "previous"}
         mode = modes.get(self.path.split("?", 1)[0])
@@ -51,7 +82,7 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         if mode is None:
             self.send_error(404)
         elif self.match is None or self.match.stopped.is_set():
-            self.send_error(503, "No checkpoint is running")
+            self.send_error(503, "No playback is running")
         else:
             try:
                 self.match.request_reset(mode)
@@ -74,7 +105,7 @@ class ViewerHandler(SimpleHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Watch a Goddard checkpoint in the browser.")
+    parser = argparse.ArgumentParser(description="Watch a Goddard checkpoint or expert demonstrations in the browser.")
     parser.add_argument("checkpoint", nargs="?", type=Path, help="trusted local checkpoint")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample", action="store_true", help="sample policy actions instead of choosing the most likely")
@@ -83,6 +114,13 @@ def main():
     parser.add_argument("--mesh", type=Path, default=os.environ.get("CARL_ARENA_OBJ", DEFAULT_MESH))
     parser.add_argument("--replay-dir", type=Path, help="override the checkpoint's replay reset directory")
     parser.add_argument("--training-pack", type=Path, help="trusted Python file exporting PACK")
+    parser.add_argument(
+        "--expert-demos", nargs="?", type=Path, const=DEFAULT_EXPERT_DEMOS,
+        help="play parsed human states from an audit JSON, aerial index (default), or .npy; no GPU/checkpoint",
+    )
+    parser.add_argument("--demo-index", type=int, default=1, help="initial demonstration, numbered from 1")
+    parser.add_argument("--demo-speed", type=float, default=1., help="expert playback speed, .1–4 (default: 1)")
+    parser.add_argument("--demo-context", type=float, default=1., help="seconds before takeoff and after landing (default: 1)")
     args = parser.parse_args()
     mesh = args.mesh.expanduser().resolve()
 
@@ -101,9 +139,24 @@ def main():
     if args.training_pack is not None and (args.checkpoint is not None or args.replay_dir is not None):
         parser.error("--training-pack cannot be combined with a checkpoint or --replay-dir")
 
+    if args.expert_demos is not None:
+        if not args.expert_demos.is_file():
+            parser.error(f"expert demonstrations not found: {args.expert_demos}")
+        if args.checkpoint is not None or args.training_pack is not None or args.sample:
+            parser.error("--expert-demos cannot be combined with a checkpoint, --training-pack, or --sample")
+
     match = None
 
-    if args.training_pack is not None:
+    if args.expert_demos is not None:
+        from vis.expert import ExpertMatch
+
+        try:
+            match = ExpertMatch(args.expert_demos, args.replay_dir, args.demo_index,
+                                args.demo_speed, args.demo_context)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        print(f"Loaded {len(match.demos):,} expert demonstrations. Blue car #1 is the canonical ego.", flush=True)
+    elif args.training_pack is not None:
         from vis.pack import PackMatch
 
         match = PackMatch(args.training_pack, seed=args.seed)
@@ -112,7 +165,7 @@ def main():
 
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
-        if payload.get("algorithm") == "pack-ppo" or payload.get("format") == "carl-training-pack-ppo-v1":
+        if payload.get("format") == "carl-training-pack-ppo-v1":
             if args.replay_dir is not None:
                 parser.error("--replay-dir is not supported for training-pack checkpoints")
 

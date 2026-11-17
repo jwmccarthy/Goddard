@@ -11,6 +11,31 @@
   </head>
   <body>
     <main id="viewport" aria-label="Match viewer">
+      <section id="expert-info" aria-label="Expert demonstration playback" hidden>
+        <strong>Expert demonstration · blue car #1</strong>
+        <label class="expert-select">Clip <select id="expert-clip" aria-label="Choose demonstration"></select></label>
+        <div class="expert-buttons">
+          <button id="expert-previous" title="Previous clip (B)">Previous</button>
+          <button id="expert-restart" title="Restart clip (R)">Restart</button>
+          <button id="expert-core" title="Pause at the first audited core frame">Core</button>
+          <button id="expert-play" title="Play/pause (Space)">Pause</button>
+          <button id="expert-next" title="Next clip (N)">Next</button>
+        </div>
+        <input id="expert-seek" type="range" min="0" max="0" value="0" step="1" aria-label="Seek demonstration frame">
+        <div class="expert-buttons">
+          <button id="expert-back" title="Previous canonical frame (Left arrow)">− frame</button>
+          <button id="expert-forward" title="Next canonical frame (Right arrow)">+ frame</button>
+          <label>Speed <select id="expert-speed" aria-label="Playback speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+          <label><input id="expert-loop" type="checkbox" checked> Loop clip</label>
+        </div>
+        <div id="expert-time"></div>
+        <div id="expert-phase"></div>
+        <div id="expert-metrics"></div>
+        <div id="expert-source"></div>
+        <div id="expert-scores"></div>
+        <div id="expert-error" role="status"></div>
+        <small>Parsed human replay states, not a simulated bot or raw video. Controls unavailable; pads omitted. Camera: 0 / 1 / 2.</small>
+      </section>
       <section id="training-info" aria-label="Training exercise" hidden>
         <ol id="training-stages" aria-label="Exercise stages"></ol>
       </section>

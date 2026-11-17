@@ -1,0 +1,241 @@
+{
+  "format": "goddard-skill-clips-v1",
+  "source": {
+    "file": "10026943886942125204-0-1fdc199f-465d-4a57-abcf-a64e67e5f459.npy",
+    "sha256": "0da433c6f59bce14ba1518f0002a13c285e4f1b5f168412f461ec510d0927d9a",
+    "frame_count": 612,
+    "frameskip": 4
+  },
+  "frame_indexing": "zero-based-half-open",
+  "skills": [
+    {
+      "id": "65bba97a-b058-4d9b-b819-e0b02cf83b64",
+      "name": "Kickoff",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "07b49a8d-509f-4e7c-8f6a-16f1cb532ad5",
+          "start_frame": 0,
+          "end_frame": 102,
+          "performer": "blue"
+        },
+        {
+          "id": "ecf31b63-0e6a-47f2-81c8-352fcb948de3",
+          "start_frame": 0,
+          "end_frame": 96,
+          "performer": "orange"
+        }
+      ]
+    },
+    {
+      "id": "0147191d-d702-4d59-ab0d-1eea9cfb9af7",
+      "name": "Speedflip",
+      "color": "#ba9ce0",
+      "clips": [
+        {
+          "id": "7bec6242-1c7b-40f7-ac81-012182e7875b",
+          "start_frame": 0,
+          "end_frame": 58,
+          "performer": "blue"
+        },
+        {
+          "id": "9c67c8a5-4778-48f1-a118-7c53a176114a",
+          "start_frame": 0,
+          "end_frame": 56,
+          "performer": "orange"
+        },
+        {
+          "id": "a62023c5-b364-4933-b5dc-d77646b47f1a",
+          "start_frame": 103,
+          "end_frame": 141,
+          "performer": "blue"
+        },
+        {
+          "id": "3244e453-2476-4a2a-a970-f1e7e1b213bd",
+          "start_frame": 274,
+          "end_frame": 314,
+          "performer": "orange"
+        },
+        {
+          "id": "da127115-b5d1-42a8-95f8-b5697a5577ed",
+          "start_frame": 494,
+          "end_frame": 535,
+          "performer": "blue"
+        },
+        {
+          "id": "374cc595-4ba5-4d2e-aa16-536a9895e224",
+          "start_frame": 535,
+          "end_frame": 574,
+          "performer": "blue"
+        }
+      ]
+    },
+    {
+      "id": "ebb7b184-9cb3-494e-a330-27902203edff",
+      "name": "Dribble",
+      "color": "#81c8a4",
+      "clips": [
+        {
+          "id": "015bf755-5754-4cf9-b595-ca847694a6c3",
+          "start_frame": 219,
+          "end_frame": 238,
+          "performer": "orange"
+        }
+      ]
+    },
+    {
+      "id": "1169a922-9f68-4b1c-9703-a578a35b6ab8",
+      "name": "Flick",
+      "color": "#e0b77c",
+      "clips": []
+    },
+    {
+      "id": "1b5054fe-a1f7-4490-a258-a17f10467f4d",
+      "name": "Half Flip",
+      "color": "#df8e9c",
+      "clips": [
+        {
+          "id": "3990a927-aa7b-423f-b042-b1635779714c",
+          "start_frame": 362,
+          "end_frame": 410,
+          "performer": "orange"
+        }
+      ]
+    },
+    {
+      "id": "1bd05f5b-3f2a-4fa5-9959-430db0c34dcf",
+      "name": "Wavedash",
+      "color": "#8acbd0",
+      "clips": [
+        {
+          "id": "6c1bd62c-86f8-4fa7-b735-c078e36f0c05",
+          "start_frame": 80,
+          "end_frame": 92,
+          "performer": "orange"
+        },
+        {
+          "id": "5bb57e26-dbb7-430c-99f8-7b068308bba9",
+          "start_frame": 502,
+          "end_frame": 531,
+          "performer": "orange"
+        }
+      ]
+    },
+    {
+      "id": "fe698303-0f15-4958-93e5-2875f14de64c",
+      "name": "Shot",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "8fcead01-001d-4f26-b062-7336a720b41d",
+          "start_frame": 571,
+          "end_frame": 606,
+          "performer": "orange"
+        }
+      ]
+    },
+    {
+      "id": "6c32df66-c5e6-459d-82c0-9fcfaa99177e",
+      "name": "Walldash",
+      "color": "#e7cb7b",
+      "clips": []
+    },
+    {
+      "id": "f9ed3e31-910f-4349-8ed5-bb5c0bc739d2",
+      "name": "Air Dribble",
+      "color": "#73cde2",
+      "clips": []
+    },
+    {
+      "id": "d2caec1f-ba9c-4def-934e-3d77736e870f",
+      "name": "Flip Reset",
+      "color": "#dba2ee",
+      "clips": []
+    },
+    {
+      "id": "62ddf34f-8d52-419c-ae3c-23568bab5a4f",
+      "name": "Air Dribble Bump",
+      "color": "#efad72",
+      "clips": []
+    },
+    {
+      "id": "1e55db56-5d1f-48e6-9713-5ae68676af47",
+      "name": "Defend Air Dribble",
+      "color": "#7fa6e8",
+      "clips": []
+    },
+    {
+      "id": "95800aab-17cc-48b1-a367-f6f74cf24121",
+      "name": "Defend Flick",
+      "color": "#c29bd8",
+      "clips": []
+    },
+    {
+      "id": "60f13de8-93b9-4d49-a5c5-292cc7044f72",
+      "name": "Recovery",
+      "color": "#9cbfa7",
+      "clips": [
+        {
+          "id": "deda0bdd-e201-4fa9-8f57-47b293161882",
+          "performer": "blue",
+          "start_frame": 72,
+          "end_frame": 102,
+          "note": "Reorients and lands after the kickoff challenge; floor contact at 98."
+        },
+        {
+          "id": "368427c1-1853-4233-833c-fc80324e3683",
+          "performer": "orange",
+          "start_frame": 72,
+          "end_frame": 96,
+          "note": "Post-kickoff landing preparation, including the landing wavedash at 83 and floor contact at 88."
+        },
+        {
+          "id": "6ea78365-b1f4-4167-87bd-f9da23efc1c3",
+          "performer": "orange",
+          "start_frame": 244,
+          "end_frame": 258,
+          "note": "Short landing recovery after the contested dribble pop at 236-242; lands at 252."
+        },
+        {
+          "id": "f395c351-32e7-40bf-926c-4accb36ba9d4",
+          "performer": "blue",
+          "start_frame": 246,
+          "end_frame": 280,
+          "note": "Reorients and descends after the aerial challenge against Orange's pop at 239-242; lands at 274."
+        },
+        {
+          "id": "16b296c8-2135-4686-85d1-a50ecc8675f9",
+          "performer": "orange",
+          "start_frame": 380,
+          "end_frame": 406,
+          "note": "Post-clearance/backflip roll and landing after the goal-side touches at 370-377; floor contact at 400."
+        },
+        {
+          "id": "95f7e26c-c0d9-4c7e-8f39-287a0c23c354",
+          "performer": "blue",
+          "start_frame": 474,
+          "end_frame": 494,
+          "note": "Recovery from the corner-wall challenge, aligning for the floor and using the late dodge at 489; lands at 490."
+        },
+        {
+          "id": "3c518e57-590a-4fd2-9184-f318ee3d683c",
+          "performer": "orange",
+          "start_frame": 488,
+          "end_frame": 527,
+          "note": "Recovery from the low wall challenge: wall/apron contact around 495, hop off the wall and landing wavedash at 518; floor contact at 521."
+        },
+        {
+          "id": "068b8a5e-3134-4515-8420-e07a0f61e593",
+          "performer": "orange",
+          "start_frame": 584,
+          "end_frame": 612,
+          "note": "Post-shot roll recovery after the strike at 575-577, through landing at 606 and immediate stabilization."
+        }
+      ]
+    }
+  ],
+  "viewer": {
+    "car_colors": {},
+    "ball_color": "#f0eee4"
+  }
+}

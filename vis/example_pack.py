@@ -12,7 +12,7 @@ from carl.training import (
     Uniform,
 )
 
-from training.wall_flip_reset import wall_flip_reset_exercise
+from vis.packs.wall_flip_reset import wall_flip_reset_exercise
 
 
 def falling_stages():

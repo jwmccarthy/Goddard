@@ -1,0 +1,243 @@
+{
+  "format": "goddard-skill-clips-v1",
+  "source": {
+    "file": "10026943886942125204-1-b7985902-39f6-4c8d-a456-113572d3b946.npy",
+    "sha256": "2f56b0cf4b172514ec6f3f3dd82273adfbd4650483ffe21b4f5a18b03c234fa6",
+    "frame_count": 511,
+    "frameskip": 4
+  },
+  "frame_indexing": "zero-based-half-open",
+  "skills": [
+    {
+      "id": "47ea6dbb-f6a4-4f7b-98b5-c79dea924bf7",
+      "name": "Kickoff",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "56a0f4cc-66bd-44b9-b26b-889369262991",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 93
+        },
+        {
+          "id": "d871bb97-0433-42e8-9227-7e1d8e518302",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 93
+        }
+      ]
+    },
+    {
+      "id": "b8375b46-5457-4346-87ee-0cf213aa9df5",
+      "name": "Speedflip",
+      "color": "#ba9ce0",
+      "clips": [
+        {
+          "id": "a447c4a6-29ec-4200-ab12-089dc1efb33d",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 49,
+          "note": "Kickoff diagonal dodge at 15, with pitch cancellation and roll recovery before the separate kickoff challenge."
+        },
+        {
+          "id": "67948072-d51c-4f5c-95a5-a97502d359f8",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 50,
+          "note": "Kickoff diagonal dodge at 16 with pitch cancellation and roll recovery."
+        },
+        {
+          "id": "1cf34663-8973-45ca-a707-923c9fca55b6",
+          "performer": "orange",
+          "start_frame": 90,
+          "end_frame": 132,
+          "note": "Post-kickoff acceleration: jump at 93, diagonal-cancel dodge at 96, landing at 128."
+        },
+        {
+          "id": "bc02a962-5407-4b4d-a095-c5538665118e",
+          "performer": "blue",
+          "start_frame": 122,
+          "end_frame": 168,
+          "note": "Retreating acceleration: jump at 126 and diagonal-cancel dodge at 130, landing at 164."
+        },
+        {
+          "id": "d36b7762-315a-41ac-b100-80dfe66e6fb0",
+          "performer": "orange",
+          "start_frame": 379,
+          "end_frame": 426,
+          "note": "Acceleration away from the corner/apron, jump at 383 and diagonal-cancel dodge at 387. Full airborne roll recovery before landing at 422, rather than a wall-arrested dash."
+        }
+      ]
+    },
+    {
+      "id": "c65d9cc5-4bce-4e98-b753-12448212f672",
+      "name": "Dribble",
+      "color": "#81c8a4",
+      "clips": []
+    },
+    {
+      "id": "86f869dc-c43f-45d3-aa47-46b45398877a",
+      "name": "Flick",
+      "color": "#e0b77c",
+      "clips": []
+    },
+    {
+      "id": "3847ba83-ea34-4aa8-a0e0-b4b7282b779d",
+      "name": "Half Flip",
+      "color": "#df8e9c",
+      "clips": []
+    },
+    {
+      "id": "fb6b2f79-8dc8-4d96-a5d0-2dc5d7055e65",
+      "name": "Wavedash",
+      "color": "#8acbd0",
+      "clips": []
+    },
+    {
+      "id": "fa4a690f-c591-4463-bfae-6abc2ef9b8d4",
+      "name": "Walldash",
+      "color": "#e7cb7b",
+      "clips": []
+    },
+    {
+      "id": "fe53bb72-5093-4fc8-9c55-30fc9c1e5fb1",
+      "name": "Shot",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "bc554615-e98d-4eb9-bd48-3a64dced37f5",
+          "performer": "blue",
+          "start_frame": 416,
+          "end_frame": 511,
+          "note": "Aerial dodge at 428 and strike around 429-430 send the ball diagonally across the field toward Orange's goal mouth; includes flight and follow-through to source end. Terminal metadata is unknown, so no scored-goal outcome is asserted."
+        }
+      ]
+    },
+    {
+      "id": "e22670f2-cdf0-41dc-b977-145822722a53",
+      "name": "Air Dribble",
+      "color": "#73cde2",
+      "clips": [
+        {
+          "id": "c7f0f11e-8c2e-453f-84a3-7a395657996d",
+          "performer": "orange",
+          "start_frame": 138,
+          "end_frame": 343,
+          "note": "Wall approach/launch at 151, aerial touches at 180 and 244, then underside reset positioning into Blue's challenge at 298-305. Uses the reset dodge at 315 and gets a further touch at 331 before losing control toward the corner."
+        },
+        {
+          "id": "b30817c2-5dc9-4353-852d-e00fc36fcae7",
+          "performer": "blue",
+          "start_frame": 366,
+          "end_frame": 445,
+          "note": "Corner-to-wall control touches at 374-389, wall launch at 396 and aerial touch at 399, followed by controlled pursuit into the dodge strike at 428-430. The later free ball flight is covered by Shot."
+        }
+      ]
+    },
+    {
+      "id": "39fe8c85-823b-408b-b176-cb627c777bcf",
+      "name": "Flip Reset",
+      "color": "#dba2ee",
+      "clips": [
+        {
+          "id": "23215c22-ac98-42b4-b33c-2d659bb6d9f8",
+          "performer": "orange",
+          "start_frame": 278,
+          "end_frame": 343,
+          "note": "Wheel-on-ball preparation followed by reset at 298-299 during the aerial challenge: ~104 UU center gap, underside alignment ~1.0 and wheel-contact flag at ~676 UU height. Renewed backward dodge at 315 from an inverted posture, followed by touch at 331. Reviewed as reset use/recovery rather than a supported Musty Flick execution."
+        }
+      ]
+    },
+    {
+      "id": "468cc995-740c-4927-ac66-fa6976c7c5d9",
+      "name": "Air Dribble Bump",
+      "color": "#efad72",
+      "clips": []
+    },
+    {
+      "id": "49320d6b-e84c-4cf0-953c-395efb09282d",
+      "name": "Ceiling Shot",
+      "color": "#8acbd0",
+      "clips": []
+    },
+    {
+      "id": "b31e6ffa-88bd-4731-8cd9-81396eb96c57",
+      "name": "Musty Flick",
+      "color": "#80b7d9",
+      "clips": []
+    },
+    {
+      "id": "063b7f43-7ca7-4d27-88ae-ce39d2dc9d71",
+      "name": "Defend Air Dribble",
+      "color": "#7fa6e8",
+      "clips": [
+        {
+          "id": "c67b967d-3c35-470a-8c7c-03c63fec402f",
+          "performer": "blue",
+          "start_frame": 220,
+          "end_frame": 312,
+          "note": "Moves goal-side of Orange's long aerial, launches at 255, dodges at 291 and contests the reset attack at 298-305."
+        },
+        {
+          "id": "76ce8b91-723b-484d-8272-ed81d8457626",
+          "performer": "orange",
+          "start_frame": 396,
+          "end_frame": 511,
+          "note": "Retreats toward Orange goal against Blue's wall-to-air counterattack and subsequent shot, then jumps onto the defensive corner/wall at 503. A defensive response, not an asserted save; source ends before resolution."
+        }
+      ]
+    },
+    {
+      "id": "6326a464-38fb-48bc-8ba0-72eea07d1d77",
+      "name": "Defend Flick",
+      "color": "#c29bd8",
+      "clips": []
+    },
+    {
+      "id": "2ba32ee9-b59b-4e7b-b522-8b98385fcaee",
+      "name": "Recovery",
+      "color": "#9cbfa7",
+      "clips": [
+        {
+          "id": "1adbedcc-b05a-4678-89aa-fe43f4498cc5",
+          "performer": "blue",
+          "start_frame": 64,
+          "end_frame": 93,
+          "note": "Post-kickoff-challenge roll and landing; floor contact at 89."
+        },
+        {
+          "id": "2534f8eb-7436-46b7-8600-e80f21a62bb9",
+          "performer": "orange",
+          "start_frame": 64,
+          "end_frame": 94,
+          "note": "Post-kickoff-challenge roll and landing; floor contact at 90."
+        },
+        {
+          "id": "0f3c4ad0-e571-468b-b5db-c8e8ab9edd0d",
+          "performer": "blue",
+          "start_frame": 312,
+          "end_frame": 351,
+          "note": "Post-aerial-defense roll/righting after the challenge at 298-305; floor contact at 345."
+        },
+        {
+          "id": "01a80e2b-1204-432b-868a-8094083b1545",
+          "performer": "orange",
+          "start_frame": 334,
+          "end_frame": 366,
+          "note": "Post-reset-use/touch descent and landing after contact at 331; floor contact at 360."
+        },
+        {
+          "id": "428e2431-e0f2-4f91-88f0-161ff1562eb8",
+          "performer": "blue",
+          "start_frame": 480,
+          "end_frame": 511,
+          "note": "Late descent and attempted landing after the wall-to-air shot. Reaches the floor roof/side-first near 505-510; source ends before a successful wheels-down recovery."
+        }
+      ]
+    }
+  ],
+  "viewer": {
+    "car_colors": {},
+    "ball_color": "#f0eee4"
+  }
+}

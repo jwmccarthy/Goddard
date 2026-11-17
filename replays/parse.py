@@ -41,15 +41,19 @@ OPP_GOAL = np.array([0.0, 5120.0, 321.3875])
 BOOST_PAD_POSITIONS = np.asarray(CARL_BOOST_PAD_POSITIONS, dtype=np.float32)
 
 # fmt: off
-CARL_TO_RLGYM_PAD = np.array((
-    15, 18, 29, 30, 3, 4, 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12,
-    13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33
-))
+CARL_TO_RLGYM_PAD = np.array(
+    (
+        15, 18, 29, 30, 3, 4, 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12,
+        13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33
+    )
+)
 
-MIRRORED_PAD = np.array((
-    1, 0, 5, 4, 3, 2, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23,
-    22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6
-))
+MIRRORED_PAD = np.array(
+    (
+        1, 0, 5, 4, 3, 2, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23,
+        22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6
+    )
+)
 # fmt: on
 
 BLUE_PADS = CARL_TO_RLGYM_PAD
@@ -73,24 +77,9 @@ def load_replay(path: Path) -> ParsedReplay | None:
         return None
 
 
-def valid_replay(replay: ParsedReplay, team_size: int = 1) -> bool:
-    n_cars = layout.team_car_count(team_size)
-
-    players = {str(player["unique_id"]): player for player in replay.metadata.get("players", [])}
-    active = [players.get(str(player_id)) for player_id in replay.player_dfs]
-    delta = replay.game_df["delta"].to_numpy()
-
-    return (
-        len(active) == n_cars
-        and all(player is not None for player in active)
-        and sum(bool(player["is_orange"]) for player in active) == team_size
-        and np.isfinite(delta).all()
-        and np.isfinite(replay.game_df["time"]).all()
-        and 0 < delta.mean() < 1 / 25
-    )
-
-
-def active_frames(replay: ParsedReplay, include_goals: bool = False) -> list[list[tuple[ReplayFrame, dict]]]:
+def active_frames(
+    replay: ParsedReplay, include_goals: bool = False
+) -> list[list[tuple[ReplayFrame, dict]]]:
     times = replay.game_df["time"].to_numpy() * 120.0
     periods = replay.analyzer["gameplay_periods"]
 
@@ -101,7 +90,7 @@ def active_frames(replay: ParsedReplay, include_goals: bool = False) -> list[lis
                 period["goal_frame"]
                 if period.get("goal_frame") is not None
                 else period["end_frame"]
-            ]
+            ],
         )
         for period in periods
     ]
@@ -124,7 +113,7 @@ def compose_ball(ball: PhysicsObject) -> np.ndarray:
         (
             ball.position / NORM_POS,
             ball.linear_velocity / NORM_BALL_VEL,
-            ball.angular_velocity / NORM_BALL_ANG
+            ball.angular_velocity / NORM_BALL_ANG,
         )
     )
 
@@ -143,8 +132,8 @@ def compose_car(car: Car, physics: PhysicsObject) -> np.ndarray:
                 car.is_demoed,
                 car.has_flipped,
                 car.has_double_jumped,
-                car.is_boosting
-            )
+                car.is_boosting,
+            ),
         )
     )
 
@@ -168,9 +157,9 @@ def compose_internal(car: Car) -> np.ndarray:
             car.autoflip_direction,
             *car.flip_torque,
             car.is_boosting,
-            car.boost_active_time
+            car.boost_active_time,
         ),
-        dtype=np.float32
+        dtype=np.float32,
     )
 
 
@@ -205,28 +194,25 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
 
     boost_features = (
         state.boost_pad_timers[pad_indices] <= 0,
-        np.linalg.norm(BOOST_PAD_POSITIONS - ego_physics.position, axis=-1) / NORM_BOOST_DIST
+        np.linalg.norm(BOOST_PAD_POSITIONS - ego_physics.position, axis=-1) / NORM_BOOST_DIST,
     )
 
     ball_relative = (
         (ball.position - ego_physics.position) / NORM_POS_REL,
-        (ball.linear_velocity - ego_physics.linear_velocity) / NORM_BALL_VEL_REL
+        (ball.linear_velocity - ego_physics.linear_velocity) / NORM_BALL_VEL_REL,
     )
 
     car_relative = [
         np.concatenate(
             (
                 (physics.position - ego_physics.position) / NORM_POS_REL,
-                (physics.linear_velocity - ego_physics.linear_velocity) / NORM_CAR_VEL_REL
+                (physics.linear_velocity - ego_physics.linear_velocity) / NORM_CAR_VEL_REL,
             )
         )
         for physics in car_physics[1:]
     ]
 
-    goals = (
-        (OWN_GOAL - ball.position) / NORM_POS_REL,
-        (OPP_GOAL - ball.position) / NORM_POS_REL
-    )
+    goals = ((OWN_GOAL - ball.position) / NORM_POS_REL, (OPP_GOAL - ball.position) / NORM_POS_REL)
 
     other_cars = [car for car_id, car in state.cars.items() if car_id != ego_id]
 
@@ -235,9 +221,9 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
             ego.ball_touches > 0,
             any(car.ball_touches > 0 for car in other_cars),
             ego.bump_victim_id is not None
-            or any(car.bump_victim_id == ego_id for car in other_cars)
+            or any(car.bump_victim_id == ego_id for car in other_cars),
         ),
-        dtype=np.float32
+        dtype=np.float32,
     )
 
     car_observations = [
@@ -253,17 +239,12 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
             *car_relative,
             *goals,
             compose_internal(ego),
-            events
+            events,
         )
     )
 
 
-def interpolate(
-    rows: np.ndarray,
-    ticks: np.ndarray,
-    invalid: np.ndarray,
-    columns: slice
-) -> None:
+def interpolate(rows: np.ndarray, ticks: np.ndarray, invalid: np.ndarray, columns: slice) -> None:
     indices = np.flatnonzero(invalid) + 1
 
     for column in range(columns.start, columns.stop):
@@ -297,7 +278,10 @@ def observation_car_count(rows: np.ndarray) -> int:
     width = rows.shape[-1]
 
     for team_size in layout.TEAM_SIZES:
-        if width == layout.team_observation_size(team_size) + layout.INTERNAL_SIZE + layout.EVENT_SIZE:
+        if (
+            width
+            == layout.team_observation_size(team_size) + layout.INTERNAL_SIZE + layout.EVENT_SIZE
+        ):
             return layout.team_car_count(team_size)
 
     raise ValueError("replay observations must contain two, four, or six cars")
@@ -321,17 +305,13 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
 
     resampled = np.stack(
         [np.interp(target_ticks, ticks, rows[:, column]) for column in range(rows.shape[1])],
-        axis=-1
+        axis=-1,
     )
 
     right = np.searchsorted(ticks, target_ticks).clip(0, len(ticks) - 1)
     left = (right - 1).clip(0, len(ticks) - 1)
 
-    nearest = np.where(
-        target_ticks - ticks[left] <= ticks[right] - target_ticks,
-        left,
-        right
-    )
+    nearest = np.where(target_ticks - ticks[left] <= ticks[right] - target_ticks, left, right)
 
     for index in range(n_cars):
         car = 9 + 21 * index
@@ -355,9 +335,9 @@ def resample(ticks: np.ndarray, rows: np.ndarray, frame_skip: int) -> np.ndarray
     discrete.extend(internal_start + field for field in INTERNAL_DISCRETE_FIELDS)
 
     resampled[:, discrete] = rows[nearest][:, discrete]
-    resampled[:, -layout.EVENT_SIZE:] = 0
+    resampled[:, -layout.EVENT_SIZE :] = 0
 
-    for source, event in np.argwhere(rows[:, -layout.EVENT_SIZE:] > 0.5):
+    for source, event in np.argwhere(rows[:, -layout.EVENT_SIZE :] > 0.5):
         target = np.abs(target_ticks - ticks[source]).argmin()
         resampled[target, -layout.EVENT_SIZE + event] = 1
 
@@ -370,7 +350,9 @@ def mark_discontinuities(rows: np.ndarray, frame_skip: int) -> np.ndarray:
     if len(rows) < 2:
         return np.pad(rows, ((0, 0), (0, 1)))
 
-    touches = rows[:-1, -layout.EVENT_SIZE:].any(axis=-1) | rows[1:, -layout.EVENT_SIZE:].any(axis=-1)
+    touches = rows[:-1, -layout.EVENT_SIZE :].any(axis=-1) | rows[1:, -layout.EVENT_SIZE :].any(
+        axis=-1
+    )
 
     discontinuity = np.zeros(len(rows) - 1, dtype=bool)
 
@@ -392,13 +374,7 @@ def mark_discontinuities(rows: np.ndarray, frame_skip: int) -> np.ndarray:
             & ~touches
         )
 
-    return np.concatenate(
-        (
-            rows,
-            np.pad(discontinuity[:, None], ((1, 0), (0, 0)))
-        ),
-        axis=-1
-    )
+    return np.concatenate((rows, np.pad(discontinuity[:, None], ((1, 0), (0, 0)))), axis=-1)
 
 
 def parse_replay(
@@ -406,24 +382,10 @@ def parse_replay(
     name: str,
     output_dir: Path,
     frame_skip: int,
-    pov_players: tuple[str, ...] | None = None,
     team_size: int = 1,
     include_goals: bool = False,
-    segment_consumer=None
 ) -> int:
     n_cars = layout.team_car_count(team_size)
-    metadata_players = replay.metadata.get("players", [])
-
-    selected = None
-
-    if pov_players is not None:
-        selected = {str(player_id).lower() for player_id in pov_players}
-        available = {str(player.get("online_id")).lower() for player in metadata_players}
-        missing = selected - available
-
-        if missing:
-            raise ValueError(f"requested POV IDs not present in replay: {sorted(missing)}")
-
     segments = active_frames(replay, include_goals=include_goals)
 
     if not segments or not any(segments):
@@ -438,19 +400,6 @@ def parse_replay(
         raise ValueError(f"replay does not have {team_size} cars per team")
 
     ego_ids = list(first.state.cars)
-
-    if selected is not None:
-        cars_by_id = {str(car_id): car_id for car_id in first.state.cars}
-
-        ego_ids = [
-            cars_by_id[str(player["unique_id"])]
-            for player in metadata_players
-            if str(player.get("online_id")).lower() in selected
-            and str(player["unique_id"]) in cars_by_id
-        ]
-
-        if len(ego_ids) != len(selected):
-            raise ValueError("requested POV IDs must map to exactly one active car each")
 
     written = 0
 
@@ -493,7 +442,7 @@ def parse_replay(
                     )
                     for _, errors in samples
                 ],
-                dtype=np.float32
+                dtype=np.float32,
             )
 
             rows = np.concatenate((rows, corrections[:, None]), axis=-1)
@@ -509,34 +458,30 @@ def parse_replay(
             if not np.isfinite(rows).all():
                 continue
 
-            metadata = {}
+            metadata = {"frameskip": frame_skip, "team_size": team_size}
             if include_goals:
                 scoring_team = samples[-1][0].state.scoring_team if terminal else None
                 if terminal and scoring_team not in (0, 1):
                     raise ValueError("goal frame has no valid scoring team")
-                metadata = {
-                    "goal_terminal": terminal,
-                    "terminal_reason": "goal" if terminal else "unknown",
-                    "goal_outcome": ("scored" if scoring_team == ego.team_num else "conceded") if terminal else None
-                }
-            if segment_consumer is not None:
-                # Selection happens before any dense files are written. The
-                # consumer sees complete original segments, never phase clips.
-                player = next(p for p in metadata_players if str(p["unique_id"]) == str(ego_id))
-                segment_consumer(rows, {**metadata, "ego_id": str(ego_id), "period": period,
-                                        "online_id": str(player.get("online_id")), "is_orange": bool(ego.team_num)})
-            else:
-                path = output_dir / f"{ego_id}-{period}-{name}.npy"
-                np.save(path, rows)
-                if include_goals:
-                    path.with_suffix(".json").write_text(json.dumps(metadata) + "\n")
+                metadata.update(
+                    {
+                        "goal_terminal": terminal,
+                        "terminal_reason": "goal" if terminal else "unknown",
+                        "goal_outcome": ("scored" if scoring_team == ego.team_num else "conceded")
+                        if terminal
+                        else None,
+                    }
+                )
+            path = output_dir / f"{ego_id}-{period}-{name}.npy"
+            np.save(path, rows)
+            path.with_suffix(".json").write_text(json.dumps(metadata) + "\n")
             written += 1
 
     return written
 
 
 def parse_path(job) -> tuple[str, str]:
-    replay_path, output_path, frame_skip, pov_players, team_size, *options = job
+    replay_path, output_path, frame_skip, team_size, *options = job
     include_goals = options[0] if options else False
 
     path = Path(replay_path)
@@ -551,24 +496,15 @@ def parse_path(job) -> tuple[str, str]:
         if replay is None:
             return path.name, "failed to load"
 
-        if not valid_replay(replay, team_size):
-            return path.name, "filtered"
-
         with TemporaryDirectory(dir=output_dir) as temporary:
             temporary = Path(temporary)
 
             written = parse_replay(
-                replay,
-                path.stem,
-                temporary,
-                frame_skip,
-                pov_players,
-                team_size,
-                include_goals
+                replay, path.stem, temporary, frame_skip, team_size, include_goals
             )
 
             if not written:
-                return path.name, "filtered"
+                return path.name, "failed (no structurally valid observation periods)"
 
             for output in temporary.iterdir():
                 output.replace(output_dir / output.name)
@@ -579,27 +515,13 @@ def parse_path(job) -> tuple[str, str]:
         return path.name, f"failed ({type(error).__name__}: {error})"
 
 
-def load_pov_manifest(path: Path) -> dict[str, tuple[str, ...]]:
-    if not path.is_file():
-        return {}
-
-    content = json.loads(path.read_text())
-
-    return {
-        str(key).lower(): tuple(value)
-        for key, value in content.items()
-        if isinstance(value, list) and value
-    }
-
-
 def parse(
     replay_dir: str | Path = RAW_DIR,
     output_dir: str | Path = PARSED_DIR,
     frame_skip: int = 4,
     workers: int = 1,
-    pov_manifest: str | Path | None = None,
     team_size: int = 1,
-    include_goals: bool = False
+    include_goals: bool = False,
 ) -> None:
     layout.team_car_count(team_size)
 
@@ -613,7 +535,7 @@ def parse(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if include_goals:
-        metadata_path = output_dir / "dac_metadata.json"
+        metadata_path = output_dir / "goal_metadata.json"
         metadata = {"format": "goal-terminal-v1", "frameskip": frame_skip, "team_size": team_size}
         if metadata_path.exists():
             if json.loads(metadata_path.read_text()) != metadata:
@@ -623,22 +545,9 @@ def parse(
         else:
             metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
-    manifest_path = Path(pov_manifest) if pov_manifest else replay_dir / "pov_players.json"
-    manifest = load_pov_manifest(manifest_path)
-
     paths = sorted(replay_dir.glob("*.replay"))
 
-    jobs = [
-        (
-            str(path),
-            str(output_dir),
-            frame_skip,
-            manifest.get(path.stem.lower()),
-            team_size,
-            include_goals
-        )
-        for path in paths
-    ]
+    jobs = [(str(path), str(output_dir), frame_skip, team_size, include_goals) for path in paths]
 
     failures = []
 
@@ -665,9 +574,11 @@ def main() -> None:
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--team-size", type=int, choices=layout.TEAM_SIZES, default=1)
-    parser.add_argument("--pov-manifest", type=Path)
-    parser.add_argument("--include-goals", action="store_true",
-                        help="include goal frames and write terminal metadata alongside parsed files")
+    parser.add_argument(
+        "--include-goals",
+        action="store_true",
+        help="include goal frames and write terminal metadata alongside parsed files",
+    )
     args = parser.parse_args()
 
     parse(
@@ -675,9 +586,8 @@ def main() -> None:
         output_dir=args.output_dir,
         frame_skip=args.frameskip,
         workers=args.workers,
-        pov_manifest=args.pov_manifest,
         team_size=args.team_size,
-        include_goals=args.include_goals
+        include_goals=args.include_goals,
     )
 
 

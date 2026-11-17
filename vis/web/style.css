@@ -1,6 +1,20 @@
 html, body, #viewport { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #0b1220; }
 canvas { display: block; touch-action: none; }
 
+#expert-info { position: absolute; z-index: 2; top: 20px; left: 20px; width: min(460px, calc(100vw - 64px)); max-height: calc(100vh - 64px); overflow: auto; padding: 12px; border: 1px solid #ffffff30; border-radius: 5px; color: #e5edf6; background: #171a1eef; font: 13px/1.5 system-ui, sans-serif; }
+#expert-info[hidden] { display: none; }
+#expert-info strong { display: block; margin-bottom: 8px; }
+#expert-info button, #expert-info select { padding: 4px 7px; color: #edf4ff; background: #2b3544; border: 1px solid #637184; border-radius: 3px; }
+#expert-info button { cursor: pointer; }
+.expert-select { display: flex; gap: 8px; align-items: center; }
+#expert-clip { min-width: 0; flex: 1; }
+.expert-buttons { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+#expert-seek { width: 100%; margin: 5px 0; }
+#expert-phase { color: #8bdfb9; font-weight: 600; }
+#expert-source { overflow-wrap: anywhere; color: #aebbc9; font-size: 11px; }
+#expert-info small { display: block; color: #aebbc9; margin-top: 8px; }
+#expert-error { color: #ffb2a8; }
+
 #viewport { position: relative; }
 #training-info {
   position: absolute;

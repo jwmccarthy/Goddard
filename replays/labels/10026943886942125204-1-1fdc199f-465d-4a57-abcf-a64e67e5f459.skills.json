@@ -1,0 +1,469 @@
+{
+  "format": "goddard-skill-clips-v1",
+  "source": {
+    "file": "10026943886942125204-1-1fdc199f-465d-4a57-abcf-a64e67e5f459.npy",
+    "sha256": "f47a7719dd617bcbd4c685abf9ec2837def1546033cef8569623a6db9b5a2ab4",
+    "frame_count": 1446,
+    "frameskip": 4
+  },
+  "frame_indexing": "zero-based-half-open",
+  "skills": [
+    {
+      "id": "cdfa95e0-a39c-4839-88c6-c1d4dcb5247f",
+      "name": "Kickoff",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "a5c515b9-af24-46a6-9d85-b9919bd2dea1",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 94
+        },
+        {
+          "id": "96f62629-7a73-49cf-b1f7-514534f3cc29",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 95
+        }
+      ]
+    },
+    {
+      "id": "81a2af23-4384-493e-a257-0db2302a40dc",
+      "name": "Speedflip",
+      "color": "#ba9ce0",
+      "clips": [
+        {
+          "id": "54bfb935-8a5a-42f5-92a8-bba62cf23276",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 51
+        },
+        {
+          "id": "94a49be1-0816-429a-a1b1-346e9deacd08",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 52
+        },
+        {
+          "id": "b6912c83-903b-4c80-b48b-00c8c4d28977",
+          "performer": "orange",
+          "start_frame": 136,
+          "end_frame": 178
+        },
+        {
+          "id": "412ae2e5-2669-4d20-9e05-2758801e9424",
+          "performer": "orange",
+          "start_frame": 279,
+          "end_frame": 324
+        },
+        {
+          "id": "8fbd0f32-6a98-4552-ab26-72e0b2af16dd",
+          "performer": "orange",
+          "start_frame": 716,
+          "end_frame": 762
+        },
+        {
+          "id": "c49fe980-cb97-45b6-9993-7a7e13e3b5cb",
+          "performer": "orange",
+          "start_frame": 880,
+          "end_frame": 922
+        },
+        {
+          "id": "03d371e2-c406-4c59-880e-fadb440de232",
+          "performer": "blue",
+          "start_frame": 1053,
+          "end_frame": 1092
+        },
+        {
+          "id": "7f75bffa-2c29-4c70-9a15-0caaed359b68",
+          "performer": "orange",
+          "start_frame": 1065,
+          "end_frame": 1106
+        },
+        {
+          "id": "913a881c-8241-4bfc-a530-9be93cf7ca61",
+          "performer": "orange",
+          "start_frame": 1327,
+          "end_frame": 1367
+        },
+        {
+          "id": "74084d8b-df7f-4a77-86cb-1f643d7b354b",
+          "performer": "orange",
+          "start_frame": 1366,
+          "end_frame": 1408
+        }
+      ]
+    },
+    {
+      "id": "82b6d25a-b646-42ed-b5c3-391eaab8d9ee",
+      "name": "Dribble",
+      "color": "#81c8a4",
+      "clips": [
+        {
+          "id": "1bfbbedb-06fc-4616-bf5b-8bc698efe922",
+          "performer": "blue",
+          "start_frame": 451,
+          "end_frame": 473,
+          "note": "Catch into a short supported front/roof carry, with touches at 457, 464 and 472, leading into the flick."
+        },
+        {
+          "id": "7a7f48ba-4c61-4e4b-b816-707a90e5b18b",
+          "performer": "blue",
+          "start_frame": 826,
+          "end_frame": 939,
+          "note": "Catch and sustained roof carry with repeated supporting touches, accelerating out of the Blue end before the jump at 938."
+        }
+      ]
+    },
+    {
+      "id": "04bd5fe1-c543-4c38-b92b-84fde479eff5",
+      "name": "Flick",
+      "color": "#e0b77c",
+      "clips": [
+        {
+          "id": "5c2be275-5186-4e2f-8d08-9dede66942a3",
+          "performer": "blue",
+          "start_frame": 471,
+          "end_frame": 512,
+          "note": "Jump from the carry at 472, diagonal dodge at 477 and release touch 479; includes landing/recovery. Orange blocks the shot at 490."
+        },
+        {
+          "id": "417bad18-47a7-4673-a07d-760925655931",
+          "performer": "blue",
+          "start_frame": 937,
+          "end_frame": 989,
+          "note": "Jump from the long roof carry at 938, turn into a side/diagonal flick at 949, then recovery through landing at 985."
+        }
+      ]
+    },
+    {
+      "id": "bce29f16-0bf0-47b2-9a49-03ee8db7e5d4",
+      "name": "Half Flip",
+      "color": "#df8e9c",
+      "clips": [
+        {
+          "id": "33d9fd92-2eae-4624-b844-e59e76acb0dc",
+          "performer": "blue",
+          "start_frame": 118,
+          "end_frame": 160,
+          "note": "Backward travel into backflip at 124, pitch cancellation and roll upright; lands facing the opposite direction at 155."
+        },
+        {
+          "id": "cff2a422-f614-4b0f-bdea-86ff8aa38cdf",
+          "performer": "blue",
+          "start_frame": 754,
+          "end_frame": 795,
+          "note": "Defensive backflip-cancel and roll recovery: ball touch 759 stops the shot, then the car reverses heading and lands upright at 789. Hybrid save/recovery rather than a carried-ball flick."
+        },
+        {
+          "id": "731562c2-6636-4319-9365-a4ba4368afc8",
+          "performer": "orange",
+          "start_frame": 840,
+          "end_frame": 881,
+          "note": "Backward travel, backflip at 846 and roll recovery to opposite heading at 879; ends before the next speedflip."
+        }
+      ]
+    },
+    {
+      "id": "3e2d7195-6ea5-437c-be83-7619c1ff9ed1",
+      "name": "Wavedash",
+      "color": "#8acbd0",
+      "clips": [
+        {
+          "id": "df949583-d195-429b-9d08-e8ca75cdfa0d",
+          "performer": "orange",
+          "start_frame": 367,
+          "end_frame": 406,
+          "note": "Jump interception at 373 followed by a late landing dodge at 400; wheel contact returns at 402. Includes the full hop and recovery."
+        }
+      ]
+    },
+    {
+      "id": "7c0f783d-0d20-40f3-8263-6e06e66b7bcf",
+      "name": "Walldash",
+      "color": "#e7cb7b",
+      "clips": []
+    },
+    {
+      "id": "00e1a0cd-25f7-4bc9-8ed0-6a899e084eeb",
+      "name": "Shot",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "6cbafff5-f72c-4b63-9031-ce697bf57f26",
+          "performer": "blue",
+          "start_frame": 471,
+          "end_frame": 512,
+          "note": "Carry-to-flick shot at 479 toward Orange goal, blocked at 490."
+        },
+        {
+          "id": "e5498316-0dc6-4f84-b5af-4d5096c5ecd6",
+          "performer": "orange",
+          "start_frame": 716,
+          "end_frame": 764,
+          "note": "Dodge attack at 722-724 toward Blue goal; Blue backflip-save touch at 759."
+        },
+        {
+          "id": "d2ac8f3d-557d-451b-932e-746c13c8b338",
+          "performer": "blue",
+          "start_frame": 937,
+          "end_frame": 1005,
+          "note": "Flick shot at 949 travels toward Orange goal; Orange makes an aerial save at 996-998."
+        },
+        {
+          "id": "59b1d59a-7d55-4165-b960-ee211d415015",
+          "performer": "orange",
+          "start_frame": 1254,
+          "end_frame": 1318,
+          "note": "Delayed reset dodge at 1259, shot touch 1265 toward Blue goal; Blue saves at 1277. Includes Orange landing/recovery."
+        },
+        {
+          "id": "8f251a7d-6de9-472b-8228-fe1c0b050510",
+          "performer": "blue",
+          "start_frame": 1350,
+          "end_frame": 1446,
+          "note": "Aerial approach and dodge strike at 1387, with follow-through to the goal-terminal end. Source metadata records a scored goal."
+        }
+      ]
+    },
+    {
+      "id": "448b3cfa-d84c-40b1-8746-0b32e0d33f16",
+      "name": "Air Dribble",
+      "color": "#73cde2",
+      "clips": [
+        {
+          "id": "c87a4bbc-1df3-419b-9391-4f830266f693",
+          "performer": "orange",
+          "start_frame": 1128,
+          "end_frame": 1318,
+          "note": "Side-wall setup and launch, underside reset, further aerial touch at 1224, delayed dodge shot and landing. Blue saves the shot."
+        }
+      ]
+    },
+    {
+      "id": "629407e1-863e-4baf-8f69-aadf93e5344a",
+      "name": "Flip Reset",
+      "color": "#dba2ee",
+      "clips": [
+        {
+          "id": "2a7cdacd-1e78-45d2-a55c-1df61f809dc0",
+          "performer": "orange",
+          "start_frame": 1178,
+          "end_frame": 1276,
+          "note": "Underside-to-ball contact around 1189-1191: minimum center gap ~112 uu, underside alignment ~0.98, car height ~1500 uu. The dodge at 1259 occurs ~3.8 seconds after wall launch 1144. Reset inferred from geometry plus late dodge; the 30 Hz ground flag misses acquisition. Includes delayed use and shot touch 1265."
+        }
+      ]
+    },
+    {
+      "id": "053924a0-1591-4855-8b06-d591ffba9d9c",
+      "name": "Air Dribble Bump",
+      "color": "#efad72",
+      "clips": []
+    },
+    {
+      "id": "fb196221-8d0c-4056-b5b5-1328dcd1e8ce",
+      "name": "Ceiling Shot",
+      "color": "#8acbd0",
+      "clips": []
+    },
+    {
+      "id": "41370872-7c9c-4c57-aa56-72db8c65959b",
+      "name": "Musty Flick",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "bd531dfd-97a5-4716-a7ea-ca8af5ea9974",
+          "start_frame": 1234,
+          "end_frame": 1289,
+          "performer": "orange"
+        }
+      ]
+    },
+    {
+      "id": "36a8975c-660a-461b-9e68-16fc427ee3d7",
+      "name": "Defend Air Dribble",
+      "color": "#7fa6e8",
+      "clips": [
+        {
+          "id": "262d7682-00b2-4811-84ed-fb5f22a2151e",
+          "performer": "blue",
+          "start_frame": 1170,
+          "end_frame": 1283,
+          "note": "Tracks Orange's wall-to-air/reset attack, positions goal-side, jumps at 1246 and saves at 1277 after the Musty release. Overlaps the narrower Defend Flick response."
+        }
+      ]
+    },
+    {
+      "id": "f683e7f6-a1b8-44ab-b9da-37c2e84a074f",
+      "name": "Defend Flick",
+      "color": "#c29bd8",
+      "clips": [
+        {
+          "id": "2eea605c-d46f-4302-a60e-9fc0f253aa91",
+          "performer": "orange",
+          "start_frame": 451,
+          "end_frame": 498,
+          "note": "Reads Blue's carry-to-flick attack, jumps at 461 ahead of the release at 479 and blocks at 490."
+        },
+        {
+          "id": "6b41364c-a8e6-49f6-bad0-914947194a76",
+          "performer": "orange",
+          "start_frame": 927,
+          "end_frame": 1004,
+          "note": "Tracks Blue's second carry/flick, retreats to the goal, jumps at 972 and saves the flick shot at 996-998."
+        },
+        {
+          "id": "92e2c525-c02d-40e8-9423-55fa54ec4136",
+          "performer": "blue",
+          "start_frame": 1234,
+          "end_frame": 1283,
+          "note": "Specific response to Orange's reset Musty Flick: defensive launch at 1246, Musty release at 1265, dodge at 1274 and save at 1277. Overlaps Defend Air Dribble."
+        }
+      ]
+    },
+    {
+      "id": "c8bb86ba-6f53-4bbe-bd9e-3b5297aa19e7",
+      "name": "Recovery",
+      "color": "#9cbfa7",
+      "clips": [
+        {
+          "id": "7d0424a6-ca8b-4b8e-b091-159b8cd5d5b7",
+          "performer": "orange",
+          "start_frame": 64,
+          "end_frame": 95,
+          "note": "Post-kickoff-challenge roll and landing; floor contact at 90."
+        },
+        {
+          "id": "ba25751a-c04f-47a5-92a6-ba65409bde60",
+          "performer": "blue",
+          "start_frame": 65,
+          "end_frame": 94,
+          "note": "Post-kickoff-challenge roll and landing; floor contact at 89."
+        },
+        {
+          "id": "a5f930a9-b697-4d68-bea9-1018bf63a908",
+          "performer": "orange",
+          "start_frame": 229,
+          "end_frame": 274,
+          "note": "Post-wall-side aerial strike descent and righting, after the touch at 212-215; lands at 268."
+        },
+        {
+          "id": "0d99cdc5-1357-4605-99c9-26e9507e739f",
+          "performer": "blue",
+          "start_frame": 279,
+          "end_frame": 310,
+          "note": "Post-interception roll and landing after the aerial touch at 272; floor contact at 304."
+        },
+        {
+          "id": "75100972-ccbc-49d2-ade8-155fa4618bdf",
+          "performer": "blue",
+          "start_frame": 329,
+          "end_frame": 358,
+          "note": "Post-ball-strike roll and landing after the dodge touch at 323-325; floor contact at 352."
+        },
+        {
+          "id": "9d2ec9c4-2a31-453a-b9ef-640dfeb3b020",
+          "performer": "orange",
+          "start_frame": 380,
+          "end_frame": 406,
+          "note": "Landing preparation after the short jump/challenge at 373, including the landing wavedash at 400; floor contact at 402."
+        },
+        {
+          "id": "37ef06f9-05ef-4af8-b639-4f374a885993",
+          "performer": "blue",
+          "start_frame": 484,
+          "end_frame": 514,
+          "note": "Roll/righting after the flick release at 479-481; lands at 508."
+        },
+        {
+          "id": "02b0bc80-a23a-4ce1-96ff-f704c7a9921a",
+          "performer": "orange",
+          "start_frame": 499,
+          "end_frame": 532,
+          "note": "Post-flick-save descent and roll after contact at 490; floor contact at 526."
+        },
+        {
+          "id": "8f3750cf-c2fc-498c-9cf1-b1d2d9971155",
+          "performer": "orange",
+          "start_frame": 578,
+          "end_frame": 619,
+          "note": "Rights and lands after the aerial dodge/strike at 553-555; floor contact at 613."
+        },
+        {
+          "id": "abbd10cd-a857-4a8c-9d4c-571bd2cbc331",
+          "performer": "blue",
+          "start_frame": 680,
+          "end_frame": 721,
+          "note": "Post-aerial-contest roll and landing after contact at 673-675; floor contact at 715."
+        },
+        {
+          "id": "96bbc5aa-4e6d-42a6-bdda-d83bd6fc6d5a",
+          "performer": "orange",
+          "start_frame": 680,
+          "end_frame": 707,
+          "note": "Post-aerial-contest righting and landing after contact at 675; floor contact at 701."
+        },
+        {
+          "id": "2896bf7e-b4ef-41ad-ad67-aad66c6927ac",
+          "performer": "orange",
+          "start_frame": 733,
+          "end_frame": 764,
+          "note": "Post-shot dodge recovery after the strike at 722-724; floor contact at 758, before the next hop."
+        },
+        {
+          "id": "85fae494-34a8-4f5b-926c-e6aeb4d82f25",
+          "performer": "blue",
+          "start_frame": 764,
+          "end_frame": 795,
+          "note": "Post-backflip-save roll and landing after the goalmouth touch at 759; floor contact at 789."
+        },
+        {
+          "id": "f27819ed-2b28-473e-8536-a45e40ea1c3a",
+          "performer": "orange",
+          "start_frame": 778,
+          "end_frame": 800,
+          "note": "Rights the car onto the goal-side apron after the follow-up jump/challenge; surface contact at 794."
+        },
+        {
+          "id": "dfdcd8c9-08bf-466f-a995-8c905e4ee3bc",
+          "performer": "blue",
+          "start_frame": 957,
+          "end_frame": 991,
+          "note": "Post-flick roll and landing after release at 949; floor contact at 985."
+        },
+        {
+          "id": "fa0471c7-0c86-4a61-9e1b-8dc52e15fc47",
+          "performer": "orange",
+          "start_frame": 1000,
+          "end_frame": 1056,
+          "note": "Post-flick-save recovery onto the goal/back wall at 1011, then turns down toward the floor to resume control."
+        },
+        {
+          "id": "2daf986a-c3fd-4ec0-a1ea-c4c17b70b0ff",
+          "performer": "orange",
+          "start_frame": 1280,
+          "end_frame": 1318,
+          "note": "Post-Musty/reset-shot roll and descent into Blue goal; lands at 1309."
+        },
+        {
+          "id": "64ac6e8d-3e59-470a-b659-13b618f4e618",
+          "performer": "blue",
+          "start_frame": 1284,
+          "end_frame": 1336,
+          "note": "Post-Musty-save roll and descent, landing on the goal wall at 1312 and returning to the floor."
+        },
+        {
+          "id": "34c5cbcd-6c73-4950-a818-0787e7830535",
+          "performer": "blue",
+          "start_frame": 1408,
+          "end_frame": 1440,
+          "note": "Post-aerial-shot roll/righting and descent following the strike at 1387; lands at 1436, before the next jump."
+        }
+      ]
+    }
+  ],
+  "viewer": {
+    "car_colors": {},
+    "ball_color": "#f0eee4"
+  }
+}

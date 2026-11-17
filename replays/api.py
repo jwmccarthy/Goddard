@@ -1,3 +1,5 @@
+import hashlib
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -11,6 +13,8 @@ import requests
 from dotenv import load_dotenv
 from rich.progress import BarColumn, Progress, TextColumn
 from tenacity import retry, retry_if_exception_type, stop_after_attempt
+
+from replays.utils import write_json
 
 load_dotenv()
 
@@ -207,3 +211,23 @@ class BallchasingClient:
 
         if unavailable:
             print(f"Unavailable replay files: {unavailable}")
+
+
+class CachedClient(BallchasingClient):
+    """Credential-free response cache for resumable RLCS acquisition."""
+
+    def __init__(self, token, directory):
+        super().__init__(token, list_rate=2., download_rate=2.)
+        self.cache = Path(directory)
+        self.cache.mkdir(parents=True, exist_ok=True)
+
+    def get_json(self, url, **params):
+        if url != API_URL and not url.startswith(API_URL + "/"):
+            raise ValueError("refusing foreign API URL")
+        key = json.dumps([url, params], sort_keys=True)
+        path = self.cache / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+        if path.exists():
+            return json.loads(path.read_text())
+        result = super().get_json(url, **params)
+        write_json(path, result)
+        return result

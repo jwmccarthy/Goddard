@@ -1,0 +1,410 @@
+{
+  "format": "goddard-skill-clips-v1",
+  "source": {
+    "file": "10026943886942125204-0-39cee4a5-57d8-4fd0-a8e3-91d832903a6b.npy",
+    "sha256": "85e7b24791e1dd92d55cbe7acaeb1d9b81b5c7e9fb984d7c9efca73a02fd9344",
+    "frame_count": 1509,
+    "frameskip": 4
+  },
+  "frame_indexing": "zero-based-half-open",
+  "skills": [
+    {
+      "id": "2c808e94-4baf-4871-9a0c-700334e18707",
+      "name": "Kickoff",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "af4b9a99-fcb4-4141-9a50-ac95d701f7f0",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 93
+        },
+        {
+          "id": "6490fabb-b369-437a-a1a8-051957b9a801",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 98
+        }
+      ]
+    },
+    {
+      "id": "298afb32-1397-4506-8b63-c2202d865148",
+      "name": "Speedflip",
+      "color": "#ba9ce0",
+      "clips": [
+        {
+          "id": "1bc73cb6-81c7-4999-bcab-06c918cb468c",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 52
+        },
+        {
+          "id": "a5afb671-deee-4e7b-bf57-b3c7d1147e23",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 51
+        },
+        {
+          "id": "02e41c79-2afb-4651-8b4d-ce78aa58e97d",
+          "performer": "blue",
+          "start_frame": 133,
+          "end_frame": 177
+        },
+        {
+          "id": "6cf667f4-7b95-4b3f-8c5d-93768ae139a2",
+          "performer": "blue",
+          "start_frame": 447,
+          "end_frame": 487
+        },
+        {
+          "id": "9edf7d14-9377-451d-8830-0ffb4ee2c499",
+          "performer": "blue",
+          "start_frame": 516,
+          "end_frame": 557
+        },
+        {
+          "id": "c180cec2-37fe-4a48-9033-5494dba3864a",
+          "performer": "blue",
+          "start_frame": 662,
+          "end_frame": 708
+        },
+        {
+          "id": "0d60cbc2-b542-49bd-8996-03bcbbd23668",
+          "performer": "orange",
+          "start_frame": 983,
+          "end_frame": 1023
+        },
+        {
+          "id": "970f1c99-0786-4fed-bdd1-1b51b889acfb",
+          "performer": "blue",
+          "start_frame": 1012,
+          "end_frame": 1051
+        },
+        {
+          "id": "22de2cde-6b30-43b3-9adf-91a7bd4674a4",
+          "performer": "orange",
+          "start_frame": 1020,
+          "end_frame": 1063
+        },
+        {
+          "id": "f725421e-6a82-45dd-940c-0cb8957839f5",
+          "performer": "blue",
+          "start_frame": 1050,
+          "end_frame": 1098
+        },
+        {
+          "id": "44be0918-f428-4151-8fa2-266b1e7a87e6",
+          "performer": "orange",
+          "start_frame": 1070,
+          "end_frame": 1111
+        },
+        {
+          "id": "e4cbd813-e58c-4cef-aef6-1427fbbbe96b",
+          "performer": "blue",
+          "start_frame": 1337,
+          "end_frame": 1379
+        }
+      ]
+    },
+    {
+      "id": "ae2cc7ea-a666-45cc-9c22-1799e8be6e86",
+      "name": "Dribble",
+      "color": "#81c8a4",
+      "clips": [
+        {
+          "id": "1298b19e-6d2d-4bdb-a4a3-37ac724cc57a",
+          "performer": "orange",
+          "start_frame": 1362,
+          "end_frame": 1430
+        }
+      ]
+    },
+    {
+      "id": "d8d5683d-d07f-4b25-acee-5d1dea3d5239",
+      "name": "Flick",
+      "color": "#e0b77c",
+      "clips": []
+    },
+    {
+      "id": "522c7bd0-608f-44e9-a304-c12d8c7f85b2",
+      "name": "Half Flip",
+      "color": "#df8e9c",
+      "clips": [
+        {
+          "id": "d21b8121-6c10-4080-8b89-60d8039057d4",
+          "performer": "blue",
+          "start_frame": 974,
+          "end_frame": 1014
+        },
+        {
+          "id": "a83e8329-5d56-4d97-b39a-437977b1e7a6",
+          "performer": "orange",
+          "start_frame": 1295,
+          "end_frame": 1347
+        }
+      ]
+    },
+    {
+      "id": "89686aeb-9dda-48fa-a655-26c647a9c78b",
+      "name": "Wavedash",
+      "color": "#8acbd0",
+      "clips": [
+        {
+          "id": "e57e465d-3ab9-4638-b983-9ddb5e14ec33",
+          "performer": "blue",
+          "start_frame": 317,
+          "end_frame": 328
+        },
+        {
+          "id": "7a43f390-fc24-40bf-9083-4642502f32fb",
+          "performer": "orange",
+          "start_frame": 319,
+          "end_frame": 329
+        },
+        {
+          "id": "fde02880-dabf-4857-8ca9-0b0a8d52520f",
+          "performer": "orange",
+          "start_frame": 359,
+          "end_frame": 373
+        }
+      ]
+    },
+    {
+      "id": "8cbce13e-35f6-4a30-8cde-a5e5b9fa9a6c",
+      "name": "Walldash",
+      "color": "#e7cb7b",
+      "clips": [
+        {
+          "id": "d90d928a-aa6d-4325-848a-5b5a9e1d5c03",
+          "performer": "orange",
+          "start_frame": 1179,
+          "end_frame": 1190
+        },
+        {
+          "id": "09b4423c-5e6c-4cda-83c9-62dd5786b4ac",
+          "performer": "blue",
+          "start_frame": 1196,
+          "end_frame": 1256
+        }
+      ]
+    },
+    {
+      "id": "4c66cd20-3f7f-4b04-8161-57c57169bc1d",
+      "name": "Shot",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "2f4a7408-abae-4f5a-afc3-b7fe94d7dd8c",
+          "performer": "blue",
+          "start_frame": 315,
+          "end_frame": 328
+        },
+        {
+          "id": "2abae58d-885c-4404-b82c-0b668470f261",
+          "performer": "blue",
+          "start_frame": 808,
+          "end_frame": 846
+        },
+        {
+          "id": "16b8fbec-db46-4f45-b4b5-84ff7b6fd9ad",
+          "performer": "orange",
+          "start_frame": 983,
+          "end_frame": 1023
+        },
+        {
+          "id": "49beec53-797f-46e3-b528-055581a25810",
+          "performer": "orange",
+          "start_frame": 1427,
+          "end_frame": 1509
+        }
+      ]
+    },
+    {
+      "id": "425d4487-5cce-4bb3-b933-bfc5782d4208",
+      "name": "Air Dribble",
+      "color": "#73cde2",
+      "clips": [
+        {
+          "id": "bb61c37d-3843-41c2-830b-94b434f3bef4",
+          "performer": "blue",
+          "start_frame": 177,
+          "end_frame": 328
+        },
+        {
+          "id": "723341a7-3e7e-4294-ab85-0da2ee01d7ee",
+          "performer": "blue",
+          "start_frame": 733,
+          "end_frame": 891
+        },
+        {
+          "id": "86bc40e3-0f9d-48e9-937b-d398094580d6",
+          "performer": "orange",
+          "start_frame": 1427,
+          "end_frame": 1509
+        }
+      ]
+    },
+    {
+      "id": "fb038b48-3c19-48c4-aadf-072d8a1e76ee",
+      "name": "Flip Reset",
+      "color": "#dba2ee",
+      "clips": [
+        {
+          "id": "7d45363c-bd75-4418-93a3-6cf37241c38c",
+          "performer": "blue",
+          "start_frame": 228,
+          "end_frame": 267
+        },
+        {
+          "id": "e80b4190-2c32-431c-b2ae-af3f4acb499f",
+          "performer": "blue",
+          "start_frame": 795,
+          "end_frame": 847
+        }
+      ]
+    },
+    {
+      "id": "6b6435d3-2239-4d5f-ad71-99a75233933a",
+      "name": "Air Dribble Bump",
+      "color": "#efad72",
+      "clips": [
+        {
+          "id": "7e75447f-e0be-4a69-bddb-76f3cdb8bbe7",
+          "performer": "orange",
+          "start_frame": 1427,
+          "end_frame": 1509,
+          "note": "Air-dribble bump attempt; close defender pass near frame 1503, contact unconfirmed."
+        }
+      ]
+    },
+    {
+      "id": "e5e46236-1918-488f-bda3-ca9f5485df41",
+      "name": "Defend Air Dribble",
+      "color": "#7fa6e8",
+      "clips": [
+        {
+          "id": "c4681e1c-1740-4613-9182-ce30d483c43f",
+          "performer": "orange",
+          "start_frame": 196,
+          "end_frame": 329,
+          "note": "Tracks Blue's wall-to-air/reset attack from the back wall, then drops toward the goalmouth to contest the landing finish around 320. Defensive attempt; no successful save is asserted."
+        },
+        {
+          "id": "5ba33640-190c-4efe-a72b-ca1f4c68f25f",
+          "performer": "orange",
+          "start_frame": 790,
+          "end_frame": 875,
+          "note": "Positions beneath Blue's second aerial/reset attack, jumps at 844 and dodges at 861; defensive ball contact at 867-869."
+        },
+        {
+          "id": "0c643716-f2c0-47b6-89f3-6bfecd61b65e",
+          "performer": "blue",
+          "start_frame": 1427,
+          "end_frame": 1509,
+          "note": "Goal-side tracking of Orange's ground-pop air dribble/bump attempt; jumps at 1492 to contest at the goalmouth. Source ends during the defense."
+        }
+      ]
+    },
+    {
+      "id": "253cf9f0-273d-4292-8ab8-1faf102e8873",
+      "name": "Defend Flick",
+      "color": "#c29bd8",
+      "clips": []
+    },
+    {
+      "id": "c19739d5-f141-458d-90c3-6dea369a0997",
+      "name": "Recovery",
+      "color": "#9cbfa7",
+      "clips": [
+        {
+          "id": "a70ab1f0-8b7a-40ff-928c-522a9804f11c",
+          "performer": "blue",
+          "start_frame": 64,
+          "end_frame": 93,
+          "note": "Post-kickoff-challenge roll recovery, landing at 88."
+        },
+        {
+          "id": "577bcd6c-ce04-4a37-b581-336c42068572",
+          "performer": "orange",
+          "start_frame": 64,
+          "end_frame": 98,
+          "note": "Post-kickoff-challenge roll recovery, landing at 93."
+        },
+        {
+          "id": "a5f8b191-bb89-4846-ac81-ae31187bd6d8",
+          "performer": "orange",
+          "start_frame": 293,
+          "end_frame": 329,
+          "note": "Late descent from the high back-wall defensive position, reorienting into the landing dodge at 322 and floor contact at 324."
+        },
+        {
+          "id": "316b95f8-d382-46e6-845d-31e3544fe79d",
+          "performer": "blue",
+          "start_frame": 298,
+          "end_frame": 328,
+          "note": "Late aerial descent and landing preparation, including the retained-flip wavedash/shot around 320-323. Recovery overlaps the attacking finish."
+        },
+        {
+          "id": "42a6b294-15b7-4c04-9cfa-5b6597c0212b",
+          "performer": "orange",
+          "start_frame": 340,
+          "end_frame": 374,
+          "note": "Follow-up landing/righting after the defensive landing bounce/hop; wavedash at 362 and floor contact at 368."
+        },
+        {
+          "id": "251aa816-4f89-4c63-86b3-da4e6b2a6864",
+          "performer": "orange",
+          "start_frame": 445,
+          "end_frame": 490,
+          "note": "Descends and rights the car after the aerial ball touch at 436; floor contact at 484."
+        },
+        {
+          "id": "34099304-0b3a-40bf-ac97-5e652d6e9b59",
+          "performer": "blue",
+          "start_frame": 846,
+          "end_frame": 897,
+          "note": "Post-reset-attack roll and descent toward the goalmouth floor; lands at 890."
+        },
+        {
+          "id": "d2c9ceeb-04ab-4552-83c8-566c5050a9a0",
+          "performer": "orange",
+          "start_frame": 874,
+          "end_frame": 909,
+          "note": "Post-save roll/righting after defensive contact at 867-869; lands at 903."
+        },
+        {
+          "id": "790b96bc-c7e2-4637-8b94-b91fbafc0b29",
+          "performer": "orange",
+          "start_frame": 952,
+          "end_frame": 981,
+          "note": "Landing recovery after the goalmouth dodge/clearance touch at 945; lands at 976."
+        },
+        {
+          "id": "7620eaa5-f6c4-4bf6-bb88-7f4edc09d77a",
+          "performer": "orange",
+          "start_frame": 994,
+          "end_frame": 1020,
+          "note": "Post-shot dodge recovery following contact at 987; lands at 1018, before the next acceleration jump."
+        },
+        {
+          "id": "841f6e39-0199-4ce0-9438-20c1449811b4",
+          "performer": "blue",
+          "start_frame": 1170,
+          "end_frame": 1195,
+          "note": "Reorients toward the side wall after the airborne corner challenge/dodge; wheel contact returns on the wall at 1189."
+        },
+        {
+          "id": "1f4569e0-918e-4908-8663-685e8f8963e5",
+          "performer": "orange",
+          "start_frame": 1317,
+          "end_frame": 1347,
+          "note": "Late righting and landing after the backward-dodge ball touch at 1307; lands at 1342."
+        }
+      ]
+    }
+  ],
+  "viewer": {
+    "car_colors": {},
+    "ball_color": "#f0eee4"
+  }
+}

@@ -1,0 +1,31 @@
+[blue_loadout]
+# Fennec with the Season 1 Silver reward decal.
+car_id = 4284
+decal_id = 5371
+team_color_id = 35
+custom_color_id = 45
+paint_finish_id = 274
+custom_finish_id = 274
+hat_id = 0 # No topper
+wheels_id = 1945 # SLK
+engine_audio_id = 4295 # Fennec
+
+[blue_loadout.paint]
+car_paint_id = 11 # Grey
+wheels_paint_id = 10 # Orange
+
+[orange_loadout]
+# Same silver reward decal and accessories on orange.
+car_id = 4284
+decal_id = 5371
+team_color_id = 35
+custom_color_id = 45
+paint_finish_id = 274
+custom_finish_id = 274
+hat_id = 0
+wheels_id = 1945
+engine_audio_id = 4295
+
+[orange_loadout.paint]
+car_paint_id = 11
+wheels_paint_id = 10

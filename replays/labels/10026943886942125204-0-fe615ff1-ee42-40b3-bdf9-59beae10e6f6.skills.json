@@ -1,0 +1,174 @@
+{
+  "format": "goddard-skill-clips-v1",
+  "source": {
+    "file": "10026943886942125204-0-fe615ff1-ee42-40b3-bdf9-59beae10e6f6.npy",
+    "sha256": "b0cada1df5d62aee664de25119e3e1ffbea92c26da7b48b20b80bc0880e2219b",
+    "frame_count": 379,
+    "frameskip": 4
+  },
+  "frame_indexing": "zero-based-half-open",
+  "skills": [
+    {
+      "id": "ad0e9c60-50bf-4a45-84d3-734b8e68e264",
+      "name": "Kickoff",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "4dd98361-b269-4f90-bcea-eda36002642d",
+          "start_frame": 0,
+          "end_frame": 104,
+          "performer": "blue"
+        },
+        {
+          "id": "c9456e34-8c67-46d2-b626-12633132ec2c",
+          "start_frame": 0,
+          "end_frame": 104,
+          "performer": "orange"
+        }
+      ]
+    },
+    {
+      "id": "35f06983-1233-4dee-ae9d-540212b92e86",
+      "name": "Speedflip",
+      "color": "#ba9ce0",
+      "clips": [
+        {
+          "id": "ed3ec5c7-e305-4e30-b9b1-f2b03bf81aea",
+          "start_frame": 0,
+          "end_frame": 49,
+          "performer": "blue"
+        },
+        {
+          "id": "8b98234b-ecd2-4d16-87f4-eda47b745e33",
+          "start_frame": 0,
+          "end_frame": 49,
+          "performer": "orange"
+        },
+        {
+          "id": "f2afbeb5-eb41-4e0c-a106-4ff25794c00d",
+          "start_frame": 183,
+          "end_frame": 227,
+          "performer": "blue"
+        }
+      ]
+    },
+    {
+      "id": "c0715088-7d06-4d87-8ed6-961aa856b148",
+      "name": "Dribble",
+      "color": "#81c8a4",
+      "clips": []
+    },
+    {
+      "id": "ef9dfe0c-0d38-4df4-b9da-04587e5bf03c",
+      "name": "Flick",
+      "color": "#e0b77c",
+      "clips": []
+    },
+    {
+      "id": "dcf7448a-53a2-4808-b272-436570e26b00",
+      "name": "Half Flip",
+      "color": "#df8e9c",
+      "clips": []
+    },
+    {
+      "id": "937f6b63-1b3d-46ac-ae87-cc6a29110fef",
+      "name": "Wavedash",
+      "color": "#8acbd0",
+      "clips": []
+    },
+    {
+      "id": "94ca11c5-76b4-4390-8498-c7c950fd0d96",
+      "name": "Walldash",
+      "color": "#e7cb7b",
+      "clips": []
+    },
+    {
+      "id": "6d20de53-4c44-4cf5-b3e5-47c82277b389",
+      "name": "Shot",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "2d12960e-a66c-48f7-b374-06e2a28214dc",
+          "start_frame": 339,
+          "end_frame": 379,
+          "performer": "blue"
+        }
+      ]
+    },
+    {
+      "id": "8dfef2a9-822b-4802-a9d4-f5f452768c05",
+      "name": "Air Dribble",
+      "color": "#73cde2",
+      "clips": []
+    },
+    {
+      "id": "cc40e8cd-3459-47f7-baea-b31e89adc237",
+      "name": "Flip Reset",
+      "color": "#dba2ee",
+      "clips": []
+    },
+    {
+      "id": "e7ba00a3-d527-4c4f-bf1d-64bbb6cec431",
+      "name": "Air Dribble Bump",
+      "color": "#efad72",
+      "clips": []
+    },
+    {
+      "id": "22b5a06d-aa0a-43d2-acae-3cd88aa6e2a0",
+      "name": "Ceiling Shot",
+      "color": "#8acbd0",
+      "clips": []
+    },
+    {
+      "id": "26417427-9e51-4111-9cd8-48547ec3d501",
+      "name": "Defend Air Dribble",
+      "color": "#7fa6e8",
+      "clips": []
+    },
+    {
+      "id": "368c59da-a7fc-4b4a-9741-d89dcac793d9",
+      "name": "Defend Flick",
+      "color": "#c29bd8",
+      "clips": []
+    },
+    {
+      "id": "93ac542f-8518-4a56-bd3c-25660a8b3206",
+      "name": "Recovery",
+      "color": "#9cbfa7",
+      "clips": [
+        {
+          "id": "0bdc2c25-08ed-4a55-b585-7061f84c23e9",
+          "performer": "blue",
+          "start_frame": 65,
+          "end_frame": 95,
+          "note": "Post-kickoff-challenge roll and landing; floor contact at 89."
+        },
+        {
+          "id": "90a05006-4d81-4afa-bbb6-0fb27566162e",
+          "performer": "orange",
+          "start_frame": 66,
+          "end_frame": 97,
+          "note": "Post-kickoff-challenge roll and landing; floor contact at 93, before the next acceleration dodge."
+        },
+        {
+          "id": "45fdc4d2-c1b3-4b85-8374-fbfb79860d78",
+          "performer": "orange",
+          "start_frame": 245,
+          "end_frame": 274,
+          "note": "Post-ball-strike roll/righting after the touch and dodge at 237-238; lands at 268."
+        },
+        {
+          "id": "bc39c075-9529-4105-82cf-f1b1f80e7b84",
+          "performer": "blue",
+          "start_frame": 359,
+          "end_frame": 379,
+          "note": "Roll/righting toward a landing after the shot touch at 352. Source ends before wheel contact; recovery is incomplete."
+        }
+      ]
+    }
+  ],
+  "viewer": {
+    "car_colors": {},
+    "ball_color": "#f0eee4"
+  }
+}

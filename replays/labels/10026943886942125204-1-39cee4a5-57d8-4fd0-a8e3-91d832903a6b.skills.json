@@ -1,0 +1,220 @@
+{
+  "format": "goddard-skill-clips-v1",
+  "source": {
+    "file": "10026943886942125204-1-39cee4a5-57d8-4fd0-a8e3-91d832903a6b.npy",
+    "sha256": "a999f810f960ad07cd9a993909d2cebb26cc7294e3c366d8baa705a5fca55868",
+    "frame_count": 331,
+    "frameskip": 4
+  },
+  "frame_indexing": "zero-based-half-open",
+  "skills": [
+    {
+      "id": "0723756f-8579-48a3-b53e-c56957eaabb8",
+      "name": "Kickoff",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "6770e7cd-7425-4f7a-805e-f3f7d8de145f",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 116
+        },
+        {
+          "id": "d5a3bd73-3bbe-4f1a-a1dd-5111398d4f50",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 110
+        }
+      ]
+    },
+    {
+      "id": "cedda110-7597-45f9-a610-ef9cb5035cbd",
+      "name": "Speedflip",
+      "color": "#ba9ce0",
+      "clips": [
+        {
+          "id": "8622079c-e79b-4872-b2e4-e2788e97ef4e",
+          "performer": "blue",
+          "start_frame": 0,
+          "end_frame": 55
+        },
+        {
+          "id": "699123cf-8873-4741-8c98-1b118d1ec420",
+          "performer": "orange",
+          "start_frame": 0,
+          "end_frame": 52
+        },
+        {
+          "id": "3f853741-9f6b-4cbc-98b0-923830367e5d",
+          "performer": "orange",
+          "start_frame": 110,
+          "end_frame": 151
+        },
+        {
+          "id": "23a01c14-7395-4295-9d69-0ba825c12aaa",
+          "performer": "blue",
+          "start_frame": 130,
+          "end_frame": 173,
+          "note": "Diagonal-cancel dodge at 136 advances the ball to the side wall; setup touch, not a Shot."
+        }
+      ]
+    },
+    {
+      "id": "01d7cf38-3198-4ee5-a9ef-23b396c565fe",
+      "name": "Dribble",
+      "color": "#81c8a4",
+      "clips": []
+    },
+    {
+      "id": "290294b4-186b-4e3b-aae3-16385aaf1864",
+      "name": "Flick",
+      "color": "#e0b77c",
+      "clips": []
+    },
+    {
+      "id": "7241d60b-546c-4dda-a71f-b1301dee4afa",
+      "name": "Half Flip",
+      "color": "#df8e9c",
+      "clips": []
+    },
+    {
+      "id": "746980f7-0e55-4b80-bca4-0bed1db51ab1",
+      "name": "Wavedash",
+      "color": "#8acbd0",
+      "clips": [
+        {
+          "id": "3171c955-585a-4e7a-a5c1-36d059bed451",
+          "performer": "orange",
+          "start_frame": 91,
+          "end_frame": 110,
+          "note": "Kickoff jump/challenge followed by delayed landing dodge at 102; ground contact returns at 106. Includes the hop and recovery."
+        },
+        {
+          "id": "be712bc8-8c4b-472c-893b-bcb2caf89b4e",
+          "performer": "blue",
+          "start_frame": 302,
+          "end_frame": 321,
+          "note": "Uses the retained reset dodge at 312 while descending, landing at 316 and accelerating into the low shot. Floor wavedash, not a Musty Flick."
+        }
+      ]
+    },
+    {
+      "id": "d34a46dc-bfc6-4ee6-a04c-48659c16a556",
+      "name": "Walldash",
+      "color": "#e7cb7b",
+      "clips": []
+    },
+    {
+      "id": "2e693010-bfd5-4bca-9e19-2c290f4982aa",
+      "name": "Shot",
+      "color": "#80b7d9",
+      "clips": [
+        {
+          "id": "26b42f94-04a7-43d2-8ecd-168e2de26caf",
+          "performer": "blue",
+          "start_frame": 302,
+          "end_frame": 331,
+          "note": "Low goal-directed finish following the landing dodge, with ball touch at 316 and follow-through. Source ends near Orange goal with unknown terminal reason; no scored-goal outcome is asserted."
+        }
+      ]
+    },
+    {
+      "id": "936173e1-9662-481d-83ed-9a634c4b2d16",
+      "name": "Air Dribble",
+      "color": "#73cde2",
+      "clips": [
+        {
+          "id": "e55fc366-470d-408f-a8be-1dd0f17e7c4c",
+          "performer": "blue",
+          "start_frame": 169,
+          "end_frame": 321,
+          "note": "Side-wall setup and touch/launch at 190, wheel-on-ball reset around 238, aerial control touch at 272, then descent and landing finish at 316."
+        }
+      ]
+    },
+    {
+      "id": "c65657fc-01d8-4231-ab1f-0415923bdeb9",
+      "name": "Flip Reset",
+      "color": "#dba2ee",
+      "clips": [
+        {
+          "id": "678ff041-5c0c-46d3-ac55-4b10410cd467",
+          "performer": "blue",
+          "start_frame": 226,
+          "end_frame": 321,
+          "note": "Underside contact around 236-238: minimum center gap ~107 UU, underside alignment ~0.99 and wheel-contact flag at ~1562 UU height. Retains the flip and uses it at 312 for the landing finish; includes acquisition through use."
+        }
+      ]
+    },
+    {
+      "id": "78b3e539-02bc-40e4-bcc2-fd2d637dd0a0",
+      "name": "Air Dribble Bump",
+      "color": "#efad72",
+      "clips": []
+    },
+    {
+      "id": "8140f96a-79be-4757-bee1-acd9e4b65fff",
+      "name": "Ceiling Shot",
+      "color": "#8acbd0",
+      "clips": []
+    },
+    {
+      "id": "d0e25a09-c1a1-4856-baa9-8a98cc677f32",
+      "name": "Musty Flick",
+      "color": "#80b7d9",
+      "clips": []
+    },
+    {
+      "id": "6fbe3a32-f4ae-42e6-8059-39c819b6ced0",
+      "name": "Defend Air Dribble",
+      "color": "#7fa6e8",
+      "clips": [
+        {
+          "id": "c48aa220-68b6-4a4a-ba66-ecf31b75630f",
+          "performer": "orange",
+          "start_frame": 210,
+          "end_frame": 331,
+          "note": "Back-wall/goal-side positioning against Blue's reset air dribble, followed by jump at 279 and dodge at 314 to challenge the low finish. No successful contact is established; source ends during the defense."
+        }
+      ]
+    },
+    {
+      "id": "4539edca-d2ff-4dd9-9877-e034f19ba908",
+      "name": "Defend Flick",
+      "color": "#c29bd8",
+      "clips": []
+    },
+    {
+      "id": "ed3acee9-e461-41a3-b8fa-2d80a08e32a1",
+      "name": "Recovery",
+      "color": "#9cbfa7",
+      "clips": [
+        {
+          "id": "beb78cd2-2d03-4061-8756-76d730cd2042",
+          "performer": "blue",
+          "start_frame": 82,
+          "end_frame": 116,
+          "note": "Post-kickoff-challenge roll and landing; floor contact at 112."
+        },
+        {
+          "id": "e399b4eb-cb23-4e4a-ad38-43fc2e766b34",
+          "performer": "orange",
+          "start_frame": 91,
+          "end_frame": 110,
+          "note": "Tight landing recovery window around the user-trimmed wavedash: dodge at 102, floor contact at 106. Excludes the earlier kickoff ball interaction."
+        },
+        {
+          "id": "ec78e86a-eaab-452c-8622-c46c91ee3b7a",
+          "performer": "blue",
+          "start_frame": 289,
+          "end_frame": 321,
+          "note": "Late reset-air-dribble descent, aligning for the retained-flip landing wavedash/shot at 312-316 and immediate floor stabilization."
+        }
+      ]
+    }
+  ],
+  "viewer": {
+    "car_colors": {},
+    "ball_color": "#f0eee4"
+  }
+}

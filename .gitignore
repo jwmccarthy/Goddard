@@ -4,8 +4,6 @@
 __pycache__/
 **/__pycache__/
 checkpoints/
-rlbot_bot/*.pt*
-!rlbot_bot/policy_latest.pt
 runs/
 .autoresearch/
 .opencode
@@ -16,6 +14,4 @@ runs/
 # Replay datasets can contain tens of thousands of large files.
 replays/raw/
 replays/parsed_replays/
-replays/ssl_duels/
-replays/ssl_duels_recent/
-replays/aerial_stratified*/
+replays/rlcs/
