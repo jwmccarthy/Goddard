@@ -23,10 +23,7 @@ class ObservationHistory:
         self.lag = (length - 1) * stride
         self._frames = observation.new_zeros(
             (len(observation), self.lag, observation.shape[-1])
-        ).transpose(
-            0,
-            1
-        )
+        ).transpose(0, 1)
 
         self.age = torch.zeros(
             len(observation),
@@ -51,9 +48,10 @@ class ObservationHistory:
         return self.positions[:, None] >= self.lag - self.age[None]
 
     def window(self, observation: torch.Tensor) -> torch.Tensor:
-        # Gather only the sampled frames, not a full lag-sized copy per value call.
+        # Gather only the sampled frames, not a full lag-sized copy.
         if self.lag:
-            past = self._frames[(self.sample_positions + self.cursor) % self.lag]
+            slots = (self.sample_positions + self.cursor) % self.lag
+            past = self._frames[slots]
         else:
             past = self._frames
 
@@ -83,39 +81,61 @@ def pack_history(frames: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     ).flatten(1)
 
 
-def rollout_critic_inputs(
+def critic_frame_cache(rollout: Rollout) -> None:
+    if rollout.critic_frames is not None:
+        return
+
+    rollout.critic_frames = torch.cat(
+        (rollout.critic_prefix, rollout.observations)
+    )
+    rollout.critic_boundaries = torch.cat(
+        (torch.zeros_like(rollout.critic_prefix_valid), rollout.dones)
+    )
+
+
+def history_frames(
     rollout: Rollout,
-    indices: torch.Tensor
-) -> torch.Tensor:
+    indices: torch.Tensor,
+    shift:   int,
+    count:   int,
+    scan:    int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Frames and validity from step + shift; resets scanned over `scan`."""
+
     history = rollout.critic_history
-
-    if rollout.critic_frames is None:
-        rollout.critic_frames = torch.cat((rollout.critic_prefix, rollout.observations))
-
-        rollout.critic_boundaries = torch.cat(
-            (torch.zeros_like(rollout.critic_prefix_valid), rollout.dones)
-        )
+    critic_frame_cache(rollout)
 
     agents = rollout.observations.shape[1]
     step, actor = indices // agents, indices % agents
+    offsets = torch.arange(count, device=indices.device) * history.stride
 
-    offsets = (
-        torch.arange(history.length, device=indices.device)
-        * history.stride
-    )
-
-    times = step[:, None] + offsets
+    times = step[:, None] + shift + offsets
     frames = rollout.critic_frames[times, actor[:, None]]
     valid = torch.ones_like(times, dtype=torch.bool)
 
     if history.lag:
         prefix_times = times.clamp_max(history.lag - 1)
-        valid &= (times >= history.lag) | rollout.critic_prefix_valid[prefix_times, actor[:, None]]
-        scan = step[:, None] + torch.arange(history.lag, device=indices.device)
-        boundaries = rollout.critic_boundaries[scan, actor[:, None]]
-        last_reset = torch.where(boundaries, scan + 1, 0).amax(1)
+        prefix_valid = rollout.critic_prefix_valid[prefix_times, actor[:, None]]
+        valid &= (times >= history.lag) | prefix_valid
 
+    if scan > 0:
+        ahead = torch.arange(scan, device=indices.device)
+        steps = step[:, None] + shift + ahead
+        boundaries = rollout.critic_boundaries[steps, actor[:, None]]
+        last_reset = torch.where(boundaries, steps + 1, 0).amax(1)
         valid &= times >= last_reset[:, None]
+
+    return frames, valid
+
+
+def rollout_critic_inputs(
+    rollout: Rollout,
+    indices: torch.Tensor
+) -> torch.Tensor:
+    history = rollout.critic_history
+    frames, valid = history_frames(
+        rollout, indices, 0, history.length, history.lag
+    )
 
     return pack_history(frames, valid)
 
@@ -131,43 +151,10 @@ def timeout_critic_inputs(
     if history is None:
         return None
 
-    if rollout.critic_frames is None:
-        rollout.critic_frames = torch.cat((rollout.critic_prefix, rollout.observations))
-
-        rollout.critic_boundaries = torch.cat(
-            (torch.zeros_like(rollout.critic_prefix_valid), rollout.dones)
-        )
-
-    agents = rollout.observations.shape[1]
-    step, actor = indices // agents, indices % agents
-
-    offsets = (
-        torch.arange(history.length - 1, device=indices.device)
-        * history.stride
+    frames, valid = history_frames(
+        rollout, indices, 1, history.length - 1, history.lag - 1
     )
-
-    times = step[:, None] + 1 + offsets
-    frames = rollout.critic_frames[times, actor[:, None]]
-    valid = torch.ones_like(times, dtype=torch.bool)
-
-    if history.lag:
-        prefix_times = times.clamp_max(history.lag - 1)
-        valid &= (times >= history.lag) | rollout.critic_prefix_valid[prefix_times, actor[:, None]]
-
-    if history.lag > 1:
-        scan = (
-            step[:, None]
-            + 1
-            + torch.arange(history.lag - 1, device=indices.device)
-        )
-
-        boundaries = rollout.critic_boundaries[scan, actor[:, None]]
-        last_reset = torch.where(boundaries, scan + 1, 0).amax(1)
-
-        valid &= times >= last_reset[:, None]
-
     frames = torch.cat((frames, final_observation[:, None]), 1)
-
     valid = torch.cat(
         (valid, torch.ones_like(indices[:, None], dtype=torch.bool)),
         1

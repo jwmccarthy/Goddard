@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
-from training.arguments import entropy_coefficients
-from training.tensors import autocast, require_finite
+from training.schedules import entropy_coefficients, scheduled_entropy_scale
+from training.tensors import autocast, compilation_mode, require_finite
 
 if TYPE_CHECKING:
     from training.rollout import Rollout
@@ -37,8 +37,14 @@ def value_statistics(
     )
 
     return {
-        "explained_variance": explained,
-        "value/return_std":   target_variance.sqrt()
+        "explained_variance":             explained,
+        "value/explained_variance_valid": valid.float(),
+        "value/return_mean":              returns.mean(),
+        "value/return_std":               target_variance.sqrt(),
+        "value/prediction_mean":          values.mean(),
+        "value/prediction_std":           values.std(unbiased=False),
+        "value/bias":                     error.mean(),
+        "value/rmse":                     error.square().mean().sqrt()
     }
 
 
@@ -56,23 +62,91 @@ def ppo_loss(
     clip_value_loss:     bool,
     value_scale:         torch.Tensor | float = 1.0,
     value_clip_coef:     float | None = None,
-    critic_observations: torch.Tensor | None = None
+    critic_observations: torch.Tensor | None = None,
+    policy_state:        torch.Tensor | None = None,
+    policy_resets:       torch.Tensor | None = None,
+    learner_mask:        torch.Tensor | None = None,
+    critic_state:        torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, log_probs, head_entropy, values = agent.get_action_and_value(
-        observations,
-        actions,
-        entropy_per_head=True,
-        critic_observations=critic_observations
+    if policy_state is None and critic_state is None:
+        _, log_probs, head_entropy, values = agent.get_action_and_value(
+            observations,
+            actions,
+            entropy_per_head=True,
+            critic_observations=critic_observations
+        )
+    else:
+        if policy_state is not None:
+            logits = agent.actor.sequence(
+                observations, policy_state, policy_resets
+            )
+        else:
+            logits = agent.actor(observations.flatten(0, 1))
+
+        if critic_state is not None:
+            values = agent.critic.sequence(
+                observations, critic_state, policy_resets
+            ).squeeze(-1).float()
+        else:
+            values = agent.get_value(
+                observations.flatten(0, 1), critic_observations
+            )
+
+        observations = observations.flatten(0, 1)
+        _, log_probs, head_entropy = agent.sample_action_logits(
+            logits.float(), observations, actions, entropy_per_head=True
+        )
+
+    return ppo_objective(
+        log_probs, head_entropy, values, old_log_probs, advantages, returns,
+        old_values, clip_coef, ent_coef, vf_coef, clip_value_loss,
+        value_scale, value_clip_coef, learner_mask
     )
+
+
+def ppo_objective(
+    log_probs:       torch.Tensor,
+    head_entropy:    torch.Tensor,
+    values:          torch.Tensor,
+    old_log_probs:   torch.Tensor,
+    advantages:      torch.Tensor,
+    returns:         torch.Tensor,
+    old_values:      torch.Tensor,
+    clip_coef:       float,
+    ent_coef:        torch.Tensor,
+    vf_coef:         float,
+    clip_value_loss: bool,
+    value_scale:     torch.Tensor | float,
+    value_clip_coef: float | None,
+    learner_mask:    torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if learner_mask is not None:
+        # Opponent actions were sampled by another policy. Mask before exp and
+        # squaring so irrelevant likelihood ratios cannot overflow the loss.
+        old_log_probs = torch.where(
+            learner_mask, old_log_probs, log_probs.detach()
+        )
+        advantages = advantages.masked_fill(~learner_mask, 0)
+        returns = torch.where(learner_mask, returns, values.detach())
+        old_values = torch.where(learner_mask, old_values, values.detach())
+
+    weights = (
+        torch.ones_like(advantages)
+        if learner_mask is None
+        else learner_mask.to(advantages.dtype)
+    )
+    weights = weights / weights.sum().clamp_min(1)
 
     log_ratio = log_probs - old_log_probs
     ratio = log_ratio.exp()
-    advantage_scale = advantages.std(unbiased=False).clamp_min(1e-8)
-    advantages = (advantages - advantages.mean()) / advantage_scale
+    advantages = advantages - (advantages * weights).sum()
+    variance = (advantages.square() * weights).sum()
+    advantages = advantages / variance.sqrt().clamp_min(1e-8)
     policy_loss = torch.maximum(
         -advantages * ratio,
         -advantages * ratio.clamp(1 - clip_coef, 1 + clip_coef)
-    ).mean()
+    )
+    policy_loss = (policy_loss * weights).sum()
 
     value_error = ((values - returns) / value_scale).square()
 
@@ -87,15 +161,16 @@ def ppo_loss(
             ((clipped_values - returns) / value_scale).square()
         )
 
-    value_loss = 0.5 * value_error.mean()
-    head_entropy = head_entropy.mean(0)
+    value_loss = 0.5 * (value_error * weights).sum()
+    head_entropy = (head_entropy * weights[:, None]).sum(0)
     entropy = head_entropy.sum()
     entropy_bonus = (ent_coef * head_entropy).sum()
     loss = policy_loss + vf_coef * value_loss - entropy_bonus
 
     with torch.no_grad():
-        kl = ((ratio - 1) - log_ratio).mean()
-        clip_fraction = ((ratio - 1).abs() > clip_coef).float().mean()
+        kl = (((ratio - 1) - log_ratio) * weights).sum()
+        clipped = ((ratio - 1).abs() > clip_coef).float()
+        clip_fraction = (clipped * weights).sum()
 
     metrics = torch.stack((
         policy_loss.detach(), value_loss.detach(), entropy.detach(),
@@ -138,6 +213,24 @@ def gathered_ppo_loss(
     critic_observations: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather inside the compiled forward so indexing can fuse with loss work."""
+    if agent.gru_policy or agent.gru_critic:
+        observations = tensors[0][batch].transpose(0, 1)
+        targets = (
+            tensor[batch].transpose(0, 1).flatten(0, 1)
+            for tensor in tensors[1:6]
+        )
+
+        return loss_function(
+            agent,
+            observations,
+            *targets,
+            *loss_arguments,
+            critic_observations,
+            policy_state=tensors[6][batch] if agent.gru_policy else None,
+            policy_resets=tensors[7][batch].transpose(0, 1),
+            learner_mask=tensors[8][batch].transpose(0, 1).flatten(),
+            critic_state=tensors[9][batch] if agent.gru_critic else None
+        )
 
     return loss_function(
         agent,
@@ -151,7 +244,8 @@ def ppo_gradient_check(
     agent:           nn.Module,
     loss:            torch.Tensor,
     max_norm:        float,
-    critic_max_norm: float
+    critic_max_norm: float,
+    found_inf:       torch.Tensor | None = None
 ) -> torch.Tensor:
     actor_norm, critic_norm = clip_actor_critic_gradients(
         agent,
@@ -160,27 +254,75 @@ def ppo_gradient_check(
         error_if_nonfinite=False
     )
 
-    return torch.stack((loss.detach(), actor_norm, critic_norm))
+    check = torch.stack((loss.detach(), actor_norm, critic_norm))
+
+    if found_inf is not None:
+        # Latch the first failure: every later Adam update must also be skipped.
+        found_inf.logical_or_(~torch.isfinite(check).all())
+
+    return check
+
+
+class PPOUpdateGuard:
+    """Use fused Adam's device-side skip flag; report failures after the update."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer) -> None:
+        self.optimizer = optimizer
+        self.found_inf: torch.Tensor | None = None
+        groups = optimizer.param_groups
+        devices = {p.device for group in groups for p in group["params"]}
+        supported = (
+            type(optimizer) in (torch.optim.Adam, torch.optim.AdamW)
+            and all(group.get("fused", False) for group in groups)
+            and len(devices) == 1
+            and next(iter(devices)).type == "cuda"
+            and not hasattr(optimizer, "found_inf")
+            and not hasattr(optimizer, "grad_scale")
+        )
+
+        if supported:
+            self.found_inf = torch.zeros(
+                (), device=next(iter(devices)), dtype=torch.float32
+            )
+
+    def step(
+        self,
+        check: torch.Tensor,
+        step:  Callable[[], object]
+    ) -> None:
+        if self.found_inf is None:
+            require_finite(check, "PPO loss/gradients")
+            step()
+            return
+
+        # This is the same skip mechanism used by GradScaler with fused Adam.
+        # It leaves parameters, moments and step counters unchanged on failure.
+        self.optimizer.found_inf = self.found_inf
+        try:
+            step()
+        finally:
+            del self.optimizer.found_inf
+
+    def finish(self) -> None:
+        if self.found_inf is not None and self.found_inf.item():
+            raise FloatingPointError(
+                "non-finite PPO loss/gradients; training stopped before "
+                "corrupting a checkpoint"
+            )
 
 
 def accumulate_ppo_metrics(
-    metrics_sum:     torch.Tensor,
-    epoch_kl:        torch.Tensor,
-    metrics:         torch.Tensor,
-    batch_size:      int
+    metrics_sum: torch.Tensor,
+    epoch_kl:    torch.Tensor,
+    metrics:     torch.Tensor,
+    batch_size:  int | torch.Tensor
 ) -> None:
     metrics_sum.add_(metrics)
     epoch_kl.add_(metrics[3] * batch_size)
 
 
 class CompiledPPOUpdate:
-    """Compiled minibatch regions separated by the pre-Adam finite check.
-
-    Keep this runtime cache on the optimizer, outside its checkpoint state_dict.
-    Mutating gradient/optimizer/metric regions deliberately do not use CUDA graph
-    trees: their buffers span successive loss/backward invocations.
-    """
-
+    """Compiled minibatch regions with device-side pre-Adam validation."""
 
     def __init__(
         self,
@@ -188,8 +330,6 @@ class CompiledPPOUpdate:
         loss_function: LossFunction,
         args:          Namespace
     ) -> None:
-        from training.setup import compilation_mode
-
         self.loss_function = getattr(
             loss_function,
             "_torchdynamo_orig_callable",
@@ -199,7 +339,7 @@ class CompiledPPOUpdate:
         self.loss = torch.compile(
             gathered_ppo_loss,
             fullgraph=True,
-            mode=compilation_mode()
+            mode=compilation_mode(cuda_graphs=args.cuda_graphs)
         )
 
         mutation_mode = compilation_mode(cuda_graphs=False)
@@ -279,6 +419,58 @@ def learner_batch(
     )
 
 
+def recurrent_batch(
+    rollout: Rollout
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Shuffle truncated sequences with their recorded initial hidden states."""
+    length = rollout.gru_sequence_length
+
+    def sequences(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.reshape(
+            -1, length, *tensor.shape[1:]
+        ).transpose(1, 2).flatten(0, 1)
+
+    tensors = (
+        rollout.observations, rollout.actions, rollout.log_probs,
+        rollout.advantages, rollout.returns, rollout.values
+    )
+    resets = torch.zeros_like(rollout.dones)
+    resets[1:].copy_(rollout.dones[:-1])
+    learner = (
+        torch.ones_like(rollout.dones)
+        if rollout.learner_mask is None
+        else rollout.learner_mask
+    )
+    sources = sequences(torch.arange(
+        rollout.dones.numel(), device=rollout.dones.device
+    ).reshape_as(rollout.dones))
+    tensors = tuple(sequences(tensor) for tensor in tensors)
+    learner = sequences(learner)
+    empty = rollout.observations.new_empty(len(learner), 0)
+    policy_prefix = (
+        empty if rollout.policy_prefix is None
+        else rollout.policy_prefix.flatten(0, 1)
+    )
+    critic_prefix = (
+        empty if rollout.critic_memory_prefix is None
+        else rollout.critic_memory_prefix.flatten(0, 1)
+    )
+    tensors += (
+        policy_prefix, sequences(resets), learner, critic_prefix
+    )
+
+    if rollout.learner_mask is not None:
+        columns = learner.any(1).nonzero().flatten()
+
+        if not len(columns):
+            raise ValueError("PPO rollout contains no learner trajectories")
+
+        tensors = tuple(tensor[columns] for tensor in tensors)
+        sources = sources[columns]
+
+    return tensors, sources
+
+
 @dataclass
 class PPOBatch:
 
@@ -290,10 +482,21 @@ class PPOBatch:
     metrics_sum:     torch.Tensor
 
 
-def prepare_ppo_batch(rollout: Rollout, args: Namespace) -> PPOBatch:
-    coefficients = entropy_coefficients(args)
-    tensors, source_indices = learner_batch(rollout)
-    observations, _, _, _, returns, values = tensors
+def prepare_ppo_batch(
+    rollout: Rollout,
+    args:    Namespace,
+    step:    int = 0
+) -> PPOBatch:
+    scale = scheduled_entropy_scale(args, step)
+    coefficients = tuple(value * scale for value in entropy_coefficients(args))
+    if args.gru_policy or args.gru_critic:
+        tensors, source_indices = recurrent_batch(rollout)
+        returns, values = (tensor[tensors[8]] for tensor in tensors[4:6])
+    else:
+        tensors, source_indices = learner_batch(rollout)
+        returns, values = tensors[4:6]
+
+    observations = tensors[0]
     diagnostics = value_statistics(values, returns)
     diagnostic_values = torch.stack(tuple(diagnostics.values()))
     require_finite(diagnostic_values, "critic diagnostics")
@@ -304,16 +507,16 @@ def prepare_ppo_batch(rollout: Rollout, args: Namespace) -> PPOBatch:
         if normalize
         else returns.new_ones(())
     )
-    critic_max_norm = args.critic_max_grad_norm
+    critic_max_norm = args.critic_max_gradient_norm
     critic_max_norm = (
-        args.max_grad_norm if critic_max_norm is None else critic_max_norm
+        args.max_gradient_norm if critic_max_norm is None else critic_max_norm
     )
-    value_clip_coef = args.value_clip_coef
+    value_clip_coef = args.value_clip_coefficient
     ent_coef = observations.new_tensor(coefficients, dtype=torch.float32)
     loss_arguments = (
-        args.clip_coef,
+        args.clip_coefficient,
         ent_coef,
-        args.vf_coef,
+        args.value_coefficient,
         args.clip_value_loss,
         value_scale,
         value_clip_coef
@@ -332,12 +535,12 @@ def prepare_ppo_batch(rollout: Rollout, args: Namespace) -> PPOBatch:
 @dataclass
 class PPOUpdateFunctions:
 
-    kernels:         CompiledPPOUpdate | None
-    loss:            Callable[..., tuple[torch.Tensor, torch.Tensor]]
-    loss_function:   LossFunction
-    gradient_check:  Callable[..., torch.Tensor]
-    optimizer_step:  Callable[[], object]
-    record_metrics:  Callable[..., None]
+    kernels:        CompiledPPOUpdate | None
+    loss:           Callable[..., tuple[torch.Tensor, torch.Tensor]]
+    loss_function:  LossFunction
+    gradient_check: Callable[..., torch.Tensor]
+    optimizer_step: Callable[[], object]
+    record_metrics: Callable[..., None]
 
 
 def prepare_ppo_functions(
@@ -373,13 +576,21 @@ def update_ppo(
     optimizer:     torch.optim.Optimizer,
     loss_function: LossFunction,
     rollout:       Rollout,
-    args:          Namespace
+    args:          Namespace,
+    step:          int = 0
 ) -> dict[str, float]:
-    batch_state = prepare_ppo_batch(rollout, args)
+    batch_state = prepare_ppo_batch(rollout, args, step)
     functions = prepare_ppo_functions(optimizer, loss_function, args)
+    guard = PPOUpdateGuard(optimizer)
     observations = batch_state.tensors[0]
     device = observations.device
     updates = 0
+    minibatch_size = args.minibatch_size
+    samples = len(observations)
+
+    if args.gru_policy or args.gru_critic:
+        minibatch_size //= rollout.gru_sequence_length
+        samples = batch_state.tensors[8].sum()
 
     if functions.kernels is not None:
         # These rollout buffers are read-only throughout PPO. Without static
@@ -393,14 +604,18 @@ def update_ppo(
         indices = torch.randperm(len(observations), device=device)
         epoch_kl = torch.zeros((), device=device)
 
-        for batch in indices.split(args.minibatch_size):
+        for batch in indices.split(minibatch_size):
             torch.compiler.cudagraph_mark_step_begin()
             optimizer.zero_grad(set_to_none=True)
-            critic_observations = (
-                rollout.critic_inputs(batch_state.source_indices[batch])
-                if rollout.critic_history is not None
-                else None
-            )
+            critic_observations = None
+
+            if rollout.critic_history is not None:
+                source = batch_state.source_indices[batch]
+
+                if args.gru_policy or args.gru_critic:
+                    source = source.T.flatten()
+
+                critic_observations = rollout.critic_inputs(source)
 
             with autocast(device, args.bf16):
                 loss, metrics = functions.loss(
@@ -416,19 +631,21 @@ def update_ppo(
             check = functions.gradient_check(
                 agent,
                 loss,
-                args.max_grad_norm,
-                batch_state.critic_max_norm
+                args.max_gradient_norm,
+                batch_state.critic_max_norm,
+                guard.found_inf
             )
-            # One safety synchronization, rather than separate loss/actor/critic
-            # barriers. Invalid losses or gradients still stop before Adam steps.
-            require_finite(check, "PPO loss/gradients")
-
-            functions.optimizer_step()
+            guard.step(check, functions.optimizer_step)
+            batch_size = (
+                batch_state.tensors[8][batch].sum()
+                if args.gru_policy or args.gru_critic
+                else len(batch)
+            )
             functions.record_metrics(
                 batch_state.metrics_sum,
                 epoch_kl,
                 metrics,
-                len(batch)
+                batch_size
             )
 
             updates += 1
@@ -436,8 +653,10 @@ def update_ppo(
         if args.target_kl is None:
             continue
 
-        if (epoch_kl / len(observations)).item() > args.target_kl:
+        if (epoch_kl / samples).item() > args.target_kl:
             break
+
+    guard.finish()
 
     return ppo_metrics(
         batch_state.metrics_sum, updates, batch_state.diagnostics
@@ -445,15 +664,14 @@ def update_ppo(
 
 
 def ppo_metrics(
-    metrics_sum:  torch.Tensor,
-    updates:      int,
-    diagnostics:  dict[str, torch.Tensor]
+    metrics_sum: torch.Tensor,
+    updates:     int,
+    diagnostics: dict[str, torch.Tensor]
 ) -> dict[str, float]:
     names = (
         "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"
-    )
-    values = (metrics_sum / updates).cpu().tolist()
-    metrics = dict(zip(names, values))
-    metrics["explained_variance"] = diagnostics["explained_variance"].item()
+    ) + tuple(diagnostics)
+    diagnostic_values = torch.stack(tuple(diagnostics.values()))
+    values = torch.cat((metrics_sum / updates, diagnostic_values))
 
-    return metrics
+    return dict(zip(names, values.cpu().tolist()))

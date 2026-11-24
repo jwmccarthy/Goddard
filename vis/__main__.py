@@ -6,12 +6,10 @@ import os
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from training.logging import configure_logging
-
-if TYPE_CHECKING:
-    from vis.playback import Match
+from vis.playback import Match
 
 WEB_ROOT = Path(__file__).with_name("web")
 DEFAULT_MESH = Path(__file__).resolve().parents[2] / "CARL/assets/arena.obj"
@@ -61,8 +59,9 @@ class ViewerHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         modes = {
-            "/reset/replay":  "replay",
-            "/reset/kickoff": "kickoff",
+            "/reset/replay":      "replay",
+            "/reset/kickoff":     "kickoff",
+            "/reload/checkpoint": "checkpoint"
         }
 
         mode = modes.get(self.path.split("?", 1)[0])
@@ -72,7 +71,10 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         elif self.match.stopped.is_set():
             self.send_error(503, "Playback stopped")
         else:
-            self.match.request_reset(mode)
+            if mode == "checkpoint":
+                self.match.request_reload()
+            else:
+                self.match.request_reset(mode)
             self.send_response(202)
             self.end_headers()
 
@@ -103,13 +105,11 @@ def main() -> None:
     parser.add_argument(
         "--mesh",
         type=Path,
-            default=os.environ.get("CARL_ARENA_OBJ", DEFAULT_MESH)
+        default=os.environ.get("CARL_ARENA_OBJ", DEFAULT_MESH)
     )
 
     parser.add_argument("--replay-dir", type=Path)
     args = parser.parse_args()
-
-    from vis.playback import Match
 
     match = Match(
         args.checkpoint,

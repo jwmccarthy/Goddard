@@ -13,11 +13,23 @@ from torch.utils.tensorboard import SummaryWriter
 from rewards import GameplayDiagnostics
 from training.checkpoints import load_checkpoint, save_checkpoint
 from training.logging import log_metrics, progress_bar, run_directory
-from training.replay_resets import ReplayResetDataset, ReplayResetProvider
-from training.schedules import checkpoint_due
+from training.ppo import update_ppo
+from training.replay_resets import (
+    ReplayResetBank,
+    ReplayResetDataset,
+    ReplayResetProvider,
+)
+from training.residual import ResidualReward
+from training.rollout import collect
+from training.schedules import (
+    checkpoint_due,
+    schedule_learning_rate,
+    scheduled_entropy_scale,
+    scheduled_gamma,
+)
 from training.self_play import OpponentPool
-from training.setup import compilation_mode, compile_functions, prepare
-from training.tensors import plain_tensor
+from training.setup import compile_functions, prepare
+from training.tensors import autocast, compilation_mode, plain_tensor
 
 if TYPE_CHECKING:
     from carl.gymnasium import CARLTorchVectorEnv
@@ -41,21 +53,41 @@ def replay_resets(
         seed=args.seed
     )
 
+    bank = None
+
+    if args.replay_reset_bank is not None:
+        bank = ReplayResetBank(
+            args.replay_reset_bank,
+            args.team_size,
+            env.device,
+            args.replay_reset_bank_temperature
+        )
+
     provider = ReplayResetProvider(
         data,
         args.replay_reset_fraction,
-        args.seed
+        args.seed,
+        bank,
+        args.replay_reset_bank_fraction if bank is not None else 0.0
     )
 
     env.reset_state_provider = provider
     logging.info("Replay resets: %s states.", f"{len(data.frames):,}")
 
+    if bank is not None:
+        logging.info(
+            "Reset bank: %s states, fraction %.3f, temperature %.2f.",
+            f"{len(bank):,}",
+            args.replay_reset_bank_fraction,
+            args.replay_reset_bank_temperature
+        )
+        logging.info("Reset bank cells: %s.", bank.cell_summary())
+
     return provider
 
 
 class TrainingRun:
-    """Shared resources and logging around the explicit training loops."""
-
+    """Shared resources and loop mechanics for the explicit training loops."""
 
     def __init__(self, args: Namespace, algorithm: str) -> None:
         self.args = args
@@ -86,12 +118,16 @@ class TrainingRun:
                 self.args.frameskip,
                 no_touch_timeout_steps=math.ceil(
                     self.args.no_touch_timeout * 120 / self.args.frameskip
-                )
+                ),
+                resets=self.resets
             )
 
             reward = self.gameplay
 
-            if self.args.compile and self.algorithm == "gaifo":
+            if self.algorithm == "residual":
+                reward = ResidualReward(self.gameplay, self.args)
+
+            if self.args.compile and self.algorithm in ("gaifo", "residual"):
                 reward = torch.compile(
                     reward,
                     fullgraph=True,
@@ -124,7 +160,7 @@ class TrainingRun:
 
         if (
             self.args.opponent_pool_size
-            and self.args.historical_opponent_fraction
+            and self.args.opponent_historical_fraction
         ):
             self.pool = OpponentPool(
                 self.agent,
@@ -146,7 +182,9 @@ class TrainingRun:
         self.directory = run_directory(self.args, self.algorithm)
         self.writer = SummaryWriter(
             self.directory,
-            purge_step=self.step + 1 if self.args.resume else None
+            purge_step=(
+                self.step * self.args.frameskip + 1 if self.args.resume else None
+            )
         )
         self.resources.callback(self.writer.close)
         self.writer.add_text("configuration", str(vars(self.args)))
@@ -155,6 +193,11 @@ class TrainingRun:
             self.args.timesteps
         )
         self.resources.callback(self.progress.stop)
+        self.gamma_tensor = None
+
+        if self.args.gamma_end is not None:
+            self.gamma_tensor = torch.empty((), device=self.env.device)
+
         observation = plain_tensor(self.env.reset())
 
         if self.pool is not None:
@@ -167,6 +210,87 @@ class TrainingRun:
             )
 
         return observation
+
+    def schedule(self) -> float:
+        """Apply this step's learning rate and return the scheduled gamma."""
+        schedule_learning_rate(self.optimizer, self.args, self.step)
+
+        return scheduled_gamma(self.args, self.step)
+
+    def discount(
+        self,
+        gamma:  float,
+        scaled: bool = False
+    ) -> float | torch.Tensor:
+        """GAE discount; scaled converts gamma from 4 ticks to the frameskip."""
+        if scaled:
+            gamma = gamma ** (self.args.frameskip / 4)
+
+        if self.gamma_tensor is None:
+            return gamma
+
+        return self.gamma_tensor.fill_(gamma)
+
+    def collect(
+        self,
+        observation: torch.Tensor,
+        **kwargs:    Any
+    ) -> torch.Tensor:
+        return collect(
+            self.env,
+            self.agent,
+            self.policy,
+            self.rollout,
+            observation,
+            self.args,
+            self.pool,
+            **kwargs
+        )
+
+    def estimate_advantages(
+        self,
+        observation: torch.Tensor,
+        gamma:       float | torch.Tensor,
+        lambda_:     float
+    ) -> None:
+        rollout = self.rollout
+
+        with torch.no_grad(), autocast(self.env.device, self.args.bf16):
+            next_value = self.agent.get_value(
+                observation,
+                rollout.critic_context(observation),
+                critic_state=rollout.critic_state
+            )
+
+        self.gae(rollout, next_value, gamma, lambda_)
+
+    def update_policy(self) -> dict[str, float]:
+        return update_ppo(
+            self.agent,
+            self.optimizer,
+            self.loss,
+            self.rollout,
+            self.args,
+            self.step
+        )
+
+    def add_common_metrics(
+        self,
+        metrics: dict[str, float],
+        gamma:   float,
+        *,
+        learner_only: bool = False
+    ) -> None:
+        rewards = self.rollout.rewards
+
+        if learner_only and self.rollout.learner_mask is not None:
+            rewards = rewards[self.rollout.learner_mask]
+
+        metrics["reward_per_tick"] = rewards.mean().item() / self.args.frameskip
+        metrics["ppo/gamma"] = gamma
+        metrics["ppo/entropy_coefficient"] = (
+            self.args.entropy_coefficient * scheduled_entropy_scale(self.args, self.step)
+        )
 
     def finish(self, metrics: dict[str, float], started: float) -> bool:
         previous = self.step

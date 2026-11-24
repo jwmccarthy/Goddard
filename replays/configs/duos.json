@@ -1,5 +1,6 @@
 {
   "team_size": 2,
+  "reconstruction": "native-v1",
   "include_groups": "swiss|group stage|gsl stage|playoff|world championship",
   "roots": [
     {"group_id": "2v2-events-gnz7nvaem1", "metadata": {"year": 2026}}

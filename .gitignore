@@ -6,7 +6,6 @@ __pycache__/
 checkpoints/
 runs/
 .evals/
-replays/labels/
 .pytest_cache/
 .ruff_cache/
 .autoresearch/
@@ -15,7 +14,9 @@ replays/labels/
 # Local replay and project backups are archives, not source files.
 *.7z
 
-# Replay datasets can contain tens of thousands of large files.
-replays/raw/
-replays/parsed_replays/
-replays/rlcs/
+# Data: replay corpora, policy clips, skill labels and the decoder build.
+replays/duels/
+replays/duos/
+clips/
+labels/
+tools/carball/carball-boxcars-0.13.1

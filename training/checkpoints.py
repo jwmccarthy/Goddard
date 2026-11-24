@@ -13,18 +13,22 @@ if TYPE_CHECKING:
     from training.models import Agent
 
 
-@lru_cache(maxsize=1)
-def read_checkpoint(path: str | Path) -> dict[str, Any]:
+def load_payload(path: str | Path) -> dict[str, Any]:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
+@lru_cache(maxsize=1)
+def read_checkpoint(path: str | Path) -> dict[str, Any]:
+    return load_payload(path)
+
+
 def save_checkpoint(
-    path:             str | Path,
-    algorithm:        str,
-    args:             Namespace,
-    agent:            Agent,
-    optimizer:        torch.optim.Optimizer,
-    step:             int,
+    path:      str | Path,
+    algorithm: str,
+    args:      Namespace,
+    agent:     Agent,
+    optimizer: torch.optim.Optimizer,
+    step:      int,
     *,
     replay_reset_rng: torch.Tensor | None = None,
     opponent_pool:    dict[str, Any] | None = None,
@@ -43,7 +47,7 @@ def save_checkpoint(
         "python_rng":       random.getstate(),
         "replay_reset_rng": replay_reset_rng,
         "opponent_pool":    opponent_pool,
-        **extra,
+        **extra
     }
 
     path = Path(path)

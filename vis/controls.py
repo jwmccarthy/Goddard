@@ -27,7 +27,7 @@ def control_values(
                 "roll":       roll,
                 "slide":      slide >= 0.5,
                 "boost":      boost >= 0.5,
-                "jump":       jump >= 0.5,
+                "jump":       jump >= 0.5
             }
         )
 

@@ -1,0 +1,52 @@
+{
+  "replay": "000f9b78-71ae-4d2d-a3df-94aa92f1a371",
+  "frames": 11473,
+  "physics_identical": true,
+  "component_differences": {
+    "15894832258126766871": {
+      "boost_amount": {
+        "bundled_vs_updated": 2,
+        "updated_vs_updated": 2
+      },
+      "boost_is_active": {
+        "bundled_vs_updated": 1,
+        "updated_vs_updated": 1
+      },
+      "jump_is_active": {
+        "bundled_vs_updated": 0,
+        "updated_vs_updated": 24
+      },
+      "double_jump_is_active": {
+        "bundled_vs_updated": 0,
+        "updated_vs_updated": 55
+      },
+      "dodge_is_active": {
+        "bundled_vs_updated": 44,
+        "updated_vs_updated": 0
+      }
+    },
+    "11727899414184306598": {
+      "boost_amount": {
+        "bundled_vs_updated": 1,
+        "updated_vs_updated": 58
+      },
+      "boost_is_active": {
+        "bundled_vs_updated": 0,
+        "updated_vs_updated": 46
+      },
+      "jump_is_active": {
+        "bundled_vs_updated": 33,
+        "updated_vs_updated": 33
+      },
+      "double_jump_is_active": {
+        "bundled_vs_updated": 1,
+        "updated_vs_updated": 56
+      },
+      "dodge_is_active": {
+        "bundled_vs_updated": 38,
+        "updated_vs_updated": 0
+      }
+    }
+  },
+  "note": "Physics match exactly. Component fields vary at actor lifecycle boundaries, including between two runs of the same decoder; reports hash the actual exports."
+}

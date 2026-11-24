@@ -9,12 +9,7 @@ import torch
 from carl.gymnasium import CARLBall, CARLCars, CARLResetState
 
 from replays import layout
-
-
-def parsed_directory(directory: str | Path) -> Path:
-    directory = Path(directory)
-
-    return directory / "parsed" if (directory / "parsed").is_dir() else directory
+from replays.dataset import parsed_directory, replay_paths
 
 
 def replay_key(path: Path) -> tuple[Path, tuple[str, ...]]:
@@ -24,16 +19,10 @@ def replay_key(path: Path) -> tuple[Path, tuple[str, ...]]:
 
 
 def replay_reset_bounds(path: Path, count: int) -> tuple[int, int]:
-    """Keep only rows strictly over four seconds from either period boundary.
-
-    Legacy exports omit preceding-goal timestamps. Treat every period edge as
-    a possible goal, including non-goal edges, rather than admitting uncertain
-    states. The extra endpoint margin also covers irregular appended goal rows.
-    """
-
+    """Keep only rows strictly over four seconds from either period boundary."""
     metadata = path.with_suffix(".json")
-    values = json.loads(metadata.read_text()) if metadata.is_file() else {}
-    frameskip = values.get("frameskip", layout.PARSED_FRAMESKIP)
+    values = json.loads(metadata.read_text())
+    frameskip = values["frameskip"]
 
     margin = math.ceil(4 * 120 / frameskip)
     start = margin + 1
@@ -101,6 +90,38 @@ def replay_internal_states(
     return (internal, known)
 
 
+def replay_eligibility(
+    path:     Path,
+    rows:     np.ndarray,
+    scene:    np.ndarray,
+    internal: np.ndarray,
+    n_cars:   int
+) -> np.ndarray:
+    """Rows a replay reset may start from, shared by the dataset and the bank."""
+
+    cars = scene[:, layout.BALL_SIZE :].reshape(-1, n_cars, layout.CAR_SIZE)
+
+    forward = cars[..., 9:12]
+    up = cars[..., 12:15]
+    forward_valid = (np.square(forward).sum(-1) >= 1e-8).all(-1)
+    right = np.cross(up, forward)
+    right_valid = (np.square(right).sum(-1) >= 1e-8).all(-1)
+
+    eligible = (
+        (rows[:, -2:] <= 0.5).all(-1)
+        & np.isfinite(scene).all(-1)
+        & np.isfinite(internal).all(axis=(1, 2))
+        & forward_valid
+        & right_valid
+    )
+
+    start, stop = replay_reset_bounds(path, len(rows))
+    eligible[:start] = False
+    eligible[stop:] = False
+
+    return eligible
+
+
 class ReplayResetSampler:
 
     def __init__(
@@ -114,7 +135,7 @@ class ReplayResetSampler:
         self.n_cars = layout.team_car_count(team_size)
         self.scene_size = layout.team_scene_size(team_size)
         self.random = random.Random(seed)
-        paths = sorted(directory.rglob("*.npy"))
+        _, paths = replay_paths(directory, team_size)
         self.groups = {}
 
         for path in paths:
@@ -127,13 +148,6 @@ class ReplayResetSampler:
 
         for path in paths:
             rows = np.load(path, mmap_mode="r", allow_pickle=False)
-
-            if (
-                rows.ndim != 2
-                or rows.shape[1] != layout.team_replay_row_size(team_size)
-                or not len(rows)
-            ):
-                continue
 
             start, stop = replay_reset_bounds(path, len(rows))
 
@@ -208,14 +222,7 @@ class ReplayResetSampler:
 
 
 class ReplayResetDataset:
-    """Uniform bounded reservoir of eligible rows; source files are read-only.
-
-    Each file contributes a hypergeometric number of rows to the reservoir.
-    This is exactly uniform without replacement over all eligible states, not
-    uniform over files. Host and device storage are bounded by max_states.
-    Both period edges have a conservative, strictly greater than four-second
-    goal buffer, shared with the viewer's ReplayResetSampler.
-    """
+    """Uniform bounded reservoir of eligible rows; source files are read-only."""
 
     def __init__(
         self,
@@ -228,7 +235,7 @@ class ReplayResetDataset:
         directory = parsed_directory(directory)
         self.n_cars = layout.team_car_count(team_size)
         scene_size = layout.team_scene_size(team_size)
-        paths = sorted(directory.rglob("*.npy"))
+        _, paths = replay_paths(directory, team_size)
         groups = {}
 
         for path in paths:
@@ -245,13 +252,6 @@ class ReplayResetDataset:
         for path in paths:
             rows = np.load(path, mmap_mode="r", allow_pickle=False)
 
-            if (
-                rows.ndim != 2
-                or rows.shape[1] != layout.team_replay_row_size(team_size)
-                or not len(rows)
-            ):
-                continue
-
             scene = np.array(rows[:, :scene_size], dtype=np.float32)
             counterparts = [other for other in groups[replay_key(path)] if other != path]
             internal, _ = replay_internal_states(
@@ -261,25 +261,7 @@ class ReplayResetDataset:
                 counterparts
             )
 
-            cars = scene[:, layout.BALL_SIZE :].reshape(-1, self.n_cars, layout.CAR_SIZE)
-
-            forward = cars[..., 9:12]
-            up = cars[..., 12:15]
-            forward_valid = (np.square(forward).sum(-1) >= 1e-8).all(-1)
-            right = np.cross(up, forward)
-            right_valid = (np.square(right).sum(-1) >= 1e-8).all(-1)
-
-            eligible = (
-                (rows[:, -2:] <= 0.5).all(-1)
-                & np.isfinite(scene).all(-1)
-                & np.isfinite(internal).all(axis=(1, 2))
-                & forward_valid
-                & right_valid
-            )
-
-            start, stop = replay_reset_bounds(path, len(rows))
-            eligible[:start] = False
-            eligible[stop:] = False
+            eligible = replay_eligibility(path, rows, scene, internal, self.n_cars)
             candidates = np.flatnonzero(eligible)
             count = len(candidates)
 
@@ -312,20 +294,122 @@ class ReplayResetDataset:
         self.internal_states = torch.from_numpy(internals[:size]).to(device)
 
 
-class ReplayResetProvider:
-    """Uniform replay sampling with a fixed RNG draw count per arena and call."""
+class ReplayResetBank:
+    """Curated aerial opportunity states with stratified sampling weights."""
 
     def __init__(
         self,
-        dataset:  ReplayResetDataset,
-        fraction: float = 0.5,
-        seed:     int = 0
+        path:        str | Path,
+        team_size:   int,
+        device:      torch.device | str,
+        temperature: float = 0.5
     ) -> None:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        n_cars = layout.team_car_count(team_size)
+        scene_size = layout.team_scene_size(team_size)
+
+        if payload["team_size"] != team_size:
+            raise ValueError(
+                f"reset bank {path} holds team size {payload['team_size']}, "
+                f"not {team_size}"
+            )
+
+        if payload["frames"].shape[1] != scene_size:
+            raise ValueError(
+                f"reset bank {path} scenes have {payload['frames'].shape[1]} "
+                f"values, expected {scene_size}"
+            )
+
+        if payload["internal_states"].shape[1:] != (n_cars, layout.INTERNAL_SIZE):
+            raise ValueError(
+                f"reset bank {path} internal states are "
+                f"{tuple(payload['internal_states'].shape[1:])}, expected "
+                f"{(n_cars, layout.INTERNAL_SIZE)}"
+            )
+
+        if not len(payload["frames"]):
+            raise ValueError(f"reset bank {path} is empty")
+
+        self.n_cars = n_cars
+        self.temperature = temperature
+        self.kind_names = list(payload["kind_names"])
+        self.surface_names = list(payload["surface_names"])
+        self.phase_names = list(payload["phase_names"])
+        self.frames = payload["frames"].to(device)
+        self.internal_states = payload["internal_states"].to(device)
+
+        for name in (
+            "kind", "surface", "phase", "time_to_event_s",
+            "event_height_uu", "episode_id", "ball_error_uu"
+        ):
+            setattr(self, name, payload[name].to(device))
+
+        phases = len(self.phase_names)
+        cells = payload["surface"].long() * phases + payload["phase"].long()
+        counts = torch.bincount(cells, minlength=len(self.surface_names) * phases)
+        mass = counts.double().pow(temperature) * (counts > 0)
+        weight = mass / mass.sum() / counts.clamp(min=1)
+
+        self.cell_counts = counts.reshape(len(self.surface_names), phases)
+        self.probabilities = weight[cells].to(device)
+        self.cumulative = self.probabilities.cumsum(0)
+        self.cumulative /= self.cumulative[-1].clone()
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def sample(
+        self,
+        shape:     torch.Size | tuple[int, ...],
+        generator: torch.Generator
+    ) -> torch.Tensor:
+        chance = torch.rand(
+            shape,
+            dtype=torch.float64,
+            device=self.frames.device,
+            generator=generator
+        )
+
+        return torch.searchsorted(self.cumulative, chance).clamp_(max=len(self) - 1)
+
+    def cell_summary(self) -> str:
+        return ", ".join(
+            f"{surface}/{phase}: {int(self.cell_counts[i, j]):,}"
+            for i, surface in enumerate(self.surface_names)
+            for j, phase in enumerate(self.phase_names)
+            if self.cell_counts[i, j]
+        )
+
+
+class ReplayResetProvider:
+    """Uniform replay and bank sampling with a fixed RNG draw count per call."""
+
+    def __init__(
+        self,
+        dataset:       ReplayResetDataset,
+        fraction:      float = 0.5,
+        seed:          int = 0,
+        bank:          ReplayResetBank | None = None,
+        bank_fraction: float = 0.0
+    ) -> None:
+        if bank is not None:
+            if bank.n_cars != dataset.n_cars:
+                raise ValueError("reset bank and dataset car counts differ")
+
+            if not 0 <= bank_fraction <= fraction:
+                raise ValueError(
+                    "bank fraction must be within [0, replay reset fraction]"
+                )
+
         self.dataset = dataset
         self.fraction = fraction
+        self.bank = bank
+        self.bank_fraction = bank_fraction
         device = dataset.frames.device
         self.generator = torch.Generator(device=device).manual_seed(seed)
         self.counts = torch.zeros(2, dtype=torch.int64, device=device)
+        self.sources = None
+        self.bank_indices = None
 
     @torch.no_grad()
     def __call__(self, reset_mask: torch.Tensor) -> CARLResetState:
@@ -345,26 +429,59 @@ class ReplayResetProvider:
 
         self.counts += torch.stack((selected.sum(), reset_mask.sum()))
 
+        if self.bank is None:
+            return self.reset_state(
+                indices,
+                simulation_indices=None,
+                reset_mask=selected
+            )
+
+        banked = reset_mask & (chance < self.bank_fraction)
+        bank_indices = self.bank.sample(reset_mask.shape, self.generator)
+
+        if self.sources is None:
+            self.sources = torch.zeros_like(reset_mask, dtype=torch.int8)
+            self.bank_indices = torch.full_like(reset_mask, -1, dtype=torch.long)
+
+        source = selected.to(torch.int8) + banked.to(torch.int8)
+        used = torch.where(banked, bank_indices, -1)
+        self.sources.copy_(torch.where(reset_mask, source, self.sources))
+        self.bank_indices.copy_(torch.where(reset_mask, used, self.bank_indices))
+
         return self.reset_state(
             indices,
+            banked=banked,
+            bank_indices=bank_indices,
             simulation_indices=None,
             reset_mask=selected
         )
 
     def reset_state(
         self,
-        indices:     torch.Tensor,
-        **selection: torch.Tensor | None
+        indices:      torch.Tensor,
+        banked:       torch.Tensor | None = None,
+        bank_indices: torch.Tensor | None = None,
+        **selection:  torch.Tensor | None
     ) -> CARLResetState:
         scene = self.dataset.frames[indices]
+        internal = self.dataset.internal_states[indices]
         n_cars = self.dataset.n_cars
+
+        if banked is not None:
+            scene = torch.where(banked[:, None], self.bank.frames[bank_indices], scene)
+            internal = torch.where(
+                banked[:, None, None],
+                self.bank.internal_states[bank_indices],
+                internal
+            )
+
         cars = scene[:, layout.BALL_SIZE :].reshape(-1, n_cars, layout.CAR_SIZE)
 
         return CARLResetState(
             **selection,
             ball=CARLBall.from_tensor(scene[:, : layout.BALL_SIZE]),
             cars=CARLCars.from_tensor(cars, n_cars),
-            car_internal_state=self.dataset.internal_states[indices],
+            car_internal_state=internal,
             normalized=True
         )
 
@@ -374,7 +491,7 @@ class ReplayResetProvider:
 
         return (
             {
-                "gameplay/replay_reset_fraction": selected / total,
+                "gameplay/replay_reset_fraction": selected / total
             }
             if total
             else {}

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-# ruff: noqa: I001
-
 import math
 from argparse import Namespace
 from collections.abc import Callable, Iterator
@@ -12,36 +10,47 @@ from torch import nn
 from torch.nn import functional as F
 
 from replays.dataset import ExpertDataset
-from training.discriminator import (  # noqa: I001
-    add_motion_noise,
+from training.discriminator import (
+    args_motion_noise,
+    args_rewards,
     balanced_pair_batch,
-    discriminator_rewards,
     mirror_scene_pairs,
-    polyak_update
+    polyak_update,
 )
-from training.tensors import autocast, require_finite
+from training.tensors import (
+    autocast,
+    compilation_mode,
+    configure_compilation_warnings,
+    require_finite,
+)
 
 if TYPE_CHECKING:
     from training.rollout import Rollout
 
 
 class TransitionPairs:
-    """Strided frame pairs with reset-aware history carried between rollouts."""
-
+    """Strided frame windows with reset-aware history across rollouts."""
 
     def __init__(
         self,
-        observation: torch.Tensor,
-        steps:       int,
-        scene_size:  int,
-        stride:      int
+        observation:   torch.Tensor,
+        steps:         int,
+        scene_size:    int,
+        stride:        int,
+        window_length: int = 2,
+        jump_enabled:  bool = False
     ) -> None:
         self.scene_size = scene_size
         self.stride = stride
+        self.span = stride * (window_length - 1)
         self.scenes = observation.new_empty(
             (steps, len(observation), scene_size)
         )
         self.successors = torch.empty_like(self.scenes)
+        self.jumps = (
+            observation.new_zeros(steps, len(observation))
+            if jump_enabled else None
+        )
         self.dones = torch.zeros(
             self.scenes.shape[:2],
             dtype=torch.bool,
@@ -51,7 +60,7 @@ class TransitionPairs:
         self.score_deltas = observation.new_zeros(self.dones.shape)
 
         self.prefix = observation.new_full(
-            (stride - 1, len(observation), scene_size),
+            (self.span - 1, len(observation), scene_size),
             float("nan")
         )
         self.prefix_dones = torch.zeros(
@@ -59,12 +68,14 @@ class TransitionPairs:
             dtype=torch.bool,
             device=observation.device
         )
-        self.offsets = torch.arange(stride - 1, device=observation.device)
+        self.offsets = torch.arange(
+            0, self.span, stride, device=observation.device
+        )
         self.started = False
-        self.frames = self.boundaries = None
+        self.frames = self.reset_counts = None
 
     def carry_history(self) -> None:
-        self.frames = self.boundaries = None
+        self.frames = self.reset_counts = None
 
         if self.started and len(self.prefix):
             if len(self.prefix) <= len(self.scenes):
@@ -89,7 +100,8 @@ class TransitionPairs:
         final_observation: torch.Tensor,
         done:              torch.Tensor,
         terminated:        torch.Tensor,
-        score_delta:       torch.Tensor
+        score_delta:       torch.Tensor,
+        actions:           torch.Tensor | None = None
     ) -> None:
         if step == 0:
             self.carry_history()
@@ -107,34 +119,50 @@ class TransitionPairs:
         self.terminated[step].copy_(terminated)
         self.score_deltas[step].copy_(score_delta)
 
+        if self.jumps is not None:
+            # CARL's factorized action order ends with the binary jump button.
+            self.jumps[step].copy_(actions[..., 6])
+
     def pairs(self, indices: torch.Tensor) -> torch.Tensor:
         actors = self.scenes.shape[1]
         step, actor = indices // actors, indices % actors
 
         if self.frames is None:
             self.frames = torch.cat((self.prefix, self.scenes))
-            self.boundaries = torch.cat((self.prefix_dones, self.dones))
+            boundaries = torch.cat((self.prefix_dones, self.dones))
+            self.reset_counts = F.pad(
+                boundaries.long().cumsum(0), (0, 0, 1, 0)
+            )
 
-        reset_steps = step[:, None] + self.offsets
-        crossed_reset = self.boundaries[reset_steps, actor[:, None]].any(1)
-        previous = self.frames[step, actor].masked_fill(
-            crossed_reset[:, None],
+        frame_steps = step[:, None] + self.offsets
+        counts = self.reset_counts[step + self.span - 1, actor]
+        crossed_reset = (
+            self.reset_counts[frame_steps, actor[:, None]] != counts[:, None]
+        )
+        previous = self.frames[frame_steps, actor[:, None]].masked_fill(
+            crossed_reset[..., None],
             float("nan")
         )
 
-        return torch.stack((previous, self.successors[step, actor]), 1)
+        pairs = torch.cat((previous, self.successors[step, actor][:, None]), 1)
+        if self.jumps is not None:
+            jump = self.jumps[step, actor, None, None]
+            pairs = torch.cat((pairs, jump.expand(-1, pairs.shape[1], 1)), -1)
+
+        return pairs
 
 
 def generated_training_indices(
     rollout: Rollout,
     scenes:  TransitionPairs
 ) -> torch.Tensor:
-    valid = ~scenes.terminated.flatten()
+    # CARL kickoffs are immediately controllable, including stationary poses.
+    valid = ~scenes.terminated
 
     if rollout.learner_mask is not None:
-        valid &= rollout.learner_mask.flatten()
+        valid &= rollout.learner_mask
 
-    return valid.nonzero().flatten()
+    return valid.flatten().nonzero().flatten()
 
 
 class PairHistory:
@@ -183,7 +211,7 @@ class PairHistory:
             ),
             "size":      self.size,
             "cursor":    self.cursor,
-            "iteration": self.iteration,
+            "iteration": self.iteration
         }
 
     def load_state_dict(
@@ -210,24 +238,43 @@ def discriminator_loss(
     labels:        torch.Tensor,
     amp:           bool
 ) -> torch.Tensor:
-    loss = pairs.new_zeros(())
     objective = F.mse_loss if amp else F.binary_cross_entropy_with_logits
+    logits = discriminator(pairs).float()
 
-    for head in discriminator.heads:
-        logits = head(pairs).float()
-        loss = loss + objective(logits, labels) * (1 if amp else 2) / 2
+    labels = labels[:, None].expand_as(logits)
 
-    return loss
+    return objective(logits, labels) * (1 if amp else 2)
+
+
+def discriminator_gradient_penalty(
+    discriminator: nn.Module,
+    expert:        torch.Tensor
+) -> torch.Tensor:
+    """R1 penalty: mean squared input gradient of the summed head logits.
+
+    torch.func.vjp keeps the gradient differentiable inside a fullgraph
+    compiled region. It specializes on the batch size, so callers must always
+    pass the same number of windows.
+    """
+
+    logits, pullback = torch.func.vjp(discriminator, expert)
+    gradient, = pullback(torch.ones_like(logits))
+    # Padded entities carry NaN inputs and no signal.
+    gradient = torch.where(torch.isnan(expert), 0.0, gradient)
+
+    return gradient.square().sum(tuple(range(1, gradient.ndim))).mean()
 
 
 def compile_discriminator_functions(
     discriminator: nn.Module,
     target:        nn.Module | None,
-    args:          Namespace
-) -> tuple[Callable, nn.Module]:
-    from training.setup import compilation_mode, configure_compilation_warnings
-
-    loss = discriminator_loss
+    args:          Namespace,
+    loss:          Callable = discriminator_loss
+) -> tuple[Callable, nn.Module, Callable | None]:
+    penalty = (
+        discriminator_gradient_penalty
+        if args.discriminator_gradient_penalty else None
+    )
     reward_model = target if target is not None else discriminator
 
     if args.compile:
@@ -240,44 +287,59 @@ def compile_discriminator_functions(
             dynamic=True
         )
 
+        if penalty is not None:
+            # One fixed microbatch shape, so a single static compilation.
+            penalty = torch.compile(
+                penalty,
+                fullgraph=True,
+                mode=compilation_mode(cuda_graphs=False),
+                dynamic=False
+            )
+
         reward_model = torch.compile(
             reward_model,
             fullgraph=True,
-            mode=compilation_mode(),
+            mode=compilation_mode(cuda_graphs=args.cuda_graphs),
             dynamic=True
         )
 
-    return loss, reward_model
+    return loss, reward_model, penalty
 
 
 def train_discriminator_batch(
-    discriminator: nn.Module,
-    optimizer:     torch.optim.Optimizer,
-    generated:     torch.Tensor,
-    expert:        torch.Tensor,
-    args:          Namespace,
-    target:        nn.Module | None,
-    loss_function: Callable
+    discriminator:    nn.Module,
+    optimizer:        torch.optim.Optimizer,
+    generated:        torch.Tensor,
+    expert:           torch.Tensor,
+    args:             Namespace,
+    target:           nn.Module | None,
+    loss_function:    Callable,
+    penalty_function: Callable | None = None
 ) -> torch.Tensor:
+    # Returns the loss, or [loss, unweighted expert gradient penalty] when the
+    # penalty weight is set. The penalty is evaluated only on full-size expert
+    # microbatches (a fixed shape, so it compiles once) and averaged over them,
+    # and is 0 for a batch with none; the BCE path is identical either way.
     count = len(generated)
-    pairs = add_motion_noise(
-        balanced_pair_batch(generated, expert),
-        args.discriminator_motion_noise_scale
-    )
+    pairs = args_motion_noise(balanced_pair_batch(generated, expert), args)
 
     if args.discriminator_mirror:
-        pairs = mirror_scene_pairs(pairs)
+        pairs = mirror_scene_pairs(pairs, args.team_size * 2)
 
     labels = torch.cat((pairs.new_ones(count), pairs.new_zeros(count)))
 
-    if args.amp:
+    if args.discriminator_amp_reward:
         labels = 2 * labels - 1
 
     optimizer.zero_grad(set_to_none=True)
+    penalized = bool(args.discriminator_gradient_penalty)
     total = pairs.new_zeros(())
+    penalty = pairs.new_zeros(())
+    microbatch = args.discriminator_update_microbatch_size
+    full = count // microbatch
 
-    for start in range(0, count, args.discriminator_update_microbatch_size):
-        stop = min(start + args.discriminator_update_microbatch_size, count)
+    for start in range(0, count, microbatch):
+        stop = min(start + microbatch, count)
         indices = torch.cat(
             (
                 torch.arange(start, stop, device=pairs.device),
@@ -291,25 +353,34 @@ def train_discriminator_batch(
                 discriminator,
                 pairs[indices],
                 labels[indices],
-                args.amp
+                args.discriminator_amp_reward
             )
             loss = loss * ((stop - start) / count)
+
+            if penalized and stop - start == microbatch:
+                unweighted = penalty_function(
+                    discriminator, pairs[count + start : count + stop]
+                )
+                loss = loss + (
+                    args.discriminator_gradient_penalty * unweighted / full
+                )
+                penalty += unweighted.detach() / full
 
         loss.backward()
         total += loss.detach()
 
     norm = nn.utils.clip_grad_norm_(
         discriminator.parameters(),
-        args.max_grad_norm,
+        args.max_gradient_norm,
         error_if_nonfinite=False
     )
     require_finite(torch.stack((total, norm)), "discriminator loss/gradients")
     optimizer.step()
 
     if target is not None:
-        polyak_update(target, discriminator, args.target_discriminator_tau)
+        polyak_update(target, discriminator, args.discriminator_target_tau)
 
-    return total
+    return torch.stack((total, penalty)) if penalized else total
 
 
 def discriminator_batches(
@@ -324,17 +395,19 @@ def discriminator_batches(
 
 
 def update_discriminator(
-    discriminator: nn.Module,
-    optimizer:     torch.optim.Optimizer,
-    experts:       ExpertDataset,
-    scenes:        TransitionPairs,
-    train:         torch.Tensor,
-    args:          Namespace,
-    history:       PairHistory,
-    target:        nn.Module | None,
-    loss_function: Callable
+    discriminator:    nn.Module,
+    optimizer:        torch.optim.Optimizer,
+    experts:          ExpertDataset,
+    scenes:           TransitionPairs,
+    train:            torch.Tensor,
+    args:             Namespace,
+    history:          PairHistory,
+    target:           nn.Module | None,
+    loss_function:    Callable,
+    penalty_function: Callable | None = None
 ) -> dict[str, float]:
-    total = torch.zeros((), device=train.device)
+    penalized = bool(args.discriminator_gradient_penalty)
+    total = torch.zeros(2 if penalized else (), device=train.device)
     updates = 0
 
     for indices in discriminator_batches(train, args):
@@ -360,15 +433,26 @@ def update_discriminator(
             experts.sample(len(indices)),
             args,
             target,
-            loss_function
+            loss_function,
+            penalty_function
         )
 
         updates += 1
 
     history.add(scenes, train)
 
+    total = total / max(updates, 1)
+
+    if penalized:
+        loss, penalty = total.tolist()
+
+        return {
+            "discriminator/train_loss":   loss,
+            "imitation/gradient_penalty": penalty
+        }
+
     return {
-        "discriminator/train_loss": (total / max(updates, 1)).item(),
+        "discriminator/train_loss": total.item()
     }
 
 
@@ -377,65 +461,70 @@ def imitation_rewards(
     reward_model: nn.Module,
     scenes:       TransitionPairs,
     rollout:      Rollout,
-    args:         Namespace
+    args:         Namespace,
+    gamma:        float | torch.Tensor
 ) -> dict[str, float]:
     rewards = rollout.rewards.flatten()
     rewards.mul_(args.gameplay_reward_weight)
     reward_sum = rewards.new_zeros(())
+    raw_reward_sum = rewards.new_zeros(())
+    learner_reward_sum = rewards.new_zeros(())
     capped = rewards.new_zeros(())
     live_heads = rewards.new_zeros(())
 
-    for start in range(
-        0,
-        len(rewards),
-        args.discriminator_inference_microbatch_size
-    ):
-        stop = min(
-            start + args.discriminator_inference_microbatch_size,
-            len(rewards)
-        )
+    size = args.discriminator_inference_microbatch_size
+
+    for start in range(0, len(rewards), size):
+        stop = min(start + size, len(rewards))
         indices = torch.arange(start, stop, device=rewards.device)
+        pairs = args_motion_noise(scenes.pairs(indices), args)
 
         with autocast(rewards.device, args.bf16):
             torch.compiler.cudagraph_mark_step_begin()
-            logits = reward_model(scenes.pairs(indices))
-            values = discriminator_rewards(
-                logits,
-                amp=args.amp,
-                discriminator_log_reward=args.discriminator_log_reward,
-                discriminator_forward_kl_reward=(
-                    args.discriminator_forward_kl_reward
-                ),
-                discriminator_ratio_cap=args.discriminator_ratio_cap
-            )
+            logits = reward_model(pairs)
+            values = args_rewards(logits, args)
 
         live = ~scenes.terminated.flatten()[indices]
-        imitation = values.masked_fill(~live, 0)
+        raw = values.masked_fill(~live, 0)
+        imitation = raw * args.imitation_reward_weight
         rewards[indices] += imitation
         reward_sum += imitation.sum()
+        raw_reward_sum += raw.sum()
+
+        if args.scale_goal_reward_by_return and rollout.learner_mask is not None:
+            learner = rollout.learner_mask.flatten()[indices]
+            learner_reward_sum += imitation.masked_fill(~learner, 0).sum()
 
         if args.discriminator_forward_kl_reward:
             over_cap = -logits.float() > math.log(args.discriminator_ratio_cap)
             capped += (over_cap & live[:, None]).sum()
-            live_heads += live.sum() * 2
+            live_heads += live.sum() * logits.shape[-1]
 
-    goal_weight = rollout.values.new_tensor(args.goal_reward_weight)
+    goal_weight = rewards.new_tensor(args.goal_reward_weight)
 
     if args.scale_goal_reward_by_return:
-        values = rollout.values.detach()
+        mean_imitation = reward_sum / len(rewards)
 
         if rollout.learner_mask is not None:
-            values = values[rollout.learner_mask]
+            count = rollout.learner_mask.sum().clamp_min(1)
+            mean_imitation = learner_reward_sum / count
 
-        goal_weight *= values.float().mean().abs()
+        # Stationary reward-rate estimate, excluding goal/gameplay rewards.
+        return_scale = mean_imitation.abs() / (1 - gamma)
+        goal_weight *= return_scale
 
     rollout.rewards.add_(scenes.score_deltas * goal_weight)
     require_finite(rollout.rewards, "GAIfO rewards")
     ticks = len(rewards) * args.frameskip
     metrics = {
-        "imitation/reward_per_tick": (reward_sum / ticks).item(),
-        "imitation/goal_weight":     goal_weight.item(),
+        "imitation/reward_per_tick":     (reward_sum / ticks).item(),
+        "imitation/raw_reward_per_tick": (raw_reward_sum / ticks).item(),
+        "imitation/reward_weight":       args.imitation_reward_weight,
+        "imitation/goal_weight":         goal_weight.item()
     }
+
+    if args.scale_goal_reward_by_return:
+        metrics["imitation/return_scale"] = return_scale.item()
 
     if args.discriminator_forward_kl_reward:
         fraction = capped / live_heads.clamp_min(1)

@@ -1,9 +1,4 @@
-"""Vectorized Nexto-era reward.
-
-Reference: Rolv-Arild/Necto, 5c56a79910decdfe1298c7cb234d08101a0bf70a,
-training/reward.py.
-This adaptation is licensed CC BY-NC-SA 4.0. It is not an official Nexto release.
-"""
+"""Vectorized Nexto-era reward (adapted from Necto, CC BY-NC-SA 4.0)."""
 
 from dataclasses import dataclass
 
@@ -136,7 +131,7 @@ class NextoReward:
             "boost_gain":         weights.boost_gain * boost_delta.clamp_min(0),
             "boost_loss":         weights.boost_loss * boost_delta.clamp_max(0),
             "ground":             -weights.ground * current.car_on_ground.float(),
-            "demo":               0.5 * weights.demo * (demo_credit - demoed),
+            "demo":               0.5 * weights.demo * (demo_credit - demoed)
         }
 
         # Goals replace shaping rather than adding to it.

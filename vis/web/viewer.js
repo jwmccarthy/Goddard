@@ -55,15 +55,14 @@ function createView() {
     cars:   new Map(),
     pads:   [],
     follow: null,
+    roster: [],
   }
 }
 
 function setCamera(view, name) {
-  view.follow = name === 'overview' ? null : name === 'blue' ? 0 : 1
-  const direction = {
-    blue:   1,
-    orange: -1,
-  }[name]
+  const car = view.roster.find((car) => String(car.id) === name)
+  view.follow = car?.id ?? null
+  const direction = car ? (car.team === 0 ? 1 : -1) : 0
   if (direction) {
     view.camera.position.set(500, 450, direction * 2500)
     view.controls.target.set(0, 60, direction * 1600)
@@ -74,25 +73,42 @@ function setCamera(view, name) {
   view.controls.update()
 }
 
+function updateRoster(view, cars) {
+  if (cars.length === view.roster.length && cars.every((car, index) => {
+    const previous = view.roster[index]
+    return car.id === previous.id && car.team === previous.team
+  })) return
+
+  view.roster = cars.map(({ id, team }) => ({ id, team }))
+  const selected = cars.some((car) => car.id === view.follow)
+  if (!selected) view.follow = null
+
+  for (const [id, car] of view.cars) {
+    if (cars.some((state) => state.id === id)) continue
+    view.world.remove(car)
+    view.cars.delete(id)
+  }
+}
+
 function bindKeyboard(view) {
   window.addEventListener('keydown', (event) => {
     if (event.target.closest('input, select, button, textarea')) return
-    const name = {
-      '0': 'overview',
-      '1': 'blue',
-      '2': 'orange',
-    }[event.key]
-    if (name) setCamera(view, name)
-    const reset = {
-      r: 'replay',
-      k: 'kickoff',
+    if (event.key === '0') setCamera(view, 'overview')
+    const car = /^[1-6]$/.test(event.key)
+      ? view.roster[Number(event.key) - 1]
+      : null
+    if (car) setCamera(view, String(car.id))
+    const command = {
+      r: '/reset/replay',
+      k: '/reset/kickoff',
+      c: '/reload/checkpoint',
     }[event.key.toLowerCase()]
-    if (!reset || event.repeat) return
-    fetch(`/reset/${reset}`, {
+    if (!command || event.repeat) return
+    fetch(command, {
       method: 'POST',
     }).then((response) => {
-      if (!response.ok) console.error(`Reset failed: ${response.status}`)
-    }).catch((error) => console.error('Reset failed:', error))
+      if (!response.ok) console.error(`Viewer command failed: ${response.status}`)
+    }).catch((error) => console.error('Viewer command failed:', error))
   })
 }
 
@@ -118,13 +134,15 @@ function position(object, before, after, alpha) {
 
 function updateCars(view, before, after, alpha) {
   after.cars.forEach((state) => {
+    const color = state.team === 0 ? 0x338fff : 0xff922b
     if (!view.cars.has(state.id)) {
-      const car = createCar(state.team === 0 ? 0x338fff : 0xff922b)
+      const car = createCar(color)
       view.cars.set(state.id, car)
       view.world.add(car)
     }
 
     const car = view.cars.get(state.id)
+    car.userData.paint.color.setHex(color)
     const previous = before.cars.find((item) => item.id === state.id) ?? state
     position(car, previous.physics, state.physics, alpha)
     car.quaternion
@@ -174,13 +192,15 @@ function render(view, frames) {
       : THREE.MathUtils.clamp(elapsed / duration, 0, 1)
 
     position(view.ball, before.ball, after.ball, alpha)
+    updateRoster(view, after.cars)
     updateCars(view, before, after, alpha)
     updatePads(view, after.pads)
   }
 
-  const [id, car] = [...view.cars.entries()][view.follow] ?? []
-  const state = after?.cars.find((item) => item.id === id)
-  const inputs = after?.controls?.[id - 1]
+  const car = view.cars.get(view.follow)
+  const index = after?.cars.findIndex((item) => item.id === view.follow) ?? -1
+  const state = after?.cars[index]
+  const inputs = after?.controls?.[index]
   updateHud(car, state, inputs)
   if (car) {
     car.getWorldPosition(target)

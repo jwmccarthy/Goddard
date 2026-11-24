@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 from carl.gymnasium.state import CarlState
 
+from training.checkpoints import load_payload
 from training.models import Agent
 from training.replay_resets import ReplayResetSampler
+from training.residual import attach_residual_actor
 from training.setup import build_env
 from training.tensors import plain_tensor
 from vis.controls import control_values
@@ -24,39 +26,75 @@ if TYPE_CHECKING:
     from carl.gymnasium import CARLResetState, CARLTorchVectorEnv
 
 
+def build_agent(
+    env:     CARLTorchVectorEnv,
+    config:  dict[str, Any],
+    payload: dict[str, Any]
+) -> Agent:
+    """Rebuild a checkpoint's agent on env's device with its actor weights."""
+    agent = Agent(
+        env.single_observation_space.shape[0],
+        env.single_action_space.nvec,
+        env.action_codec,
+        config["hidden_size"],
+        config["layers"],
+        policy_hidden=config["policy_hidden_size"],
+        policy_layers=config["policy_layers"],
+        joint_actions=config["joint_actions"],
+        gru_policy=config["gru_policy"]
+    )
+
+    if config.get("residual_policy", False):
+        attach_residual_actor(
+            agent, env.single_observation_space.shape[0], config
+        )
+
+    agent = agent.to(env.device)
+
+    actor = {
+        key.removeprefix("actor."): value
+        for key, value in payload["agent"].items()
+        if key.startswith("actor.")
+    }
+
+    agent.actor.load_state_dict(actor, strict=True)
+    agent.eval()
+
+    return agent
+
+
 def load_policy(
     checkpoint: Path,
     seed:       int
 ) -> tuple[CARLTorchVectorEnv, Agent, dict[str, Any], int]:
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload = load_payload(checkpoint)
 
     config = dict(payload["config"], n_sim=1, seed=seed, resume=None)
 
     env = build_env(SimpleNamespace(**config))
 
     try:
-        agent = Agent(
-            env.single_observation_space.shape[0],
-            env.single_action_space.nvec,
-            env.action_codec,
-            config["hidden_size"],
-            config["layers"],
-            joint_actions=config["joint_actions"]
-        ).to(env.device)
-
-        actor = {
-            key.removeprefix("actor."): value
-            for key, value in payload["agent"].items()
-            if key.startswith("actor.")
-        }
-
-        agent.actor.load_state_dict(actor, strict=True)
-        agent.eval()
+        agent = build_agent(env, config, payload)
     except BaseException:
         env.close()
         raise
 
     return (env, agent, config, payload["step"])
+
+
+def initial_policy_state(
+    env:    CARLTorchVectorEnv,
+    agent:  Agent,
+    config: dict[str, Any]
+) -> torch.Tensor | None:
+    if not agent.gru_policy:
+        return None
+
+    return torch.zeros(
+        env.n_envs,
+        config["policy_hidden_size"],
+        device=env.device
+    )
 
 
 def snapshot(
@@ -121,7 +159,11 @@ class Match:
     ) -> None:
         torch.manual_seed(seed)
 
-        self.env, self.agent, self.config, step = load_policy(checkpoint, seed)
+        # Keep latest.pt unresolved so future reloads follow its new target.
+        self.checkpoint = checkpoint.expanduser().absolute()
+        self.replay_dir = replay_dir
+        self.env, self.agent, self.config, step = load_policy(self.checkpoint, seed)
+        self.checkpoint_step = step
 
         if replay_dir is not None:
             self.config["replay_dir"] = replay_dir
@@ -130,10 +172,11 @@ class Match:
         self.stopped = threading.Event()
         self.revision = 0
         self.data = None
-        self.reset_requests = queue.SimpleQueue()
+        self.requests = queue.SimpleQueue()
         self.replay_resets = None
         self.seed = seed
         self.sample = sample
+        self.policy_state = initial_policy_state(self.env, self.agent, self.config)
         self.replay_seed = replay_seed
         self.thread = threading.Thread(target=self.run, daemon=True)
 
@@ -157,7 +200,43 @@ class Match:
         if mode not in ("replay", "kickoff"):
             raise ValueError(f"unknown reset mode: {mode}")
 
-        self.reset_requests.put(mode)
+        self.requests.put(mode)
+
+    def request_reload(self) -> None:
+        self.requests.put("checkpoint")
+
+    def reload_checkpoint(self) -> torch.Tensor:
+        """Load the latest policy before swapping it in."""
+        checkpoint = self.checkpoint.parent / "latest.pt"
+        env, agent, config, step = load_policy(checkpoint, self.seed)
+
+        try:
+            if self.replay_dir is not None:
+                config["replay_dir"] = self.replay_dir
+
+            observation = plain_tensor(env.reset())
+            policy_state = initial_policy_state(env, agent, config)
+            replay_resets = self.replay_resets
+
+            if (
+                config["team_size"] != self.config["team_size"]
+                or Path(config["replay_dir"]).resolve()
+                != Path(self.config["replay_dir"]).resolve()
+            ):
+                replay_resets = None
+        except BaseException:
+            env.close()
+            raise
+
+        previous_env = self.env
+        self.env, self.agent, self.config = env, agent, config
+        self.policy_state = policy_state
+        self.checkpoint_step = step
+        self.replay_resets = replay_resets
+        previous_env.close()
+        logging.info("Reloaded checkpoint: %s steps (%s).", f"{step:,}", checkpoint)
+
+        return observation
 
     def reset(self, mode: str) -> torch.Tensor:
         state = None
@@ -185,7 +264,12 @@ class Match:
         try:
             self.env.reset_state_provider = replay_state if state is not None else None
 
-            return plain_tensor(self.env.reset())
+            observation = plain_tensor(self.env.reset())
+
+            if self.policy_state is not None:
+                self.policy_state.zero_()
+
+            return observation
         finally:
             self.env.reset_state_provider = provider
 
@@ -199,35 +283,46 @@ class Match:
 
             while not self.stopped.is_set():
                 try:
-                    mode = self.reset_requests.get_nowait()
+                    mode = self.requests.get_nowait()
                 except queue.Empty:
                     mode = None
 
                 if mode is not None:
                     try:
-                        observation = self.reset(mode)
-                    except (OSError, ValueError):
-                        logging.exception("Could not reset viewer to %s", mode)
+                        observation = (
+                            self.reload_checkpoint() if mode == "checkpoint"
+                            else self.reset(mode)
+                        )
+                    except Exception:
+                        logging.exception("Could not apply viewer command: %s", mode)
                     else:
                         episode += 1
+                        timestep = self.config["frameskip"] / 120.0
                         deadline = time.monotonic()
 
-                actions = self.agent.get_action(
-                    observation,
-                    sample=self.sample
-                )
+                if self.policy_state is None:
+                    actions = self.agent.get_action(
+                        observation, sample=self.sample
+                    )
+                else:
+                    actions, self.policy_state = (
+                        self.agent.get_recurrent_action(
+                            observation, self.policy_state, sample=self.sample
+                        )
+                    )
 
                 ball, cars, pads = snapshot(self.env)
                 data = json.dumps(
                     {
-                        "episode":  episode,
-                        "ball":     asdict(ball),
-                        "cars":     [asdict(car) for car in cars],
-                        "pads":     pads,
-                        "controls": control_values(
+                        "episode":         episode,
+                        "checkpoint_step": self.checkpoint_step,
+                        "ball":            asdict(ball),
+                        "cars":            [asdict(car) for car in cars],
+                        "pads":            pads,
+                        "controls":        control_values(
                             actions,
                             self.env.discrete_actions
-                        ),
+                        )
                     },
                     allow_nan=False,
                     separators=(",", ":")
@@ -240,6 +335,12 @@ class Match:
 
                 observation, _, terminated, truncated, _ = self.env.step(actions)
                 observation = plain_tensor(observation)
+
+                if self.policy_state is not None:
+                    self.policy_state.masked_fill_(
+                        (terminated | truncated)[:, None], 0
+                    )
+
                 episode += int((terminated | truncated).any().item())
                 deadline = max(deadline + timestep, time.monotonic())
 

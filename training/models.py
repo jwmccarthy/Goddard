@@ -7,6 +7,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from training.recurrent import GRUSequence
+
 
 class ActionCodec(Protocol):
 
@@ -35,6 +37,84 @@ def mlp(
     nn.init.zeros_(linear.bias)
 
     return nn.Sequential(*modules, linear)
+
+
+class GRUModel(nn.Module):
+    """GRU with batched projections, fused gates, and batched gradients."""
+
+    def __init__(
+        self,
+        observation_size: int,
+        output_size:      int,
+        hidden_size:      int,
+        layers:           int,
+        gain:             float = 0.01
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.encoder = mlp(
+            observation_size, 3 * hidden_size, hidden_size, layers, 1.0
+        )
+        self.recurrent = nn.Linear(hidden_size, 3 * hidden_size)
+        self.output = nn.Linear(hidden_size, output_size)
+
+        for weight in self.recurrent.weight.chunk(3):
+            nn.init.orthogonal_(weight)
+
+        nn.init.zeros_(self.recurrent.bias)
+        nn.init.orthogonal_(self.output.weight, gain)
+        nn.init.zeros_(self.output.bias)
+
+    def cell(
+        self,
+        projected: torch.Tensor,
+        state:     torch.Tensor
+    ) -> torch.Tensor:
+        # GEMMs use autocast; gates and persistent memory accumulate in FP32.
+        inputs = projected.float().chunk(3, dim=-1)
+        hidden = self.recurrent(state).float().chunk(3, dim=-1)
+        reset = (inputs[0] + hidden[0]).sigmoid()
+        update = (inputs[1] + hidden[1]).sigmoid()
+        candidate = (inputs[2] + reset * hidden[2]).tanh()
+
+        return candidate + update * (state - candidate)
+
+    def forward(
+        self,
+        observations: torch.Tensor,
+        state:        torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self.cell(self.encoder(observations), state)
+
+        return self.output(state), state
+
+    def sequence(
+        self,
+        observations: torch.Tensor,
+        state:        torch.Tensor,
+        resets:       torch.Tensor
+    ) -> torch.Tensor:
+        states = self.sequence_states(observations, state, resets)
+
+        return self.output(states.flatten(0, 1))
+
+    def sequence_states(
+        self,
+        observations: torch.Tensor,
+        state:        torch.Tensor,
+        resets:       torch.Tensor
+    ) -> torch.Tensor:
+        # One large encoder/projection batch instead of a GEMM per timestep.
+        projected = self.encoder(observations.flatten(0, 1))
+        projected = projected.reshape(*observations.shape[:2], -1)
+
+        return GRUSequence.apply(
+            projected,
+            state,
+            resets,
+            self.recurrent.weight.to(projected.dtype),
+            self.recurrent.bias.to(projected.dtype)
+        )
 
 
 class HistoryMLPCritic(nn.Module):
@@ -73,11 +153,12 @@ class HistoryMLPCritic(nn.Module):
     def forward(self, history: torch.Tensor) -> torch.Tensor:
         frames = history.reshape(-1, self.length, self.observation_size + 1)
 
-        observations, valid = (frames[..., :-1], frames[..., -1:])
+        observations, valid = frames[..., :-1], frames[..., -1:]
 
         if self.relative:
-            # Current frame stays absolute; only earlier raw scene physics becomes
-            # a temporal delta. Fuel, flags, derived inputs and controller state stay absolute.
+            # Current frame stays absolute; only earlier raw scene physics
+            # becomes a temporal delta. Fuel, flags, derived inputs and
+            # controller state stay absolute.
             relative = observations - observations[:, -1:]
             earlier = (
                 torch.arange(self.length, device=history.device)
@@ -99,22 +180,34 @@ class Agent(nn.Module):
 
     def __init__(
         self,
-        observation_size:     int,
-        action_sizes:         tuple[int, ...],
-        action_codec:         ActionCodec,
-        hidden_size:          int = 384,
-        layers:               int = 3,
+        observation_size: int,
+        action_sizes:     tuple[int, ...],
+        action_codec:     ActionCodec,
+        hidden_size:      int = 512,
+        layers:           int = 4,
         *,
+        policy_hidden:        int | None = None,
+        policy_layers:        int | None = None,
+        critic_hidden:        int | None = None,
+        critic_layers:        int | None = None,
         mlp_critic:           bool = False,
         critic_window_length: int = 4,
         critic_relative:      bool = False,
         n_cars:               int | None = None,
-        joint_actions:        bool = False
+        joint_actions:        bool = False,
+        gru_policy:           bool = False,
+        gru_critic:           bool = False
     ) -> None:
         super().__init__()
         self.action_sizes = tuple(int(size) for size in action_sizes)
         self.action_codec = action_codec
         self.joint_actions = joint_actions
+        self.gru_policy = gru_policy
+        self.gru_critic = gru_critic
+        policy_hidden = hidden_size if policy_hidden is None else policy_hidden
+        policy_layers = layers if policy_layers is None else policy_layers
+        critic_hidden = hidden_size if critic_hidden is None else critic_hidden
+        critic_layers = layers if critic_layers is None else critic_layers
 
         if joint_actions:
             axes = (torch.arange(size) for size in self.action_sizes)
@@ -129,52 +222,95 @@ class Agent(nn.Module):
             )
 
             self.register_buffer("action_table", table, persistent=False)
-
             self.register_buffer(
                 "action_mask_indices",
                 table + offsets,
                 persistent=False
             )
-
             self.register_buffer("action_strides", strides, persistent=False)
 
         output_size = (
             math.prod(self.action_sizes)
             if joint_actions else sum(self.action_sizes)
         )
-        self.actor = mlp(
-            observation_size,
-            output_size,
-            hidden_size,
-            layers,
-            0.01
-        )
+
+        if gru_policy:
+            self.actor = GRUModel(
+                observation_size, output_size, policy_hidden, policy_layers
+            )
+        else:
+            self.actor = mlp(
+                observation_size,
+                output_size,
+                policy_hidden,
+                policy_layers,
+                0.01
+            )
 
         self.mlp_critic = mlp_critic
 
-        if mlp_critic:
+        if gru_critic:
+            self.critic = GRUModel(
+                observation_size, 1, critic_hidden, critic_layers, gain=1.0
+            )
+        elif mlp_critic:
             self.critic = HistoryMLPCritic(
                 observation_size,
                 critic_window_length,
                 n_cars,
                 critic_relative,
-                hidden_size,
-                layers
+                critic_hidden,
+                critic_layers
             )
         else:
-            self.critic = mlp(observation_size, 1, hidden_size, layers, 1.0)
+            self.critic = mlp(
+                observation_size, 1, critic_hidden, critic_layers, 1.0
+            )
 
     def get_value(
         self,
         observations:        torch.Tensor,
-        critic_observations: torch.Tensor | None = None
+        critic_observations: torch.Tensor | None = None,
+        critic_state:        torch.Tensor | None = None
     ) -> torch.Tensor:
-        if self.mlp_critic and critic_observations is None:
-            raise ValueError("history critic requires causal critic observations")
+        if self.gru_critic:
+            return self.get_recurrent_value(observations, critic_state)[0]
 
         inputs = critic_observations if self.mlp_critic else observations
 
         return self.critic(inputs).squeeze(-1).float()
+
+    def get_recurrent_value(
+        self,
+        observations: torch.Tensor,
+        state:        torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        values, state = self.critic(observations, state)
+
+        return values.squeeze(-1).float(), state
+
+    def get_recurrent_critic_action_and_value(
+        self,
+        observations: torch.Tensor,
+        critic_state: torch.Tensor,
+        policy_state: torch.Tensor | None = None
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor | None, torch.Tensor
+    ]:
+        if self.gru_policy:
+            logits, policy_state = self.actor(observations, policy_state)
+        else:
+            logits = self.actor(observations)
+
+        actions, log_prob, entropy = self.sample_action_logits(
+            logits.float(), observations
+        )
+        values, critic_state = self.get_recurrent_value(
+            observations, critic_state
+        )
+
+        return actions, log_prob, entropy, values, policy_state, critic_state
 
     def get_action_and_log_prob(
         self,
@@ -269,6 +405,37 @@ class Agent(nn.Module):
             log_prob,
             entropy,
             self.get_value(observations, critic_observations)
+        )
+
+    def get_recurrent_action(
+        self,
+        observations: torch.Tensor,
+        state:        torch.Tensor,
+        sample:       bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits, state = self.actor(observations, state)
+        actions = self.sample_action_logits(
+            logits.float(), observations, sample=sample
+        )[0]
+
+        return actions, state
+
+    def get_recurrent_action_and_value(
+        self,
+        observations:        torch.Tensor,
+        state:               torch.Tensor,
+        critic_observations: torch.Tensor | None = None
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        logits, state = self.actor(observations, state)
+        actions, log_prob, entropy = self.sample_action_logits(
+            logits.float(), observations
+        )
+
+        return (
+            actions, log_prob, entropy,
+            self.get_value(observations, critic_observations), state
         )
 
 
