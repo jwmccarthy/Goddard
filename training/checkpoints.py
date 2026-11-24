@@ -52,20 +52,25 @@ def save_checkpoint(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
     latest = path if path.name == "latest.pt" else None
 
     if latest is not None:
         path = path.with_name(f"checkpoint_{step}.pt")
 
     temporary = path.with_suffix(path.suffix + ".tmp")
+
     torch.save(payload, temporary)
     temporary.replace(path)
 
-    if latest is not None:
-        temporary = latest.with_suffix(latest.suffix + ".tmp")
-        temporary.unlink(missing_ok=True)
-        temporary.symlink_to(path.name)
-        temporary.replace(latest)
+    if latest is None:
+        return
+
+    temporary = latest.with_suffix(latest.suffix + ".tmp")
+
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(path.name)
+    temporary.replace(latest)
 
 
 def load_checkpoint(
@@ -75,8 +80,10 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     payload = read_checkpoint(path)
     read_checkpoint.cache_clear()
+
     agent.load_state_dict(payload["agent"])
     optimizer.load_state_dict(payload["optimizer"])
+
     torch.set_rng_state(payload["torch_rng"])
     torch.cuda.set_rng_state_all(payload["cuda_rng"])
     np.random.set_state(payload["numpy_rng"])

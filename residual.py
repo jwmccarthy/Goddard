@@ -5,7 +5,6 @@ from ppo import train
 from training.arguments import (
     add_options,
     add_ppo_arguments,
-    check_reset_bank,
     check_unchanged,
     resolve_ppo_arguments,
     resume_arguments,
@@ -18,9 +17,6 @@ BASE_POLICY_FIELDS = (
     "team_size",
     "hidden_size",
     "layers",
-    "previous_controls",
-    "joint_actions",
-    "gru_policy",
     "policy_hidden_size",
     "policy_layers"
 )
@@ -31,6 +27,7 @@ def parse_arguments() -> argparse.Namespace:
         description="RESIDUAL for CARL",
         allow_abbrev=False
     )
+
     add_ppo_arguments(parser)
     add_residual_arguments(parser)
 
@@ -62,7 +59,6 @@ def parse_arguments() -> argparse.Namespace:
         if args.team_size != previous["team_size"]:
             parser.error("team size differs from the resumed checkpoint")
 
-    check_reset_bank(parser, args)
     resolve_ppo_arguments(parser, args)
     validate_residual_arguments(parser, args)
 
@@ -73,20 +69,31 @@ def add_residual_arguments(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(
         residual_policy=True,
         replay_reset_fraction=0.0,
-        opponent_historical_fraction=1.0,
         learning_rate=1e-4,
         entropy_coefficient=0.0,
-        clip_value_loss=False,
         normalize_value_loss=True,
         critic_max_gradient_norm=1.0
     )
 
+    opponents = parser.add_argument_group("self-play")
+
+    add_options(
+        opponents,
+        {
+            "opponent_pool_size":           8,
+            "opponent_snapshot_interval":   10_000_000,
+            "opponent_historical_fraction": 1.0
+        }
+    )
+
     group = parser.add_argument_group("residual policy")
+
     group.add_argument(
         "--base-checkpoint",
         type=Path,
         help="GAIfO checkpoint to freeze when starting a new residual run."
     )
+
     add_options(
         group,
         {
@@ -113,12 +120,14 @@ def residual_base_defaults(
 
     config = payload["config"]
     defaults = {key: config[key] for key in BASE_POLICY_FIELDS}
+
     defaults.update(
         frameskip=config["frameskip"],
         replay_dir=config["replay_dir"],
         critic_hidden_size=args.critic_hidden_size or args.hidden_size,
         critic_layers=args.critic_layers or args.layers
     )
+
     parser.set_defaults(**defaults)
     args = parser.parse_args()
 

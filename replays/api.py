@@ -75,6 +75,7 @@ class BallchasingClient:
 
         self.list_interval = 1.0 / list_rate
         self.download_interval = 1.0 / download_rate
+
         self._download_lock = Lock()
         self._next_download_at = time.monotonic()
         self._download_sessions = local()
@@ -89,9 +90,11 @@ class BallchasingClient:
         time.sleep(self.list_interval)
 
         params = {key.replace("_", "-"): value for key, value in params.items()}
+
         response = _send_with_backoff(
             lambda: self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         )
+
         response.raise_for_status()
 
         return response.json()
@@ -141,6 +144,7 @@ class BallchasingClient:
         response.raise_for_status()
 
         path = output_dir / f"{replay_id}.replay"
+
         temporary = path.with_suffix(".replay.part")
         temporary.write_bytes(response.content)
         temporary.replace(path)
@@ -160,6 +164,7 @@ class BallchasingClient:
                 break
 
             next_params = parse_qs(urlparse(page.next_url).query)
+
             missing = {
                 key: value
                 for key, value in params.items()

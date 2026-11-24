@@ -22,6 +22,7 @@ def native_frame(position, velocity):
     angular = np.zeros((count, 3))
     values = np.column_stack([position, velocity, angular, quaternion])
     frame = pd.DataFrame(values, columns=POSITION + VELOCITY + ANGULAR + QUATERNION)
+
     frame["is_sleeping"] = 0
 
     return frame
@@ -36,8 +37,11 @@ class NativeTimingTests(unittest.TestCase):
         position = np.array([0, 0, 500]) + elapsed[:, None] * [900, -300, 1000]
         position += 0.5 * GRAVITY * elapsed[:, None] * (elapsed[:, None] + 1 / 120)
         recorded = np.arange(len(elapsed)) * 4.
+
         fit = estimate_timing(recorded, position, velocity, ball=True, boundary=np.zeros(80, bool))
+
         np.testing.assert_array_equal(fit.ticks, durations)
+
         self.assertTrue(fit.accepted.all())
 
     def test_demo_respawn_never_interpolates_between_lifetimes(self):
@@ -47,7 +51,9 @@ class NativeTimingTests(unittest.TestCase):
         )
         track = NativeTrack.from_frame(frame, np.arange(4) * 4., np.zeros(4, bool), ball=False)
         sampled = track.sample(np.array([6., 8., 10., 12.]))
+
         np.testing.assert_array_equal(sampled.available, [True, False, False, True])
+
         self.assertEqual(sampled.position[0, 0], 104)
         self.assertEqual(sampled.position[-1, 0], 5000)
         self.assertFalse(((sampled.position[:, 0] > 104) & (sampled.position[:, 0] < 5000)).any())
@@ -60,13 +66,17 @@ class ReconstructionIntegrationTests(unittest.TestCase):
             cars = 2 * team
             rows = np.zeros((3, layout.team_replay_row_size(team)), dtype=np.float32)
             rows[:, :6] = [0.2, 0.1, 0.3, 0.1, 0.2, 0.3]
+
             for car in range(cars):
                 start = 9 + 21 * car
                 rows[:, start:start + 6] = [car * 0.1, 0, 0.1, car * 0.2, 0, 0]
 
             refresh_relative_fields(rows, cars)
+
             offset = 9 + 21 * cars + 68
+
             np.testing.assert_allclose(rows[:, offset:offset + 3], (rows[:, :3] - rows[:, 9:12]) / 2)
+
             self.assertTrue(np.isfinite(rows).all())
 
 
@@ -77,6 +87,7 @@ class ReplayResultTests(unittest.TestCase):
                 "team_0_score": scores[0],
                 "team_1_score": scores[1]
             }}
+
             self.assertEqual(winning_team(metadata), winner)
 
         self.assertIsNone(winning_team({}))

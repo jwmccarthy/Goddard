@@ -40,6 +40,7 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
+
         revision = 0
 
         try:
@@ -52,6 +53,7 @@ class ViewerHandler(SimpleHTTPRequestHandler):
                     revision, data = (self.match.revision, self.match.data)
 
                 message = f"data: {data}\n\n" if data else ": waiting\n\n"
+
                 self.wfile.write(message.encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -68,15 +70,21 @@ class ViewerHandler(SimpleHTTPRequestHandler):
 
         if mode is None:
             self.send_error(404)
-        elif self.match.stopped.is_set():
+
+            return
+
+        if self.match.stopped.is_set():
             self.send_error(503, "Playback stopped")
+
+            return
+
+        if mode == "checkpoint":
+            self.match.request_reload()
         else:
-            if mode == "checkpoint":
-                self.match.request_reload()
-            else:
-                self.match.request_reset(mode)
-            self.send_response(202)
-            self.end_headers()
+            self.match.request_reset(mode)
+
+        self.send_response(202)
+        self.end_headers()
 
     def translate_path(self, path: str) -> str:
         if path.split("?", 1)[0] == "/arena.obj":
@@ -94,6 +102,7 @@ class ViewerHandler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     configure_logging()
+
     parser = argparse.ArgumentParser(description="Watch a Goddard checkpoint in the browser.")
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--seed", type=int, default=0)
@@ -109,6 +118,7 @@ def main() -> None:
     )
 
     parser.add_argument("--replay-dir", type=Path)
+
     args = parser.parse_args()
 
     match = Match(

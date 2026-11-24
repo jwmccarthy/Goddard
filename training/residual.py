@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from argparse import Namespace
 from typing import TYPE_CHECKING, Any
 
@@ -26,16 +25,16 @@ class ResidualActor(nn.Module):
         output_size:      int,
         hidden_size:      int,
         layers:           int,
-        scale:            float,
-        recurrent:        bool
+        scale:            float
     ) -> None:
         super().__init__()
         self.base = base.requires_grad_(False).eval()
+
         self.correction = mlp(
             observation_size, output_size, hidden_size, layers, gain=0.0
         )
+
         self.scale = scale
-        self.recurrent = recurrent
 
     def train(self, mode: bool = True) -> ResidualActor:
         super().train(mode)
@@ -43,32 +42,11 @@ class ResidualActor(nn.Module):
 
         return self
 
-    def forward(
-        self,
-        observations: torch.Tensor,
-        state:        torch.Tensor | None = None
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            if self.recurrent:
-                logits, state = self.base(observations, state)
-            else:
-                logits = self.base(observations)
+            logits = self.base(observations)
 
         correction = self.correction(observations)
-        logits = logits.float() + self.scale * correction.float()
-
-        return (logits, state) if self.recurrent else logits
-
-    def sequence(
-        self,
-        observations: torch.Tensor,
-        state:        torch.Tensor,
-        resets:       torch.Tensor
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            logits = self.base.sequence(observations, state, resets)
-
-        correction = self.correction(observations.flatten(0, 1))
 
         return logits.float() + self.scale * correction.float()
 
@@ -78,18 +56,13 @@ def attach_residual_actor(
     observation_size: int,
     config:           dict[str, Any]
 ) -> None:
-    output_size = (
-        math.prod(agent.action_sizes)
-        if agent.joint_actions else sum(agent.action_sizes)
-    )
     agent.actor = ResidualActor(
         agent.actor,
         observation_size,
-        output_size,
+        sum(agent.action_sizes),
         config["residual_hidden_size"],
         config["residual_layers"],
-        config["residual_scale"],
-        agent.gru_policy
+        config["residual_scale"]
     )
 
 
@@ -149,16 +122,20 @@ class ResidualOpponents:
     def refresh(self, actors: dict[int, ResidualActor]) -> None:
         identities = sorted(actors)
         models = [actors[identity].correction for identity in identities]
+
         layers = [index for index, layer in enumerate(models[0])
                   if isinstance(layer, nn.Linear)]
+
         self.weights = tuple(
             torch.stack([model[index].weight for model in models])
             for index in layers
         )
+
         self.biases = tuple(
             torch.stack([model[index].bias for model in models])
             for index in layers
         )
+
         self.identities = torch.tensor(
             identities, device=self.weights[0].device
         )
@@ -166,17 +143,14 @@ class ResidualOpponents:
     def __call__(
         self,
         observations: torch.Tensor,
-        identities:   torch.Tensor,
-        state:        torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        identities:   torch.Tensor
+    ) -> torch.Tensor:
         slots = torch.searchsorted(self.identities, identities)
+
         correction = self.logits(
             observations, slots, self.weights, self.biases
         )
 
-        if state is None:
-            logits = self.base(observations)
-        else:
-            logits, state = self.base(observations, state)
+        logits = self.base(observations)
 
-        return logits.float() + self.scale * correction, state
+        return logits.float() + self.scale * correction

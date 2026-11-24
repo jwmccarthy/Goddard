@@ -3,7 +3,6 @@ import time
 
 from training.arguments import (
     add_ppo_arguments,
-    check_reset_bank,
     resolve_ppo_arguments,
     resume_arguments,
 )
@@ -36,6 +35,7 @@ def parse_arguments() -> argparse.Namespace:
         description="PPO for CARL",
         allow_abbrev=False
     )
+
     add_ppo_arguments(parser)
 
     args = parser.parse_args()
@@ -52,7 +52,6 @@ def parse_arguments() -> argparse.Namespace:
         if args.team_size != previous["team_size"]:
             parser.error("team size differs from the resumed checkpoint")
 
-    check_reset_bank(parser, args)
     resolve_ppo_arguments(parser, args)
 
     return args

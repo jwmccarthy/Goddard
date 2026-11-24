@@ -2,29 +2,6 @@ from argparse import Namespace
 
 import torch
 
-ACTION_HEAD_NAMES = (
-    "horizontal",
-    "vertical",
-    "throttle",
-    "powerslide",
-    "boost",
-    "air_roll",
-    "jump"
-)
-
-
-def entropy_coefficients(args: Namespace) -> tuple[float, ...]:
-    if args.joint_actions:
-        return (args.entropy_coefficient,)
-
-    overrides = (
-        getattr(args, f"entropy_coefficient_{name}") for name in ACTION_HEAD_NAMES
-    )
-
-    return tuple(
-        args.entropy_coefficient if value is None else value for value in overrides
-    )
-
 
 def checkpoint_due(args: Namespace, previous_step: int, step: int) -> bool:
     return (
@@ -60,6 +37,7 @@ def schedule_learning_rate(
     step:      int
 ) -> None:
     fraction = min(step / args.timesteps, 1.0)
+
     optimizer.param_groups[0]["lr"] = args.learning_rate + fraction * (
         args.learning_rate_end - args.learning_rate
     )

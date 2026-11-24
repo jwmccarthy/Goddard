@@ -27,23 +27,12 @@ OPP_GOAL = np.array([0.0, 5120.0, 321.3875])
 
 BOOST_PAD_POSITIONS = np.asarray(CARL_BOOST_PAD_POSITIONS, dtype=np.float32)
 
-# CARL boost pad order reflected across x=0, with y unchanged.
-REFLECTED_BOOST_PADS = (
-     1,  0,  3,  2,  5,  4,  6,  8,  7, 10,  9, 11, 13, 12, 15, 14, 18,
-    17, 16, 20, 19, 23, 22, 21, 25, 24, 27, 26, 28, 30, 29, 32, 31, 33
-)
-
-
 def team_car_count(team_size: int) -> int:
     return 2 * team_size
 
 
 def team_scene_size(team_size: int) -> int:
     return BALL_SIZE + team_car_count(team_size) * CAR_SIZE
-
-
-def team_imitation_size(team_size: int, boost_pad_state: bool) -> int:
-    return team_scene_size(team_size) + BOOST_PAD_COUNT * boost_pad_state
 
 
 def team_observation_size(team_size: int) -> int:

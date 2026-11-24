@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from replays.reconstruction import MODES
+from replays.reconstruction import VERSION
 from replays.timing import Status
 from replays.utils import file_sha256
 
@@ -20,7 +20,7 @@ def confidence_path(path: Path) -> Path:
 def write_confidence(
     path:    Path,
     quality: dict[str, np.ndarray],
-    version: str = "native-v1"
+    version: str = VERSION
 ) -> dict:
     np.savez_compressed(
         confidence_path(path),
@@ -29,6 +29,7 @@ def write_confidence(
         source_sha256=np.asarray(file_sha256(path)),
         **quality
     )
+
     status = quality["status"]
 
     return {
@@ -60,7 +61,7 @@ def load_confidence(
 
         if (
             archive["format"].item() != FORMAT
-            or stored not in MODES[1:]
+            or stored != VERSION
             or (version is not None and stored != version)
         ):
             raise ValueError(f"unsupported replay reconstruction quality: {target}")

@@ -29,6 +29,7 @@ def require_finite(tensor: torch.Tensor, name: str) -> None:
 def configure_compilation_warnings() -> None:
     config.autotune_num_choices_displayed = 0
     config.max_autotune_report_choices_stats = False
+
     logger = logging.getLogger("torch._inductor.select_algorithm")
 
     if _autotune_log_filter not in logger.filters:

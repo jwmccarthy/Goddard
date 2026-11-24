@@ -9,7 +9,6 @@ from training.arguments import (
     add_options,
     add_ppo_arguments,
     add_switches,
-    check_reset_bank,
     check_unchanged,
     resolve_ppo_arguments,
     resume_arguments,
@@ -23,13 +22,13 @@ from training.discriminator import (
 from training.gaifo import Imitation
 from training.logging import configure_logging
 from training.runtime import TrainingRun
-from training.style_potential import check_style_potential_args
 
 
 def train(run: TrainingRun) -> None:
     args = run.args
     imitation = Imitation(args, run.env)
     observation = run.start()
+
     imitation.start(observation, run.payload)
 
     while run.step < args.timesteps:
@@ -38,7 +37,8 @@ def train(run: TrainingRun) -> None:
         gae_gamma = run.discount(gamma, scaled=True)
 
         observation = run.collect(observation, transitions=imitation.scenes)
-        metrics = imitation.update(run.rollout, gae_gamma)
+        metrics = imitation.update(run.rollout)
+
         run.estimate_advantages(observation, gae_gamma, args.reward_gae_lambda)
 
         metrics.update(run.update_policy())
@@ -56,6 +56,7 @@ def parse_arguments() -> argparse.Namespace:
         description="GAIFO for CARL",
         allow_abbrev=False
     )
+
     add_ppo_arguments(parser)
     add_gaifo_arguments(parser)
 
@@ -83,7 +84,6 @@ def parse_arguments() -> argparse.Namespace:
         check_imitation_resume(parser, args, payload, previous)
 
     check_imitation_arguments(parser, args)
-    check_reset_bank(parser, args)
     resolve_ppo_arguments(parser, args)
     resolve_gaifo_defaults(args)
 
@@ -106,40 +106,31 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
         timesteps=2_000_000_000,
         learning_rate_end=5e-5,
         adam_epsilon=1e-8,
-        clip_value_loss=False,
         normalize_value_loss=True,
         critic_max_gradient_norm=1.0,
-        replay_reset_fraction=0.75,
-        opponent_pool_size=0
+        replay_reset_fraction=0.75
     )
 
     group = parser.add_argument_group("GAIfO")
-    group.add_argument("--expert-frame-limit", type=int)
+
     group.add_argument(
         "--discriminator-holdout-fraction",
         type=float,
         default=0.1,
         help="Fraction of expert matches reserved for checkpoint scoring."
     )
+
     group.add_argument(
         "--discriminator-holdout-samples",
         type=int,
         default=8192,
         help="Maximum expert and generated windows scored per checkpoint."
     )
+
     group.add_argument(
         "--imitation-reward-weight",
         type=float,
         help="Scale discriminator reward per decision. Defaults to frameskip/8."
-    )
-    group.add_argument(
-        "--scale-goal-reward-by-return",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Scale goal reward by abs(mean imitation reward) / "
-            "(1 - effective gamma), excluding goal and gameplay rewards."
-        )
     )
 
     add_options(
@@ -149,14 +140,9 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
             "discriminator_angular_noise_scale":       math.radians(0.5),
             "discriminator_learning_rate":             3e-4,
             "discriminator_ratio_cap":                 10.0,
-            "discriminator_gradient_penalty":          0.0,
             "discriminator_batch_size":                65_536,
             "discriminator_update_microbatch_size":    16_384,
             "discriminator_inference_microbatch_size": 16_384,
-            "discriminator_history_capacity":          262_144,
-            "discriminator_history_add_size":          16_384,
-            "discriminator_history_interval":          4,
-            "discriminator_history_mix_fraction":      0.0,
             "gameplay_reward_weight":                  0.0,
             "goal_reward_weight":                      0.0
         }
@@ -168,6 +154,7 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
         default=128,
         help="Hidden width of each discriminator MLP (default: 128)."
     )
+
     group.add_argument(
         "--discriminator-layers",
         type=int,
@@ -180,6 +167,7 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=4
     )
+
     group.add_argument(
         "--discriminator-decision-stride",
         type=int,
@@ -190,16 +178,10 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
     add_switches(
         group,
         {
-            "discriminator_flags":               True,
             "discriminator_boost":               True,
-            "discriminator_boost_pad_state":     False,
             "discriminator_mirror":              True,
-            "discriminator_jump":                False,
-            "discriminator_endpoint_scalars":    False,
             "discriminator_round_boost":         True,
-            "discriminator_integrate_positions": False,
-            "discriminator_ego_only":            False,
-            "discriminator_ball_spin":           True
+            "discriminator_integrate_positions": False
         }
     )
 
@@ -211,12 +193,6 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
             "Number of strided frames (at least 2); later frames are "
             "relative to the first."
         )
-    )
-    group.add_argument(
-        "--discriminator-factorize",
-        action="store_true",
-        default=True,
-        help="Ego/global heads for every team size."
     )
 
     group.add_argument(
@@ -233,34 +209,6 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     group.add_argument(
-        "--style-potential-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Potential-based shaping toward states where expert play collects "
-            "discriminator reward the policy is missing, relative to the "
-            "imitation reward weight. 0 disables it (default); 0.05 is the "
-            "suggested starting value (shaping noise about equal to the "
-            "imitation reward's)."
-        )
-    )
-    group.add_argument(
-        "--style-potential-interval",
-        type=int,
-        default=10,
-        help="Rollouts between refits of the style potential (default: 10)."
-    )
-    group.add_argument(
-        "--style-potential-horizon",
-        type=int,
-        default=128,
-        help=(
-            "Expert decisions summed per style potential target before "
-            "bootstrapping on the current potential (default: 128)."
-        )
-    )
-
-    group.add_argument(
         "--discriminator-target",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -268,6 +216,7 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     smoothing = group.add_mutually_exclusive_group()
+
     smoothing.add_argument(
         "--discriminator-target-tau",
         dest="discriminator_target_tau",
@@ -275,6 +224,7 @@ def add_gaifo_arguments(parser: argparse.ArgumentParser) -> None:
         default=2 / 9,
         help="EMA new-weight fraction per discriminator update (default: 2/9)."
     )
+
     smoothing.add_argument(
         "--discriminator-target-span",
         dest="discriminator_target_tau",
@@ -305,11 +255,7 @@ def check_imitation_resume(
         (
             "discriminator_hidden_size",
             "discriminator_layers",
-            "discriminator_jump",
-            "discriminator_boost_pad_state",
-            "discriminator_integrate_positions",
-            "discriminator_ball_spin",
-            "discriminator_ego_only"
+            "discriminator_integrate_positions"
         )
     )
 
@@ -328,15 +274,9 @@ def check_imitation_resume(
 
 
 def check_imitation_arguments(
-    parser:    argparse.ArgumentParser,
-    args:      argparse.Namespace
+    parser: argparse.ArgumentParser,
+    args:   argparse.Namespace
 ) -> None:
-    if args.style_potential_weight:
-        try:
-            check_style_potential_args(args)
-        except ValueError as error:
-            parser.error(str(error))
-
     if not 0 <= args.discriminator_holdout_fraction < 1:
         parser.error("discriminator holdout fraction must be in [0, 1)")
 
@@ -345,9 +285,6 @@ def check_imitation_arguments(
 
 
 def resolve_gaifo_defaults(args: argparse.Namespace) -> None:
-    if args.discriminator_jump:
-        args.discriminator_flags = False
-
     if args.imitation_reward_weight is None:
         args.imitation_reward_weight = args.frameskip / 8
 
@@ -356,9 +293,11 @@ def resolve_gaifo_defaults(args: argparse.Namespace) -> None:
 
     args.discriminator_amp_reward = args.discriminator_reward == "amp"
     args.discriminator_log_reward = args.discriminator_reward == "log"
+
     args.discriminator_forward_kl_reward = (
         args.discriminator_reward == "forward-kl"
     )
+
     args.reward_gae_lambda = args.gae_lambda ** (args.frameskip / 4)
 
 

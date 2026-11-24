@@ -39,9 +39,7 @@ def build_agent(
         config["hidden_size"],
         config["layers"],
         policy_hidden=config["policy_hidden_size"],
-        policy_layers=config["policy_layers"],
-        joint_actions=config["joint_actions"],
-        gru_policy=config["gru_policy"]
+        policy_layers=config["policy_layers"]
     )
 
     if config.get("residual_policy", False):
@@ -68,33 +66,17 @@ def load_policy(
     seed:       int
 ) -> tuple[CARLTorchVectorEnv, Agent, dict[str, Any], int]:
     payload = load_payload(checkpoint)
-
     config = dict(payload["config"], n_sim=1, seed=seed, resume=None)
-
     env = build_env(SimpleNamespace(**config))
 
     try:
         agent = build_agent(env, config, payload)
     except BaseException:
         env.close()
+
         raise
 
     return (env, agent, config, payload["step"])
-
-
-def initial_policy_state(
-    env:    CARLTorchVectorEnv,
-    agent:  Agent,
-    config: dict[str, Any]
-) -> torch.Tensor | None:
-    if not agent.gru_policy:
-        return None
-
-    return torch.zeros(
-        env.n_envs,
-        config["policy_hidden_size"],
-        device=env.device
-    )
 
 
 def snapshot(
@@ -103,6 +85,7 @@ def snapshot(
 ) -> tuple[Physics, tuple[Car, ...], tuple[tuple[tuple[float, ...], bool], ...]]:
     # CARL's torch wrapper has no public physical-state accessor yet.
     raw = torch.from_dlpack(env._env.get_state()).cpu().clone()
+
     state = CarlState.from_raw(
         raw,
         env.n_cars,
@@ -117,6 +100,7 @@ def snapshot(
     )
 
     blue_cars = env.n_cars // 2 if blue_cars is None else blue_cars
+
     cars = tuple(
         Car(
             id=index + 1,
@@ -176,7 +160,6 @@ class Match:
         self.replay_resets = None
         self.seed = seed
         self.sample = sample
-        self.policy_state = initial_policy_state(self.env, self.agent, self.config)
         self.replay_seed = replay_seed
         self.thread = threading.Thread(target=self.run, daemon=True)
 
@@ -215,7 +198,6 @@ class Match:
                 config["replay_dir"] = self.replay_dir
 
             observation = plain_tensor(env.reset())
-            policy_state = initial_policy_state(env, agent, config)
             replay_resets = self.replay_resets
 
             if (
@@ -226,14 +208,17 @@ class Match:
                 replay_resets = None
         except BaseException:
             env.close()
+
             raise
 
         previous_env = self.env
+
         self.env, self.agent, self.config = env, agent, config
-        self.policy_state = policy_state
         self.checkpoint_step = step
         self.replay_resets = replay_resets
+
         previous_env.close()
+
         logging.info("Reloaded checkpoint: %s steps (%s).", f"{step:,}", checkpoint)
 
         return observation
@@ -264,12 +249,7 @@ class Match:
         try:
             self.env.reset_state_provider = replay_state if state is not None else None
 
-            observation = plain_tensor(self.env.reset())
-
-            if self.policy_state is not None:
-                self.policy_state.zero_()
-
-            return observation
+            return plain_tensor(self.env.reset())
         finally:
             self.env.reset_state_provider = provider
 
@@ -300,18 +280,10 @@ class Match:
                         timestep = self.config["frameskip"] / 120.0
                         deadline = time.monotonic()
 
-                if self.policy_state is None:
-                    actions = self.agent.get_action(
-                        observation, sample=self.sample
-                    )
-                else:
-                    actions, self.policy_state = (
-                        self.agent.get_recurrent_action(
-                            observation, self.policy_state, sample=self.sample
-                        )
-                    )
+                actions = self.agent.get_action(observation, sample=self.sample)
 
                 ball, cars, pads = snapshot(self.env)
+
                 data = json.dumps(
                     {
                         "episode":         episode,
@@ -336,11 +308,6 @@ class Match:
                 observation, _, terminated, truncated, _ = self.env.step(actions)
                 observation = plain_tensor(observation)
 
-                if self.policy_state is not None:
-                    self.policy_state.masked_fill_(
-                        (terminated | truncated)[:, None], 0
-                    )
-
                 episode += int((terminated | truncated).any().item())
                 deadline = max(deadline + timestep, time.monotonic())
 
@@ -348,7 +315,6 @@ class Match:
 
         except Exception:
             logging.exception("Checkpoint playback stopped")
-
         finally:
             self.env.close()
             self.stopped.set()

@@ -31,6 +31,7 @@ def period_end(replay, period: dict, index: int, diagnostics: list | None) -> in
     # The upstream converter trims at a sleeping ball but still indexes
     # the original end for non-goal periods, overrunning truncated files.
     ball = replay.ball_df.loc[period["start_frame"]:end]
+
     sleeping = ball.index[
         (ball["is_sleeping"] == 1) & (ball["pos_x"] != 0) & (ball["pos_y"] != 0)
     ]
@@ -96,13 +97,16 @@ def period_replays(replay, team_size=None, metadata=None, diagnostics=None):
     """Keep reconnect actors separate and omit periods spanning roster changes."""
     teams = source_teams(metadata)
     players = {p["unique_id"]: p for p in replay.metadata["players"]}
+
     spans = {}
 
     for uid, data in replay.player_dfs.items():
         valid = data["pos_x"].dropna()
 
-        if len(valid):
-            spans[uid] = (valid.index[0], valid.index[-1])
+        if not len(valid):
+            continue
+
+        spans[uid] = (valid.index[0], valid.index[-1])
 
     expected_size = team_size
 
@@ -110,9 +114,11 @@ def period_replays(replay, team_size=None, metadata=None, diagnostics=None):
         period = dict(original)
         start = period["start_frame"]
         end = period_end(replay, period, index, diagnostics)
+
         roster = period_roster(
             spans, players, teams, start, end, index, diagnostics
         )
+
         size = expected_size if expected_size is not None else len(roster) // 2
 
         if not roster or not balanced(roster, size):
@@ -126,14 +132,18 @@ def period_replays(replay, team_size=None, metadata=None, diagnostics=None):
                 })
 
             yield index, None
+
             continue
 
         expected_size = size
+
         view = copy(replay)
         view.metadata = {**replay.metadata, "players": roster}
+
         view.player_dfs = {
             p["unique_id"]: replay.player_dfs[p["unique_id"]] for p in roster
         }
+
         view.analyzer = {**replay.analyzer, "gameplay_periods": [period]}
 
         yield index, view

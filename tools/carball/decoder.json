@@ -1,7 +1,0 @@
-{
-  "repository": "https://github.com/Rolv-Arild/rust-carball",
-  "commit": "6b9519d25663ac2868a80cb8ca60ae9882a9433f",
-  "boxcars": "0.13.1",
-  "build": "cargo build --release --no-default-features",
-  "binary_sha256": "194322d3746e2eac27604af03dd02a08993648e2956911daf68da3963cd0ff3b"
-}

@@ -47,8 +47,10 @@ def discover(
             return
 
         visited.add(group["id"])
+
         name = group.get("name", group["id"])
         path = path + [name]
+
         selected = selected or pattern is None or bool(pattern.search(name))
         direct = group.get("direct_replays")
 
@@ -60,10 +62,12 @@ def discover(
                 sort_dir="asc"
             ):
                 uid = item["id"].lower()
+
                 record = entries.setdefault(
                     uid,
                     {"id": uid, "metadata": item, "occurrences": []}
                 )
+
                 record["occurrences"].append(
                     {"group_id": group["id"], "path": path}
                 )
@@ -159,6 +163,7 @@ def collect(
 ) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
     """Discover every root, deduplicating by replay id and by match."""
     selected: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+
     matches = {
         key: uid for uid, record in records.items()
         if (key := match_key(record["provenance"]))
@@ -167,6 +172,7 @@ def collect(
     for root in config["roots"]:
         entries = discover(client, root, config.get("include_groups"))
         write_json(output / "provenance" / f"{root['group_id']}.json", entries)
+
         logging.info("%s: %s discovered.", root["group_id"], len(entries))
 
         for uid, item in entries.items():
@@ -175,6 +181,7 @@ def collect(
 
             if owner != uid:
                 logging.info("%s duplicates match of %s.", uid, owner)
+
                 continue
 
             if uid in selected:
@@ -196,12 +203,15 @@ def download(
 ) -> None:
     raw = output / "raw"
     raw.mkdir(parents=True, exist_ok=True)
+
     client = CachedClient(
         os.environ["BALLCHASING_TOKEN"], output / "provenance/api_cache", refresh
     )
+
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     records = {record["id"]: record for record in manifest.get("records", [])}
+
     selected = collect(client, config, output, records)
     pending = [uid for uid in selected if not (raw / f"{uid}.replay").exists()]
     errors: dict[str, str] = {}
@@ -212,10 +222,12 @@ def download(
     for uid, (root, item) in selected.items():
         path = raw / f"{uid}.replay"
 
-        if path.is_file():
-            records[uid] = update_record(
-                records.get(uid, {}), uid, item, path, root, config["team_size"]
-            )
+        if not path.is_file():
+            continue
+
+        records[uid] = update_record(
+            records.get(uid, {}), uid, item, path, root, config["team_size"]
+        )
 
     write_json(
         manifest_path,
@@ -224,6 +236,7 @@ def download(
             "records": sorted(records.values(), key=lambda r: r["id"])
         }
     )
+
     write_json(output / "provenance/download-errors.json", errors)
 
     if errors:
@@ -234,13 +247,16 @@ def download(
 
 def main() -> None:
     configure_logging()
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--workers", type=int, default=4)
+
     parser.add_argument(
         "--refresh", action="store_true",
         help="Refresh cached group inventories."
     )
+
     args = parser.parse_args()
 
     download(

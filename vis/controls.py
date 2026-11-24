@@ -1,6 +1,10 @@
 import torch
 
 
+def axis(value: int) -> int:
+    return -1 if value == 1 else 1 if value == 2 else 0
+
+
 def control_values(
     actions:  torch.Tensor,
     discrete: bool = True
@@ -11,9 +15,6 @@ def control_values(
 
     for horizontal, vertical, throttle, slide, boost, roll, jump in values:
         if discrete:
-            def axis(value: int) -> int:
-                return -1 if value == 1 else 1 if value == 2 else 0
-
             horizontal, vertical, throttle, roll = map(
                 axis,
                 (horizontal, vertical, throttle, roll)

@@ -15,14 +15,8 @@ from rlgym_tools.rocket_league.replays.replay_frame import ReplayFrame
 
 from replays import REPLAYS_DIR, layout
 from replays.confidence import write_confidence
-from replays.jump_actions import write_jump_actions
 from replays.periods import period_replays
-from replays.quality import resample_period
-from replays.reconstruction import (
-    EXPERIMENTAL_VERSION,
-    PeriodReconstruction,
-    Refinements,
-)
+from replays.reconstruction import VERSION, PeriodReconstruction
 from replays.results import winning_team
 from replays.utils import file_sha256, write_json
 from training.logging import configure_logging
@@ -93,11 +87,13 @@ def active_frames(
 
         period = view.analyzer["gameplay_periods"][0]
         goal = period.get("goal_frame") is not None
+
         start = times[period["start_frame"]]
         end = times[period["goal_frame"] if goal else period["end_frame"]]
 
         for frame, errors in replay_to_rlgym(view, calculate_error=True):
             tick = frame.state.tick_count
+
             if start <= tick < end or (goal and tick == end):
                 segments[index].append((frame, errors))
 
@@ -178,11 +174,13 @@ def build_observation(frame: ReplayFrame, car_ids: list[str]) -> np.ndarray:
     invert = bool(ego.team_num)
 
     ball = state.ball.inverted() if invert else state.ball
+
     car_physics = [
         state.cars[car_id].physics.inverted()
         if invert else state.cars[car_id].physics
         for car_id in car_ids
     ]
+
     ego_physics = car_physics[0]
 
     pad_indices = ORANGE_PADS if invert else BLUE_PADS
@@ -261,7 +259,6 @@ def parse_replay(
     name:            str,
     output_dir:      Path,
     team_size:       int | None = None,
-    reconstruction:  str = "legacy",
     source_metadata: dict | None = None,
     diagnostics:     list | None = None
 ) -> int:
@@ -285,12 +282,13 @@ def parse_replay(
         raise ValueError(f"replay does not have {team_size} cars per team")
 
     winner = winning_team(getattr(replay, "metadata", {}))
-    refinements = Refinements() if reconstruction == EXPERIMENTAL_VERSION else None
+
     native = {
-        period: PeriodReconstruction.build(replay, samples, refinements)
+        period: PeriodReconstruction.build(replay, samples)
         for period, samples in enumerate(segments)
-        if reconstruction != "legacy" and len(samples) >= 2
+        if len(samples) >= 2
     }
+
     written = 0
 
     for period, samples in enumerate(segments):
@@ -303,15 +301,13 @@ def parse_replay(
             car_ids = team_ordered_ids(cars, ego_id)
             quality = {}
 
-            if reconstruction == "legacy":
-                result = parse_period(samples, car_ids, team_size, ego.team_num)
-            elif period in native:
-                result = parse_period(
-                    samples, car_ids, team_size, ego.team_num,
-                    reconstruction=native[period], quality=quality
-                )
-            else:
+            if period not in native:
                 continue
+
+            result = parse_period(
+                samples, car_ids, team_size, ego.team_num,
+                native[period], quality
+            )
 
             if result is None:
                 continue
@@ -319,32 +315,30 @@ def parse_replay(
             rows, metadata = result
             metadata["ego_team"] = ego.team_num
             metadata["winner_team"] = winner
+
             metadata["ego_won"] = (
                 ego.team_num == winner if winner is not None else None
             )
+
             path = output_dir / f"{ego_id}-{period}-{name}.npy"
             np.save(path, rows)
-            metadata["reconstruction"] = (
-                write_confidence(path, quality, reconstruction)
-                if quality else {"version": "legacy"}
-            )
+
+            metadata["reconstruction"] = write_confidence(path, quality)
+
             path.with_suffix(".json").write_text(json.dumps(metadata) + "\n")
-            write_jump_actions(
-                path, samples, ego_id, len(rows), metadata["goal_terminal"]
-            )
+
             written += 1
 
     return written
 
 
 def parse_period(
-    samples:   list[tuple[ReplayFrame, dict]],
-    car_ids:   list[str],
-    team_size: int,
-    ego_team:  int,
-    *,
-    reconstruction: PeriodReconstruction | None = None,
-    quality:        dict | None = None
+    samples:        list[tuple[ReplayFrame, dict]],
+    car_ids:        list[str],
+    team_size:      int,
+    ego_team:       int,
+    reconstruction: PeriodReconstruction,
+    quality:        dict
 ) -> tuple[np.ndarray, dict] | None:
     if not samples or any(
         car_id not in frame.state.cars
@@ -361,7 +355,9 @@ def parse_period(
     rows = np.stack(
         [build_observation(frame, car_ids) for frame, _ in samples]
     ).astype(np.float32, copy=False)
+
     checked = car_ids if team_size > 1 else car_ids[:1]
+
     corrections = np.asarray(
         [
             any(large_correction(errors.get(car_id)) for car_id in checked)
@@ -369,20 +365,17 @@ def parse_period(
         ],
         dtype=np.float32
     )
+
     rows = np.concatenate((rows, corrections[:, None]), axis=-1)
 
     last = samples[-1][0].state
     terminal = bool(getattr(last, "goal_scored", False))
 
-    if reconstruction is None:
-        rows = resample_period(ticks, rows, terminal)
-    else:
-        rows, diagnostics = reconstruction.resample(
-            samples, rows, car_ids, terminal, ego_team
-        )
+    rows, diagnostics = reconstruction.resample(
+        samples, rows, car_ids, terminal, ego_team
+    )
 
-        if quality is not None:
-            quality.update(diagnostics)
+    quality.update(diagnostics)
 
     if not np.isfinite(rows).all():
         return None
@@ -437,8 +430,10 @@ def is_parsed(
 
 def parse_path(job: tuple) -> tuple[str, str]:
     record, output_path, *options = job
-    reconstruction = options[0] if options else "legacy"
+
+    reconstruction = options[0] if options else VERSION
     carball_path = options[1] if len(options) > 1 else None
+
     path = Path(record["raw"])
     uid = record["id"]
     output_dir = Path(output_path)
@@ -466,7 +461,6 @@ def parse_path(job: tuple) -> tuple[str, str]:
                 uid,
                 Path(temporary),
                 record.get("team_size"),
-                reconstruction=reconstruction,
                 source_metadata=record.get("provenance", {}).get("metadata"),
                 diagnostics=diagnostics
             )
@@ -504,10 +498,12 @@ def publish_exports(temporary: Path, output_dir: Path) -> list[dict]:
 
     for output in sorted(temporary.iterdir()):
         destination = output_dir / "parsed" / output.name
+
         files.append({
             "file":   str(destination.relative_to(output_dir)),
             "sha256": file_sha256(output)
         })
+
         output.replace(destination)
 
     return files
@@ -516,17 +512,23 @@ def publish_exports(temporary: Path, output_dir: Path) -> list[dict]:
 def parse(
     output_dir:     Path,
     workers:        int = 4,
-    reconstruction: str = "legacy",
+    reconstruction: str = VERSION,
     carball_path:   Path | None = None
 ) -> None:
     """Parse every raw replay in a corpus's manifest into parsed/ and reports/."""
+    if reconstruction != VERSION:
+        raise ValueError(f"unsupported reconstruction: {reconstruction}")
+
     (output_dir / "parsed").mkdir(exist_ok=True)
     (output_dir / "reports").mkdir(exist_ok=True)
+
     records = json.loads((output_dir / "manifest.json").read_text())["records"]
+
     jobs = [
         (record, output_dir, reconstruction, carball_path)
         for record in records
     ]
+
     failures = []
 
     with Progress() as progress:
@@ -550,12 +552,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=parse.__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--workers", type=int, default=4)
+
     parser.add_argument(
         "--carball-path",
         type=Path,
-        default=REPLAYS_DIR.parent / "tools/carball/carball-boxcars-0.13.1",
-        help="Carball decoder; the default is the build every corpus was parsed with."
+        required=True,
+        help="Carball decoder built from tools/carball/carball-source.patch."
     )
+
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
 

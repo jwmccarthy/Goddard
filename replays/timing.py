@@ -7,7 +7,6 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from replays.layout import TICK_RATE
-from replays.rotations import angular_displacement
 
 GRAVITY = np.array([0.0, 0.0, -650.0])
 
@@ -69,11 +68,14 @@ def impulse_motion(
 
     duration = np.asarray(duration)[..., None]
     impulse = v1 - v0 - gravity * duration
+
     remaining = p1 - p0 - v0 * duration
     remaining -= 0.5 * gravity * duration * (duration + 1 / TICK_RATE)
+
     lag = np.sum(remaining * impulse, axis=-1)
     lag /= np.maximum(np.sum(impulse ** 2, axis=-1), 1e-12)
     lag = np.clip(lag, 0, duration[..., 0])
+
     error = magnitude(remaining - impulse * lag[..., None])
 
     return (impulse, duration[..., 0] - lag, error)
@@ -98,10 +100,13 @@ def angular_timing(
     start = Rotation.from_quat(rotation[:-1])
     end = Rotation.from_quat(rotation[1:])
     increment = (end * start.inv()).as_rotvec()
+
     mean = (angular[:-1] + angular[1:]) / 2
     speed = magnitude(mean)
+
     ticks = np.sum(increment * mean, axis=-1)
     ticks *= TICK_RATE / np.maximum(speed ** 2, 1e-12)
+
     rounded = np.rint(ticks)
     error = magnitude(increment - mean * rounded[:, None] / TICK_RATE)
 
@@ -122,24 +127,27 @@ def estimate_timing(
     ball:     bool,
     boundary: np.ndarray,
     rotation: np.ndarray | None = None,
-    angular:  np.ndarray | None = None,
-    joint:    bool = False
+    angular:  np.ndarray | None = None
 ) -> TimingFit:
     """Pick per-interval tick counts from smooth and one-impulse fits."""
 
     elapsed = np.diff(ticks)
+
     p0, p1 = position[:-1], position[1:]
     v0, v1 = velocity[:-1], velocity[1:]
     delta = v1 - v0
     mean = (v0 + v1) / 2
+
     candidates = np.arange(1, 25)
     duration = candidates / TICK_RATE
+
     residual = p1[:, None] - p0[:, None]
     residual = residual - mean[:, None] * duration[None, :, None]
     residual -= delta[:, None] / (2 * TICK_RATE)
     smooth_error = magnitude(residual)
 
     gravity = GRAVITY if ball else np.zeros(3)
+
     _, _, impulse_error = impulse_motion(
         p0[:, None],
         p1[:, None],
@@ -148,6 +156,7 @@ def estimate_timing(
         duration[None, :],
         gravity
     )
+
     smooth_index, smooth_best, smooth_margin = best_fit(smooth_error)
     impulse_index, impulse_best, impulse_margin = best_fit(impulse_error)
 
@@ -158,6 +167,7 @@ def estimate_timing(
         supported = np.maximum(p0[:, 2], p1[:, 2]) < 150
         supported &= np.maximum(np.abs(v0[:, 2]), np.abs(v1[:, 2])) < 60
         acceleration = np.where(supported[:, None], 0, GRAVITY)
+
         smooth &= magnitude(
             delta - acceleration * duration[smooth_index, None]
         ) < 30
@@ -168,8 +178,10 @@ def estimate_timing(
     chosen = np.where(smooth, smooth_index, impulse_index)
     error = np.where(smooth, smooth_best, impulse_best)
     margin = np.where(smooth, smooth_margin, impulse_margin)
+
     inferred = candidates[chosen].astype(float)
     low_motion = magnitude(mean) <= 200
+
     invalid = boundary | (elapsed <= 0) | (elapsed > 30)
     invalid |= ~np.isfinite(position[:-1]).all(1)
     invalid |= ~np.isfinite(position[1:]).all(1)
@@ -177,15 +189,13 @@ def estimate_timing(
 
     status = np.where(error >= 2, Status.POOR_FIT, Status.AMBIGUOUS)
     status = status.astype(np.uint16)
+
     status[low_motion] = Status.LOW_MOTION
     status[invalid] = Status.BOUNDARY
     status[accepted] = Status.ESTIMATED
     status[accepted & impulse] |= Status.IMPULSE
 
-    if (
-        not joint and rotation is not None
-        and angular is not None and len(elapsed)
-    ):
+    if rotation is not None and angular is not None and len(elapsed):
         angular_ticks, reliable = angular_timing(rotation, angular)
         conflict = accepted & reliable & (inferred != angular_ticks)
         status[conflict] = Status.ANGULAR_CONFLICT
@@ -194,63 +204,11 @@ def estimate_timing(
     confidence = np.full(len(elapsed), 0.25, dtype=np.float32)
     confidence[low_motion] = 0.5
     confidence[invalid] = 0
+
     confidence[accepted] = np.where(impulse[accepted], 0.75, 0.95)
     inferred[~accepted] = elapsed[~accepted]
 
-    fit = TimingFit(inferred, status, error, margin, confidence)
-
-    if joint and not ball and rotation is not None and angular is not None:
-        refine_car_timing(fit, rotation, angular, smooth_error, delta, invalid)
-        fit.ticks[~fit.accepted] = elapsed[~fit.accepted]
-
-    return fit
-
-
-def refine_car_timing(
-    fit:          TimingFit,
-    rotation:     np.ndarray,
-    angular:      np.ndarray,
-    linear_error: np.ndarray,
-    delta:        np.ndarray,
-    invalid:      np.ndarray
-) -> None:
-    """Resolve translational ambiguity using rotation on a shared car clock."""
-
-    if not len(fit.ticks):
-        return
-
-    start = Rotation.from_quat(rotation[:-1])
-    end = Rotation.from_quat(rotation[1:])
-    increment = (end * start.inv()).as_rotvec()
-    candidates = np.arange(1, 25)
-    duration = candidates / TICK_RATE
-    w0, w1 = angular[:-1], angular[1:]
-    predicted = angular_displacement(
-        w0[:, None], w1[:, None], duration[None]
-    )
-    errors = magnitude(increment[:, None] - predicted)
-    indices, best, margin = best_fit(errors)
-    speed = magnitude((w0 + w1) / 2)
-    reliable = (speed > 0.5) & (best < 0.01)
-    reliable &= margin > np.maximum(0.001, speed / TICK_RATE * 0.3)
-    reliable &= np.maximum(magnitude(w0), magnitude(w1)) < 5
-    reliable &= magnitude(w1 - w0) < 0.5
-    reliable &= ~invalid
-
-    inferred = candidates[indices]
-    conflict = reliable & fit.accepted & (fit.ticks != inferred)
-    # Strong signals that disagree do not authorize a compromise clock.
-    fit.status[conflict] = Status.ANGULAR_CONFLICT
-    fit.confidence[conflict] = 0.25
-
-    translation = linear_error[np.arange(len(indices)), indices]
-    accepted = reliable & ~conflict & (translation < 2)
-    accepted &= magnitude(delta) / duration[indices] < 5000
-    fit.ticks[accepted] = inferred[accepted]
-    fit.status[accepted] = Status.ESTIMATED | Status.JOINT_TIMING
-    fit.error[accepted] = translation[accepted]
-    fit.margin[accepted] = margin[accepted]
-    fit.confidence[accepted] = 0.85
+    return TimingFit(inferred, status, error, margin, confidence)
 
 
 def anchored_clock(
@@ -264,6 +222,7 @@ def anchored_clock(
     """Bounded per-entity clock that keeps recorded time at anchors."""
 
     clock = ticks.copy()
+
     fit.status[locked[:-1] | locked[1:]] |= Status.CONTACT_LOCK
     good = fit.accepted & ~locked[:-1] & ~locked[1:]
 
@@ -272,6 +231,7 @@ def anchored_clock(
             continue
 
         source = ticks[start:stop + 1]
+
         candidate = np.r_[0, np.cumsum(fit.ticks[start:stop])]
         candidate += np.median(source - candidate)
         shift = candidate - source

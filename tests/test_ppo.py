@@ -21,10 +21,12 @@ class PPOUpdateGuardTests(unittest.TestCase):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         elif isinstance(actual, dict):
             self.assertEqual(actual.keys(), expected.keys())
+
             for key in actual:
                 self.assert_state_equal(actual[key], expected[key])
         elif isinstance(actual, (tuple, list)):
             self.assertEqual(len(actual), len(expected))
+
             for a, b in zip(actual, expected):
                 self.assert_state_equal(a, b)
         else:
@@ -36,6 +38,7 @@ class PPOUpdateGuardTests(unittest.TestCase):
             for amsgrad in (False, True):
                 with self.subTest(optimizer=cls.__name__, amsgrad=amsgrad):
                     torch.manual_seed(17)
+
                     actual = ActorCritic("cuda")
                     expected = copy.deepcopy(actual)
 
@@ -47,6 +50,7 @@ class PPOUpdateGuardTests(unittest.TestCase):
 
                     a, b = optimizer(actual), optimizer(expected)
                     guard = PPOUpdateGuard(a)
+
                     self.assertIsNotNone(guard.found_inf)
 
                     for iteration in range(5):
@@ -56,9 +60,11 @@ class PPOUpdateGuardTests(unittest.TestCase):
 
                         loss = torch.tensor(.5, device="cuda")
                         check = ppo_gradient_check(actual, loss, .5, 1., guard.found_inf)
+
                         ppo_gradient_check(expected, loss, .5, 1.)
                         guard.step(check, a.step)
                         b.step()
+
                         self.assert_state_equal(actual.state_dict(), expected.state_dict())
                         self.assert_state_equal(a.state_dict(), b.state_dict())
 
@@ -69,6 +75,7 @@ class PPOUpdateGuardTests(unittest.TestCase):
                             guard = PPOUpdateGuard(a)
 
                     guard.finish()
+
                     self.assertFalse(hasattr(a, "found_inf"))
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA fused Adam")
@@ -78,15 +85,18 @@ class PPOUpdateGuardTests(unittest.TestCase):
                 with self.subTest(compiled=compiled, failure=failure):
                     agent = ActorCritic("cuda")
                     optimizer = torch.optim.Adam(agent.parameters(), fused=True)
+
                     for parameter in agent.parameters():
                         parameter.grad = torch.ones_like(parameter)
 
                     optimizer.step()
+
                     weights = copy.deepcopy(agent.state_dict())
                     state = copy.deepcopy(optimizer.state_dict())
                     guard = PPOUpdateGuard(optimizer)
                     check_fn = ppo_gradient_check
                     step = optimizer.step
+
                     if compiled:
                         check_fn = torch.compile(check_fn, fullgraph=True)
                         step = torch.compile(step)
@@ -96,21 +106,25 @@ class PPOUpdateGuardTests(unittest.TestCase):
                             parameter.grad = torch.ones_like(parameter)
 
                         loss = torch.tensor(.5, device="cuda")
-                        if attempt == 0:
-                            if failure == "loss":
-                                loss.fill_(float("nan"))
-                            else:
-                                value = {
-                                    "nan":           float("nan"),
-                                    "inf":           float("inf"),
-                                    "norm_overflow": 1e30,
-                                    "critic_nan":    float("nan")
-                                }[failure]
-                                module = agent.critic if failure == "critic_nan" else agent.actor
-                                next(module.parameters()).grad.fill_(value)
+
+                        if attempt == 0 and failure == "loss":
+                            loss.fill_(float("nan"))
+
+                        if attempt == 0 and failure != "loss":
+                            value = {
+                                "nan":           float("nan"),
+                                "inf":           float("inf"),
+                                "norm_overflow": 1e30,
+                                "critic_nan":    float("nan")
+                            }[failure]
+                            module = agent.critic if failure == "critic_nan" else agent.actor
+
+                            next(module.parameters()).grad.fill_(value)
 
                         check = check_fn(agent, loss, .5, 1., guard.found_inf)
+
                         guard.step(check, step)
+
                         self.assert_state_equal(agent.state_dict(), weights)
                         self.assert_state_equal(optimizer.state_dict(), state)
 

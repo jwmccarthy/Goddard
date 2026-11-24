@@ -14,9 +14,8 @@ runs/
 # Local replay and project backups are archives, not source files.
 *.7z
 
-# Data: replay corpora, policy clips, skill labels and the decoder build.
+# Data: replay corpora, policy clips and skill labels.
 replays/duels/
 replays/duos/
 clips/
 labels/
-tools/carball/carball-boxcars-0.13.1

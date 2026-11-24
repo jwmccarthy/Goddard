@@ -43,8 +43,10 @@ class NextoReward:
         # Reference RLGym goal geometry.
         blue = ball.new_tensor([0.0, -5560.0, 321.3875])
         orange = ball.new_tensor([0.0, 5560.0, 321.3875])
+
         blue_quality = torch.exp(-(blue - ball).norm(dim=-1) / 2300.0)
         orange_quality = torch.exp(-(orange - ball).norm(dim=-1) / 2300.0)
+
         state_quality = 0.25 * weights.goal_distance * (
             orange_quality - blue_quality
         )
@@ -52,14 +54,17 @@ class NextoReward:
         blue_back = ball.new_tensor([0.0, -6000.0, 321.3875])
         orange_back = ball.new_tensor([0.0, 6000.0, 321.3875])
         to_ball = ball[:, None] - cars
+
         blue_alignment = F.cosine_similarity(
             to_ball, blue_back - cars, dim=-1, eps=1e-8
         )
         orange_alignment = F.cosine_similarity(
             to_ball, orange_back - cars, dim=-1, eps=1e-8
         )
+
         alignment = 0.5 * (orange_alignment - blue_alignment) * state.team_sign
         distance_quality = torch.exp(-to_ball.norm(dim=-1) / 1410.0)
+
         player_quality = (
             weights.player_distance * distance_quality
             + weights.player_alignment * alignment
@@ -80,6 +85,7 @@ class NextoReward:
     def goal_rewards(self, context: StepContext) -> torch.Tensor:
         current, previous = context.current, context.previous
         weights = self.weights
+
         score = context.events.score_delta[:, None] * current.team_sign
         speed = previous.ball_velocity.norm(dim=-1)[:, None]
         to_ball = current.car_position - previous.ball_position[:, None]
@@ -87,6 +93,7 @@ class NextoReward:
 
         # The reference uses goal_bonus for both bonuses.
         scored = weights.goal * score + weights.goal_bonus * speed / 6000.0
+
         conceded = -weights.goal_bonus * (
             1 - torch.exp(-defender_distance / 2300.0)
         )
@@ -97,6 +104,7 @@ class NextoReward:
     def components(self, context: StepContext) -> dict[str, torch.Tensor]:
         current, previous = context.current, context.previous
         weights = self.weights
+
         state_quality, player_quality = self.qualities(current)
         old_state_quality, old_player_quality = self.qualities(previous)
 
@@ -105,6 +113,7 @@ class NextoReward:
         height = 0.5 * heights / 2044.0
         velocity_change = current.ball_velocity - previous.ball_velocity
         acceleration = velocity_change.norm(dim=-1) / 2300.0
+
         touch_height = (
             weights.touch_height * touches
             * (2 - current.car_on_ground.float()) * height
@@ -136,6 +145,7 @@ class NextoReward:
 
         # Goals replace shaping rather than adding to it.
         goal = context.events.score_delta.ne(0)[:, None]
+
         components = {
             name: self.distribute(value.masked_fill(goal, 0))
             for name, value in base.items()

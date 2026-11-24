@@ -26,21 +26,11 @@ METRICS = {
     "value/bias":                      "critic/bias",
     "value/rmse":                      "critic/rmse",
     "discriminator/train_loss":        "gaifo/loss",
-    "imitation/gradient_penalty":      "gaifo/gradient_penalty",
     "imitation/reward_per_tick":       "gaifo/reward",
     "imitation/raw_reward_per_tick":   "gaifo/raw_reward",
     "imitation/reward_weight":         "gaifo/imitation_reward_weight",
     "imitation/goal_weight":           "gaifo/goal_weight",
-    "imitation/return_scale":          "gaifo/return_scale",
     "imitation/ratio_capped_fraction": "gaifo/capped_fraction",
-    **{
-        f"style_potential/{name}": f"style/{name}"
-        for name in (
-            "expert_reward_mean", "expert_reward_std", "target_mean",
-            "target_std", "complete_fraction", "mean_chain_decisions", "fit_loss",
-            "policy_potential_mean", "shaping_mean", "shaping_std"
-        )
-    },
     "gameplay/goals_for_per_1000_ticks":      "game/goals_per_1000_ticks",
     "gameplay/touches_per_1000_ticks":        "game/touches_per_1000_ticks",
     "gameplay/aerial_touches_per_1000_ticks": (
@@ -54,15 +44,6 @@ METRICS = {
     ),
     "gameplay/timeout_fraction":               "game/timeout_fraction",
     "gameplay/replay_reset_fraction":          "game/replay_reset_fraction",
-    "gameplay/bank_aerial_touch_rate":         "game/bank_aerial_touch_rate",
-    "gameplay/replay_aerial_touch_rate":       "game/replay_aerial_touch_rate",
-    "gameplay/bank_aerial_touch_rate_floor":   "game/bank_aerial_touch_rate_floor",
-    "gameplay/bank_aerial_touch_rate_wall":    "game/bank_aerial_touch_rate_wall",
-    "gameplay/bank_aerial_touch_rate_ceiling": (
-        "game/bank_aerial_touch_rate_ceiling"
-    ),
-    "gameplay/bank_aerial_touch_rate_ramp": "game/bank_aerial_touch_rate_ramp",
-    "gameplay/bank_tick_share":             "game/bank_tick_share",
     "self_play/pool_size":                  "self_play/pool_size",
     "self_play/resident_snapshots":         "self_play/resident_snapshots",
     "self_play/historical_match_fraction":  "self_play/historical_fraction",
@@ -127,6 +108,7 @@ def log_metrics(
             writer.add_scalar(tag, metrics[name], ticks)
 
     rate = metrics["physics_ticks_per_second"]
+
     progress.update(
         task,
         completed=min(step, progress.tasks[task].total),

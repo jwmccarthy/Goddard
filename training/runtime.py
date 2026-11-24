@@ -14,11 +14,7 @@ from rewards import GameplayDiagnostics
 from training.checkpoints import load_checkpoint, save_checkpoint
 from training.logging import log_metrics, progress_bar, run_directory
 from training.ppo import update_ppo
-from training.replay_resets import (
-    ReplayResetBank,
-    ReplayResetDataset,
-    ReplayResetProvider,
-)
+from training.replay_resets import ReplayResetDataset, ReplayResetProvider
 from training.residual import ResidualReward
 from training.rollout import collect
 from training.schedules import (
@@ -53,35 +49,10 @@ def replay_resets(
         seed=args.seed
     )
 
-    bank = None
-
-    if args.replay_reset_bank is not None:
-        bank = ReplayResetBank(
-            args.replay_reset_bank,
-            args.team_size,
-            env.device,
-            args.replay_reset_bank_temperature
-        )
-
-    provider = ReplayResetProvider(
-        data,
-        args.replay_reset_fraction,
-        args.seed,
-        bank,
-        args.replay_reset_bank_fraction if bank is not None else 0.0
-    )
+    provider = ReplayResetProvider(data, args.replay_reset_fraction, args.seed)
 
     env.reset_state_provider = provider
     logging.info("Replay resets: %s states.", f"{len(data.frames):,}")
-
-    if bank is not None:
-        logging.info(
-            "Reset bank: %s states, fraction %.3f, temperature %.2f.",
-            f"{len(bank):,}",
-            args.replay_reset_bank_fraction,
-            args.replay_reset_bank_temperature
-        )
-        logging.info("Reset bank cells: %s.", bank.cell_summary())
 
     return provider
 
@@ -111,6 +82,7 @@ class TrainingRun:
             self.env, self.agent, self.optimizer, self.rollout = prepare(self.args)
             self.resources.callback(self.env.close)
             self.resets = replay_resets(self.args, self.env)
+
             self.gameplay = GameplayDiagnostics(
                 self.args.n_sim,
                 self.env.n_cars,
@@ -118,8 +90,7 @@ class TrainingRun:
                 self.args.frameskip,
                 no_touch_timeout_steps=math.ceil(
                     self.args.no_touch_timeout * 120 / self.args.frameskip
-                ),
-                resets=self.resets
+                )
             )
 
             reward = self.gameplay
@@ -137,6 +108,7 @@ class TrainingRun:
             self.env.register_reward(reward)
         except BaseException:
             self.resources.close()
+
             raise
 
     def start(self) -> torch.Tensor:
@@ -153,13 +125,14 @@ class TrainingRun:
             self.step = self.payload["step"]
 
             reset_rng = self.payload["replay_reset_rng"]
+
             if self.resets is not None and reset_rng is not None:
                 self.resets.generator.set_state(reset_rng)
 
         self.pool = None
 
         if (
-            self.args.opponent_pool_size
+            self.algorithm == "residual"
             and self.args.opponent_historical_fraction
         ):
             self.pool = OpponentPool(
@@ -179,20 +152,26 @@ class TrainingRun:
             self.agent,
             self.args
         )
+
         self.directory = run_directory(self.args, self.algorithm)
+
         self.writer = SummaryWriter(
             self.directory,
             purge_step=(
                 self.step * self.args.frameskip + 1 if self.args.resume else None
             )
         )
+
         self.resources.callback(self.writer.close)
         self.writer.add_text("configuration", str(vars(self.args)))
+
         self.progress, self.task = progress_bar(
             self.algorithm.upper(),
             self.args.timesteps
         )
+
         self.resources.callback(self.progress.stop)
+
         self.gamma_tensor = None
 
         if self.args.gamma_end is not None:
@@ -223,6 +202,7 @@ class TrainingRun:
         scaled: bool = False
     ) -> float | torch.Tensor:
         """GAE discount; scaled converts gamma from 4 ticks to the frameskip."""
+
         if scaled:
             gamma = gamma ** (self.args.frameskip / 4)
 
@@ -256,11 +236,7 @@ class TrainingRun:
         rollout = self.rollout
 
         with torch.no_grad(), autocast(self.env.device, self.args.bf16):
-            next_value = self.agent.get_value(
-                observation,
-                rollout.critic_context(observation),
-                critic_state=rollout.critic_state
-            )
+            next_value = self.agent.get_value(observation)
 
         self.gae(rollout, next_value, gamma, lambda_)
 
@@ -288,6 +264,7 @@ class TrainingRun:
 
         metrics["reward_per_tick"] = rewards.mean().item() / self.args.frameskip
         metrics["ppo/gamma"] = gamma
+
         metrics["ppo/entropy_coefficient"] = (
             self.args.entropy_coefficient * scheduled_entropy_scale(self.args, self.step)
         )
@@ -301,8 +278,10 @@ class TrainingRun:
             metrics.update(self.pool.diagnostic_metrics())
 
         torch.cuda.synchronize(self.env.device)
+
         elapsed = time.perf_counter() - started
         ticks = self.rollout.rewards.numel() * self.args.frameskip
+
         metrics["physics_ticks_per_second"] = ticks / elapsed
         metrics.update(self.gameplay.diagnostic_metrics())
 
@@ -324,6 +303,7 @@ class TrainingRun:
         replay_reset_rng = (
             self.resets.generator.get_state() if self.resets is not None else None
         )
+
         opponent_pool = (
             self.pool.state_dict() if self.pool is not None else None
         )

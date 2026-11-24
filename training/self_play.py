@@ -1,4 +1,4 @@
-"""Episode-persistent historical opponents; only live-policy cars train PPO."""
+"""Episode-persistent residual opponents; only live-policy cars train PPO."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from training.residual import ResidualActor, ResidualOpponents
+from training.residual import ResidualOpponents
 
 if TYPE_CHECKING:
     from training.models import Agent
@@ -30,20 +30,11 @@ class OpponentPool:
         self.team_size = args.team_size
         self.n_cars = 2 * self.team_size
         self.device = torch.device(device)
-        self.residual = (
-            ResidualOpponents(agent.actor, args)
-            if isinstance(agent.actor, ResidualActor) else None
-        )
-        self.policy_state = (
-            torch.zeros(
-                args.n_sim * self.n_cars,
-                args.policy_hidden_size,
-                device=self.device
-            )
-            if agent.gru_policy
-            else None
-        )
+
+        self.residual = ResidualOpponents(agent.actor, args)
+
         self.generator = torch.Generator(device=self.device).manual_seed(args.seed + 9173)
+
         self.assignments = torch.full(
             (args.n_sim,),
             -1,
@@ -61,12 +52,15 @@ class OpponentPool:
         self.published = []
         self.next_id = 0
         self.last_snapshot_step = step
+
         self.add_snapshot(step)
 
     def add_snapshot(self, step: int) -> None:
         actor = self.copy_actor()
         identity = self.next_id
+
         self.next_id += 1
+
         self.snapshots[identity] = {
             "actor": actor,
             "step":  step
@@ -75,6 +69,7 @@ class OpponentPool:
         self.published.append(identity)
         self.published = self.published[-self.capacity :]
         self.last_snapshot_step = step
+
         self.prune_snapshots()
         self.refresh_residual()
 
@@ -97,19 +92,15 @@ class OpponentPool:
 
     def copy_actor(self) -> torch.nn.Module:
         # Residual snapshots differ only in their correction weights.
-        memo = (
-            {id(self.agent.actor.base): self.agent.actor.base}
-            if self.residual is not None else None
-        )
+        memo = {id(self.agent.actor.base): self.agent.actor.base}
 
         return copy.deepcopy(self.agent.actor, memo).eval().requires_grad_(False)
 
     def refresh_residual(self) -> None:
-        if self.residual is not None:
-            self.residual.refresh({
-                identity: snapshot["actor"]
-                for identity, snapshot in self.snapshots.items()
-            })
+        self.residual.refresh({
+            identity: snapshot["actor"]
+            for identity, snapshot in self.snapshots.items()
+        })
 
     def maybe_snapshot(self, step: int) -> None:
         if step - self.last_snapshot_step >= self.interval:
@@ -124,11 +115,6 @@ class OpponentPool:
 
         if not count:
             return
-
-        if self.policy_state is not None:
-            self.policy_state.view(len(reset_mask), self.n_cars, -1)[
-                simulations
-            ] = 0
 
         historical = (
             torch.rand(count, device=self.device, generator=self.generator)
@@ -161,46 +147,15 @@ class OpponentPool:
     ) -> None:
         opponents = ~self.learner_mask()
         identities = self.assignments.repeat_interleave(self.n_cars)
+        indices = opponents.nonzero().flatten()
 
-        if self.residual is not None:
-            indices = opponents.nonzero().flatten()
-
-            if not len(indices):
-                return
-
-            batch = observations[indices]
-            state = (
-                self.policy_state[indices]
-                if self.policy_state is not None else None
-            )
-            logits, state = self.residual(batch, identities[indices], state)
-
-            if self.policy_state is not None:
-                self.policy_state[indices] = state
-
-            actions[indices] = self.agent.sample_action_logits(logits, batch)[0]
-
+        if not len(indices):
             return
 
-        for identity, snapshot in self.snapshots.items():
-            indices = ((identities == identity) & opponents).nonzero().flatten()
+        batch = observations[indices]
+        logits = self.residual(batch, identities[indices])
 
-            if not len(indices):
-                continue
-
-            batch = observations[indices]
-
-            if self.policy_state is None:
-                logits = snapshot["actor"](batch)
-            else:
-                logits, state = snapshot["actor"](
-                    batch, self.policy_state[indices]
-                )
-                self.policy_state[indices] = state
-
-            actions[indices] = self.agent.sample_action_logits(
-                logits.float(), batch
-            )[0]
+        actions[indices] = self.agent.sample_action_logits(logits, batch)[0]
 
     def state_dict(self) -> dict[str, object]:
         # Simulator episodes are not checkpointed. Resume starts fresh episodes,
@@ -226,23 +181,22 @@ class OpponentPool:
     def load_state_dict(self, state: dict[str, object]) -> None:
         snapshots = state["snapshots"][-self.capacity :]
 
-        if self.residual is not None:
-            base = {
-                f"base.{key}": value.detach().cpu()
-                for key, value in self.agent.actor.base.state_dict().items()
+        base = {
+            f"base.{key}": value.detach().cpu()
+            for key, value in self.agent.actor.base.state_dict().items()
+        }
+
+        for snapshot in snapshots:
+            saved = {
+                key: value for key, value in snapshot["actor"].items()
+                if key.startswith("base.")
             }
 
-            for snapshot in snapshots:
-                saved = {
-                    key: value for key, value in snapshot["actor"].items()
-                    if key.startswith("base.")
-                }
-
-                if saved.keys() != base.keys() or any(
-                    not torch.equal(saved[key].cpu(), value)
-                    for key, value in base.items()
-                ):
-                    raise ValueError("opponent snapshot has a different base")
+            if saved.keys() != base.keys() or any(
+                not torch.equal(saved[key].cpu(), value)
+                for key, value in base.items()
+            ):
+                raise ValueError("opponent snapshot has a different base")
 
         self.snapshots.clear()
         self.published.clear()
@@ -250,17 +204,16 @@ class OpponentPool:
         for snapshot in snapshots:
             actor = self.copy_actor()
 
-            if self.residual is not None:
-                correction = {
-                    key.removeprefix("correction."): value
-                    for key, value in snapshot["actor"].items()
-                    if key.startswith("correction.")
-                }
-                actor.correction.load_state_dict(correction, strict=True)
-            else:
-                actor.load_state_dict(snapshot["actor"], strict=True)
+            correction = {
+                key.removeprefix("correction."): value
+                for key, value in snapshot["actor"].items()
+                if key.startswith("correction.")
+            }
+
+            actor.correction.load_state_dict(correction, strict=True)
 
             identity = snapshot["id"]
+
             self.snapshots[identity] = {
                 "actor": actor,
                 "step":  snapshot["step"]
@@ -274,11 +227,9 @@ class OpponentPool:
             raise ValueError("opponent pool snapshot IDs are inconsistent")
 
         self.last_snapshot_step = state["last_snapshot_step"]
+
         self.generator.set_state(state["rng"])
         self.assignments.fill_(-1)
-
-        if self.policy_state is not None:
-            self.policy_state.zero_()
 
         self.refresh_residual()
 

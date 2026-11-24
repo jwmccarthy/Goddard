@@ -38,8 +38,10 @@ def player_results(metadata: dict) -> dict[str, bool]:
         identity = player.get("unique_id")
         orange = player.get("is_orange")
 
-        if identity is not None and type(orange) is bool:
-            results[str(identity)] = int(orange) == winner
+        if identity is None or type(orange) is not bool:
+            continue
+
+        results[str(identity)] = int(orange) == winner
 
     return results
 
@@ -52,6 +54,7 @@ def replay_result(root: Path, identity: str) -> dict[str, bool]:
 
     cache_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     cache = cache_dir / "goddard" / "replay-results" / f"{file_sha256(raw)}.json"
+
     cached = read_cache(cache)
 
     if cached is not None:
@@ -113,6 +116,7 @@ def write_cache(cache: Path, results: dict[str, bool]) -> None:
 
 def winning_perspectives(paths: list[Path], directory: Path) -> list[Path]:
     """Select only known match-winning ego perspectives, never reset data."""
+
     root = directory.parent if directory.name == "parsed" else directory
     selected = []
     pending: dict[str, list[tuple[Path, str]]] = {}
@@ -127,12 +131,15 @@ def winning_perspectives(paths: list[Path], directory: Path) -> list[Path]:
                 selected.append(path)
             elif values["ego_won"] is False:
                 losing += 1
+
             continue
 
         parts = path.stem.split("-", 2)
 
-        if len(parts) == 3:
-            pending.setdefault(parts[2], []).append((path, parts[0]))
+        if len(parts) != 3:
+            continue
+
+        pending.setdefault(parts[2], []).append((path, parts[0]))
 
     def load(identity: str) -> dict[str, bool]:
         try:
@@ -157,6 +164,7 @@ def winning_perspectives(paths: list[Path], directory: Path) -> list[Path]:
 
     selected.sort()
     unknown = len(paths) - len(selected) - losing
+
     logging.info(
         "Expert perspectives: %s winning, %s losing, %s unknown.",
         f"{len(selected):,}", f"{losing:,}", f"{unknown:,}"

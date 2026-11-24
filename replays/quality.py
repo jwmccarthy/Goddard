@@ -20,19 +20,24 @@ def motion_discontinuities(
     frame_touches = rows[:, -layout.EVENT_SIZE :].any(axis=-1)
     touches = frame_touches[:-1] | frame_touches[1:]
     ego_cars = range(n_cars if n_cars > 2 else 1)
+
     bodies = [(0, layout.BALL_VELOCITY_SCALE)] + [
         (layout.BALL_SIZE + layout.CAR_SIZE * index, layout.CAR_VELOCITY_SCALE)
         for index in ego_cars
     ]
+
     position_scale = np.array(layout.POSITION_SCALE)
 
     for start, velocity_scale in bodies:
         position = rows[:, start : start + 3] * position_scale
         velocity = rows[:, start + 3 : start + 6] * velocity_scale
+
         expected = (velocity[:-1] + velocity[1:]) * (frameskip / 240.0)
         position_error = np.diff(position, axis=0) - expected
+
         residual = np.linalg.norm(position_error, axis=-1) / 100
         speed_change = np.linalg.norm(np.diff(velocity, axis=0), axis=-1) / 100
+
         invalid = (
             (residual > MAX_POSITION_RESIDUAL)
             & (speed_change < MIN_IMPULSE_SPEED_CHANGE)
@@ -125,6 +130,7 @@ def resample(
 
     sample_count = int((ticks[-1] - ticks[0]) // frame_skip) + 1
     target_ticks = ticks[0] + np.arange(sample_count) * frame_skip
+
     resampled = np.stack(
         [
             np.interp(target_ticks, ticks, rows[:, column])
