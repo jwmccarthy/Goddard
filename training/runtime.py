@@ -79,7 +79,15 @@ class TrainingRun:
 
     def initialize(self) -> None:
         try:
-            self.env, self.agent, self.optimizer, self.rollout = prepare(self.args)
+            shaping = (
+                self.algorithm == "ppo"
+                or self.args.gameplay_reward_weight > 0
+            )
+
+            self.env, self.agent, self.optimizer, self.rollout = prepare(
+                self.args, shaping
+            )
+
             self.resources.callback(self.env.close)
             self.resets = replay_resets(self.args, self.env)
 
@@ -90,7 +98,8 @@ class TrainingRun:
                 self.args.frameskip,
                 no_touch_timeout_steps=math.ceil(
                     self.args.no_touch_timeout * 120 / self.args.frameskip
-                )
+                ),
+                shaping=shaping
             )
 
             reward = self.gameplay

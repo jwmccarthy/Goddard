@@ -1,3 +1,3 @@
 from rewards.diagnostics import GameplayDiagnostics as GameplayDiagnostics
-from rewards.shaping import NextoReward as NextoReward
-from rewards.shaping import NextoWeights as NextoWeights
+from rewards.goddard import GoddardReward as GoddardReward
+from rewards.goddard import GoddardWeights as GoddardWeights

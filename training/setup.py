@@ -17,8 +17,9 @@ from training.tensors import compilation_mode, configure_compilation_warnings
 
 
 def build_env(
-    args:         Namespace,
-    reward_funcs: Callable[..., torch.Tensor] | None = None
+    args:           Namespace,
+    reward_funcs:   Callable[..., torch.Tensor] | None = None,
+    capture_events: bool = False
 ) -> CARLTorchVectorEnv:
     return CARLTorchVectorEnv(
         n_sim=args.n_sim,
@@ -32,12 +33,14 @@ def build_env(
         discrete_actions=True,
         reward_funcs=reward_funcs,
         masked_resets=True,
-        defer_episode_reporting=True
+        defer_episode_reporting=True,
+        capture_events=capture_events
     )
 
 
 def prepare(
-    args: Namespace
+    args:    Namespace,
+    shaping: bool = False
 ) -> tuple[CARLTorchVectorEnv, Agent, torch.optim.Optimizer, Rollout]:
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -48,7 +51,7 @@ def prepare(
 
     torch.set_float32_matmul_precision("high")
 
-    env = build_env(args)
+    env = build_env(args, capture_events=shaping)
 
     try:
         agent = Agent(

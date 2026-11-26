@@ -67,7 +67,7 @@ def attach_residual_actor(
 
 
 class ResidualReward:
-    """Team score reward, with optional Nexto shaping and gameplay diagnostics."""
+    """Team score reward, with optional Goddard shaping and gameplay diagnostics."""
 
     def __init__(self, gameplay: GameplayDiagnostics, args: Namespace) -> None:
         self.gameplay = gameplay

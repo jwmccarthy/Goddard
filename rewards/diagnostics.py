@@ -3,14 +3,14 @@ from __future__ import annotations
 import torch
 from carl.gymnasium.state import StepContext
 
-from rewards.shaping import NextoReward
+from rewards.goddard import GoddardReward
 
 TOUCH_WINDOW_TICKS = 8
 CROSSBAR_HEIGHT = 642.775
 
 
 class GameplayDiagnostics:
-    """Nexto rewards and the gameplay counters shown in training logs."""
+    """Goddard rewards and the gameplay counters shown in training logs."""
 
     def __init__(
         self,
@@ -18,12 +18,13 @@ class GameplayDiagnostics:
         n_cars:                 int,
         device:                 torch.device,
         frameskip:              int,
-        no_touch_timeout_steps: int = 0
+        no_touch_timeout_steps: int = 0,
+        shaping:                bool = False
     ) -> None:
         self.n_cars = n_cars
         self.frameskip = frameskip
         self.no_touch_timeout_steps = no_touch_timeout_steps
-        self.reward = NextoReward(n_cars)
+        self.reward = GoddardReward(n_sim, n_cars, device) if shaping else None
         self.touch_steps = torch.zeros(n_sim, dtype=torch.long, device=device)
         self.fixed_touch_windows = frameskip in (1, 2, 4, 8)
         self.window_ticks = torch.zeros(
@@ -74,6 +75,9 @@ class GameplayDiagnostics:
         self.counts["goals_for"] += (score > 0).sum()
         self.counts["episodes"] += context.events.done.sum() * self.n_cars
         self.counts["timeouts"] += timeout.sum() * self.n_cars
+
+        if self.reward is None:
+            return torch.zeros_like(score, dtype=torch.float32)
 
         return self.reward(context)
 
