@@ -17,19 +17,19 @@ BALL_MAX_SPEED = 6000.0
 
 @dataclass(frozen=True)
 class GoddardWeights:
-    kickoff:          float = 0.25
-    speed_gain:       float = 0.2
-    speed_loss:       float = 0.05
-    boost_gain:       float = 0.2
-    ground_boost:     float = 0.001
-    aerial_touch:     float = 0.5
-    ceiling:          float = 0.1
-    flip_reset:       float = 0.5
-    goal:             float = 5.0
-    goal_speed:       float = 1.0
-    goal_height:      float = 1.0
-    demo:             float = 0.5
-    upside_down:      float = 0.005
+    kickoff:      float = 0.25
+    speed_gain:   float = 0.2
+    speed_loss:   float = 0.05
+    boost_gain:   float = 0.2
+    ground_boost: float = 0.001
+    aerial_touch: float = 0.5
+    ceiling:      float = 0.1
+    flip_reset:   float = 0.5
+    goal:         float = 5.0
+    goal_speed:   float = 1.0
+    goal_height:  float = 1.0
+    demo:         float = 0.5
+    upside_down:  float = 0.005
 
 
 class GoddardReward:
