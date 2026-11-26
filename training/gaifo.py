@@ -238,8 +238,8 @@ class Imitation:
 
                 gen = generated_logits[:, index]
                 exp = expert_logits[:, index]
-                gen_acc = (gen >= 0).float().mean()
-                exp_acc = (exp < 0).float().mean()
+                gen_acc = (gen < 0).float().mean()
+                exp_acc = (exp >= 0).float().mean()
 
                 metrics[f"{prefix}/generated_accuracy"] = gen_acc.item()
                 metrics[f"{prefix}/expert_accuracy"] = exp_acc.item()

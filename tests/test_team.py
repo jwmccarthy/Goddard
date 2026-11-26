@@ -237,7 +237,7 @@ class PerCarTrainingTests(unittest.TestCase):
 
 class ConstantDiscriminator(nn.Module):
     def forward(self, frames):
-        return frames.new_full((len(frames), 2), -math.log(2))
+        return frames.new_full((len(frames), 2), math.log(2))
 
 
 class FixedScenes:

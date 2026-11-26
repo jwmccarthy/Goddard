@@ -220,7 +220,7 @@ def train_discriminator_batch(
     if args.discriminator_mirror:
         pairs = mirror_scene_pairs(pairs, args.team_size * 2)
 
-    labels = torch.cat((pairs.new_ones(count), pairs.new_zeros(count)))
+    labels = torch.cat((pairs.new_zeros(count), pairs.new_ones(count)))
 
     if args.discriminator_amp_reward:
         labels = 2 * labels - 1
@@ -352,7 +352,7 @@ def imitation_rewards(
         raw_reward_sum += raw.sum()
 
         if args.discriminator_forward_kl_reward:
-            over_cap = -logits.float() > math.log(args.discriminator_ratio_cap)
+            over_cap = logits.float() > math.log(args.discriminator_ratio_cap)
             capped += (over_cap & live[:, None]).sum()
             live_heads += live.sum() * logits.shape[-1]
 

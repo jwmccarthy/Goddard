@@ -639,22 +639,22 @@ def discriminator_rewards(
     discriminator_forward_kl_reward: bool = False,
     discriminator_ratio_cap:         float = 10.0
 ) -> torch.Tensor:
-    # Expert labels are zero/-1, generated labels are one/+1, as before.
+    # Expert labels are one/+1, generated labels are zero/-1.
     logits = logits.float()
 
     if discriminator_forward_kl_reward:
         cap = math.log(discriminator_ratio_cap)
-        odds = (-logits).clamp(max=cap).exp()
+        odds = logits.clamp(max=cap).exp()
 
         return odds.clamp_max(discriminator_ratio_cap).mean(-1) - 1.0
 
     if discriminator_log_reward:
-        return F.logsigmoid(-logits).mean(-1)
+        return F.logsigmoid(logits).mean(-1)
 
     rewards = (
-        (1 - 0.25 * (logits + 1).square()).clamp_min(0)
+        (1 - 0.25 * (logits - 1).square()).clamp_min(0)
         if amp
-        else F.softplus(-logits)
+        else F.softplus(logits)
     )
 
     return rewards.mean(-1)
