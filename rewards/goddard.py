@@ -17,7 +17,6 @@ BALL_MAX_SPEED = 6000.0
 
 @dataclass(frozen=True)
 class GoddardWeights:
-
     kickoff:          float = 0.25
     speed_gain:       float = 0.2
     speed_loss:       float = 0.05
